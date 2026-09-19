@@ -126,7 +126,18 @@ MAX_AGE_SECONDS = 3 * 3600
 #   privacydev.net / nitter.net  500'd on 2026-09-17
 #   xcancel.com        suspended 2026-09-14 — kept: auto-revives in the chain
 #                      if it returns
+# round 13 (2026-09-20): nitter.cf added as FIRST. Live probe 2026-09-20:
+# plain RSS works WITHOUT a token, feed fully fresh (top item == newest
+# posted tweet), robots allow-all + dynamic sitemaps, operator explicitly
+# welcomes crawlers (teapot commit 59884be, 2026-09-19). jaydenha.uk moves
+# to #3: kept as fallback, but as #1 it was the instance that served
+# stale-but-200 feeds and masked fresher fallbacks (the ~30-min delay).
+# xitter.cf (#2) is the SAME backend as nitter.cf (canonicals point at
+# nitter.cf) — it is a pure URL-level backup (separate DNS/TLS path), not
+# an independent instance.
 RSS_INSTANCES = [
+    "https://nitter.cf",
+    "https://xitter.cf",
     "https://nitter.jaydenha.uk",
     "https://nitter.meowing.monster",
     "https://nitter.click",
