@@ -239,6 +239,15 @@ REDDIT_FEED_TOKEN = os.getenv("REDDIT_FEED_TOKEN", "").strip()
 # on redlib.miningtcup.me requests only.
 MININGTCUP_TOKEN = os.getenv("NITTER_RSS_TOKEN", "").strip()
 
+# round 15 (2026-09-20): eddrit.com — public Reddit frontend with basic
+# RSS (github.com/corenting/eddrit). Token-free: no REDDIT_FEED_TOKEN, no
+# bot check — plain client verified live 2026-09-20 on ALL 6 tracked subs.
+# Feed URL: /r/<sub>/.rss (per-post: /r/<sub>/comments/<id>/.rss).
+# Media URLs are the originals (preview.redd.it / i.redd.it / v.redd.it);
+# only post permalinks are rewritten to eddrit.com — the post id still
+# comes from the same /comments/<id>/ path every other frontend uses.
+EDDRIT_BASE = "https://eddrit.com"
+
 # OPTIONAL (FULL MODE, path a): Reddit script app credentials.
 # reddit.com/prefs/apps -> create another app -> type "script" ->
 # redirect http://localhost. Client ID = under the app name; secret via the
@@ -1364,6 +1373,26 @@ async def fetch_working_reddit_feed(session: aiohttp.ClientSession, subreddit: s
         if feed:
             logging.info(f"Successfully fetched r/{subreddit} from {instance}")
             return feed
+        # round 15 (2026-09-20): eddrit.com — token-free RSS fallback.
+        # Sits AFTER redlib.miningtcup.me (token-gated, tried first) and
+        # BEFORE the Arctic Shift search backup (archive, laggier).
+        # Same session/headers/timeout/success handoff as the redlib
+        # branch: _fetch_feed is that path (BROWSER_HEADERS + RSS Accept,
+        # ClientTimeout(total=15), 429 retries, /comments/ validation).
+        if instance == "https://redlib.miningtcup.me":
+            try:
+                eddrit_url = f"{EDDRIT_BASE}/r/{subreddit}/.rss"
+                logging.info(f"trying eddrit feed: {eddrit_url}")
+                eddrit_feed = await _fetch_feed(session, eddrit_url, EDDRIT_BASE)
+                if eddrit_feed:
+                    logging.info(
+                        f"eddrit feed OK: r/{subreddit} -> "
+                        f"{len(eddrit_feed.entries)} entries")
+                    logging.info(f"Successfully fetched r/{subreddit} from {EDDRIT_BASE}")
+                    return eddrit_feed
+            except Exception as e:
+                logging.error(
+                    f"eddrit feed failed for r/{subreddit}: {e} — falling through")
     logging.warning(f"Could not fetch valid RSS feed for r/{subreddit} from any instance.")
     return None
 

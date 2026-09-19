@@ -139,6 +139,11 @@ RSS_INSTANCES = [
     "https://nitter.cf",
     "https://xitter.cf",
     "https://nitter.jaydenha.uk",
+    # round 14 (2026-09-20): live-probed fresh + token-free today.
+    # x.n0g.xyz is an alias of nitter.gravitywell.xyz (independent
+    # backend from nitter.cf); xitter.cf (#2) is nitter.cf's alias.
+    "https://x.yuuki.sh",
+    "https://x.n0g.xyz",
     "https://nitter.meowing.monster",
     "https://nitter.click",
     "https://nitter.xitter.cc",
