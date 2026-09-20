@@ -280,6 +280,15 @@ PENDING_FILE = "pending_reddit.json"
 PENDING_RECHECK_SECONDS = int(os.getenv("PENDING_RECHECK_SECONDS", "1800"))  # 30 min
 PENDING_MAX_AGE_SECONDS = 48 * 3600  # matches the 48h posting window
 
+# Round 32 (2026-09-20): SHORT re-check interval for states that can change
+# quickly — posts awaiting moderator approval ("pending approval" /
+# "not_live") and transient "all live sources are down" misses. A
+# newly-approved post then posts on the next cron tick (default 300 s)
+# instead of waiting up to 30 min. Removed/deleted posts are NEVER
+# re-checked (they re-enter via RSS if restored — see _NO_RECHECK_REASONS
+# below); media-waiting posts keep the 30-min interval.
+APPROVAL_RECHECK_SECONDS = int(os.getenv("APPROVAL_RECHECK_SECONDS", "300"))  # 5 min
+
 # ---------------------------------------------------------------------------
 # ■ RSS SOURCES (unchanged from V1/V2 — see round 8/9 notes)
 # ---------------------------------------------------------------------------
@@ -523,6 +532,60 @@ def pending_due(pending: dict, key: str, now: float) -> bool:
     if not isinstance(entry, dict):
         return True
     return now - float(entry.get("last_checked") or 0) >= PENDING_RECHECK_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# ■ ROUND 32 (2026-09-20): REASON-AWARE PENDING RE-CHECK
+# Live-verified both sides on 2026-09-20:
+#   * production logs: ~19 mod-removed posts resurfacing from the Arctic
+#     backup every run, re-verified through the full proxy chain (~13 s
+#     each) on every 30-min cycle — 15-20 min runs posting nothing until
+#     the 48 h window expired them;
+#   * queued post 1wl41aj ("Post is awaiting moderator approval."):
+#     invisible to ALL live sources (redditez/vxreddit/embeddit 404) — it
+#     sits in the pending cache and re-checks on the short interval,
+#     posting the moment a live source can see it.
+# Treatment by reason:
+#   * removed/deleted (the no-recheck set): NEVER re-checked while the
+#     entry exists (self-expires at the 48 h window). A removed post
+#     cannot change state while removed; if a mod RESTORES it, it
+#     re-enters via RSS with a fresh "updated" stamp — an RSS entry
+#     bypasses the skip and the full pipeline posts it.
+#   * approval-pending / transient-sources-down: the SHORT
+#     APPROVAL_RECHECK_SECONDS interval (default 300 s).
+#   * media_wait / partial_gallery / unknown: the round-30
+#     PENDING_RECHECK_SECONDS (30 min) throttle, unchanged.
+# ---------------------------------------------------------------------------
+_NO_RECHECK_REASONS = frozenset({
+    "removal_notice",             # round-20 gate: proxy body had the notice
+    "removal notice",             # round-18 gate: RSS/archive body had it
+    "title marker",               # "[removed]" / "[deleted]" as whole title
+    "whole-body marker",          # "[removed]" / "[deleted]" as whole body
+    "removed by moderator",
+    "removed by moderators/filters",
+    "deleted by author",
+})
+_SHORT_RECHECK_REASONS = frozenset({"not_live", "sources_down", "pending approval"})
+
+
+def _pending_throttle_skip(pending: dict, key: str, now: float, entry) -> bool:
+    """Round 32: should this pending post be skipped (not re-verified) now?
+
+    Removed/deleted posts: always skipped — EXCEPT when the entry came from
+    RSS (entry is not an _ArcticEntry), i.e. the post re-appeared in the
+    feed with fresh content (a restore): the full pipeline runs and either
+    posts it (now live) or re-queues it (still shows a notice).
+    """
+    pend = pending.get(key)
+    reason = pend.get("reason") if isinstance(pend, dict) else None
+    if reason in _NO_RECHECK_REASONS:
+        # Arctic resurface -> skip (never re-verified); RSS re-appearance
+        # (a restore, fresh "updated" stamp) -> run the full pipeline.
+        return isinstance(entry, _ArcticEntry)
+    interval = (APPROVAL_RECHECK_SECONDS if reason in _SHORT_RECHECK_REASONS
+                else PENDING_RECHECK_SECONDS)
+    last = float(pend.get("last_checked") or 0) if isinstance(pend, dict) else 0.0
+    return now - last < interval
 
 
 def normalize_reddit_path(link: str) -> str | None:
@@ -842,7 +905,13 @@ _REMOVED_TITLE_RE = re.compile(
 _REMOVED_WHOLE_BODY_RE = re.compile(
     r"^\*{0,2}\[ ?(?:deleted|removed) ?\]\*{0,2}$"
     r"|^\*{0,2}\[ ?removed ?by ?moderator ?\]\*{0,2}$", re.I)
+# round 32 (2026-09-20): the mod-queue banner "Post is awaiting moderator
+# approval." (observed live 2026-09-20, post 1wl41aj). A queued post is NOT
+# removed: it is re-checked on the short approval interval and posts as
+# soon as it is approved. Checked FIRST — the banner never co-occurs with a
+# removal notice, so order is safe.
 _REMOVED_NOTICE_RES = (
+    (re.compile(r"awaiting (?:moderator )?approval", re.I), "pending approval"),
     (re.compile(r"sorry,? (?:this|the) post (?:has been|was) (?:removed|deleted)", re.I), "removal notice"),
     (re.compile(r"\[ ?removed ?by ?moderator ?\]", re.I), "removed by moderator"),
     (re.compile(r"removed by (?:the )?(?:moderators?|reddit)", re.I),
@@ -856,7 +925,8 @@ def removed_post_reason(title: str | None, body: str | None) -> str | None:
     (still pending approval), else None. Observed notices (2026-09-17 live
     run): "[deleted]", "[removed]", "**[ Removed by moderator ]**",
     "Sorry, this post has been removed by the moderators of r/...",
-    "Sorry, this post was deleted by the person who originally posted it".
+    "Sorry, this post was deleted by the person who originally posted it",
+    "Post is awaiting moderator approval." (2026-09-20, post 1wl41aj).
     Only the first 400 chars of the body are inspected — a legitimate post
     that merely mentions a deletion later in its text must not be caught.
     An EMPTY body is NOT treated as removed (legitimate image/link posts
@@ -1081,12 +1151,19 @@ def _repair_label_url_mangle(lines: list) -> list:
 # archive-sourced post is only posted when at least one live source can
 # actually retrieve it; otherwise it is skipped and NOT cached — once it
 # is approved or restored it becomes visible and posts normally on a
-# later run. RSS-sourced posts and TEST POST rebuilds are unaffected.
+# later run. TEST POST rebuilds are unaffected. Round 32 (2026-09-20):
+# RSS-sourced posts now run this gate too (live 1wl41aj: the feed delivers
+# queued posts with real content) — with feed_ok=False, i.e. the redlib
+# post pages only as the fallback, never the feed itself.
 # ---------------------------------------------------------------------------
 
-async def verify_archive_post_live(session, path: str, label: str = ""):
-    """Verify an archive-sourced post is still LIVE on reddit.
-    Returns (live: bool, why: str)."""
+async def verify_archive_post_live(session, path: str, label: str = "",
+                                   feed_ok: bool = True):
+    """Verify a post is still LIVE on reddit.
+    Returns (live: bool, why: str). Round 32: feed_ok=False when the
+    candidate ITSELF came from the RSS feed — the feed cannot verify the
+    feed (a queued post sits in the feed with real content, live 1wl41aj),
+    so the fallback then uses the redlib post pages only."""
     health = _proxy_health or {}
     proxy_down = (reddit_proxy is None or all(
         isinstance(health.get(s), dict) and health[s].get("ok") is False
@@ -1099,15 +1176,35 @@ async def verify_archive_post_live(session, path: str, label: str = ""):
         if result:
             _reason = removed_post_reason(result.get("title"), result.get("body"))
             if _reason:
+                if _reason == "pending approval":
+                    return False, (f"live source {result.get('service')} shows "
+                                   f"the post is still awaiting moderator "
+                                   f"approval")
                 return False, (f"live source {result.get('service')} still "
                                f"shows a removal notice ({_reason})")
             return True, f"live via {result.get('service')}"
     # redlib (the "other means"): the post page only exists while the
-    # post is live on reddit.
-    try:
-        base = await fetch_test_post_base(session, path, label)
-    except Exception:
-        base = None
+    # post is live on reddit. Round 32: when the candidate itself came
+    # from the RSS feed (feed_ok=False), the feed is NOT a verification
+    # source — it is the very place the queued post sits with real
+    # content (live 1wl41aj) — so the fallback uses the redlib post
+    # pages ONLY (independent live sources).
+    base = None
+    if feed_ok:
+        try:
+            base = await fetch_test_post_base(session, path, label)
+        except Exception:
+            base = None
+    else:
+        for _inst in REDDIT_RSS_INSTANCES:
+            try:
+                _page = await _fetch_redlib_post_page(session, _inst, path)
+            except Exception:
+                _page = None
+            if _page:
+                base = base_from_redlib_page(_page, path)
+                if base:
+                    break
     if base and (base.get("title") or base.get("body")):
         return True, "live via redlib"
     if proxy_down:
@@ -2847,12 +2944,20 @@ async def main():
             # (manual tools must always exercise the full pipeline).
             if (not TEST_POST_ID and not DRY_RUN
                     and unique_key in pending
-                    and not pending_due(pending, unique_key, now)):
+                    and _pending_throttle_skip(pending, unique_key, now, entry)):
                 _pend = pending[unique_key]
-                _due_in = int(PENDING_RECHECK_SECONDS
-                              - (now - float(_pend.get("last_checked") or 0)))
-                logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — "
-                             f"skipping recheck, due again in ~{_due_in}s.")
+                if _pend.get("reason") in _NO_RECHECK_REASONS:
+                    logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — "
+                                 f"not re-checking (removed posts re-enter via RSS "
+                                 f"when restored; entry expires at the 48 h window).")
+                else:
+                    _interval = (APPROVAL_RECHECK_SECONDS
+                                 if _pend.get("reason") in _SHORT_RECHECK_REASONS
+                                 else PENDING_RECHECK_SECONDS)
+                    _due_in = int(_interval
+                                  - (now - float(_pend.get("last_checked") or 0)))
+                    logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — "
+                                 f"skipping recheck, due again in ~{_due_in}s.")
                 continue
 
             if entry is not None:
@@ -2933,27 +3038,36 @@ async def main():
                 _removed = removed_post_reason(_r_title, _r_body)
                 if _removed:
                     mark_pending(pending, unique_key, _removed, now)
-                    logging.info(f"[{unique_key}] post appears removed/deleted "
-                                 f"({_removed}) — skipping, not cached (will post "
-                                 f"once approved).")
+                    logging.info(f"[{unique_key}] post appears removed/deleted/"
+                                 f"awaiting approval ({_removed}) — skipping, not "
+                                 f"cached (will post once approved).")
                     continue
 
-            # ---- round 20: liveness gate for archive-sourced posts ----
+            # ---- round 20 + round 32: liveness gate for ALL sourced posts ----
             # The Arctic archive can carry posts that are no longer live on
-            # reddit (removed / deleted / still pending approval). Verify a
-            # live source (proxy chain, then redlib) can actually retrieve
-            # the post before posting it; otherwise skip + don't cache.
-            if (not TEST_POST_ID and entry is not None
-                    and isinstance(entry, _ArcticEntry)):
-                _live, _why = await verify_archive_post_live(session, path,
-                                                             label=unique_key)
+            # reddit (removed / deleted / still pending approval) — and,
+            # live-verified 2026-09-20 (post 1wl41aj, "Post is awaiting
+            # moderator approval."): the RSS feed ALSO delivers queued posts
+            # with their REAL content (no banner in the feed text), which the
+            # round-18 text filter cannot see — the post was built + posted
+            # to Discord while still in the mod queue. So the gate now runs
+            # for RSS-sourced posts too, with feed_ok=False (the feed cannot
+            # verify the feed — the redlib post pages are the independent
+            # fallback). Otherwise skip + don't cache: a queued post
+            # re-checks on the short approval interval and posts the moment
+            # a live source can see it.
+            if not TEST_POST_ID and entry is not None:
+                _live, _why = await verify_archive_post_live(
+                    session, path, label=unique_key,
+                    feed_ok=not isinstance(entry, _ArcticEntry))
                 if not _live:
                     mark_pending(pending, unique_key,
-                                 "removal_notice" if "removal notice" in _why
+                                 "pending approval" if "awaiting moderator approval" in _why
+                                 else "removal_notice" if "removal notice" in _why
                                  else "sources_down" if "all live sources are down" in _why
                                  else "not_live", now)
-                    logging.info(f"[{unique_key}] archive post not verified "
-                                 f"live ({_why}) — skipping, not cached (will "
+                    logging.info(f"[{unique_key}] post not verified live "
+                                 f"({_why}) — skipping, not cached (will "
                                  f"post once approved/restored).")
                     continue
 
