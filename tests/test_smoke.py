@@ -1774,6 +1774,30 @@ check("r30 P3: workflow commits pending_reddit.json with the other caches",
 check("r30 P3: pending_reddit.json exists at the repo root for the checkout",
       os.path.exists(os.path.join(ROOT, "pending_reddit.json")))
 
+# ---- R31: feed-token .json probe gate (REDDIT_JSON_PROBE) ----------------
+_r31_saved = (v3.JSON_PROBE_MODE, v3.REDDIT_CLIENT_ID, v3.REDDIT_CLIENT_SECRET)
+try:
+    def _r31_probe(mode, cid, csecret):
+        v3.JSON_PROBE_MODE = mode
+        v3.REDDIT_CLIENT_ID = cid
+        v3.REDDIT_CLIENT_SECRET = csecret
+        return v3.feedtoken_probe_enabled()
+    check("r31 probe: auto (default) without an OAuth app is OFF (the 65 s 403 probe)",
+          _r31_probe("auto", "", "") is False)
+    check("r31 probe: unset/empty mode = auto — without an app is OFF",
+          _r31_probe("", "", "") is False)
+    check("r31 probe: auto WITH both app secrets is ON (legacy fallback under working OAuth)",
+          _r31_probe("auto", "clientid", "clientsecret") is True)
+    check("r31 probe: force is ON even without an app",
+          _r31_probe("force", "", "") is True)
+    check("r31 probe: off wins even with an app",
+          _r31_probe("off", "clientid", "clientsecret") is False)
+    check("r31 probe: fetch_post_json's feed-token branch is gated",
+          "REDDIT_FEED_TOKEN and feedtoken_probe_enabled()"
+          in inspect.getsource(v3.fetch_post_json))
+finally:
+    (v3.JSON_PROBE_MODE, v3.REDDIT_CLIENT_ID, v3.REDDIT_CLIENT_SECRET) = _r31_saved
+
 
 print()
 if failures:
