@@ -88,6 +88,8 @@ jobs:
           # YOUTUBE_MEDIA_EMBED — '1' also tries to PLAY youtube links (seaof.glass);
           #                       default = thumbnail + spark button only
           # FEEDTOKEN_JSON_STAGGER — seconds to wait between feed-token .json attempts
+          #                       (round 31: only while the probe runs — see
+          #                       REDDIT_JSON_PROBE below)
           # PENDING_RECHECK_SECONDS — seconds between live re-checks of skipped
           #                       (removed/pending/media-waiting) posts; default
           #                       1800 (30 min). Lower = newly-approved posts are
@@ -100,17 +102,25 @@ jobs:
           # YOUTUBE_MEDIA_EMBED: ${{ vars.YOUTUBE_MEDIA_EMBED }}
           # FEEDTOKEN_JSON_STAGGER: ${{ vars.FEEDTOKEN_JSON_STAGGER }}
           # PENDING_RECHECK_SECONDS: ${{ vars.PENDING_RECHECK_SECONDS }}
+          # REDDIT_JSON_PROBE — round 31: feed-token .json FULL-MODE probe —
+          #   auto (default; unset/empty = auto) = only when the OAuth app
+          #   secrets below exist; force = always try (legacy, 65 s per run
+          #   with new posts); off = never.
+          REDDIT_JSON_PROBE: ${{ vars.REDDIT_JSON_PROBE }}
           WEBHOOK_REDDIT_ZENLESSZONEZEROLEAKS_: ${{ secrets.WEBHOOK_REDDIT_ZENLESSZONEZEROLEAKS_ }}
           WEBHOOK_REDDIT_GENSHIN_IMPACT_LEAKS: ${{ secrets.WEBHOOK_REDDIT_GENSHIN_IMPACT_LEAKS }}
           WEBHOOK_REDDIT_HONKAISTARRAIL_LEAKS: ${{ secrets.WEBHOOK_REDDIT_HONKAISTARRAIL_LEAKS }}
           WEBHOOK_REDDIT_WUTHERINGWAVESLEAKS: ${{ secrets.WEBHOOK_REDDIT_WUTHERINGWAVESLEAKS }}
           WEBHOOK_REDDIT_HONKAINEXUSANIMALEAKS: ${{ secrets.WEBHOOK_REDDIT_HONKAINEXUSANIMALEAKS }}
           WEBHOOK_REDDIT_ANANTALEAKS: ${{ secrets.WEBHOOK_REDDIT_ANANTALEAKS }}
-          # OPTIONAL (V3 full mode): Reddit script app (reddit.com/prefs/apps ->
+          # OPTIONAL (V3 FULL MODE): Reddit script app (reddit.com/prefs/apps ->
           # type "script" -> redirect http://localhost). 2026: new API access may
           # require Reddit's approval form — V3 works without it (native mode).
-          # REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
-          # REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          # Round 31: wired LIVE — empty secrets are harmless (the script
+          # requires BOTH non-empty); set both = FULL MODE, no code change,
+          # and the feed-token .json probe re-enables itself (auto mode).
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
         # ───────────────────────────────────────────────────────────────────
         # TESTING AREA (how updates ship):
         # • A new/changed script lives in "testing area/" FIRST (e.g.
