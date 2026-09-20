@@ -91,9 +91,11 @@ jobs:
           #                       (round 31: only while the probe runs — see
           #                       REDDIT_JSON_PROBE below)
           # PENDING_RECHECK_SECONDS — seconds between live re-checks of skipped
-          #                       (removed/pending/media-waiting) posts; default
-          #                       1800 (30 min). Lower = newly-approved posts are
-          #                       caught sooner, higher = faster quiet runs.
+          #                       (media-waiting) posts; default 1800 (30 min).
+          #                       (Round 32: removed posts are NEVER re-checked —
+          #                       they re-enter via RSS if a mod restores them;
+          #                       approval-queued posts re-check at
+          #                       APPROVAL_RECHECK_SECONDS instead.)
           # PROXY_MEDIA: ${{ vars.PROXY_MEDIA }}
           # PROXY_WARMUP_POST: ${{ vars.PROXY_WARMUP_POST }}
           # YOUTUBE_LINK_MESSAGE: ${{ vars.YOUTUBE_LINK_MESSAGE }}
@@ -102,6 +104,12 @@ jobs:
           # YOUTUBE_MEDIA_EMBED: ${{ vars.YOUTUBE_MEDIA_EMBED }}
           # FEEDTOKEN_JSON_STAGGER: ${{ vars.FEEDTOKEN_JSON_STAGGER }}
           # PENDING_RECHECK_SECONDS: ${{ vars.PENDING_RECHECK_SECONDS }}
+          # APPROVAL_RECHECK_SECONDS — round 32: seconds between re-checks of
+          #                       approval-queued / transient sources-down
+          #                       posts; default 300 (5 min). Lower = a
+          #                       newly-approved post hits Discord sooner;
+          #                       higher = quieter runs.
+          # APPROVAL_RECHECK_SECONDS: ${{ vars.APPROVAL_RECHECK_SECONDS }}
           # REDDIT_JSON_PROBE — round 31: feed-token .json FULL-MODE probe —
           #   auto (default; unset/empty = auto) = only when the OAuth app
           #   secrets below exist; force = always try (legacy, 65 s per run
