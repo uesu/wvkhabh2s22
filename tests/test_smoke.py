@@ -1706,8 +1706,9 @@ check("r30 main: pending cache loaded next to the dedup cache",
       "pending = load_pending()" in _r30_main)
 _r30_throttle = _r30_main.split("pending-post recheck throttle", 1)[-1].split("if entry is not None:", 1)[0]
 for _cond in ("not TEST_POST_ID", "not DRY_RUN", "unique_key in pending",
-              "not pending_due(pending, unique_key, now)"):
-    check(f"r30 throttle keeps condition: {_cond}", _cond in _r30_throttle, _r30_throttle)
+              "_pending_throttle_skip(pending, unique_key, now, entry)"):
+    check(f"r30 throttle keeps condition: {_cond} (round 32: the due-decision "
+          f"moved into the reason-aware helper)", _cond in _r30_throttle, _r30_throttle)
 check("r30 throttle: skips with `continue` and never caches as posted",
       _r30_throttle.rstrip().endswith("continue") and "posted.add" not in _r30_throttle,
       _r30_throttle)
@@ -1797,6 +1798,64 @@ try:
           in inspect.getsource(v3.fetch_post_json))
 finally:
     (v3.JSON_PROBE_MODE, v3.REDDIT_CLIENT_ID, v3.REDDIT_CLIENT_SECRET) = _r31_saved
+
+# ---- R32: reason-aware pending re-check + RSS liveness gate (round 32)
+import inspect as _r32_inspect
+
+_r32_arctic = v3._ArcticEntry({"id": "x1", "subreddit": "AnantaLeaks"})
+_r32_rss = _FakeEntry("/r/AnantaLeaks/comments/x1/t/", "t", "a", "<p>b</p>")
+_r32_main_src = _r32_inspect.getsource(v3.main)
+
+
+def _r32_pend(reason):
+    return {"k": {"first_seen": 0.0, "last_checked": 1000.0, "reason": reason}}
+
+
+check("r32: removed post (Arctic resurface) is NEVER re-checked, even at +1 h",
+      v3._pending_throttle_skip(_r32_pend("removal_notice"), "k", 4600.0, _r32_arctic) is True)
+check("r32: removed post that RE-APPEARS via RSS bypasses the skip (restore path)",
+      v3._pending_throttle_skip(_r32_pend("removal_notice"), "k", 4600.0, _r32_rss) is False)
+check("r32: title-marker (deleted) post from the Arctic backup is skipped too",
+      v3._pending_throttle_skip(_r32_pend("title marker"), "k", 4600.0, _r32_arctic) is True)
+check("r32: approval-queued post (not_live) is skipped before the short interval (+60 s)",
+      v3._pending_throttle_skip(_r32_pend("not_live"), "k", 1060.0, _r32_arctic) is True)
+check("r32: approval-queued post (not_live) is DUE at the short interval (+300 s)",
+      v3._pending_throttle_skip(_r32_pend("not_live"), "k", 1300.0, _r32_arctic) is False)
+check("r32: 'pending approval' (banner) re-checks on the short interval (+300 s due)",
+      v3._pending_throttle_skip(_r32_pend("pending approval"), "k", 1300.0, _r32_arctic) is False)
+check("r32: sources_down (transient) re-checks on the short interval (+60 s skipped)",
+      v3._pending_throttle_skip(_r32_pend("sources_down"), "k", 1060.0, _r32_arctic) is True)
+check("r32: media_wait keeps the round-30 30-min throttle (+60 s skipped, +30 min due)",
+      v3._pending_throttle_skip(_r32_pend("media_wait"), "k", 1060.0, _r32_arctic) is True
+      and v3._pending_throttle_skip(_r32_pend("media_wait"), "k", 2800.0, _r32_arctic) is False)
+check("r32: unknown/missing reason falls back to the round-30 30-min throttle",
+      v3._pending_throttle_skip(_r32_pend(None), "k", 1060.0, _r32_arctic) is True
+      and v3._pending_throttle_skip(_r32_pend(None), "k", 2800.0, _r32_arctic) is False)
+check("r32: the no-recheck set is exactly the removal/deletion reasons",
+      v3._NO_RECHECK_REASONS == frozenset({
+          "removal_notice", "removal notice", "title marker", "whole-body marker",
+          "removed by moderator", "removed by moderators/filters", "deleted by author"}))
+check("r32: the short-recheck set is exactly the approval/transient reasons",
+      v3._SHORT_RECHECK_REASONS == frozenset(
+          {"not_live", "sources_down", "pending approval"}))
+check("r32: the mod-queue banner is recognized as 'pending approval'",
+      v3.removed_post_reason("Happy Birthday Caesar | Pink Pages",
+                             "Post is awaiting moderator approval.") == "pending approval")
+check("r32: clean post text is NOT flagged (no false positive)",
+      v3.removed_post_reason("leak title",
+                             "new info here https://example.com/x") is None)
+check("r32: the round-20 liveness gate maps the banner to 'pending approval'",
+      '"awaiting moderator approval" in _why' in _r32_main_src)
+check("r32: the main loop uses the reason-aware helper (wired)",
+      "_pending_throttle_skip(pending, unique_key, now, entry)" in _r32_main_src)
+_r32_gate = _r32_main_src.split("liveness gate", 1)[1].split(
+    "post once approved/restored", 1)[0]
+check("r32: the liveness gate now covers RSS entries too (live 1wl41aj: a "
+      "queued post arrived via RSS with real content and was posted — the "
+      "gate was Arctic-only)",
+      "if not TEST_POST_ID and entry is not None:" in _r32_gate
+      and "and isinstance(entry, _ArcticEntry)):" not in _r32_main_src
+      and "feed_ok=not isinstance(entry, _ArcticEntry)" in _r32_gate, _r32_gate)
 
 
 print()
