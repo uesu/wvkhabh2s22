@@ -15,12 +15,14 @@
 #        2026 note: new API access may require Reddit's approval form
 #        (Responsible Builder Policy) — not guaranteed, so V3 never depends
 #        on it. If you get one, just add the two secrets; no code change.
-#     b) FEED TOKEN ON .json (workaround, tried automatically):
+#     b) FEED TOKEN ON .json (ROUND 31: only when the OAuth app above exists,
+#        or REDDIT_JSON_PROBE=force — see JSON_PROBE_MODE below):
 #        www.reddit.com/comments/<id>.json?…&feed=<REDDIT_FEED_TOKEN>.
-#        Anonymous .json is 403 from datacenters (verified); whether your
-#        feed token lifts that is answered by your FIRST test run — the log
-#        line says exactly which path worked. Tried once per run; a 403
-#        result is remembered for that run.
+#        Anonymous .json is 403 from datacenters (verified 2026-09-20), and
+#        the feed token's documented role is the RSS rate tier — so without
+#        an OAuth app the attempt is pure 65 s + a 403 log line per run with
+#        new posts, and auto mode skips it entirely. A 403 result is
+#        remembered for that run.
 #     FULL MODE adds: every photo (20-photo posts → 2nd container),
 #     upvotes/comments stats, video fallback_url (with audio), and true
 #     crosspost full-embeds (fetches the original post, 1 level).
@@ -381,6 +383,32 @@ DASH_QUALITIES = (720, 1080, 480, 360)
 # this is the polite sleep before each attempt (lower it ONLY if your token
 # reliably works on .json).
 FEEDTOKEN_JSON_STAGGER = int(os.getenv("FEEDTOKEN_JSON_STAGGER", "65"))
+
+# ---------------------------------------------------------------------------
+# ■ ROUND 31 (2026-09-20): FEED-TOKEN .json FULL-MODE PROBE GATE
+# Live-verified: Reddit 403s .json from datacenter IPs, so without an OAuth
+# app the round-12 probe was 65 s of guaranteed 403 log noise per run with
+# new posts (first attempt only — a 403 is remembered for the rest of the
+# run; steady-state runs never reached it).
+#   auto (default; unset/empty = auto) — probe runs only when BOTH
+#          REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET are set (a real app
+#          exists — then this is the legacy fallback under a working
+#          OAuth path);
+#   force — legacy behavior: always try (65 s wait) on a run with new posts;
+#   off   — never.
+# Repo Variable REDDIT_JSON_PROBE (wired in reddit_monitor.yml).
+# ---------------------------------------------------------------------------
+JSON_PROBE_MODE = os.getenv("REDDIT_JSON_PROBE", "auto").strip().lower()
+
+
+def feedtoken_probe_enabled() -> bool:
+    """Round 31: should the feed-token .json FULL-MODE probe run?"""
+    if JSON_PROBE_MODE == "off":
+        return False
+    if JSON_PROBE_MODE == "force":
+        return True
+    # auto (default; also any unrecognized value): only with a real app.
+    return bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET)
 
 # Text display budget (Discord: 4000 chars total per message across all
 # text components; we keep header+body+stats comfortably under it).
@@ -1471,9 +1499,11 @@ async def fetch_post_json(session: aiohttp.ClientSession, post_id: str, use_oaut
     token = await get_oauth_token(session) if use_oauth else None
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    elif not _feedtoken_json_failed and REDDIT_FEED_TOKEN:
+    elif not _feedtoken_json_failed and REDDIT_FEED_TOKEN and feedtoken_probe_enabled():
         # Workaround attempt: the personal feed token on a .json endpoint.
         # Anonymous .json is 403 from datacenters; the token MIGHT lift it.
+        # Round 31: only reached when REDDIT_JSON_PROBE allows it
+        # (auto = only with an OAuth app; force = always; off = never).
         url = (f"https://www.reddit.com/comments/{post_id}.json"
                f"?limit=25&raw_json=1&feed={REDDIT_FEED_TOKEN}")
         headers = dict(BROWSER_HEADERS)
@@ -2670,10 +2700,26 @@ async def main():
         logging.warning("REDDIT_FEED_TOKEN not set — running anonymously. The combined feed "
                         "(1 request/run) usually fits the ~1 req/min limit, but add your feed "
                         "token (old.reddit.com -> Preferences -> Feeds) as REDDIT_FEED_TOKEN "
-                        "to be bulletproof. (V3 also tries it on .json for FULL MODE.)")
+                        "to be bulletproof. (V3 also uses it on .json for FULL MODE — "
+                        "round 31: only when an OAuth app exists or REDDIT_JSON_PROBE=force.)")
     if not (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET):
-        logging.info("No Reddit OAuth app secrets — FULL MODE may still work via the feed "
-                     "token on .json (tested once per run); otherwise cards use native RSS data.")
+        if feedtoken_probe_enabled():
+            logging.info("No Reddit OAuth app secrets — V3 uses native RSS data; the feed "
+                         "token .json FULL-MODE probe runs FORCED (REDDIT_JSON_PROBE=force — "
+                         "legacy behavior: 65 s wait + one attempt per run with new posts, "
+                         "403 expected from datacenter IPs).")
+        else:
+            if JSON_PROBE_MODE == "off":
+                _probe_why = "REDDIT_JSON_PROBE=off"
+            else:
+                _probe_why = ("no OAuth app secrets — datacenter IPs 403 the .json route "
+                              "anyway, so the probe would only cost 65 s + a 403 log line "
+                              "per run with new posts")
+            logging.info("No Reddit OAuth app secrets — V3 uses native RSS data; the feed "
+                         "token .json FULL-MODE probe is skipped (" + _probe_why + "). "
+                         "Set REDDIT_JSON_PROBE=force to re-enable, or add "
+                         "REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET for FULL MODE "
+                         "(reddit.com/prefs/apps -> type 'script') — no code change.")
 
     posted = load_posted()
     pending = load_pending()
