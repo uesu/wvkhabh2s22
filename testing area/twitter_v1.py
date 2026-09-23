@@ -62,7 +62,7 @@ STATIC_BUTTONS = [
         "emoji": {"name": "📰"},
     },
     {
-        "label": "Support",
+        "label": "Donate",
         "url": "https://ko-fi.com/jieunlatte",
         "emoji": {"name": "☕"},
     },
