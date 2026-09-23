@@ -212,7 +212,7 @@ STATIC_BUTTONS = [
         "emoji": {"id": "1439878792653832253", "name": "starward11", "animated": True},
     },
     {
-        "label": "Support",
+        "label": "Donate",
         "url": "https://ko-fi.com/jieunlatte",
         "emoji": {"id": "1509026327548657914", "name": "starwardfans", "animated": True},
     },
