@@ -242,7 +242,7 @@ g2 = [c for c in c2["components"] if c.get("type") == 12]
 check("layout: 2nd gallery has 2 items", len(g2) == 1 and len(g2[0]["items"]) == 2, str(len(g2)))
 row = [c for c in c2["components"] if c.get("type") == 1][0]
 labels = [b["label"] for b in row["components"]]
-check("buttons: Read Post, YouTube, statics", labels == ["Read Post", "YouTube", "Citlali News", "Support"], str(labels))
+check("buttons: Read Post, YouTube, statics", labels == ["Read Post", "YouTube", "Citlali News", "Donate"], str(labels))
 yt = row["components"][1]
 check("buttons: youtube uses starwardspark3",
       yt["emoji"] == {"id": "1483083423290490891", "name": "starwardspark3", "animated": True}, str(yt))
