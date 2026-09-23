@@ -428,7 +428,7 @@ READ_POST_EMOJI = {"id": "1472388018689282261", "name": "starwardhmm", "animated
 YOUTUBE_EMOJI = {"id": "1483083423290490891", "name": "starwardspark3", "animated": True}
 STATIC_BUTTONS = [
     {"label": "Citlali News", "url": "https://discord.gg/HyrVP9wRXu", "emoji": {"id": "1439878792653832253", "name": "starward11", "animated": True}},
-    {"label": "Support", "url": "https://ko-fi.com/jieunlatte", "emoji": {"id": "1509026327548657914", "name": "starwardfans", "animated": True}},
+    {"label": "Donate", "url": "https://ko-fi.com/jieunlatte", "emoji": {"id": "1509026327548657914", "name": "starwardfans", "animated": True}},
 ]
 
 # ---------------------------------------------------------------------------
