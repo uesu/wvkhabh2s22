@@ -214,7 +214,7 @@ import logging
 import html as html_lib
 import aiohttp
 import feedparser
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -1107,6 +1107,66 @@ def _unwrap_url_labelled_links(line: str) -> str:
     return _URL_LABELLED.sub(r"\1", line)
 
 
+# ---------------------------------------------------------------------------
+# ■ ROUND 33 (2026-09-25): CLEAN URL-TEXTED MARKDOWN LINKS (1wpejir/1wpdxhs)
+# A well-formed descriptive link whose LABEL is a bare URL and whose TARGET
+# differs has no handler: rounds 15-22 intentionally leave descriptive
+# links byte-identical (round 22 unwraps only the self-referential '[U](U)'
+# class), and the card printed the raw link literally — label, brackets and
+# the full ~330-char target included — when the target is a
+# youtube.com/redirect wrapper the author copied from a YouTube video
+# description (live 2026-09-25, r/Zenlesszonezeroleaks_ 1wpejir + 1wpdxhs,
+# M0W1/M2W1 Phoenix showcase posts):
+#   ...help of [https://zzzanalytics.vercel.app/](https://www.youtube.com/redirect?event=video_description&redir_token=...&q=https%3A%2F%2Fzzzanalytics.vercel.app%2F&v=...)
+# On a CLEAN line (round 22's identical mangle-residue guard), collapse such
+# a link to a display form:
+#   * label is a bare URL -> the bare URL (Discord auto-links it; when the
+#     target is a youtube.com/redirect wrapper the label IS the real site,
+#     so the label is the better link to show);
+#   * label is not a URL and the target is a youtube.com/redirect wrapper
+#     -> 'label (decoded destination)' (the wrapper is an opaque copied
+#     artifact; its q= / qp= param carries the real URL).
+# Every other line stays byte-identical: prose-labelled descriptive links,
+# mangle residue (the round-20/21 repairers'), '[U](U)' (round 22). The
+# bare-URL line merge in _repair_label_url_mangle now also receives lines
+# this rule turned into bare URLs (a whole-line '[U](redirect)' joins under
+# its label exactly like the round-22 class).
+# ---------------------------------------------------------------------------
+_URL_TEXTED_RE = re.compile(r"\[([^\s\[\]]+)\]\((https?://[^\s()]+)\)")
+
+
+def _decode_yt_redirect_target(url: str) -> str | None:
+    """The real destination of a youtube.com/redirect wrapper: its q= (or
+    qp=) param, percent-decoded. None when absent or not an http(s) URL."""
+    m = re.search(r"[?&](?:q|qp)=([^&\s]+)", url or "")
+    if not m:
+        return None
+    target = unquote(m.group(1))
+    return target if re.match(r"https?://", target) else None
+
+
+def _clean_url_texted_links(line: str) -> str:
+    """Round 33: see the header block. Only on CLEAN lines (no mangle
+    residue), mirroring round 22's guard."""
+    if not _URL_TEXTED_RE.search(line):
+        return line
+    rest = _LINK_OK.sub("", line)
+    if re.search(r"https?://", rest) or rest.count("[") != rest.count("]"):
+        return line
+
+    def _repl(m):
+        label, url = m.group(1), m.group(2)
+        if re.match(r"https?://", label):
+            return label
+        if "youtube.com/redirect?" in url:
+            target = _decode_yt_redirect_target(url)
+            if target:
+                return f"{label} ({target})"
+        return m.group(0)
+
+    return _URL_TEXTED_RE.sub(_repl, line)
+
+
 def _repair_label_url_mangle(lines: list) -> list:
     """Round 20/21/22 pre-pass for repair_mangled_link_lines:
       * a mangled link line collapses to one plain 'label + bare URL'
@@ -1124,6 +1184,7 @@ def _repair_label_url_mangle(lines: list) -> list:
     for raw in lines:
         line = _fix_doubled_link_line(raw.strip())
         line = _unwrap_url_labelled_links(line)
+        line = _clean_url_texted_links(line)   # round 33
         if re.fullmatch(r"https?://[^\s\[\]]+", line) and out:
             if out[-1] and not re.search(r"https?://", out[-1]):
                 out[-1] = out[-1] + " " + line
