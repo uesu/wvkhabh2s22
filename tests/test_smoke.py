@@ -1857,6 +1857,41 @@ check("r32: the liveness gate now covers RSS entries too (live 1wl41aj: a "
       and "and isinstance(entry, _ArcticEntry)):" not in _r32_main_src
       and "feed_ok=not isinstance(entry, _ArcticEntry)" in _r32_gate, _r32_gate)
 
+# ---- R33: clean URL-texted markdown links (round 33, live 1wpejir/1wpdxhs)
+_r33_yt = ("https://www.youtube.com/redirect?event=video_description"
+           "&redir_token=QUZZTVljRkRQTmRtYnhjNXd3X0V2Y1I0b0x4NnxBTl9p"
+           "&q=https%3A%2F%2Fzzzanalytics.vercel.app%2F&v=tE3llvk8-tA")
+_r33_line = ("Data from the thumbnail (alongside the combat summary under this "
+             "post) was gathered with the help of "
+             f"[https://zzzanalytics.vercel.app/]({_r33_yt})")
+_r33_want = ("Data from the thumbnail (alongside the combat summary under this "
+             "post) was gathered with the help of https://zzzanalytics.vercel.app/")
+check("r33: URL-texted link with a youtube-redirect target -> the bare URL",
+      v3._clean_url_texted_links(_r33_line) == _r33_want,
+      v3._clean_url_texted_links(_r33_line))
+check("r33: the live 1wpejir/1wpdxhs line is clean end-to-end through _line_stage",
+      v3._line_stage([_r33_line]) == [_r33_want], str(v3._line_stage([_r33_line])))
+check("r33: URL-texted link with a normal target -> the bare URL too",
+      v3._clean_url_texted_links("see [https://a.com/x](https://a.com/x/real)")
+      == "see https://a.com/x")
+check("r33: prose label + youtube-redirect target -> 'label (decoded destination)'",
+      v3._clean_url_texted_links(f"see [zzz]({_r33_yt})")
+      == "see zzz (https://zzzanalytics.vercel.app/)")
+check("r33: prose label + normal target stays byte-identical (descriptive links)",
+      v3._clean_url_texted_links("see [read more](https://a.com/x)")
+      == "see [read more](https://a.com/x)")
+check("r33: [U](U) self-referential links are still round 22's (pre-pass intact)",
+      v3._repair_label_url_mangle(["Firefly video [https://b23.tv/x](https://b23.tv/x)"])
+      == ["Firefly video https://b23.tv/x"])
+check("r33: a whole-line [U](redirect) merges under its label (round 21/22 behavior)",
+      v3._repair_label_url_mangle(
+          ["Video", f"[https://zzzanalytics.vercel.app/]({_r33_yt})"])
+      == ["Video https://zzzanalytics.vercel.app/"])
+check("r33: mangle residue is left for the round-20/21 repairers (guard holds)",
+      v3._clean_url_texted_links(
+          "Firefly video [[https://b23.tv/x](https://b23.tv/x)](https://b23.tv/x)")
+      == "Firefly video [[https://b23.tv/x](https://b23.tv/x)](https://b23.tv/x)")
+
 
 print()
 if failures:
