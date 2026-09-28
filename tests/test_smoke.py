@@ -1704,7 +1704,8 @@ finally:
 _r30_main = inspect.getsource(v3.main)
 check("r30 main: pending cache loaded next to the dedup cache",
       "pending = load_pending()" in _r30_main)
-_r30_throttle = _r30_main.split("pending-post recheck throttle", 1)[-1].split("if entry is not None:", 1)[0]
+_r30_throttle = _r30_main.split("pending-post recheck throttle", 1)[-1].split(
+    "# ---- round 35 (2026-09-28): NSFW content gate", 1)[0]
 for _cond in ("not TEST_POST_ID", "not DRY_RUN", "unique_key in pending",
               "_pending_throttle_skip(pending, unique_key, now, entry)"):
     check(f"r30 throttle keeps condition: {_cond} (round 32: the due-decision "
@@ -1715,8 +1716,9 @@ check("r30 throttle: skips with `continue` and never caches as posted",
 check("r30 throttle runs BEFORE any network work (the whole point)",
       _r30_main.index("pending-post recheck throttle")
       < _r30_main.index("post_json = await fetch_post_json"))
-check("r30 gates: all four skip paths record a pending entry",
-      _r30_main.count("mark_pending(pending, unique_key") == 4
+check("r30/r35 gates: all five skip paths record a pending entry",
+      _r30_main.count("mark_pending(pending, unique_key") == 5
+      and "mark_pending(pending, unique_key, reason, now)" in _r30_main
       and 'mark_pending(pending, unique_key, "media_wait", now)' in _r30_main
       and 'mark_pending(pending, unique_key, "partial_gallery", now)' in _r30_main,
       str(_r30_main.count("mark_pending(pending, unique_key")))
@@ -1835,10 +1837,11 @@ check("r32: media_wait keeps the round-30 30-min throttle (+60 s skipped, +30 mi
 check("r32: unknown/missing reason falls back to the round-30 30-min throttle",
       v3._pending_throttle_skip(_r32_pend(None), "k", 1060.0, _r32_arctic) is True
       and v3._pending_throttle_skip(_r32_pend(None), "k", 2800.0, _r32_arctic) is False)
-check("r32: the no-recheck set is exactly the removal/deletion reasons",
+check("r32/r35: no-recheck set is exactly removal/deletion + nsfw_flag reasons",
       v3._NO_RECHECK_REASONS == frozenset({
           "removal_notice", "removal notice", "title marker", "whole-body marker",
-          "removed by moderator", "removed by moderators/filters", "deleted by author"}))
+          "removed by moderator", "removed by moderators/filters", "deleted by author",
+          "nsfw_flag"}))
 check("r32: the short-recheck set is exactly the approval/transient reasons",
       v3._SHORT_RECHECK_REASONS == frozenset(
           {"not_live", "sources_down", "pending approval"}))
@@ -2004,6 +2007,125 @@ check("r34b: the X run verifies its save (a missing this-run key is a loud error
       "DEDUP GUARD" in _r34t_main_src
       and "save_posted_urls(posted_urls, frozenset(posted_urls - posted_urls_at_start))"
       in _r34t_main_src)
+
+# ---- R35: NSFW content gate (live BopLeaks spam 1ws8huc / 1ws99dp) ------
+# The gate checks exactly Reddit's over_18 flag and "nsfw" thumbnail
+# sentinel. Spoilers use a separate field and must pass. Unknown metadata
+# fails open; flagged posts are held in pending and never sent to Discord.
+_r35_over = {"over_18": True, "thumbnail": "nsfw"}
+_r35_thumb = {"over_18": False, "thumbnail": "nsfw"}
+_r35_clean_spoiler = {"over_18": False, "thumbnail": "spoiler", "spoiler": True}
+check("r35: over_18=True is held",
+      v3.nsfw_gate_reason("aaa111", "author", _r35_over) == "nsfw_flag")
+check("r35: the nsfw thumbnail sentinel is held even when over_18=False",
+      v3.nsfw_gate_reason("bbb222", "author", _r35_thumb) == "nsfw_flag")
+check("r35: a clean post passes",
+      v3.nsfw_gate_reason("ccc333", "author", {"over_18": False,
+                                                 "thumbnail": "default"}) is None)
+check("r35: unknown metadata fails OPEN",
+      v3.nsfw_gate_reason("ddd444", "author", None) is None)
+check("r35: spoiler=True is a different field and passes untouched",
+      v3.nsfw_gate_reason("ccc333", "author", _r35_clean_spoiler) is None)
+_r35_original_allowlist = v3.NSFW_ALLOWLIST
+try:
+    v3.NSFW_ALLOWLIST = ["AllowedAuthor", "t3_eee555"]
+    check("r35: allowlisted author bypasses the gate (case/prefix insensitive)",
+          v3.nsfw_gate_reason("fff666", "/u/allowedauthor", _r35_over) is None)
+    check("r35: allowlisted post ID bypasses the gate (t3_ prefix accepted)",
+          v3.nsfw_gate_reason("eee555", "somebody", _r35_over) is None)
+    check("r35: a non-allowlisted flagged post is still held",
+          v3.nsfw_gate_reason("fff666", "somebody", _r35_over) == "nsfw_flag")
+finally:
+    v3.NSFW_ALLOWLIST = _r35_original_allowlist
+
+
+class _R35Response:
+    def __init__(self, payload, status=200):
+        self.payload = payload
+        self.status = status
+
+    async def json(self, content_type=None):
+        return self.payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class _R35Session:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.calls = []
+
+    def get(self, url, params=None, **kwargs):
+        self.calls.append((url, params, kwargs))
+        if self.error:
+            raise self.error
+        return self.response
+
+
+_r35_payload = {"data": [
+    {"id": "aaa111", "over_18": True, "thumbnail": "nsfw"},
+    {"id": "bbb222", "over_18": False, "thumbnail": "nsfw"},
+    {"id": "ccc333", "over_18": False, "thumbnail": "spoiler", "spoiler": True},
+]}
+_r35_original_fail_count = v3._arctic_fail_count
+try:
+    v3._arctic_fail_count = 0
+    _r35_session = _R35Session(_R35Response(_r35_payload))
+    _r35_flags = asyncio.run(v3.fetch_arctic_nsfw_flags(
+        _r35_session, ["aaa111", "bbb222", "ccc333", "ddd444"], label="test"))
+    check("r35: all IDs use ONE batched Arctic request",
+          len(_r35_session.calls) == 1
+          and _r35_session.calls[0][0].endswith("/api/posts/ids")
+          and _r35_session.calls[0][1] == {
+              "ids": "aaa111,bbb222,ccc333,ddd444"}, str(_r35_session.calls))
+    check("r35: batched lookup preserves over_18=True",
+          _r35_flags["aaa111"]["over_18"] is True, str(_r35_flags))
+    check("r35: batched lookup preserves the nsfw thumbnail sentinel",
+          _r35_flags["bbb222"]["over_18"] is False
+          and _r35_flags["bbb222"]["thumbnail"] == "nsfw", str(_r35_flags))
+    check("r35: spoiler metadata remains clean (not confused with NSFW)",
+          v3.nsfw_gate_reason("ccc333", "author", _r35_flags["ccc333"]) is None,
+          str(_r35_flags))
+    check("r35: an ID absent from Arctic is unknown (fail-open)",
+          _r35_flags["ddd444"] is None, str(_r35_flags))
+
+    v3._arctic_fail_count = 0
+    _r35_down = asyncio.run(v3.fetch_arctic_nsfw_flags(
+        _R35Session(error=RuntimeError("network down")), ["aaa111", "ccc333"]))
+    check("r35: a failed lookup makes every requested ID unknown (fail-open)",
+          _r35_down == {"aaa111": None, "ccc333": None}, str(_r35_down))
+finally:
+    v3._arctic_fail_count = _r35_original_fail_count
+
+check("r35: nsfw_flag uses the archive no-recheck pending path",
+      "nsfw_flag" in v3._NO_RECHECK_REASONS)
+_r35_main_src = inspect.getsource(v3.main)
+_r35_loop = "for subreddit, path, unique_key, published_ts, activity_ts, entry in new_posts:"
+check("r35: the single batched lookup is wired before the posting loop",
+      "fetch_arctic_nsfw_flags(" in _r35_main_src
+      and _r35_main_src.index("fetch_arctic_nsfw_flags(") < _r35_main_src.index(_r35_loop))
+check("r35: a no-new-post run returns before making the new lookup",
+      _r35_main_src.index("if total_found == 0:")
+      < _r35_main_src.index("fetch_arctic_nsfw_flags("))
+check("r35: TEST_POST_ID explicitly bypasses both lookup and decision",
+      "if TEST_POST_ID:\n            nsfw_flags = {}" in _r35_main_src
+      and "if not TEST_POST_ID:\n                nsfw_post_id" in _r35_main_src)
+check("r35: a flagged post is held and logged, then exits before Discord",
+      "mark_pending(pending, unique_key, reason, now)" in _r35_main_src
+      and "NSFW GATE:" in _r35_main_src
+      and "NOT posted to Discord" in _r35_main_src)
+check("r35: pass and unknown paths are visible in NSFW SCAN logs",
+      "NSFW SCAN:" in _r35_main_src and "proceeding (fail-open)" in _r35_main_src
+      and "thumbnail_nsfw" in _r35_main_src)
+with open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8") as _r35_f:
+    _r35_workflow = _r35_f.read()
+check("r35: the optional repository Variable is wired into the live workflow",
+      "NSFW_ALLOWLIST: ${{ vars.NSFW_ALLOWLIST }}" in _r35_workflow)
 
 
 print()
