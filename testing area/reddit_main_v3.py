@@ -300,6 +300,13 @@ PENDING_FILE = "pending_reddit.json"
 PENDING_RECHECK_SECONDS = int(os.getenv("PENDING_RECHECK_SECONDS", "1800"))  # 30 min
 PENDING_MAX_AGE_SECONDS = 48 * 3600  # matches the 48h posting window
 
+# Round 35 (2026-09-28): optional escape list for the NSFW content gate.
+# This is a repository Variable, not a secret: comma-separated author names
+# or post IDs that bypass the gate. Empty (the default) means no exceptions.
+NSFW_ALLOWLIST = [
+    value.strip() for value in os.getenv("NSFW_ALLOWLIST", "").split(",") if value.strip()
+]
+
 # Round 32 (2026-09-20): SHORT re-check interval for states that can change
 # quickly — posts awaiting moderator approval ("pending approval" /
 # "not_live") and transient "all live sources are down" misses. A
@@ -660,6 +667,10 @@ _NO_RECHECK_REASONS = frozenset({
     "removed by moderator",
     "removed by moderators/filters",
     "deleted by author",
+    # Round 35: an archive-sourced NSFW post stays held for the 48 h window.
+    # An RSS reappearance still runs the gate again, just like the restore
+    # path for removal notices.
+    "nsfw_flag",
 })
 _SHORT_RECHECK_REASONS = frozenset({"not_live", "sources_down", "pending approval"})
 
@@ -828,6 +839,89 @@ async def fetch_arctic_post(session, post_id: str, label: str = "") -> dict | No
         _arctic_fail_count += 1
         logging.info(f"[{label or post_id}] Arctic Shift unavailable: {exc}")
         return None
+
+
+async def fetch_arctic_nsfw_flags(session, post_ids: list, label: str = "") -> dict:
+    """Return Reddit's two NSFW markers for up to 500 post IDs in one call.
+
+    Values are ``{"over_18": bool, "thumbnail": str}``, or ``None`` when
+    Arctic Shift is unavailable or has not archived an ID yet. Unknown must
+    fail open in the caller: a metadata outage must never hold a clean post.
+    The full records are requested because Arctic Shift does not expose
+    ``thumbnail`` as a selectable ``fields`` value.
+    """
+    global _arctic_fail_count
+    requested = list(dict.fromkeys(str(post_id or "").lower() for post_id in post_ids))
+    flags = {post_id: None for post_id in requested if post_id}
+    ids = [post_id for post_id in requested
+           if re.fullmatch(r"[a-z0-9]+", post_id or "")][:500]
+    if not ids or _arctic_fail_count >= 3:
+        return flags
+    try:
+        async with session.get(
+            ARCTIC_POSTS_URL,
+            params={"ids": ",".join(ids)},
+            headers=dict(BROWSER_HEADERS),
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 200:
+                raise ValueError(f"HTTP {resp.status}")
+            data = await resp.json(content_type=None)
+        posts = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(posts, list):
+            raise ValueError("invalid archive response")
+        _arctic_fail_count = 0
+        for post in posts:
+            if not isinstance(post, dict):
+                continue
+            post_id = str(post.get("id") or "").lower()
+            if post_id not in flags or not isinstance(post.get("over_18"), bool):
+                continue
+            flags[post_id] = {
+                "over_18": post["over_18"],
+                "thumbnail": str(post.get("thumbnail") or "").strip().lower(),
+            }
+        return flags
+    except Exception as exc:
+        _arctic_fail_count += 1
+        logging.info(f"[{label or 'nsfw-gate'}] Arctic Shift NSFW flag lookup "
+                     f"unavailable: {exc} — failing open for this run.")
+        return flags
+
+
+def _nsfw_allowlist_forms(value) -> set:
+    """Case-insensitive allowlist forms for a post ID or Reddit author."""
+    raw = str(value or "").strip().casefold()
+    if not raw:
+        return set()
+    forms = {raw}
+    if raw.startswith("/u/"):
+        forms.add(raw[3:])
+    elif raw.startswith("u/"):
+        forms.add(raw[2:])
+    if raw.startswith("t3_"):
+        forms.add(raw[3:])
+    return forms
+
+
+def nsfw_gate_reason(post_id: str, author: str, markers: dict | None) -> str | None:
+    """Return ``nsfw_flag`` only for Reddit's NSFW markers.
+
+    ``markers=None`` is an unavailable/not-yet-archived lookup and fails
+    open. Spoilers are intentionally irrelevant: Reddit stores them in the
+    separate ``spoiler`` field, which this decision never reads.
+    """
+    if not isinstance(markers, dict):
+        return None
+    flagged = (markers.get("over_18") is True
+               or str(markers.get("thumbnail") or "").casefold() == "nsfw")
+    if not flagged:
+        return None
+    candidates = _nsfw_allowlist_forms(post_id) | _nsfw_allowlist_forms(author)
+    allowed = set()
+    for value in NSFW_ALLOWLIST:
+        allowed.update(_nsfw_allowlist_forms(value))
+    return None if candidates & allowed else "nsfw_flag"
 
 
 def arctic_crosspost_orig(post) -> dict | None:
@@ -3107,6 +3201,18 @@ async def main():
         # re-post storm.
         new_posts = cap_new_posts(new_posts, MAX_POSTS_PER_RUN)
 
+        # Round 35: fetch Reddit's two NSFW markers for every candidate in
+        # ONE keyless Arctic Shift request. Explicit test-post rebuilds bypass
+        # the gate; unavailable/not-yet-archived metadata fails open below.
+        if TEST_POST_ID:
+            nsfw_flags = {}
+        else:
+            nsfw_flags = await fetch_arctic_nsfw_flags(
+                session,
+                [extract_post_id(post[1]) or "" for post in new_posts],
+                label="nsfw-gate",
+            )
+
         for subreddit, path, unique_key, published_ts, activity_ts, entry in new_posts:
             # Round 34: double dedup (belt and braces) — collect() already
             # skips keys in the loaded cache, but a key can surface twice in
@@ -3136,9 +3242,14 @@ async def main():
                     and _pending_throttle_skip(pending, unique_key, now, entry)):
                 _pend = pending[unique_key]
                 if _pend.get("reason") in _NO_RECHECK_REASONS:
-                    logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — "
-                                 f"not re-checking (removed posts re-enter via RSS "
-                                 f"when restored; entry expires at the 48 h window).")
+                    if _pend.get("reason") == "nsfw_flag":
+                        logging.info(f"[{unique_key}] pending (nsfw_flag) — held by "
+                                     f"the NSFW content gate (entry expires at the "
+                                     f"48 h window).")
+                    else:
+                        logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — "
+                                     f"not re-checking (removed posts re-enter via RSS "
+                                     f"when restored; entry expires at the 48 h window).")
                 else:
                     _interval = (APPROVAL_RECHECK_SECONDS
                                  if _pend.get("reason") in _SHORT_RECHECK_REASONS
@@ -3148,6 +3259,39 @@ async def main():
                     logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — "
                                  f"skipping recheck, due again in ~{_due_in}s.")
                 continue
+
+            # ---- round 35 (2026-09-28): NSFW content gate ---------------
+            # A post can reach RSS while still live and be removed seconds
+            # later, so the liveness gates cannot close this window. Check
+            # exactly Reddit's two NSFW markers before any media or webhook
+            # work. The separate `spoiler` field is deliberately untouched.
+            if not TEST_POST_ID:
+                nsfw_post_id = (extract_post_id(path) or "").lower()
+                nsfw_markers = nsfw_flags.get(nsfw_post_id)
+                if nsfw_markers is None:
+                    logging.info(f"NSFW SCAN: {unique_key} over_18=unknown "
+                                 f"thumbnail_nsfw=unknown — proceeding (fail-open).")
+                else:
+                    over_18 = nsfw_markers.get("over_18") is True
+                    thumbnail_nsfw = nsfw_markers.get("thumbnail") == "nsfw"
+                    reason = nsfw_gate_reason(
+                        nsfw_post_id,
+                        str(getattr(entry, "author", "") or ""),
+                        nsfw_markers,
+                    )
+                    marker_log = (f"over_18={over_18} "
+                                  f"thumbnail_nsfw={thumbnail_nsfw}")
+                    if reason:
+                        mark_pending(pending, unique_key, reason, now)
+                        logging.warning(f"NSFW GATE: {unique_key} SKIPPED "
+                                        f"({marker_log}) — held 48 h "
+                                        f"({reason}), NOT posted to Discord.")
+                        continue
+                    if over_18 or thumbnail_nsfw:
+                        logging.info(f"NSFW SCAN: {unique_key} {marker_log} — "
+                                     f"allowlisted (NSFW_ALLOWLIST), proceeding.")
+                    else:
+                        logging.info(f"NSFW SCAN: {unique_key} {marker_log} (PASS)")
 
             if entry is not None:
                 base = entry_to_base_data(entry)
