@@ -115,6 +115,9 @@ jobs:
           #   secrets below exist; force = always try (legacy, 65 s per run
           #   with new posts); off = never.
           REDDIT_JSON_PROBE: ${{ vars.REDDIT_JSON_PROBE }}
+          # Round 35: optional comma-separated author names / post IDs that
+          # bypass the NSFW content gate. Empty means no exceptions.
+          NSFW_ALLOWLIST: ${{ vars.NSFW_ALLOWLIST }}
           WEBHOOK_REDDIT_ZENLESSZONEZEROLEAKS_: ${{ secrets.WEBHOOK_REDDIT_ZENLESSZONEZEROLEAKS_ }}
           WEBHOOK_REDDIT_GENSHIN_IMPACT_LEAKS: ${{ secrets.WEBHOOK_REDDIT_GENSHIN_IMPACT_LEAKS }}
           WEBHOOK_REDDIT_HONKAISTARRAIL_LEAKS: ${{ secrets.WEBHOOK_REDDIT_HONKAISTARRAIL_LEAKS }}
