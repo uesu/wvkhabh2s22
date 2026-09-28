@@ -1744,14 +1744,18 @@ try:
           _r30_first == _r30_second, f"{_r30_first!r} vs {_r30_second!r}")
     check("r30 P1: ids written in sorted order",
           json.loads(_r30_first) == sorted(_r30_ids), _r30_first)
-    _r30_many = {str(2100555373073790000 + i) for i in range(_r30_x.MAX_CACHE_SIZE + 25)}
+    _r30_many = {f"TYPEII_EN_{2100555373073790000 + i}"
+                 for i in range(_r30_x.MAX_CACHE_SIZE_PER_ACCOUNT + 25)}
     _r30_x.save_posted_urls(_r30_many)
     with open(_r30_x.CACHE_FILE, "r", encoding="utf-8") as _fh:
         _r30_trim = json.load(_fh)
-    check("r30 P1: trim keeps the NEWEST MAX_CACHE_SIZE ids",
-          len(_r30_trim) == _r30_x.MAX_CACHE_SIZE
-          and _r30_trim == sorted(_r30_many)[-_r30_x.MAX_CACHE_SIZE:]
-          and _r30_trim[-1] == max(_r30_many, key=int), str(_r30_trim[:2]))
+    check("r30 P1 (round 34 semantics): trim keeps the account's NEWEST ids "
+          "(per-account retention replaced the global lexicographic trim — "
+          "the 2026-09-28 AnantaLeaks re-post loop)",
+          len(_r30_trim) == _r30_x.MAX_CACHE_SIZE_PER_ACCOUNT
+          and _r30_trim == sorted(_r30_many)[-_r30_x.MAX_CACHE_SIZE_PER_ACCOUNT:]
+          and _r30_trim[-1] == max(_r30_many, key=lambda k: int(k.rsplit("_", 1)[1])),
+          str(_r30_trim[:2]))
 finally:
     os.chdir(_r30_cwd)
     shutil.rmtree(_r30_xdir, ignore_errors=True)
@@ -1891,6 +1895,115 @@ check("r33: mangle residue is left for the round-20/21 repairers (guard holds)",
       v3._clean_url_texted_links(
           "Firefly video [[https://b23.tv/x](https://b23.tv/x)](https://b23.tv/x)")
       == "Firefly video [[https://b23.tv/x](https://b23.tv/x)](https://b23.tv/x)")
+
+# ---- R34: dedup-cache retention (round 34, live AnantaLeaks re-post loop)
+# The 2026-09-28 incident: at the 500-key cap, `sorted(posted)[-500:]`
+# evicted the alphabetically-first sub (AnantaLeaks) on EVERY save, so its
+# live posts re-posted on every 5-min run. Retention is now per-sub,
+# newest-first; keys posted this run always survive.
+_r34_posted = {f"Genshin_Impact_Leaks_1w{i:05d}" for i in range(300)}  # over the 250 quota
+_r34_posted |= {f"AnantaLeaks_1wq{i:04d}" for i in range(5)}          # alphabetically first
+_r34_this_run = frozenset({"AnantaLeaks_1wq0004", "Genshin_Impact_Leaks_1w00299"})
+_r34_kept = v3._shrink_posted_cache(_r34_posted, _r34_this_run)
+check("r34: the alphabetically-first sub's newest keys SURVIVE eviction "
+      "(2026-09-28: AnantaLeaks keys were evicted on every save)",
+      {"AnantaLeaks_1wq0000", "AnantaLeaks_1wq0004"} <= _r34_kept,
+      str(sorted(k for k in _r34_kept if k.startswith("AnantaLeaks_"))))
+check("r34: a 300-key sub keeps its NEWEST 250 (oldest 50 evicted, newest kept)",
+      "Genshin_Impact_Leaks_1w00049" not in _r34_kept
+      and "Genshin_Impact_Leaks_1w00050" in _r34_kept
+      and "Genshin_Impact_Leaks_1w00299" in _r34_kept
+      and sum(1 for k in _r34_kept if k.startswith("Genshin_")) == 250,
+      str(len(_r34_kept)))
+check("r34: keys posted this run always survive, even over quota",
+      _r34_this_run <= _r34_kept, str(_r34_this_run - _r34_kept))
+check("r34: under-quota sets pass through unchanged",
+      v3._shrink_posted_cache({"AnantaLeaks_1wq0000"}, frozenset())
+      == {"AnantaLeaks_1wq0000"})
+_r34_tmp = tempfile.mkdtemp()
+_r34_cwd = os.getcwd()
+try:
+    os.chdir(_r34_tmp)
+    _r34_saved = v3.save_posted(_r34_posted, _r34_this_run)
+    with open("posted_reddit.json", encoding="utf-8") as _r34_f:
+        _r34_raw = _r34_f.read()
+    _r34_on_disk = set(json.loads(_r34_raw))
+    check("r34: save round-trip — disk set == kept set (cap applied, this-run kept)",
+          _r34_on_disk == _r34_kept and _r34_saved == _r34_kept,
+          f"disk={len(_r34_on_disk)} kept={len(_r34_kept)}")
+    check("r34: saved file is sorted (byte-stable across runs, quiet-run commits)",
+          _r34_raw == json.dumps(sorted(_r34_on_disk), indent=2))
+finally:
+    os.chdir(_r34_cwd)
+    shutil.rmtree(_r34_tmp, ignore_errors=True)
+_r34_feed = [("S", f"/p/{i}/", f"S_{i:04d}", i, i, None) for i in range(40)]
+_r34_capped = v3.cap_new_posts(list(_r34_feed), 25)
+check("r34: flood cap keeps the NEWEST 25 of a 40-entry run (oldest 15 retry next run)",
+      len(_r34_capped) == 25 and _r34_capped[0][2] == "S_0015"
+      and _r34_capped[-1][2] == "S_0039",
+      str([p[2] for p in _r34_capped][:3]))
+check("r34: under-cap runs pass through unchanged",
+      v3.cap_new_posts(list(_r34_feed[:10]), 25) == _r34_feed[:10])
+_r34_main_src = inspect.getsource(v3.main)
+_r34_loop_head = _r34_main_src.split(
+    "for subreddit, path, unique_key, published_ts, activity_ts, entry in new_posts:",
+    1)[1].split("webhook_url = get_webhook_for_subreddit(subreddit)", 1)[0]
+check("r34: the posting loop re-checks the dedup cache before posting (double guard, "
+      "TEST POST rebuilds exempt)",
+      "if not TEST_POST_ID and unique_key in posted:" in _r34_loop_head, _r34_loop_head)
+check("r34: the per-run flood cap is wired into main",
+      "cap_new_posts(new_posts, MAX_POSTS_PER_RUN)" in _r34_main_src)
+check("r34: BOTH save sites verify the save (a missing this-run key is a loud error)",
+      _r34_main_src.count("_verify_dedup_save(posted_at_start, posted, saved)") == 2,
+      str(_r34_main_src.count("_verify_dedup_save(posted_at_start, posted, saved)")))
+
+# ---- R34b: X dedup-cache retention (round 34 — same cap bug in twitter_v3)
+# The save wrote `sorted(posted_urls)[-500:]`; keys are
+# `{account}_{tweet_id}`, so at the cap the alphabetically-first account
+# (Ananta_EN) would lose keys on every save — the Reddit 2026-09-28 loop,
+# latent on X (cache was at ~143/500 when round 34 landed).
+x3 = load_module("smoke_twitter_v3_r34", "testing area/twitter_v3.py")
+_r34t_posted = {f"Wuthering_Waves_210{i:016d}" for i in range(300)}  # over the 250 quota
+_r34t_posted |= {f"Ananta_EN_19{i:017d}" for i in range(5)}         # alphabetically first
+_r34t_this_run = frozenset({"Ananta_EN_1900000000000000004",
+                            "Wuthering_Waves_2100000000000000299"})
+_r34t_kept = x3._shrink_posted_urls(_r34t_posted, _r34t_this_run)
+check("r34b: the alphabetically-first account's newest keys SURVIVE eviction "
+      "(the latent X twin of the 2026-09-28 AnantaLeaks loop)",
+      {"Ananta_EN_1900000000000000000", "Ananta_EN_1900000000000000004"} <= _r34t_kept,
+      str(sorted(k for k in _r34t_kept if k.startswith("Ananta_EN_"))))
+check("r34b: a 300-key account keeps its NEWEST 250 (oldest 50 evicted, newest kept)",
+      "Wuthering_Waves_2100000000000000049" not in _r34t_kept
+      and "Wuthering_Waves_2100000000000000050" in _r34t_kept
+      and "Wuthering_Waves_2100000000000000299" in _r34t_kept
+      and sum(1 for k in _r34t_kept if k.startswith("Wuthering_Waves_")) == 250,
+      str(len(_r34t_kept)))
+check("r34b: keys posted this run always survive, even over quota",
+      _r34t_this_run <= _r34t_kept, str(_r34t_this_run - _r34t_kept))
+check("r34b: under-quota sets pass through unchanged",
+      x3._shrink_posted_urls({"Ananta_EN_1900000000000000000"}, frozenset())
+      == {"Ananta_EN_1900000000000000000"})
+_r34t_tmp = tempfile.mkdtemp()
+_r34t_cwd = os.getcwd()
+try:
+    os.chdir(_r34t_tmp)
+    _r34t_saved = x3.save_posted_urls(_r34t_posted, _r34t_this_run)
+    with open("posted_tweets.json", encoding="utf-8") as _r34t_f:
+        _r34t_raw = _r34t_f.read()
+    _r34t_on_disk = set(json.loads(_r34t_raw))
+    check("r34b: X save round-trip — disk set == kept set (sorted, cap applied)",
+          _r34t_on_disk == _r34t_kept and _r34t_saved == _r34t_kept,
+          f"disk={len(_r34t_on_disk)} kept={len(_r34t_kept)}")
+    check("r34b: X saved file is sorted (byte-stable across runs)",
+          _r34t_raw == json.dumps(sorted(_r34t_on_disk), indent=2))
+finally:
+    os.chdir(_r34t_cwd)
+    shutil.rmtree(_r34t_tmp, ignore_errors=True)
+_r34t_main_src = inspect.getsource(x3.main)
+check("r34b: the X run verifies its save (a missing this-run key is a loud error)",
+      "DEDUP GUARD" in _r34t_main_src
+      and "save_posted_urls(posted_urls, frozenset(posted_urls - posted_urls_at_start))"
+      in _r34t_main_src)
 
 
 print()
