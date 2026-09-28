@@ -105,6 +105,21 @@ ACCOUNTS = [acc.strip() for acc in ACCOUNTS_STR.split(",") if acc.strip()]
 DEFAULT_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 CACHE_FILE = "posted_tweets.json"
+# Round 34 (2026-09-28): the old single global cap (MAX_CACHE_SIZE below) was
+# enforced as `sorted(posted_urls)[-MAX_CACHE_SIZE:]` — a LEXICOGRAPHIC
+# eviction. The old comment claimed the keys are bare 19-digit tweet ids
+# (lexicographic == numeric) — WRONG: the keys are `{account}_{tweet_id}`,
+# so at the 500 cap the alphabetically-FIRST account's keys (Ananta_EN sorts
+# before HonkaiNA / PomPom_HonkaiSR / TYPEII_EN / Wuthering_Waves) would be
+# evicted on every save — the same 2026-09-28 AnantaLeaks re-post loop on
+# Reddit, latent here (the cache was at ~143/500 keys when round 34 landed).
+# Retention is now PER-ACCOUNT, newest-first (numeric tweet ids sort
+# chronologically within an account), with a generous global backstop.
+# Both are overridable via repo Variables.
+MAX_CACHE_SIZE_PER_ACCOUNT = int(os.getenv("MAX_CACHE_SIZE_PER_ACCOUNT", "250"))
+MAX_CACHE_SIZE_TOTAL = int(os.getenv("MAX_CACHE_SIZE_TOTAL", "10000"))
+# Round 34: retired pre-round-34 global cap (kept so old references still
+# resolve; the save no longer uses it).
 MAX_CACHE_SIZE = 500
 MAX_AGE_SECONDS = 3 * 3600
 
@@ -275,18 +290,65 @@ def load_posted_urls() -> set:
     return set()
 
 
-def save_posted_urls(posted_urls: set):
+def _shrink_posted_urls(posted_urls: set, keep_newest: frozenset = frozenset()) -> set:
+    """Round 34 (2026-09-28): cap the dedup cache WITHOUT lexicographic
+    eviction (see the MAX_CACHE_SIZE_PER_ACCOUNT note).
+
+    Pre-round-34 the save wrote `sorted(posted_urls)[-MAX_CACHE_SIZE:]`:
+    keys are `{account}_{tweet_id}`, so at the 500 cap that would drop the
+    alphabetically-FIRST account's keys (Ananta_EN) on every save — the same
+    silent re-post loop the Reddit engine hit live on 2026-09-28. Retention
+    now keeps the NEWEST MAX_CACHE_SIZE_PER_ACCOUNT keys of EACH account
+    (numeric tweet ids sort chronologically within an account), then applies
+    the MAX_CACHE_SIZE_TOTAL backstop. Keys in `keep_newest` (posted THIS
+    run) always survive, whatever else is trimmed.
+    """
+    by_acc: dict = {}
+    for key in posted_urls:
+        by_acc.setdefault(key.partition("_")[0], []).append(key)
+
+    def _trim(keys: list, quota: int) -> list:
+        keys.sort()  # numeric tweet ids: chronological within an account
+        return keys[-quota:] if len(keys) > quota else keys
+
+    kept: set = set()
+    evicted: set = set()
+    for keys in by_acc.values():
+        kept.update(_trim(keys, MAX_CACHE_SIZE_PER_ACCOUNT))
+        if len(keys) > MAX_CACHE_SIZE_PER_ACCOUNT:
+            evicted.update(keys[:-MAX_CACHE_SIZE_PER_ACCOUNT])
+    # Global backstop (never expected to trigger: 5 accounts x 250 = 1250 << 10000).
+    if len(kept) > MAX_CACHE_SIZE_TOTAL:
+        per_acc = max(1, MAX_CACHE_SIZE_TOTAL // max(1, len(by_acc)))
+        kept = set()
+        for keys in by_acc.values():
+            kept.update(_trim(keys, per_acc))
+    # Belt and braces: keys posted THIS run always survive.
+    kept |= set(keep_newest) & posted_urls
+    if evicted:
+        logging.warning(f"dedup cache: evicted {len(evicted)} oldest key(s) "
+                        f"(per-account cap {MAX_CACHE_SIZE_PER_ACCOUNT}): "
+                        f"{sorted(evicted)[:10]}")
+    return kept
+
+
+def save_posted_urls(posted_urls: set, keep_newest: frozenset = frozenset()) -> set:
+    """Save the dedup cache and return the set actually written ({} on a
+    failed write).
+
+    Written sorted so identical sets stay byte-identical (quiet runs create
+    no commits — round 30). Round 34: retention is per-account newest-first
+    (_shrink_posted_urls) instead of the lexicographic `[-MAX_CACHE_SIZE:]`
+    slice.
+    """
     try:
+        kept = _shrink_posted_urls(posted_urls, keep_newest)
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            # round 30 (2026-09-19): sorted() — the same set of ids now dumps
-            # byte-identical, so runs that post nothing commit NOTHING.
-            # (The set's order used to shuffle every run because Python
-            # randomizes str hashes per process.) All current tweet ids are
-            # 19 digits, so lexicographic sort == numeric sort, and the
-            # [-MAX_CACHE_SIZE:] trim keeps the NEWEST 500.
-            json.dump(sorted(posted_urls)[-MAX_CACHE_SIZE:], f, indent=2)
+            json.dump(sorted(kept), f, indent=2)
+        return kept
     except Exception as e:
         logging.error(f"Error saving cache: {e}")
+        return set()
 
 
 def accent_from_color(color) -> int:
@@ -1030,6 +1092,24 @@ async def main():
     posted_urls = load_posted_urls()
     is_first_run = len(posted_urls) == 0
     now = time.time()
+    # Round 34: remember the pre-run cache so the save can be verified
+    # (a just-posted key missing from the saved file = it WILL re-post).
+    posted_urls_at_start = set(posted_urls)
+    # Round 34: saturation warning — the pre-round-34 cap failure was silent
+    # (lexicographic eviction logged nothing). Warn when an account is within
+    # 10 keys of its per-account quota or the total is within 10% of the
+    # backstop, so the next eviction burst is visible in the log.
+    _acc_counts: dict = {}
+    for _k in posted_urls:
+        _pfx = _k.partition("_")[0]
+        _acc_counts[_pfx] = _acc_counts.get(_pfx, 0) + 1
+    _hot = {a: n for a, n in _acc_counts.items() if n >= MAX_CACHE_SIZE_PER_ACCOUNT - 10}
+    if _hot or len(posted_urls) >= MAX_CACHE_SIZE_TOTAL * 9 // 10:
+        logging.warning(f"dedup cache near cap: {len(posted_urls)} key(s) "
+                        f"(per-account quota {MAX_CACHE_SIZE_PER_ACCOUNT}, "
+                        f"backstop {MAX_CACHE_SIZE_TOTAL})"
+                        + (f"; hot: " + ", ".join(f"{a}={n}" for a, n in sorted(_hot.items()))
+                           if _hot else ""))
 
     async with aiohttp.ClientSession() as session:
         feeds_tasks = [fetch_working_feed(session, acc) for acc in ACCOUNTS]
@@ -1226,7 +1306,12 @@ async def main():
                         body = await resp.text()
                         logging.error(f"Discord error {resp.status} for {unique_key}: {body}")
 
-    save_posted_urls(posted_urls)
+    saved = save_posted_urls(posted_urls, frozenset(posted_urls - posted_urls_at_start))
+    missing = (posted_urls - posted_urls_at_start) - saved
+    if missing:
+        logging.error(f"DEDUP GUARD: {len(missing)} key(s) posted this run are "
+                      f"MISSING from the saved dedup cache — they WILL be "
+                      f"re-posted next run: {sorted(missing)[:10]}")
     logging.info("Twitter V3 Monitor execution finished.")
 
 

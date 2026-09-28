@@ -260,7 +260,27 @@ REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
 REDDIT_API_USER_AGENT = "python:uesu.news-express:v3 (personal rss monitor)"
 
 CACHE_FILE = "posted_reddit.json"
+# Round 34 (2026-09-28): the old single global cap (MAX_CACHE_SIZE below) was
+# enforced as `sorted(posted)[-MAX_CACHE_SIZE:]` — a LEXICOGRAPHIC eviction.
+# Keys are `{sub}_{post_id}`, so once the six tracked subs crossed 500 total
+# keys, the alphabetically-FIRST sub's keys — AnantaLeaks_* sorts before
+# Genshin_Impact_Leaks / Honkai* / WutheringWavesLeaks /
+# Zenlesszonezeroleaks_ — were evicted on EVERY save: added right after each
+# post, dropped in the same save, missing from the next run's dedup check,
+# re-posted (live incident 2026-09-28: AnantaLeaks_1wqhmw1 / 1wqphp3 /
+# 1wriz86 on every 5-min cron run). Retention is now PER-SUBREDDIT,
+# newest-first (leet post ids sort chronologically WITHIN a subreddit), with
+# a generous global backstop. All three are overridable via repo Variables.
+MAX_CACHE_SIZE_PER_SUB = int(os.getenv("MAX_CACHE_SIZE_PER_SUB", "250"))
+MAX_CACHE_SIZE_TOTAL = int(os.getenv("MAX_CACHE_SIZE_TOTAL", "10000"))
+# Round 34: retired pre-round-34 global cap (kept so old references — e.g.
+# tests/README — still resolve; the save no longer uses it).
 MAX_CACHE_SIZE = 500
+# Round 34: per-run flood cap — one run posts at most this many NEW posts
+# (the newest ones); the rest retry next run inside the 48 h window. A loud
+# log line instead of a mass re-post storm if the dedup cache ever loses
+# keys again.
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "25"))
 
 # Wide window (48h) so posts approved from a subreddit's moderator queue a day
 # or more later are still caught (approval bumps the RSS "updated" stamp).
@@ -481,14 +501,90 @@ def load_posted() -> set:
     return set()
 
 
-def save_posted(posted: set):
+def _shrink_posted_cache(posted: set, keep_newest: frozenset = frozenset()) -> set:
+    """Round 34 (2026-09-28): cap the dedup cache WITHOUT lexicographic
+    eviction (see the MAX_CACHE_SIZE_PER_SUB note).
+
+    Pre-round-34 the save wrote `sorted(posted)[-MAX_CACHE_SIZE:]`: at the
+    cap that dropped the ALPHABETICALLY-FIRST keys — AnantaLeaks' keys, every
+    time. Retention now keeps the NEWEST MAX_CACHE_SIZE_PER_SUB keys of EACH
+    subreddit (leet post ids sort chronologically within a sub), then applies
+    the MAX_CACHE_SIZE_TOTAL backstop. Keys in `keep_newest` (posted THIS
+    run) always survive, whatever else is trimmed.
+    """
+    by_sub: dict = {}
+    for key in posted:
+        by_sub.setdefault(key.partition("_")[0], []).append(key)
+
+    def _trim(keys: list, quota: int) -> list:
+        keys.sort()  # leet ids: chronological within a subreddit
+        return keys[-quota:] if len(keys) > quota else keys
+
+    kept: set = set()
+    evicted: set = set()
+    for keys in by_sub.values():
+        kept.update(_trim(keys, MAX_CACHE_SIZE_PER_SUB))
+        if len(keys) > MAX_CACHE_SIZE_PER_SUB:
+            evicted.update(keys[:-MAX_CACHE_SIZE_PER_SUB])
+    # Global backstop (never expected to trigger: 6 subs x 250 = 1500 << 10000).
+    if len(kept) > MAX_CACHE_SIZE_TOTAL:
+        per_sub = max(1, MAX_CACHE_SIZE_TOTAL // max(1, len(by_sub)))
+        kept = set()
+        for keys in by_sub.values():
+            kept.update(_trim(keys, per_sub))
+    # Belt and braces: keys posted THIS run always survive.
+    kept |= set(keep_newest) & posted
+    if evicted:
+        logging.warning(f"dedup cache: evicted {len(evicted)} oldest key(s) "
+                        f"(per-sub cap {MAX_CACHE_SIZE_PER_SUB}): "
+                        f"{sorted(evicted)[:10]}")
+    return kept
+
+
+def _verify_dedup_save(posted_at_start: set, posted: set, saved: set) -> None:
+    """Round 34: after a save, prove every key posted THIS run made it to
+    disk. A missing key WILL be re-posted next run — that must be a loud log
+    line, never a silent failure (the 2026-09-28 AnantaLeaks re-post loop
+    ran silently for hours)."""
+    missing = (posted - posted_at_start) - saved
+    if missing:
+        logging.error(f"DEDUP GUARD: {len(missing)} key(s) posted this run are "
+                      f"MISSING from the saved dedup cache — they WILL be "
+                      f"re-posted next run: {sorted(missing)[:10]}")
+
+
+def cap_new_posts(new_posts: list, cap: int) -> list:
+    """Round 34: bound one run's post count (MAX_POSTS_PER_RUN note).
+    `new_posts` is sorted oldest-first; keep the NEWEST `cap` entries and
+    log the dropped oldest (they retry next run inside the 48 h window)."""
+    if len(new_posts) <= cap:
+        return new_posts
+    dropped = [p[2] for p in new_posts[:len(new_posts) - cap]]
+    logging.warning(f"POST FLOOD GUARD: {len(new_posts)} new posts this run "
+                    f"exceed the cap of {cap} — posting the newest {cap}; the "
+                    f"{len(dropped)} oldest retry next run inside the 48 h "
+                    f"window. Dropped: {dropped}")
+    return new_posts[-cap:]
+
+
+def save_posted(posted: set, keep_newest: frozenset = frozenset()) -> set:
+    """Save the dedup cache and return the set actually written ({} on a
+    failed write).
+
+    Written sorted so identical sets stay byte-identical (quiet runs create
+    no commits from process-dependent set iteration order). Round 34:
+    retention is per-sub newest-first (_shrink_posted_cache) instead of the
+    lexicographic `[-MAX_CACHE_SIZE:]` slice that evicted AnantaLeaks keys
+    forever once 500 keys accumulated.
+    """
     try:
+        kept = _shrink_posted_cache(posted, keep_newest)
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            # Keep identical sets byte-identical so quiet runs do not create
-            # commits from process-dependent set iteration order.
-            json.dump(sorted(posted)[-MAX_CACHE_SIZE:], f, indent=2)
+            json.dump(sorted(kept), f, indent=2)
+        return kept
     except Exception as e:
         logging.error(f"Error saving cache: {e}")
+        return set()
 
 
 def load_pending() -> dict:
@@ -2883,6 +2979,24 @@ async def main():
     pending = load_pending()
     is_first_run = len(posted) == 0
     now = time.time()
+    # Round 34: remember the pre-run cache so every save can be verified
+    # (a just-posted key missing from the saved file = it WILL re-post).
+    posted_at_start = set(posted)
+    # Round 34: saturation warning — the pre-round-34 cap failure was
+    # completely silent (lexicographic eviction logged nothing). Warn when a
+    # sub is within 10 keys of its per-sub quota or the total is within 10%
+    # of the backstop, so the next eviction burst is visible in the log.
+    _sub_counts: dict = {}
+    for _k in posted:
+        _pfx = _k.partition("_")[0]
+        _sub_counts[_pfx] = _sub_counts.get(_pfx, 0) + 1
+    _hot = {s: n for s, n in _sub_counts.items() if n >= MAX_CACHE_SIZE_PER_SUB - 10}
+    if _hot or len(posted) >= MAX_CACHE_SIZE_TOTAL * 9 // 10:
+        logging.warning(f"dedup cache near cap: {len(posted)} key(s) (per-sub "
+                        f"quota {MAX_CACHE_SIZE_PER_SUB}, backstop "
+                        f"{MAX_CACHE_SIZE_TOTAL})"
+                        + (f"; hot: " + ", ".join(f"{s}={n}" for s, n in sorted(_hot.items()))
+                           if _hot else ""))
 
     use_oauth = bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET)
 
@@ -2978,7 +3092,8 @@ async def main():
         total_found = len(new_posts)
         if total_found == 0:
             logging.info("No new Reddit posts to post.")
-            save_posted(posted)
+            saved = save_posted(posted, frozenset(posted - posted_at_start))
+            _verify_dedup_save(posted_at_start, posted, saved)
             save_pending(pending)
             return
 
@@ -2987,7 +3102,20 @@ async def main():
         # newest first per sub for stable ordering
         new_posts.sort(key=lambda p: p[3])
 
+        # Round 34: per-run flood cap (see MAX_POSTS_PER_RUN) — any future
+        # cache loss causes ONE capped run with a loud log line, not a mass
+        # re-post storm.
+        new_posts = cap_new_posts(new_posts, MAX_POSTS_PER_RUN)
+
         for subreddit, path, unique_key, published_ts, activity_ts, entry in new_posts:
+            # Round 34: double dedup (belt and braces) — collect() already
+            # skips keys in the loaded cache, but a key can surface twice in
+            # ONE run's feed (new + mod-queue listings) or via any future
+            # code path; re-check the live set before the expensive pipeline.
+            # TEST POST rebuilds are exempt (re-testing a cached post is
+            # their whole point).
+            if not TEST_POST_ID and unique_key in posted:
+                continue
             webhook_url = get_webhook_for_subreddit(subreddit)
             if not webhook_url:
                 logging.error(f"No webhook configured for r/{subreddit}. Skipping {unique_key}.")
@@ -3229,7 +3357,8 @@ async def main():
     if DRY_RUN:
         logging.info("DRY RUN finished: cache NOT saved, Discord NOT touched.")
     else:
-        save_posted(posted)
+        saved = save_posted(posted, frozenset(posted - posted_at_start))
+        _verify_dedup_save(posted_at_start, posted, saved)
         save_pending(pending)
         logging.info("Reddit V3 Monitor execution finished.")
 
