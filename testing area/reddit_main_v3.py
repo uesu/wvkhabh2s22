@@ -214,7 +214,7 @@ import logging
 import html as html_lib
 import aiohttp
 import feedparser
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -315,6 +315,28 @@ NSFW_ALLOWLIST = [
 # re-checked (they re-enter via RSS if restored — see _NO_RECHECK_REASONS
 # below); media-waiting posts keep the 30-min interval.
 APPROVAL_RECHECK_SECONDS = int(os.getenv("APPROVAL_RECHECK_SECONDS", "300"))  # 5 min
+
+# Round 36 (2026-09-29): settle window — a NEW post younger than this many
+# seconds is NOT posted this run: no state is written (it simply stays
+# "new"), the next run re-evaluates it with every existing gate, and a post
+# that got removed in the meantime (auto-removal / Reddit filter / author
+# self-delete / fast mod action) is then held as a removal notice instead
+# of posted. 0 = off. Posts first seen already older than the window —
+# including RESTORED posts, whose age is the original publish time — post at
+# zero delay.
+POST_SETTLE_SECONDS = int(os.getenv("POST_SETTLE_SECONDS", "300"))  # 5 min
+# Round 36: duplicate-media gate — skip a new post whose exact media
+# identity (a reused i.redd.it file or the same external destination URL) is
+# already on Discord from an earlier post in the SAME sub. Only a POSTED
+# post can be the winner, so a skip never costs a unique post. 0 = off.
+# (Re-uploaded files get NEW i.redd.it URLs and re-created galleries get new
+# gallery ids — those are NOT caught by design: same URL = same content is
+# provable, and the gate never guesses.)
+DUP_MEDIA_GATE = os.getenv("DUP_MEDIA_GATE", "1").strip().lower() not in ("0", "false", "no", "off", "")
+# Round 36: how many of the sub's NEWEST posted keys are compared by the
+# duplicate-media gate (leet post ids sort chronologically WITHIN a sub —
+# days of history on busy subs, months on quiet ones).
+DUP_MEDIA_POSTED_WINDOW = 120
 
 # ---------------------------------------------------------------------------
 # ■ RSS SOURCES (unchanged from V1/V2 — see round 8/9 notes)
@@ -619,13 +641,25 @@ def save_pending(pending: dict) -> None:
         logging.error(f"Error saving pending cache: {e}")
 
 
-def mark_pending(pending: dict, key: str, reason: str, now: float) -> None:
+def mark_pending(pending: dict, key: str, reason: str, now: float,
+                 source: str | None = None, title: str | None = None,
+                 published_ts: float | None = None) -> None:
+    # Round 36 (2026-09-29): optional audit fields (source rss/arctic,
+    # title, publish time) — purely additive; existing callers and existing
+    # pending_reddit.json files keep working unchanged.
     entry = pending.get(key)
     if isinstance(entry, dict):
         entry["last_checked"] = now
         entry["reason"] = reason
     else:
-        pending[key] = {"first_seen": now, "last_checked": now, "reason": reason}
+        entry = {"first_seen": now, "last_checked": now, "reason": reason}
+        pending[key] = entry
+    if source is not None:
+        entry["source"] = source
+    if title is not None:
+        entry["title"] = title
+    if published_ts is not None:
+        entry["published_ts"] = int(published_ts)
 
 
 def pending_due(pending: dict, key: str, now: float) -> bool:
@@ -671,6 +705,10 @@ _NO_RECHECK_REASONS = frozenset({
     # An RSS reappearance still runs the gate again, just like the restore
     # path for removal notices.
     "nsfw_flag",
+    # Round 36: a same-media duplicate of an already-posted post is held for
+    # the 48 h window; an RSS reappearance re-runs the gate (the winner is
+    # re-checked against the posted cache), like the restore path above.
+    "duplicate_media",
 })
 _SHORT_RECHECK_REASONS = frozenset({"not_live", "sources_down", "pending approval"})
 
@@ -844,7 +882,8 @@ async def fetch_arctic_post(session, post_id: str, label: str = "") -> dict | No
 async def fetch_arctic_nsfw_flags(session, post_ids: list, label: str = "") -> dict:
     """Return Reddit's two NSFW markers for up to 500 post IDs in one call.
 
-    Values are ``{"over_18": bool, "thumbnail": str}``, or ``None`` when
+    Values are ``{"over_18": bool, "thumbnail": str, "url": str}``, or
+    ``None`` when
     Arctic Shift is unavailable or has not archived an ID yet. Unknown must
     fail open in the caller: a metadata outage must never hold a clean post.
     The full records are requested because Arctic Shift does not expose
@@ -880,6 +919,9 @@ async def fetch_arctic_nsfw_flags(session, post_ids: list, label: str = "") -> d
             flags[post_id] = {
                 "over_18": post["over_18"],
                 "thumbnail": str(post.get("thumbnail") or "").strip().lower(),
+                # round 36: destination URL — the duplicate-media gate's
+                # identity source (additive; the NSFW gate never reads it)
+                "url": str(post.get("url_overridden_by_dest") or post.get("url") or ""),
             }
         return flags
     except Exception as exc:
@@ -922,6 +964,78 @@ def nsfw_gate_reason(post_id: str, author: str, markers: dict | None) -> str | N
     for value in NSFW_ALLOWLIST:
         allowed.update(_nsfw_allowlist_forms(value))
     return None if candidates & allowed else "nsfw_flag"
+
+
+def settle_holds(published_ts: float, now: float) -> bool:
+    """Round 36 (2026-09-29): True when a NEW post must wait one more run —
+    its age is below the POST_SETTLE_SECONDS window. 0 = off. A RESTORED
+    post's age is its ORIGINAL publish time, so restores never wait here."""
+    return POST_SETTLE_SECONDS > 0 and (now - float(published_ts)) < POST_SETTLE_SECONDS
+
+
+def media_identity(url) -> str | None:
+    """Return a provable exact-media identity, or None to fail open."""
+    raw = str(url or "").strip()
+    if not raw.lower().startswith(("http://", "https://")):
+        return None
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return None
+    host = (parsed.hostname or "").lower().rstrip(".")
+    path = parsed.path or ""
+    if not host or not path:
+        return None
+    if host in ("i.redd.it", "preview.redd.it"):
+        swapped = i_reddit_swap(raw)
+        if swapped:
+            return swapped
+        return "https://i.redd.it/" + path.lstrip("/")
+    if host in ("www.reddit.com", "old.reddit.com", "np.reddit.com",
+                "reddit.com", "api.reddit.com"):
+        return None
+    if host.endswith(".reddit.com") or host.endswith(".redditmedia.com"):
+        return None
+    return host + path.rstrip("/")
+
+
+async def fetch_arctic_urls(session, post_ids: list, label: str = "") -> dict:
+    """Fetch destination URLs for up to 500 IDs in one Arctic call."""
+    global _arctic_fail_count
+    urls: dict = {}
+    ids = [p for p in dict.fromkeys(str(i or "").lower() for i in post_ids)
+           if re.fullmatch(r"[a-z0-9]+", p)]
+    if not ids or _arctic_fail_count >= 3:
+        return urls
+    try:
+        async with session.get(ARCTIC_POSTS_URL, params={"ids": ",".join(ids[:500])},
+                               headers=dict(BROWSER_HEADERS),
+                               timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                raise ValueError(f"HTTP {resp.status}")
+            data = await resp.json(content_type=None)
+        posts = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(posts, list):
+            raise ValueError("invalid archive response")
+        _arctic_fail_count = 0
+        for post in posts:
+            if not isinstance(post, dict) or not post.get("id"):
+                continue
+            urls[str(post["id"]).lower()] = str(
+                post.get("url_overridden_by_dest") or post.get("url") or "")
+        return urls
+    except Exception as exc:
+        _arctic_fail_count += 1
+        logging.info(f"[{label or 'dup-gate'}] Arctic Shift url lookup unavailable: "
+                     f"{exc} — duplicate gate fails open for this run.")
+        return urls
+
+
+def dup_media_hit(posted_map: dict | None, identity: str | None) -> str | None:
+    """Return the posted winner key for identity, otherwise fail open."""
+    if not identity or not isinstance(posted_map, dict):
+        return None
+    return posted_map.get(identity)
 
 
 def arctic_crosspost_orig(post) -> dict | None:
@@ -3213,6 +3327,27 @@ async def main():
                 label="nsfw-gate",
             )
 
+        # Round 36: build exact-media maps from posted history, once per run.
+        _dup_posted: dict = {}
+        if DUP_MEDIA_GATE and not TEST_POST_ID and new_posts:
+            _hot_subs = sorted({post[0] for post in new_posts})
+            _hist_ids = []
+            for _sub in _hot_subs:
+                _sub_keys = sorted(k for k in posted if k.rsplit("_", 1)[0] == _sub)
+                _hist_ids.extend(k.rsplit("_", 1)[1] for k in _sub_keys[-DUP_MEDIA_POSTED_WINDOW:])
+            if len(_hist_ids) > 500:
+                _hist_ids = _hist_ids[-500:]
+            if _hist_ids:
+                _hist_urls = await fetch_arctic_urls(session, _hist_ids, label="dup-gate")
+                for _sub in _hot_subs:
+                    _m = {}
+                    for _k in sorted(k for k in posted if k.rsplit("_", 1)[0] == _sub):
+                        _ident = media_identity(_hist_urls.get(_k.rsplit("_", 1)[1]))
+                        if _ident and _ident not in _m:
+                            _m[_ident] = _k
+                    if _m:
+                        _dup_posted[_sub] = _m
+
         for subreddit, path, unique_key, published_ts, activity_ts, entry in new_posts:
             # Round 34: double dedup (belt and braces) — collect() already
             # skips keys in the loaded cache, but a key can surface twice in
@@ -3228,6 +3363,8 @@ async def main():
                 continue
 
             reddit_url = f"https://www.reddit.com{path}"
+            _entry_source36 = ("arctic" if isinstance(entry, _ArcticEntry)
+                               else "rss")
 
             # ---- round 30 (2026-09-19): pending-post recheck throttle ----
             # A post an earlier run skipped (removed/deleted, still pending
@@ -3246,6 +3383,10 @@ async def main():
                         logging.info(f"[{unique_key}] pending (nsfw_flag) — held by "
                                      f"the NSFW content gate (entry expires at the "
                                      f"48 h window).")
+                    elif _pend.get("reason") == "duplicate_media":
+                        logging.info(f"[{unique_key}] pending (duplicate_media) — held by "
+                                     f"the round-36 duplicate-media gate (entry expires at "
+                                     f"the 48 h window).")
                     else:
                         logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — "
                                      f"not re-checking (removed posts re-enter via RSS "
@@ -3292,6 +3433,37 @@ async def main():
                                      f"allowlisted (NSFW_ALLOWLIST), proceeding.")
                     else:
                         logging.info(f"NSFW SCAN: {unique_key} {marker_log} (PASS)")
+
+            # ---- round 36: settle window + duplicate-media gate ----------
+            if not TEST_POST_ID and not DRY_RUN and settle_holds(published_ts, now):
+                logging.info(f"SETTLE: {unique_key} age {int(now - published_ts)}s "
+                             f"< {POST_SETTLE_SECONDS}s — holding (survival check); "
+                             f"re-evaluated next run.")
+                continue
+            if not TEST_POST_ID and not DRY_RUN and DUP_MEDIA_GATE:
+                _dup_pid = (extract_post_id(path) or "").lower()
+                _dup_identity = media_identity((nsfw_flags.get(_dup_pid) or {}).get("url") or "")
+                _dup_winner = dup_media_hit(_dup_posted.get(subreddit), _dup_identity)
+                if _dup_winner:
+                    mark_pending(pending, unique_key, "duplicate_media", now,
+                                 source=_entry_source36,
+                                 title=str(getattr(entry, "title", "") or "")[:200],
+                                 published_ts=published_ts)
+                    logging.warning(f"DUP GATE: {unique_key} SKIPPED (same media as "
+                                    f"{_dup_winner}, already on Discord) — held 48 h "
+                                    f"(duplicate_media), NOT posted to Discord.")
+                    continue
+                if _dup_identity:
+                    logging.info(f"DUP SCAN: {unique_key} media unique (PASS)")
+                else:
+                    logging.info(f"DUP SCAN: {unique_key} media identity unknown — "
+                                 f"proceeding (fail-open).")
+            if (unique_key in pending
+                    and str(pending[unique_key].get("reason") or "") in _NO_RECHECK_REASONS
+                    and not isinstance(entry, _ArcticEntry)):
+                logging.info(f"RESTORED: {unique_key} pending "
+                             f"({pending[unique_key].get('reason')}) reappeared via RSS — "
+                             f"running full pipeline (posts if live).")
 
             if entry is not None:
                 base = entry_to_base_data(entry)
@@ -3370,7 +3542,9 @@ async def main():
                            or str(base.get("body") or ""))
                 _removed = removed_post_reason(_r_title, _r_body)
                 if _removed:
-                    mark_pending(pending, unique_key, _removed, now)
+                    mark_pending(pending, unique_key, _removed, now,
+                                 source=_entry_source36, title=_r_title[:200],
+                                 published_ts=published_ts)
                     logging.info(f"[{unique_key}] post appears removed/deleted/"
                                  f"awaiting approval ({_removed}) — skipping, not "
                                  f"cached (will post once approved).")
@@ -3398,7 +3572,10 @@ async def main():
                                  "pending approval" if "awaiting moderator approval" in _why
                                  else "removal_notice" if "removal notice" in _why
                                  else "sources_down" if "all live sources are down" in _why
-                                 else "not_live", now)
+                                 else "not_live", now,
+                                 source=_entry_source36,
+                                 title=str(base.get("title") or "")[:200],
+                                 published_ts=published_ts)
                     logging.info(f"[{unique_key}] post not verified live "
                                  f"({_why}) — skipping, not cached (will "
                                  f"post once approved/restored).")
