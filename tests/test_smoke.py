@@ -2202,6 +2202,16 @@ check("r36-hotfix: the gate is ON in a clean environment (smoke default)",
       v3.DUP_MEDIA_GATE is True)
 
 
+
+# ---- R37: mod-queue gate ----
+check("r37: queue request text is detected", v3.MOD_QUEUE_REQUEST_RE.search("Please respond to this comment with a mirror link") is not None)
+check("r37: listing ids are extracted", v3._listing_post_ids('<a href="/r/X/comments/abc111/t/">x</a>') == {"abc111"})
+check("r37: both signals hold", v3.mod_queue_decision("respond to this comment with", {"other"}, "abc111") == "pending approval")
+check("r37: visible on listing releases", v3.mod_queue_decision("respond to this comment with", {"abc111"}, "abc111") is None)
+check("r37: all uncertainty fails open", v3.mod_queue_decision(None, {"other"}, "abc111") is None and v3.mod_queue_decision("respond to this comment with", None, "abc111") is None)
+check("r37: empty gate defaults on", v3.MOD_QUEUE_GATE is True)
+check("r37: main loop wiring is after liveness", "mod_queue_reason(" in inspect.getsource(v3.main) and "MOD_QUEUE_WINDOW_SECONDS" in inspect.getsource(v3.main))
+
 print()
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
