@@ -2169,6 +2169,38 @@ check("r36: the posted-history lookup is wired before the posting loop", "fetch_
 with open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8") as _r36_f: _r36_workflow = _r36_f.read()
 check("r36: the two new repository Variables are wired into the live workflow", "POST_SETTLE_SECONDS: ${{ vars.POST_SETTLE_SECONDS }}" in _r36_workflow and "DUP_MEDIA_GATE: ${{ vars.DUP_MEDIA_GATE }}" in _r36_workflow)
 
+# ---- R36 hotfix (2026-09-29): GHA passes UNSET Variables as empty strings ----
+# (wired via vars.X, an unset repo Variable arrives as "" — the round-36 first
+# deploy crashed at import with int(""). Empty/blank/garbage must fall back
+# to the code defaults, never break the run.)
+_r36_saved_settle = os.environ.get("POST_SETTLE_SECONDS")
+try:
+    os.environ.pop("POST_SETTLE_SECONDS", None)
+    check("r36-hotfix: an unset POST_SETTLE_SECONDS uses the 300 s default",
+          v3._env_int("POST_SETTLE_SECONDS", 300) == 300)
+    os.environ["POST_SETTLE_SECONDS"] = ""
+    check("r36-hotfix: an EMPTY value (the live GHA crash) uses the 300 s default, not a crash",
+          v3._env_int("POST_SETTLE_SECONDS", 300) == 300)
+    os.environ["POST_SETTLE_SECONDS"] = "   "
+    check("r36-hotfix: a blank value uses the 300 s default",
+          v3._env_int("POST_SETTLE_SECONDS", 300) == 300)
+    os.environ["POST_SETTLE_SECONDS"] = "not-a-number"
+    check("r36-hotfix: a garbage value uses the 300 s default, not a crash",
+          v3._env_int("POST_SETTLE_SECONDS", 300) == 300)
+    os.environ["POST_SETTLE_SECONDS"] = "450"
+    check("r36-hotfix: a valid numeric override is still honored",
+          v3._env_int("POST_SETTLE_SECONDS", 300) == 450)
+finally:
+    if _r36_saved_settle is None:
+        os.environ.pop("POST_SETTLE_SECONDS", None)
+    else:
+        os.environ["POST_SETTLE_SECONDS"] = _r36_saved_settle
+_r36_dup_line = next(l for l in inspect.getsource(v3).splitlines() if l.startswith("DUP_MEDIA_GATE = "))
+check("r36-hotfix: an empty DUP_MEDIA_GATE value does NOT disable the gate (default on)",
+      '""' not in _r36_dup_line and 'not in ("0", "false", "no", "off")' in _r36_dup_line)
+check("r36-hotfix: the gate is ON in a clean environment (smoke default)",
+      v3.DUP_MEDIA_GATE is True)
+
 
 print()
 if failures:
