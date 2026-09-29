@@ -118,7 +118,7 @@ jobs:
           # Round 35: optional comma-separated author names / post IDs that
           # bypass the NSFW content gate. Empty means no exceptions.
           NSFW_ALLOWLIST: ${{ vars.NSFW_ALLOWLIST }}
-          # Round 36: settle window and duplicate-media gate.
+          # Round 36: settle window and duplicate-media gate (empty = code defaults: 300 s / on).
           POST_SETTLE_SECONDS: ${{ vars.POST_SETTLE_SECONDS }}
           DUP_MEDIA_GATE: ${{ vars.DUP_MEDIA_GATE }}
           WEBHOOK_REDDIT_ZENLESSZONEZEROLEAKS_: ${{ secrets.WEBHOOK_REDDIT_ZENLESSZONEZEROLEAKS_ }}
