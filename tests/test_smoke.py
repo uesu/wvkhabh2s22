@@ -2212,6 +2212,53 @@ check("r37: all uncertainty fails open", v3.mod_queue_decision(None, {"other"}, 
 check("r37: empty gate defaults on", v3.MOD_QUEUE_GATE is True)
 check("r37: main loop wiring is after liveness", "mod_queue_reason(" in inspect.getsource(v3.main) and "MOD_QUEUE_WINDOW_SECONDS" in inspect.getsource(v3.main))
 
+# ---- R37 hotfix (2026-09-30): the /new listing fetch must carry the
+# miningtcup token, and both gate outcomes must be visible in the log ----
+_r37_listing_src = inspect.getsource(v3._fetch_new_listing)
+check("r37-hotfix: the /new listing fetch carries the miningtcup token",
+      "_with_miningtcup_token" in _r37_listing_src)
+check("r37-hotfix: an unreadable /new listing is logged (blind fail-open is visible)",
+      "MODQUEUE-LISTING" in _r37_listing_src)
+check("r37-hotfix: a cleared queue check logs it (proceeding is visible)",
+      "no queue hold" in inspect.getsource(v3.main))
+
+# ---- R38a (2026-09-30): link posts carry the YouTube URL as the destination ----
+check("r38a: a link post's YouTube destination is picked up from the final body",
+      'if not yt_url:\n        yt_url = extract_youtube_url(body)' in inspect.getsource(v3.resolve_post_media))
+
+# ---- R38c (2026-09-30): gallery video pickup (1wt59lm: image + clip) ----
+_r38c_area = ('<h1 class="post_title"></h1><div class="post_content">'
+              '<a href="/link/1wt59lm/video/1wevaos4efsh1/player">x</a></div>')
+check("r38c: a redlib player link yields the gallery video id",
+      v3.extract_redlib_video_id(_r38c_area) == "1wevaos4efsh1")
+_r38c_dash = ('<h1 class="post_title"></h1><div class="post_content">'
+              '<source src="https://v.redd.it/1wevaos4efsh1/DASH_720.mp4">')
+check("r38c: a direct v.redd.it URL yields the gallery video id",
+      v3.extract_redlib_video_id(_r38c_dash) == "1wevaos4efsh1")
+check("r38c: a page without a video yields None",
+      v3.extract_redlib_video_id(_r38c_area.replace("1wevaos4efsh1", "img9")) is None)
+check("r38c: a gallery video item keeps the post's photos (tile-only rule spared)",
+      'not x.get("gallery")' in inspect.getsource(v3.resolve_post_media))
+check("r38c: the redlib harvest appends the resolved gallery video",
+      '"gallery": True' in inspect.getsource(v3.enrich_gallery_redlib))
+
+# ---- R38c hardening (found during apply): payload edge cases ----
+_r38c_pay = {"title": "T", "author": "a", "body": "", "stats": None,
+             "youtube_url": None, "crosspost": None, "op_comment": None}
+_r38c_p1 = v3.build_v3_payload("s", dict(_r38c_pay, media=(
+    [{"kind": "image", "url": f"https://i.redd.it/{i}.jpg"} for i in range(v3.MEDIA_PER_GALLERY)]
+    + [{"kind": "video", "url": "https://v.redd.it/v.mp4", "gallery": True}])),
+    "https://r/x", 1)
+check("r38c-hardening: 10 photos + gallery video never emits an empty gallery (Discord 400)",
+      all(len(g["items"]) > 0
+          for ct in _r38c_p1["components"] for g in ct["components"] if g.get("type") == 12))
+_r38c_p2 = v3.build_v3_payload("s", dict(_r38c_pay, media=[
+    {"kind": "video", "url": "https://v.redd.it/v.mp4"}]), "https://r/x", 1)
+_r38c_c2 = _r38c_p2["components"][0]["components"]
+_r38c_gi = next(i for i, c in enumerate(_r38c_c2) if c.get("type") == 12)
+check("r38c-hardening: a video-only card keeps its legacy divider before the tile",
+      _r38c_gi > 0 and _r38c_c2[_r38c_gi - 1].get("type") == 14)
+
 print()
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
