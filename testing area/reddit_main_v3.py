@@ -352,6 +352,46 @@ DUP_MEDIA_GATE = os.getenv("DUP_MEDIA_GATE", "1").strip().lower() not in ("0", "
 # days of history on busy subs, months on quiet ones).
 DUP_MEDIA_POSTED_WINDOW = 120
 
+# Round 37: hold posts positively identified as awaiting moderator approval.
+MOD_QUEUE_GATE = os.getenv("MOD_QUEUE_GATE", "1").strip().lower() not in ("0", "false", "no", "off")
+MOD_QUEUE_WINDOW_SECONDS = _env_int("MOD_QUEUE_WINDOW_SECONDS", 6 * 3600)
+MOD_QUEUE_REQUEST_RE = re.compile(r"respond to this comment with|temporarily sent to the moderators for review", re.I)
+MOD_QUEUE_LISTING_ID_RE = re.compile(r"/comments/([a-z0-9]+)/", re.I)
+_mod_queue_listing_cache: dict = {}
+
+def _listing_post_ids(page_html):
+    return set(m.lower() for m in MOD_QUEUE_LISTING_ID_RE.findall(page_html or ""))
+
+def mod_queue_decision(page_html, listing_ids, post_id):
+    if not page_html or not MOD_QUEUE_REQUEST_RE.search(page_html) or not post_id or listing_ids is None:
+        return None
+    return None if post_id.lower() in listing_ids else "pending approval"
+
+async def _fetch_new_listing(session, subreddit):
+    if subreddit in _mod_queue_listing_cache:
+        return _mod_queue_listing_cache[subreddit]
+    result = None
+    for instance in REDDIT_RSS_INSTANCES:
+        try:
+            async with session.get(f"{instance}/r/{subreddit}/new?limit=100", headers=BROWSER_HEADERS,
+                                   timeout=aiohttp.ClientTimeout(total=10), allow_redirects=True) as resp:
+                html = await resp.text() if resp.status == 200 and "html" in (resp.headers.get("Content-Type") or "").lower() else None
+        except Exception:
+            html = None
+        if html:
+            ids = _listing_post_ids(html)
+            if ids:
+                result = ids; break
+    _mod_queue_listing_cache[subreddit] = result
+    return result
+
+async def mod_queue_reason(session, subreddit, path, label=""):
+    pages = await asyncio.gather(*[_fetch_redlib_post_page(session, inst, path) for inst in REDDIT_RSS_INSTANCES])
+    page = next((h for h in pages if h), None)
+    if not page:
+        return None
+    return mod_queue_decision(page, await _fetch_new_listing(session, subreddit), extract_post_id(path) or "")
+
 # ---------------------------------------------------------------------------
 # ■ RSS SOURCES (unchanged from V1/V2 — see round 8/9 notes)
 # ---------------------------------------------------------------------------
@@ -3199,6 +3239,7 @@ async def main():
 
     posted = load_posted()
     pending = load_pending()
+    _mod_queue_listing_cache.clear()
     is_first_run = len(posted) == 0
     now = time.time()
     # Round 34: remember the pre-run cache so every save can be verified
@@ -3593,6 +3634,16 @@ async def main():
                     logging.info(f"[{unique_key}] post not verified live "
                                  f"({_why}) — skipping, not cached (will "
                                  f"post once approved/restored).")
+                    continue
+
+            if (not TEST_POST_ID and not DRY_RUN and entry is not None and MOD_QUEUE_GATE
+                    and (now - published_ts) < MOD_QUEUE_WINDOW_SECONDS):
+                _mq = await mod_queue_reason(session, subreddit, path, unique_key)
+                if _mq:
+                    _mq_pending = mark_pending
+                    _mq_pending(pending, unique_key, _mq, now, source=_entry_source36,
+                                 title=str(base.get("title") or "")[:200], published_ts=published_ts)
+                    logging.info(f"MODQUEUE: {unique_key} age {int(now - published_ts)}s — awaiting moderator approval — holding")
                     continue
 
             try:
