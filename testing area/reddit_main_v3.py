@@ -357,15 +357,77 @@ MOD_QUEUE_GATE = os.getenv("MOD_QUEUE_GATE", "1").strip().lower() not in ("0", "
 MOD_QUEUE_WINDOW_SECONDS = _env_int("MOD_QUEUE_WINDOW_SECONDS", 6 * 3600)
 MOD_QUEUE_REQUEST_RE = re.compile(r"respond to this comment with|temporarily sent to the moderators for review", re.I)
 MOD_QUEUE_LISTING_ID_RE = re.compile(r"/comments/([a-z0-9]+)/", re.I)
+
+# Round 38d (2026-09-29): a post can be natively queued with no AutoModerator
+# comment at all, so round 37 has no positive text signal to inspect. A post
+# absent from a readable /new listing is held only when its own relative age
+# is demonstrably inside that listing's visible age span. The tail margin is
+# deliberately tied to the existing gate window: this adds no new workflow
+# setting, remains conservative when the window is changed, and keeps the
+# normal window as the hard fail-open cap.
+MOD_QUEUE_TAIL_MARGIN_SECONDS = MOD_QUEUE_WINDOW_SECONDS
+_REDLIB_AGE_TEXT = r"(\d+)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)\s+ago"
+_REDLIB_CREATED_AGE_RE = re.compile(
+    rf"class\s*=\s*[\"'][^\"']*\bcreated\b[^\"']*[\"'][^>]*>\s*{_REDLIB_AGE_TEXT}",
+    re.I,
+)
+_REDLIB_BARE_AGE_RE = re.compile(rf">\s*{_REDLIB_AGE_TEXT}\s*<", re.I)
+_REDLIB_AGE_UNITS = {
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+}
 _mod_queue_listing_cache: dict = {}
+
+def _redlib_ages_seconds(page_html):
+    """Return visible relative ages in seconds, in page order.
+
+    Redlib normally labels them with a ``created`` class. A bare-element
+    fallback supports the equivalent markup emitted by other listing sources.
+    Parsing never guesses: an unparseable page returns no age and the queue
+    gate fails open.
+    """
+    html = page_html or ""
+    pairs = _REDLIB_CREATED_AGE_RE.findall(html)
+    if not pairs:
+        pairs = _REDLIB_BARE_AGE_RE.findall(html)
+    return [int(value) * _REDLIB_AGE_UNITS[unit.lower()]
+            for value, unit in pairs]
+
+def _listing_oldest_age(page_html):
+    ages = _redlib_ages_seconds(page_html)
+    return max(ages) if ages else None
 
 def _listing_post_ids(page_html):
     return set(m.lower() for m in MOD_QUEUE_LISTING_ID_RE.findall(page_html or ""))
 
-def mod_queue_decision(page_html, listing_ids, post_id):
-    if not page_html or not MOD_QUEUE_REQUEST_RE.search(page_html) or not post_id or listing_ids is None:
+def mod_queue_decision(page_html, listing_ids, post_id, listing_oldest_age=None):
+    """Return ``pending approval`` only for an evidenced queue hold.
+
+    Round 37 keeps its positive AutoModerator signal. Round 38d additionally
+    handles zero-comment native queue posts through negative space: a post
+    absent from /new is held only while its parsed age fits within the
+    listing's oldest visible age plus the conservative tail margin. Missing
+    page/listing data, missing ages, and malformed input always fail open.
+    """
+    if not page_html or not post_id or listing_ids is None:
         return None
-    return None if post_id.lower() in listing_ids else "pending approval"
+    if post_id.lower() in listing_ids:
+        return None  # Present in the public listing: it was released.
+    if MOD_QUEUE_REQUEST_RE.search(page_html):
+        return "pending approval"  # Round 37's positive-signal path.
+
+    # Round 38d: no queue text (native queue, zero comments). The first age
+    # on a post page is the post header; a /new listing has no comments, so
+    # its oldest age bounds the visible listing span. Any uncertainty remains
+    # a fail-open result rather than an unbounded hold.
+    post_ages = _redlib_ages_seconds(page_html)
+    if not post_ages or listing_oldest_age is None:
+        return None
+    if post_ages[0] < listing_oldest_age + MOD_QUEUE_TAIL_MARGIN_SECONDS:
+        return "pending approval"
+    return None
 
 async def _fetch_new_listing(session, subreddit):
     if subreddit in _mod_queue_listing_cache:
@@ -387,7 +449,10 @@ async def _fetch_new_listing(session, subreddit):
         if html:
             ids = _listing_post_ids(html)
             if ids:
-                result = ids; break
+                # Keep the listing's oldest visible age with its IDs. A
+                # missing age is intentional: round 38d then fails open.
+                result = (ids, _listing_oldest_age(html))
+                break
     if result is None:
         logging.info(f"MODQUEUE-LISTING: r/{subreddit} /new listing unavailable "
                      f"(all instances) — the mod-queue gate will fail open this run.")
@@ -396,10 +461,20 @@ async def _fetch_new_listing(session, subreddit):
 
 async def mod_queue_reason(session, subreddit, path, label=""):
     pages = await asyncio.gather(*[_fetch_redlib_post_page(session, inst, path) for inst in REDDIT_RSS_INSTANCES])
-    page = next((h for h in pages if h), None)
+    # Preserve the round-37 positive signal wherever it was rendered. For a
+    # zero-comment native queue post, prefer a page that actually exposes a
+    # relative post age over a generic/JS shell from an earlier instance.
+    page = next((h for h in pages if h and MOD_QUEUE_REQUEST_RE.search(h)), None)
+    if page is None:
+        page = next((h for h in pages if h and _redlib_ages_seconds(h)), None)
+    if page is None:
+        page = next((h for h in pages if h), None)
     if not page:
         return None
-    return mod_queue_decision(page, await _fetch_new_listing(session, subreddit), extract_post_id(path) or "")
+    listing = await _fetch_new_listing(session, subreddit)
+    listing_ids, listing_oldest_age = (None, None) if listing is None else listing
+    return mod_queue_decision(page, listing_ids, extract_post_id(path) or "",
+                              listing_oldest_age=listing_oldest_age)
 
 # ---------------------------------------------------------------------------
 # ■ RSS SOURCES (unchanged from V1/V2 — see round 8/9 notes)
