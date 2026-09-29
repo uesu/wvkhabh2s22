@@ -324,7 +324,19 @@ APPROVAL_RECHECK_SECONDS = int(os.getenv("APPROVAL_RECHECK_SECONDS", "300"))  # 
 # of posted. 0 = off. Posts first seen already older than the window —
 # including RESTORED posts, whose age is the original publish time — post at
 # zero delay.
-POST_SETTLE_SECONDS = int(os.getenv("POST_SETTLE_SECONDS", "300"))  # 5 min
+# Round 36 hotfix (2026-09-29): a GHA workflow that wires a repo Variable
+# passes it as an EMPTY STRING when the Variable is unset (os.getenv() then
+# returns "" instead of None, so the "300" default never applied) — the first
+# prod deploy crashed at import with int(""). Empty, blank, and non-numeric
+# values now fall back to the default; a valid number still overrides.
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int((os.getenv(name) or "").strip() or str(default))
+    except ValueError:
+        return default
+
+
+POST_SETTLE_SECONDS = _env_int("POST_SETTLE_SECONDS", 300)  # 5 min
 # Round 36: duplicate-media gate — skip a new post whose exact media
 # identity (a reused i.redd.it file or the same external destination URL) is
 # already on Discord from an earlier post in the SAME sub. Only a POSTED
@@ -332,7 +344,9 @@ POST_SETTLE_SECONDS = int(os.getenv("POST_SETTLE_SECONDS", "300"))  # 5 min
 # (Re-uploaded files get NEW i.redd.it URLs and re-created galleries get new
 # gallery ids — those are NOT caught by design: same URL = same content is
 # provable, and the gate never guesses.)
-DUP_MEDIA_GATE = os.getenv("DUP_MEDIA_GATE", "1").strip().lower() not in ("0", "false", "no", "off", "")
+# Round 36 hotfix (2026-09-29): an empty value (unset GHA Variable) is the
+# DEFAULT (on), not an off switch — only an explicit off value disables it.
+DUP_MEDIA_GATE = os.getenv("DUP_MEDIA_GATE", "1").strip().lower() not in ("0", "false", "no", "off")
 # Round 36: how many of the sub's NEWEST posted keys are compared by the
 # duplicate-media gate (leet post ids sort chronologically WITHIN a sub —
 # days of history on busy subs, months on quiet ones).
