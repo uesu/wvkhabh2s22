@@ -1716,11 +1716,12 @@ check("r30 throttle: skips with `continue` and never caches as posted",
 check("r30 throttle runs BEFORE any network work (the whole point)",
       _r30_main.index("pending-post recheck throttle")
       < _r30_main.index("post_json = await fetch_post_json"))
-check("r30/r35 gates: all five skip paths record a pending entry",
-      _r30_main.count("mark_pending(pending, unique_key") == 5
+check("r30/r35/r36 gates: all six skip paths record a pending entry",
+      _r30_main.count("mark_pending(pending, unique_key") == 6
       and "mark_pending(pending, unique_key, reason, now)" in _r30_main
       and 'mark_pending(pending, unique_key, "media_wait", now)' in _r30_main
-      and 'mark_pending(pending, unique_key, "partial_gallery", now)' in _r30_main,
+      and 'mark_pending(pending, unique_key, "partial_gallery", now)' in _r30_main
+      and 'mark_pending(pending, unique_key, "duplicate_media", now' in _r30_main,
       str(_r30_main.count("mark_pending(pending, unique_key")))
 check("r30 posted: a successful post clears the pending entry",
       "pending.pop(unique_key, None)" in _r30_main)
@@ -1837,11 +1838,11 @@ check("r32: media_wait keeps the round-30 30-min throttle (+60 s skipped, +30 mi
 check("r32: unknown/missing reason falls back to the round-30 30-min throttle",
       v3._pending_throttle_skip(_r32_pend(None), "k", 1060.0, _r32_arctic) is True
       and v3._pending_throttle_skip(_r32_pend(None), "k", 2800.0, _r32_arctic) is False)
-check("r32/r35: no-recheck set is exactly removal/deletion + nsfw_flag reasons",
+check("r32/r35/r36: no-recheck set is exactly removal/deletion + nsfw/duplicate reasons",
       v3._NO_RECHECK_REASONS == frozenset({
           "removal_notice", "removal notice", "title marker", "whole-body marker",
           "removed by moderator", "removed by moderators/filters", "deleted by author",
-          "nsfw_flag"}))
+          "nsfw_flag", "duplicate_media"}))
 check("r32: the short-recheck set is exactly the approval/transient reasons",
       v3._SHORT_RECHECK_REASONS == frozenset(
           {"not_live", "sources_down", "pending approval"}))
@@ -2126,6 +2127,47 @@ with open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="
     _r35_workflow = _r35_f.read()
 check("r35: the optional repository Variable is wired into the live workflow",
       "NSFW_ALLOWLIST: ${{ vars.NSFW_ALLOWLIST }}" in _r35_workflow)
+
+# ---- R36: settle window + duplicate-media gate + pending audit fields ----
+check("r36: duplicate_media uses the archive no-recheck pending path", "duplicate_media" in v3._NO_RECHECK_REASONS)
+_r36_orig_settle = v3.POST_SETTLE_SECONDS
+v3.POST_SETTLE_SECONDS = 300
+check("r36: settle holds a post 100 s old (window 300 s)", v3.settle_holds(900.0, 1000.0) is True)
+check("r36: settle passes a post 500 s old (window 300 s)", v3.settle_holds(500.0, 1000.0) is False)
+v3.POST_SETTLE_SECONDS = 0
+check("r36: settle is off with POST_SETTLE_SECONDS=0", v3.settle_holds(999.0, 1000.0) is False)
+v3.POST_SETTLE_SECONDS = _r36_orig_settle
+check("r36: a bare i.redd.it URL is its own identity", v3.media_identity("https://i.redd.it/07k97gjymdsh1.jpeg") == "https://i.redd.it/07k97gjymdsh1.jpeg")
+check("r36: a signed/slug preview.redd.it URL collapses to the i.redd.it file", v3.media_identity("https://preview.redd.it/aha-splash-v0-xeqyq5flmdsh1.jpg?width=1080&s=x") == "https://i.redd.it/xeqyq5flmdsh1.jpg")
+check("r36: a preview.redd.it png collapses hosts (same file)", v3.media_identity("https://preview.redd.it/xyz.png?width=1280&s=x") == "https://i.redd.it/xyz.png")
+check("r36: an external destination URL normalizes (host case + query stripped)", v3.media_identity("HTTPS://Hsr.Nanoka.cc/Item/71/?ref=rss") == "hsr.nanoka.cc/Item/71")
+check("r36: external path case is kept (no false-positive collisions)", v3.media_identity("https://Example.COM/Path/Case") == "example.com/Path/Case")
+check("r36: a gallery URL is never an identity (re-galleries get new ids)", v3.media_identity("https://www.reddit.com/gallery/1wsyy4e") is None)
+check("r36: a post permalink is never an identity (unique per post)", v3.media_identity("https://www.reddit.com/r/x/comments/id/t/") is None)
+check("r36: an empty/unknown URL is never an identity (fail-open)", v3.media_identity("") is None and v3.media_identity(None) is None)
+_r36_payload = {"data": [{"id":"aaa111","url_overridden_by_dest":"https://hsr.nanoka.cc/item/71/","url":"x"},{"id":"bbb222","url":"https://i.redd.it/x.jpeg"}]}
+_r36_urls = asyncio.run(v3.fetch_arctic_urls(_R35Session(_R35Response(_r36_payload)), ["aaa111","bbb222","ddd444"]))
+check("r36: the url lookup prefers url_overridden_by_dest", _r36_urls.get("aaa111") == "https://hsr.nanoka.cc/item/71/")
+check("r36: the url lookup falls back to url", _r36_urls.get("bbb222") == "https://i.redd.it/x.jpeg")
+check("r36: an ID absent from Arctic is unknown (fail-open)", _r36_urls.get("ddd444") is None)
+_r36_down = asyncio.run(v3.fetch_arctic_urls(_R35Session(error=RuntimeError("network down")), ["aaa111"]))
+check("r36: a failed url lookup returns {} (fail-open, never a hold)", _r36_down == {})
+check("r36: a posted same-identity post is the duplicate's winner", v3.dup_media_hit({"a":"Sub_x"}, "a") == "Sub_x")
+check("r36: no posted map -> no hit", v3.dup_media_hit(None, "a") is None)
+check("r36: an unknown identity never hits (fail-open)", v3.dup_media_hit({"a":"Sub_x"}, None) is None)
+check("r36: a different identity never hits", v3.dup_media_hit({"a":"Sub_x"}, "b") is None)
+_r36_pend = {}; v3.mark_pending(_r36_pend, "Sub_abc111", "media_wait", 1000.0)
+check("r36: the legacy mark_pending call shape still works", _r36_pend["Sub_abc111"] == {"first_seen":1000.0,"last_checked":1000.0,"reason":"media_wait"})
+v3.mark_pending(_r36_pend, "Sub_abc111", "removal_notice", 2000.0, source="rss", title="Aha kit", published_ts=1234.0)
+check("r36: mark_pending stores the round-36 audit fields (additive)", _r36_pend["Sub_abc111"]["source"] == "rss" and _r36_pend["Sub_abc111"]["published_ts"] == 1234)
+_r36_main_src = inspect.getsource(v3.main)
+check("r36: the settle gate is wired in the loop and holds fresh posts one run", "settle_holds(" in _r36_main_src and "SETTLE:" in _r36_main_src)
+check("r36: a same-media duplicate of an already-posted post is held, not posted", "DUP GATE:" in _r36_main_src and 'mark_pending(pending, unique_key, "duplicate_media", now' in _r36_main_src)
+check("r36: every new post logs its media decision (wiring visible in the run log)", "DUP SCAN:" in _r36_main_src)
+check("r36: a restored no-recheck post re-entering via RSS is logged loudly", "RESTORED:" in _r36_main_src)
+check("r36: the posted-history lookup is wired before the posting loop", "fetch_arctic_urls(" in _r36_main_src and _r36_main_src.index("fetch_arctic_urls(") < _r36_main_src.index(_r35_loop))
+with open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8") as _r36_f: _r36_workflow = _r36_f.read()
+check("r36: the two new repository Variables are wired into the live workflow", "POST_SETTLE_SECONDS: ${{ vars.POST_SETTLE_SECONDS }}" in _r36_workflow and "DUP_MEDIA_GATE: ${{ vars.DUP_MEDIA_GATE }}" in _r36_workflow)
 
 
 print()
