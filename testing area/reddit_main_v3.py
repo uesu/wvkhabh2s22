@@ -373,7 +373,13 @@ async def _fetch_new_listing(session, subreddit):
     result = None
     for instance in REDDIT_RSS_INSTANCES:
         try:
-            async with session.get(f"{instance}/r/{subreddit}/new?limit=100", headers=BROWSER_HEADERS,
+            # Round 37 hotfix (2026-09-30): miningtcup sits behind its DogWAF
+            # and rejects untokenized requests — without the token the /new
+            # listing was unreadable on EVERY instance and the gate failed
+            # open on every queued post. The helper is a no-op for every
+            # non-miningtcup URL (same helper the post-page fetch uses).
+            async with session.get(_with_miningtcup_token(f"{instance}/r/{subreddit}/new?limit=100"),
+                                   headers=BROWSER_HEADERS,
                                    timeout=aiohttp.ClientTimeout(total=10), allow_redirects=True) as resp:
                 html = await resp.text() if resp.status == 200 and "html" in (resp.headers.get("Content-Type") or "").lower() else None
         except Exception:
@@ -382,6 +388,9 @@ async def _fetch_new_listing(session, subreddit):
             ids = _listing_post_ids(html)
             if ids:
                 result = ids; break
+    if result is None:
+        logging.info(f"MODQUEUE-LISTING: r/{subreddit} /new listing unavailable "
+                     f"(all instances) — the mod-queue gate will fail open this run.")
     _mod_queue_listing_cache[subreddit] = result
     return result
 
@@ -2377,6 +2386,27 @@ def extract_redlib_gallery(page_html: str | None) -> list[dict]:
     return extract_native_media(_redlib_post_area(page_html))
 
 
+# Round 38c (2026-09-30): a gallery post can carry a reddit-hosted VIDEO
+# item (1wt59lm: image + clip). The image harvest above never sees it —
+# themes either inline a v.redd.it URL or link the instance's player page
+# (/link/<post>/video/<id>); both carry the same base62 id the DASH chain
+# resolves. (Markup verified live on safereddit, 2026-09-30.)
+REDDIL_PLAYER_VIDEO_RE = re.compile(r"/link/[a-z0-9]+/video/([a-z0-9]{5,20})")
+
+
+def extract_redlib_video_id(page_html: str | None) -> str | None:
+    """The reddit video id of a GALLERY video item on a redlib post page
+    (post area only), or None when the page has no video."""
+    if not page_html:
+        return None
+    area = _redlib_post_area(page_html)
+    vid = extract_vreddit_id(area)
+    if vid:
+        return vid
+    pm = REDDIL_PLAYER_VIDEO_RE.search(area)
+    return pm.group(1) if pm else None
+
+
 def base_from_redlib_page(page_html: str | None, path: str) -> dict | None:
     """
     Round 12c: native base for a TEST POST when the post JSON is unavailable
@@ -2500,11 +2530,27 @@ async def enrich_gallery_redlib(session: aiohttp.ClientSession, path: str,
     pages = await asyncio.gather(
         *[_fetch_redlib_post_page(session, inst, path) for inst in REDDIT_RSS_INSTANCES]
     )
+    video_vid = None
     for instance, html in zip(REDDIT_RSS_INSTANCES, pages):
         if not html:
             continue
+        if video_vid is None:
+            video_vid = extract_redlib_video_id(html)
         items = extract_redlib_gallery(html)
         if items:
+            # Round 38c: a gallery can carry a reddit-hosted VIDEO item
+            # (1wt59lm: image + clip) the image harvest above never sees —
+            # the redlib page renders it as a player link. Resolve it
+            # through the same DASH chain the native video path uses (no
+            # silent fallback — only a range-checked mp4 ever lands on the
+            # card); "gallery" marks it so the round-13 video-tile-only
+            # rule keeps the post's photos.
+            if video_vid and not any(i["kind"] == "video" for i in items):
+                _vurl = await resolve_video_url(session, video_vid, None)
+                if _vurl:
+                    items.append({"kind": "video", "url": _vurl, "gallery": True})
+                    logging.info(f"[{label}] redlib gallery video {video_vid} "
+                                 f"resolved — {len(items)} media item(s).")
             logging.info(f"[{label}] gallery via redlib ({instance}) — "
                          f"{len(items)} media item(s).")
             return items
@@ -2869,6 +2915,16 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                 proxy_media_used = True
                 logging.info(f"[{label or 'proxy'}] card media via {proxy['service']} "
                              f"— 1 video tile.")
+            elif (not video_dead and not arctic_is_video and redlib_items
+                  and any(x["kind"] == "video" for x in redlib_items)):
+                # round 38c: a redlib gallery WITH a video item is the most
+                # complete source — every photo + the video tile (1wt59lm)
+                media = [dict(x) for x in redlib_items
+                         if not (has_video and _is_external_preview(x["url"]))]
+                _use_proxy_text()
+                proxy_media_used = True
+                logging.info(f"[{label or 'proxy'}] card media via redlib harvest "
+                             f"(gallery video) — {len(media)} item(s).")
             elif (not video_dead and not arctic_is_video and arctic_items
                   and len(arctic_items) >= max(1, len(proxy_images))):
                 media = [dict(item) for item in arctic_items]
@@ -2925,8 +2981,10 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
         media = [x for x in media
                  if x["kind"] in ("video", "gif") or not _is_external_preview(x["url"])]
     else:
-        if proxy_media_used and any(x["kind"] == "video" for x in media):
+        if proxy_media_used and any(x["kind"] == "video" and not x.get("gallery")
+                                    for x in media):
             # round 13: the proxy video tile only (no first-frame / poster dup)
+            # (round 38c: a GALLERY video item keeps the post's photos)
             media = [x for x in media if x["kind"] in ("video", "gif")]
         elif not post_json:
             # ---- NATIVE MODE media (no reddit video resolved) ----
@@ -2940,7 +2998,7 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                 # filled the gallery — a shorter redlib/RSS list must never
                 # downgrade it. The `not media` fallbacks below still run
                 # when the winning branch produced an empty list.
-                if arctic_items:
+                if arctic_items and not any(x["kind"] == "video" for x in redlib_items):
                     media = [dict(item) for item in arctic_items]
                 elif redlib_items:
                     # round 14: the COMPLETE ordered gallery (incl. GIFs,
@@ -2992,6 +3050,14 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
             media.append({"kind": "image", "url": video_poster})
             logging.info("video unavailable -> using first-frame poster + button.")
 
+    # Round 38a (2026-09-30): link posts carry the YouTube URL as the
+    # DESTINATION (youtu.be/... as the post URL, a bare URL line in the
+    # final body) — base-time extraction only saw the RSS content, which
+    # is empty for link posts (live 2026-09-30: 1wtmbmh went out as a
+    # bare URL line with no button). The final body is the last place
+    # the URL can be — extract it before the tile/button build.
+    if not yt_url:
+        yt_url = extract_youtube_url(body)
     # youtube tile / thumbnail (both modes)
     yt_vid, yt_live = extract_youtube_id(yt_url)
     if yt_vid:
@@ -3093,6 +3159,11 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
             header += f"\n*🔁 Crosspost of {_cp_url or 'the original post'}*"
 
     media = data["media"]
+    # Round 38c (2026-09-30): a video tile renders in its OWN media block —
+    # photos in one gallery, the video in a separate one below it (Discord
+    # renders every type-12 as its own block). No video -> identical card.
+    _vid_media = [m for m in media if m["kind"] == "video"]
+    _photo_media = [m for m in media if m["kind"] != "video"]
     stats = data["stats"]
     ts_suffix = f"   •   🕐 <t:{posted_ts}:f>"
     if stats:
@@ -3114,8 +3185,12 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
     def gallery(items: list) -> dict:
         return {"type": 12, "items": [{"media": {"url": m["url"]}} for m in items]}
 
-    if len(media) > MEDIA_PER_GALLERY:
-        first, second = media[:MEDIA_PER_GALLERY], media[MEDIA_PER_GALLERY:]
+    # Round 38c hardening: the split MUST key on the PHOTO count — with
+    # exactly 10 photos + a gallery video, len(media)=11 would open the
+    # two-container branch with an EMPTY second photo gallery (a type-12
+    # with 0 items is a Discord 400 — the whole card would be rejected).
+    if len(_photo_media) > MEDIA_PER_GALLERY:
+        first, second = _photo_media[:MEDIA_PER_GALLERY], _photo_media[MEDIA_PER_GALLERY:]
         container1 = {"type": 17, "accent_color": 16729344, "components": [
             {"type": 10, "content": header},
         ]}
@@ -3128,10 +3203,13 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
         container2 = {"type": 17, "accent_color": 16729344, "components": [
             {"type": 14, "divider": True, "spacing": 1},
             gallery(second),
-            {"type": 10, "content": stats_line},
-            {"type": 14, "divider": True, "spacing": 1},
-            row,
         ]}
+        if _vid_media:
+            # round 38c: the video tile keeps its OWN media block
+            container2["components"].append(gallery(_vid_media))
+        container2["components"].append({"type": 10, "content": stats_line})
+        container2["components"].append({"type": 14, "divider": True, "spacing": 1})
+        container2["components"].append(row)
         return {"flags": IS_COMPONENTS_V2,
                 "components": [container1, container2]}
 
@@ -3141,8 +3219,14 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
     if op_line:
         inner.append({"type": 10, "content": op_line})
     if media:
+        # Round 38c hardening: the divider precedes ANY media (a video-only
+        # card — the round-13 tile — keeps its legacy divider too).
         inner.append({"type": 14, "divider": True, "spacing": 1})
-        inner.append(gallery(media))
+    if _photo_media:
+        inner.append(gallery(_photo_media))
+    if _vid_media:
+        # round 38c: the video tile gets its OWN media block, below the photos
+        inner.append(gallery(_vid_media))
     inner.append({"type": 10, "content": stats_line})
     inner.append({"type": 14, "divider": True, "spacing": 1})
     inner.append(row)
@@ -3639,6 +3723,8 @@ async def main():
             if (not TEST_POST_ID and not DRY_RUN and entry is not None and MOD_QUEUE_GATE
                     and (now - published_ts) < MOD_QUEUE_WINDOW_SECONDS):
                 _mq = await mod_queue_reason(session, subreddit, path, unique_key)
+                if not _mq:
+                    logging.info(f"MODQUEUE: {unique_key} — no queue hold — proceeding")
                 if _mq:
                     _mq_pending = mark_pending
                     _mq_pending(pending, unique_key, _mq, now, source=_entry_source36,
