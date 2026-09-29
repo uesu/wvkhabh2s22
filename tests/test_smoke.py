@@ -2222,6 +2222,99 @@ check("r37-hotfix: an unreadable /new listing is logged (blind fail-open is visi
 check("r37-hotfix: a cleared queue check logs it (proceeding is visible)",
       "no queue hold" in inspect.getsource(v3.main))
 
+# ---- R38d (2026-09-29): native/zero-comment mod-queue detection ----------
+# A post that is natively queued can have no AutoModerator comment. It is
+# therefore absent from /new but carries no positive queue text. Hold only if
+# both the post age and listing span are parseable; every missing signal must
+# retain round 37's fail-open behavior.
+_r38d_page = '<span class="created" title="x">2h ago</span><div>plain post body</div>'
+_r38d_listing_ids = {"other1", "other2"}
+check("r38d: absent + no queue text + inside listing span holds",
+      v3.mod_queue_decision(_r38d_page, _r38d_listing_ids, "abc111",
+                            listing_oldest_age=12 * 3600) == "pending approval")
+check("r38d: the round-37 positive queue-text path remains unchanged",
+      v3.mod_queue_decision("respond to this comment with", {"other"}, "abc111")
+      == "pending approval")
+check("r38d: a post present in /new releases even with a parsed age",
+      v3.mod_queue_decision(_r38d_page, {"abc111"}, "abc111",
+                            listing_oldest_age=12 * 3600) is None)
+check("r38d: a blind listing fails open",
+      v3.mod_queue_decision(_r38d_page, None, "abc111", listing_oldest_age=12 * 3600)
+      is None)
+check("r38d: an unparseable post age fails open",
+      v3.mod_queue_decision('<span class="created">just now</span>', _r38d_listing_ids,
+                            "abc111", listing_oldest_age=12 * 3600) is None)
+check("r38d: a missing listing age fails open",
+      v3.mod_queue_decision(_r38d_page, _r38d_listing_ids, "abc111") is None)
+check("r38d: a post older than the safe listing span fails open",
+      v3.mod_queue_decision('<span class="created">40h ago</span>', _r38d_listing_ids,
+                            "abc111", listing_oldest_age=12 * 3600) is None)
+check("r38d: the window-sized margin preserves a conservative tail",
+      v3.mod_queue_decision('<span class="created">5h ago</span>', _r38d_listing_ids,
+                            "abc111", listing_oldest_age=4 * 3600) == "pending approval")
+_r38d_listing_html = ('<a href="/r/X/comments/other1/t/"><span class="created">10m ago</span></a>'
+                      '<a href="/r/X/comments/other2/t/"><span class="created">12h ago</span></a>')
+check("r38d: listing span uses the oldest visible age",
+      v3._listing_oldest_age(_r38d_listing_html) == 12 * 3600)
+check("r38d: word-form redlib ages are parsed",
+      v3._redlib_ages_seconds('<span class="created">2 hours ago</span>') == [2 * 3600])
+check("r38d: bare relative-age markup is a safe fallback",
+      v3._redlib_ages_seconds('<time>3h ago</time>') == [3 * 3600])
+check("r38d: a listing without a parseable age has no safe span",
+      v3._listing_oldest_age('<a href="/r/X/comments/other1/t/">no age</a>') is None)
+
+class _R38dListingResponse:
+    status = 200
+    headers = {"Content-Type": "text/html; charset=utf-8"}
+
+    async def text(self):
+        return _r38d_listing_html
+
+
+class _R38dListingRequest:
+    async def __aenter__(self):
+        return _R38dListingResponse()
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _R38dListingSession:
+    def get(self, *args, **kwargs):
+        return _R38dListingRequest()
+
+
+_r38d_cache_before = dict(v3._mod_queue_listing_cache)
+try:
+    v3._mod_queue_listing_cache.clear()
+    _r38d_listing = asyncio.run(v3._fetch_new_listing(_R38dListingSession(), "QueueTest"))
+    check("r38d: listing fetch caches IDs with its parsed oldest age",
+          _r38d_listing == ({"other1", "other2"}, 12 * 3600), str(_r38d_listing))
+finally:
+    v3._mod_queue_listing_cache.clear()
+    v3._mod_queue_listing_cache.update(_r38d_cache_before)
+
+_r38d_original_page_fetch = v3._fetch_redlib_post_page
+_r38d_original_listing_fetch = v3._fetch_new_listing
+async def _r38d_post_page(_session, instance, _path):
+    # A generic first-party shell must not mask a later redlib page that has
+    # the relative post age required by the negative-space decision.
+    return "<html>generic shell</html>" if instance == v3.REDDIT_RSS_INSTANCES[0] else _r38d_page
+async def _r38d_listing_fetch(*args, **kwargs):
+    return _r38d_listing_ids, 12 * 3600
+try:
+    v3._fetch_redlib_post_page = _r38d_post_page
+    v3._fetch_new_listing = _r38d_listing_fetch
+    check("r38d: mod_queue_reason selects a parseable page and passes the listing age",
+          asyncio.run(v3.mod_queue_reason(object(), "QueueTest", "/r/X/comments/abc111/t/"))
+          == "pending approval")
+finally:
+    v3._fetch_redlib_post_page = _r38d_original_page_fetch
+    v3._fetch_new_listing = _r38d_original_listing_fetch
+
+check("r38d: the tail margin is tied to the existing window (no new workflow Variable)",
+      v3.MOD_QUEUE_TAIL_MARGIN_SECONDS == v3.MOD_QUEUE_WINDOW_SECONDS)
+
 # ---- R38a (2026-09-30): link posts carry the YouTube URL as the destination ----
 check("r38a: a link post's YouTube destination is picked up from the final body",
       'if not yt_url:\n        yt_url = extract_youtube_url(body)' in inspect.getsource(v3.resolve_post_media))
