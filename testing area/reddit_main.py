@@ -86,27 +86,24 @@ MAX_AGE_SECONDS = 48 * 3600
 # ---------------------------------------------------------------------------
 # ■ RSS SOURCES
 #
-# PRIMARY (round 9): ONE COMBINED feed request for ALL subreddits
-# (see _combined_feed_url below) — always www.reddit.com.
-#
-# FALLBACK (only if the combined feed fails), tried in order:
-#   • www.reddit.com  -> native Reddit RSS (+ ?feed= token when set).
-#   • old.reddit.com  -> often returns an HTML "Welcome to Reddit" interstitial
-#                        to datacenter IPs (0 entries) — fallback only.
-#   • Redlib mirrors  -> ALL official registry instances live-probed
-#                        2026-09-13: behind Anubis/Cloudflare/gammaspectra
-#                        bot challenges, or dead (410/404/SSL). Kept only in
-#                        case a challenge ever relaxes. Refresh candidates at
-#                        github.com/redlib-org/redlib-instances.
-# The script validates that the response actually CONTAINS reddit permalinks
-# before accepting it, and logs why each source was skipped.
+# PRIMARY: one combined native Reddit RSS request covers all subreddits.
+# FALLBACK: native Reddit/old Reddit are followed by community Redlib mirrors.
+# Round 39 (2026-09-30) adds the current official registry's token-free,
+# non-Cloudflare candidates (catsarch US, nadeko CL, privadency DE) before the
+# retained legacy mirrors. r4fo is deliberately excluded because the registry
+# marks it Cloudflare-fronted. Every response is still validated for Reddit
+# permalinks before it is accepted, so a challenge or HTML shell fails closed
+# and the chain continues.
 # ---------------------------------------------------------------------------
 REDDIT_RSS_INSTANCES = [
     "https://www.reddit.com",
     "https://old.reddit.com",
-    "https://safereddit.com",           # 2026-09-13: Anubis bot check (fallback lottery)
-    "https://red.artemislena.eu",       # 2026-09-13: Anubis bot check (fallback lottery)
-    "https://redlib.privacyredirect.com",  # 2026-09-13: Anubis bot check (fallback lottery)
+    "https://redlib.catsarch.com",
+    "https://redlib.nadeko.net",
+    "https://redlib.privadency.com",
+    "https://safereddit.com",
+    "https://red.artemislena.eu",
+    "https://redlib.privacyredirect.com",
 ]
 
 # 429 (rate limit) retry waits: first retry after 6s (short bursts, verified

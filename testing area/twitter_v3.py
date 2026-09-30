@@ -123,58 +123,26 @@ MAX_CACHE_SIZE_TOTAL = int(os.getenv("MAX_CACHE_SIZE_TOTAL", "10000"))
 MAX_CACHE_SIZE = 500
 MAX_AGE_SECONDS = 3 * 3600
 
-# round 12 (2026-09-17): nitter fleet refreshed from the status.d420.de
-# tracker (2026-09-17) + live plain-RSS probes. The tracker's health/RSS
-# flags flip back and forth, so the WHOLE tracked fleet is listed — order is
-# today's evidence (verified-fresh first, known-dead last); the chain stops
-# at the first instance that answers with real entries.
-#   jaydenha.uk        verified fresh via plain RSS probe (2026-09-17) -> FIRST
-#   meowing.monster    verified fresh via plain RSS probe (2026-09-17)
-#   click / xitter.cc  RSS "disabled" at probe time — kept: the tracker's RSS
-#                      flags flip back and forth
-#   miningtcup.me      healthy, RSS ok BUT behind a bot check — needs the
-#                      emailed RSS token (see RSS_TOKEN_ENV); without a valid
-#                      token the chain logs the challenge and moves on
-#   netbub             unreachable at probe time (flags flip back)
-#   thepixora          alive but behind a dog-captcha bot check (2026-09-17)
-#   perennialte.ch     serves a STALE RSS (site works in browsers)
-#   privacydev.net / nitter.net  500'd on 2026-09-17
-#   xcancel.com        suspended 2026-09-14 — kept: auto-revives in the chain
-#                      if it returns
-# round 13 (2026-09-20): nitter.cf added as FIRST. Live probe 2026-09-20:
-# plain RSS works WITHOUT a token, feed fully fresh (top item == newest
-# posted tweet), robots allow-all + dynamic sitemaps, operator explicitly
-# welcomes crawlers (teapot commit 59884be, 2026-09-19). jaydenha.uk moves
-# to #3: kept as fallback, but as #1 it was the instance that served
-# stale-but-200 feeds and masked fresher fallbacks (the ~30-min delay).
-# xitter.cf (#2) is the SAME backend as nitter.cf (canonicals point at
-# nitter.cf) — it is a pure URL-level backup (separate DNS/TLS path), not
-# an independent instance.
+# Round 39 (2026-09-30): refresh from status.d420.de at 06:06 UTC.
+# The first three hosts were healthy with RSS enabled and 87–96% all-time
+# availability; jaydenha was healthy/RSS-enabled but runs an older build, so it
+# remains a fallback. The previous unlisted, RSS-disabled, stale, or suspended
+# endpoints were retired: serial fallback means each one otherwise adds a full
+# request timeout on an outage. Keep this list short and ordered; revisit it
+# only after the tracker reports a current RSS-capable replacement.
 RSS_INSTANCES = [
-    "https://nitter.cf",
-    "https://xitter.cf",
-    "https://nitter.jaydenha.uk",
-    # round 14 (2026-09-20): live-probed fresh + token-free today.
-    # x.n0g.xyz is an alias of nitter.gravitywell.xyz (independent
-    # backend from nitter.cf); xitter.cf (#2) is nitter.cf's alias.
-    "https://x.yuuki.sh",
-    "https://x.n0g.xyz",
     "https://nitter.meowing.monster",
-    "https://nitter.click",
-    "https://nitter.xitter.cc",
-    "https://nitter.miningtcup.me",
     "https://nitter.netbub.com",
     "https://shitter.thepixora.com",
-    "https://nitter.perennialte.ch",
-    "https://nitter.privacydev.net",
-    "https://nitter.net",
-    "https://xcancel.com",
+    "https://nitter.jaydenha.uk",
+    # Token-gated fallback; harmlessly skipped without NITTER_RSS_TOKEN.
+    "https://nitter.miningtcup.me",
 ]
 
 # round 12 (2026-09-17): token-gated instances. nitter.miningtcup.me hides
 # its RSS behind a bot check; the operator emails out RSS tokens (request
 # sent to nitter-rss@miningtcup.me). When the token arrives, set it as the
-# repo VARIABLE NITTER_RSS_TOKEN (Settings -> Secrets and variables ->
+# repo SECRET NITTER_RSS_TOKEN (Settings -> Secrets and variables ->
 # Actions -> Variables) — the next run picks it up (read at call time, no
 # code change). The token is sent BOTH ways: Authorization: Bearer header
 # and ?token= query param, so either convention works. Round 14

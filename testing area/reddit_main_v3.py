@@ -546,20 +546,27 @@ async def mod_queue_reason(session, subreddit, path, label=""):
                               listing_oldest_age=listing_oldest_age)
 
 # ---------------------------------------------------------------------------
-# ■ RSS SOURCES (unchanged from V1/V2 — see round 8/9 notes)
+# ■ RSS SOURCES
+#
+# PRIMARY: one combined native Reddit RSS request covers all subreddits.
+# FALLBACK: native Reddit/old Reddit are followed by the token-gated miningtcup
+# Redlib host, then the current official registry's token-free, non-Cloudflare
+# candidates (catsarch US, nadeko CL, privadency DE), then retained legacy
+# mirrors. Round 39 (2026-09-30) deliberately excludes r4fo because the
+# registry marks it Cloudflare-fronted. Every response is validated for Reddit
+# permalinks before it is accepted, so a challenge or HTML shell fails closed.
 # ---------------------------------------------------------------------------
 REDDIT_RSS_INSTANCES = [
     "https://www.reddit.com",
     "https://old.reddit.com",
-    # round 24 (2026-09-18): miningtcup's redlib (the operator behind the
-    # nitter.miningtcup.me RSS token). Behind their DogWAF anti-bot — the
-    # miningtcup token below is appended as ?token= on this host; if the
-    # operator scoped it to nitter only, it logs a bot-check miss and the
-    # chain moves on, exactly like the Anubis instances below.
+    # Token-gated fallback; harmlessly skipped when NITTER_RSS_TOKEN is empty.
     "https://redlib.miningtcup.me",
-    "https://safereddit.com",           # 2026-09-13: Anubis bot check (fallback lottery)
-    "https://red.artemislena.eu",       # 2026-09-13: Anubis bot check (fallback lottery)
-    "https://redlib.privacyredirect.com",  # 2026-09-13: Anubis bot check (fallback lottery)
+    "https://redlib.catsarch.com",
+    "https://redlib.nadeko.net",
+    "https://redlib.privadency.com",
+    "https://safereddit.com",
+    "https://red.artemislena.eu",
+    "https://redlib.privacyredirect.com",
 ]
 
 RATE_LIMIT_RETRY_DELAY_1 = 6

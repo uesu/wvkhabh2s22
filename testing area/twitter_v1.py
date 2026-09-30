@@ -29,11 +29,18 @@ CACHE_FILE = "posted_tweets.json"
 MAX_CACHE_SIZE = 500
 MAX_AGE_SECONDS = 3 * 3600
 
+# Round 39 (2026-09-30): refresh from status.d420.de at 06:06 UTC.
+# The first three hosts were healthy with RSS enabled and 87–96% all-time
+# availability; jaydenha was healthy/RSS-enabled but runs an older build, so it
+# remains a fallback. The previous unlisted, RSS-disabled, stale, or suspended
+# endpoints were retired: serial fallback means each one otherwise adds a full
+# request timeout on an outage. Keep this list short and ordered; revisit it
+# only after the tracker reports a current RSS-capable replacement.
 RSS_INSTANCES = [
-    "https://nitter.perennialte.ch",
-    "https://nitter.privacydev.net",
-    "https://nitter.net",
-    "https://xcancel.com",
+    "https://nitter.meowing.monster",
+    "https://nitter.netbub.com",
+    "https://shitter.thepixora.com",
+    "https://nitter.jaydenha.uk",
 ]
 
 FXTWITTER_API_BASE = "https://api.fxtwitter.com"
