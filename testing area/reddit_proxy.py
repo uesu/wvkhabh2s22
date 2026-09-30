@@ -168,7 +168,8 @@ def _og_meta(page_html: str) -> dict:
 def _strip_html(value) -> str:
     if not value:
         return ""
-    text = re.sub(r"(?i)<br\s*/?>", "\n", value)
+    text = re.sub(r"(?is)<span\s+[^>]*\bclass=[\"\x27][^\"\x27]*\b(?:md-)?spoiler(?:-text)?\b[^\"\x27]*[\"\x27][^>]*>(.*?)</span>", r"||\1||", value)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
     text = re.sub(r"<[^>]+>", " ", text)
     text = html_lib.unescape(text)
     lines = [re.sub(r"\s{2,}", " ", ln).strip() for ln in text.splitlines()]
@@ -450,7 +451,8 @@ def clean_proxy_body(value) -> str:
     """
     if not value:
         return ""
-    text = re.sub(r'(?is)<a\s[^>]*href="([^"]+)"[^>]*>(.*?)</a>', r'[\2](\1)', value)
+    text = re.sub(r"(?is)<span\s+[^>]*\bclass=[\"\x27][^\"\x27]*\b(?:md-)?spoiler(?:-text)?\b[^\"\x27]*[\"\x27][^>]*>(.*?)</span>", r"||\1||", value)
+    text = re.sub(r'(?is)<a\s[^>]*href="([^"]+)"[^>]*>(.*?)</a>', r'[\2](\1)', text)
     text = re.sub(r"(?is)<(?:b|strong)\s*>(.*?)</(?:b|strong)>", r"**\1**", text)
     # round 16: same structural markdown as the RSS path
     text = re.sub(r"(?is)<blockquote[^>]*>", "\x01", text)

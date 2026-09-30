@@ -1529,6 +1529,7 @@ def strip_html(value: str | None) -> str:
     """Removes tags from HTML-ish strings (used for JSON selftext etc.)."""
     if not value:
         return ""
+    value = re.sub(r"(?is)<span\s+[^>]*\bclass=[\"\x27][^\"\x27]*\b(?:md-)?spoiler(?:-text)?\b[^\"\x27]*[\"\x27][^>]*>(.*?)</span>", r"||\1||", value)
     value = re.sub(r"(?i)<br\s*/?>", " ", value)
     value = re.sub(r"<[^>]+>", "", value)
     value = html_lib.unescape(value)
@@ -1954,6 +1955,8 @@ def clean_rss_body(value: str | None) -> str:
     if not value:
         return ""
     text = value
+    # Spoilers in HTML tags -> Discord spoiler ||...||
+    text = re.sub(r"(?is)<span\s+[^>]*\bclass=[\"\x27][^\"\x27]*\b(?:md-)?spoiler(?:-text)?\b[^\"\x27]*[\"\x27][^>]*>(.*?)</span>", r"||\1||", text)
     # Round 41: ensure space before links attached directly to preceding text/punctuation
     # (a leading `>` in the class keeps tag-to-tag adjacency like <strong><a> untouched)
     text = re.sub(r"(?is)(?<=[^\s\[\(>])<a\s", " <a ", text)
