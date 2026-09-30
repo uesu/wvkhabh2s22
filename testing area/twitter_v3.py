@@ -131,6 +131,13 @@ MAX_AGE_SECONDS = 3 * 3600
 # request timeout on an outage. Keep this list short and ordered; revisit it
 # only after the tracker reports a current RSS-capable replacement.
 RSS_INSTANCES = [
+    # Round 40 (2026-09-30): operator decision — nitter.cf + xitter.cf restored as
+    # the primary pair after live review (2026-09-30: both confirmed serving, plus
+    # a 2-hour 100%-uptime fleet run). Unlisted on the d420 tracker (4cuck/teapot
+    # operator; trust warnings on record, risk operator-accepted).
+    # DO NOT REMOVE without operator sign-off.
+    "https://nitter.cf",
+    "https://xitter.cf",
     "https://nitter.meowing.monster",
     "https://nitter.netbub.com",
     "https://shitter.thepixora.com",
