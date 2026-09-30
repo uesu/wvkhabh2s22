@@ -527,6 +527,15 @@ for module in (v3, proxy):
           == "Firefly video https://b23.tv/dkCXgES\n\n"
              "Feixiao video https://b23.tv/XojBeMr\n\n"
              "Therta video https://b23.tv/PNtXo0u")
+    # ---- round 41: reddit html spoiler conversion ---------------------------
+    check("r41 html spoiler tag converts to discord spoiler",
+          cleaner('<p>Spoiler: <span class="md-spoiler-text">boss dies</span></p>')
+          == "Spoiler: ||boss dies||")
+    check("r41 megathread spoiler policy case",
+          cleaner("<blockquote><code>3.1 Ending &gt;!spoilers here, between the symbols on the ends!&lt;</code>"
+                  "\n3.1 Ending <span class=\"md-spoiler-text\">spoilers here, between the symbols on the ends</span></blockquote>")
+          == "> 3.1 Ending >!spoilers here, between the symbols on the ends!<\n"
+             "> 3.1 Ending ||spoilers here, between the symbols on the ends||")
 
 check("r15 author underscore", v3._clean_author_name(
     "](https://reddit.com/post)\n*by) Knight_Steve_") == "Knight_Steve_")
