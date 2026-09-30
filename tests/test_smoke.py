@@ -2315,6 +2315,90 @@ finally:
 check("r38d: the tail margin is tied to the existing window (no new workflow Variable)",
       v3.MOD_QUEUE_TAIL_MARGIN_SECONDS == v3.MOD_QUEUE_WINDOW_SECONDS)
 
+# ---- R38e (2026-09-30): token-authenticated RSS is the primary listing signal
+# for native moderator-queue posts. Keep the fixture deterministic: the
+# parser receives an explicit clock, while the fetch test verifies live URL
+# construction and preserves the existing HTML fallback through R38d above.
+from email.utils import parsedate_to_datetime as _r38e_pdt
+
+_r38e_rss = ('<?xml version="1.0"?><rss><channel>'
+             '<item><title>a</title><link>https://www.reddit.com/r/X/comments/aaa111/t/</link>'
+             '<pubDate>Wed, 30 Sep 2026 05:00:00 GMT</pubDate></item>'
+             '<item><title>b</title><link>https://old.reddit.com/r/X/comments/bbb222/t/</link>'
+             '<pubDate><![CDATA[Wed, 30 Sep 2026 06:30:00 GMT]]></pubDate></item>'
+             '<item><title>c</title><link>https://www.reddit.com/r/X/comments/ccc333/t/</link>'
+             '<pubDate>not a date</pubDate></item>'
+             '</channel></rss>')
+_r38e_clock = _r38e_pdt("Wed, 30 Sep 2026 08:00:00 GMT").timestamp()
+_r38e_expected = 3 * 3600
+# Keep the network-shaped fixture safely in the past even when the smoke test
+# runs before the hand-written 2026 dates above (the parser test itself uses
+# its explicit clock and remains deterministic).
+_r38e_fetch_rss = _r38e_rss.replace("30 Sep 2026", "30 Sep 2000")
+check("r38e: RSS entry links yield the listing IDs",
+      v3._listing_post_ids(_r38e_rss) == {"aaa111", "bbb222", "ccc333"})
+check("r38e: the oldest parseable pubDate defines the span",
+      v3._rss_oldest_age(_r38e_rss, now=_r38e_clock) == _r38e_expected)
+check("r38e: malformed and future pubDates fail open rather than narrowing the span",
+      v3._rss_oldest_age("<rss><pubDate>not a date</pubDate></rss>", now=_r38e_clock) is None
+      and v3._rss_oldest_age("<rss><pubDate>Thu, 01 Oct 2099 00:00:00 GMT</pubDate></rss>",
+                              now=_r38e_clock) is None)
+_r38e_page = '<span class="created">2h ago</span><div>native queued post</div>'
+check("r38e: an absent native post inside the RSS span is held",
+      v3.mod_queue_decision(_r38e_page, {"other1"}, "queued1",
+                            listing_oldest_age=12 * 3600) == "pending approval")
+check("r38e: an RSS-visible post is released immediately",
+      v3.mod_queue_decision(_r38e_page, {"queued1"}, "queued1",
+                            listing_oldest_age=12 * 3600) is None)
+
+class _R38eResponse:
+    status = 200
+    headers = {"Content-Type": "application/rss+xml"}
+
+    async def text(self):
+        return _r38e_fetch_rss
+
+
+class _R38eRequest:
+    async def __aenter__(self):
+        return _R38eResponse()
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _R38eSession:
+    def __init__(self):
+        self.urls = []
+
+    def get(self, url, **kwargs):
+        self.urls.append(url)
+        return _R38eRequest()
+
+
+_r38e_cache_before = dict(v3._mod_queue_listing_cache)
+_r38e_token_before = v3.REDDIT_FEED_TOKEN
+try:
+    v3._mod_queue_listing_cache.clear()
+    v3.REDDIT_FEED_TOKEN = "smoke token"
+    _r38e_session = _R38eSession()
+    _r38e_listing = asyncio.run(v3._fetch_new_listing(_r38e_session, "RssTest"))
+    _r38e_ids, _r38e_span = _r38e_listing
+    check("r38e: RSS listing is tried first and returns IDs plus a span",
+          _r38e_ids == {"aaa111", "bbb222", "ccc333"}
+          and _r38e_span is not None
+          and _r38e_session.urls[0].startswith("https://www.reddit.com/r/RssTest/new.rss")
+          and "feed=smoke%20token" in _r38e_session.urls[0],
+          f"listing={_r38e_listing!r} urls={_r38e_session.urls}")
+finally:
+    v3.REDDIT_FEED_TOKEN = _r38e_token_before
+    v3._mod_queue_listing_cache.clear()
+    v3._mod_queue_listing_cache.update(_r38e_cache_before)
+
+check("r38e: the RSS listing source uses the existing feed token and no new setting",
+      "REDDIT_FEED_TOKEN" in inspect.getsource(v3._fetch_new_listing)
+      and "new.rss?limit=100" in inspect.getsource(v3._fetch_new_listing))
+
 # ---- R38a (2026-09-30): link posts carry the YouTube URL as the destination ----
 check("r38a: a link post's YouTube destination is picked up from the final body",
       'if not yt_url:\n        yt_url = extract_youtube_url(body)' in inspect.getsource(v3.resolve_post_media))
