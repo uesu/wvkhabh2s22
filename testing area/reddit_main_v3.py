@@ -214,6 +214,7 @@ import logging
 import html as html_lib
 import aiohttp
 import feedparser
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote, unquote, urlparse
 from dotenv import load_dotenv
 
@@ -402,6 +403,39 @@ def _listing_oldest_age(page_html):
 def _listing_post_ids(page_html):
     return set(m.lower() for m in MOD_QUEUE_LISTING_ID_RE.findall(page_html or ""))
 
+# Round 38e (2026-09-30): use the token-authenticated public RSS listing as
+# the primary negative-space signal for native moderator-queue posts. GitHub
+# Actions datacenter IPs frequently cannot read the HTML /new pages, while
+# the monitor's normal RSS path already works with REDDIT_FEED_TOKEN. RSS
+# entry links carry the same /comments/<id>/ shape and pubDate gives an
+# exact listing-span boundary without parsing relative-age text.
+_RSS_LISTING_INSTANCES = ("https://www.reddit.com", "https://old.reddit.com")
+_RSS_DOCUMENT_RE = re.compile(r"<(?:rss|feed|rdf:rdf)\b", re.I)
+_RSS_PUBDATE_RE = re.compile(
+    r"<pubDate\b[^>]*>\s*(?:<!\[CDATA\[)?\s*([^<]*?)\s*(?:\]\]>)?\s*</pubDate>",
+    re.I | re.S,
+)
+
+
+def _rss_oldest_age(xml, now=None):
+    """Return the oldest usable RSS entry age in seconds.
+
+    A missing, malformed, or future-dated pubDate returns ``None`` so the
+    queue gate retains its fail-open behavior. ``now`` is injectable for the
+    offline smoke test; production callers use the current wall clock.
+    """
+    clock = time.time() if now is None else now
+    best = None
+    for raw in _RSS_PUBDATE_RE.findall(xml or ""):
+        try:
+            timestamp = parsedate_to_datetime(raw.strip()).timestamp()
+        except (TypeError, ValueError, OverflowError, OSError):
+            continue
+        age = clock - timestamp
+        if age >= 0 and (best is None or age > best):
+            best = age
+    return best
+
 def mod_queue_decision(page_html, listing_ids, post_id, listing_oldest_age=None):
     """Return ``pending approval`` only for an evidenced queue hold.
 
@@ -432,30 +466,65 @@ def mod_queue_decision(page_html, listing_ids, post_id, listing_oldest_age=None)
 async def _fetch_new_listing(session, subreddit):
     if subreddit in _mod_queue_listing_cache:
         return _mod_queue_listing_cache[subreddit]
+
     result = None
-    for instance in REDDIT_RSS_INSTANCES:
+    # Round 38e: try Reddit's token-authenticated RSS listing first. This is
+    # the same public-feed path already used by the monitor, but unlike the
+    # HTML /new pages it is reachable from the production runner often enough
+    # to provide a useful release signal. The cache keeps this to one listing
+    # lookup per subreddit per run.
+    for instance in _RSS_LISTING_INSTANCES:
+        xml = None
         try:
-            # Round 37 hotfix (2026-09-30): miningtcup sits behind its DogWAF
-            # and rejects untokenized requests — without the token the /new
-            # listing was unreadable on EVERY instance and the gate failed
-            # open on every queued post. The helper is a no-op for every
-            # non-miningtcup URL (same helper the post-page fetch uses).
-            async with session.get(_with_miningtcup_token(f"{instance}/r/{subreddit}/new?limit=100"),
-                                   headers=BROWSER_HEADERS,
-                                   timeout=aiohttp.ClientTimeout(total=10), allow_redirects=True) as resp:
-                html = await resp.text() if resp.status == 200 and "html" in (resp.headers.get("Content-Type") or "").lower() else None
+            url = f"{instance}/r/{subreddit}/new.rss?limit=100"
+            if REDDIT_FEED_TOKEN:
+                # Feed tokens are credentials; quote them as a query value and
+                # never include the resulting URL in a log message.
+                url += f"&feed={quote(REDDIT_FEED_TOKEN, safe='')}"
+            async with session.get(url, headers=BROWSER_HEADERS,
+                                   timeout=aiohttp.ClientTimeout(total=10),
+                                   allow_redirects=True) as resp:
+                xml = await resp.text() if resp.status == 200 else None
         except Exception:
-            html = None
-        if html:
-            ids = _listing_post_ids(html)
+            xml = None
+        if xml and _RSS_DOCUMENT_RE.search(xml):
+            ids = _listing_post_ids(xml)
             if ids:
-                # Keep the listing's oldest visible age with its IDs. A
-                # missing age is intentional: round 38d then fails open.
-                result = (ids, _listing_oldest_age(html))
+                result = (ids, _rss_oldest_age(xml))
+                logging.info(f"MODQUEUE-LISTING: r/{subreddit} /new listing via rss "
+                             f"({len(ids)} entries).")
                 break
+
+    # Preserve the round-37/38d HTML fallback for instances that can answer
+    # the listing even when Reddit RSS is unavailable or rate-limited.
+    if result is None:
+        for instance in REDDIT_RSS_INSTANCES:
+            html = None
+            try:
+                # Round 37 hotfix (2026-09-30): miningtcup sits behind its DogWAF
+                # and rejects untokenized requests — without the token the /new
+                # listing was unreadable on EVERY instance and the gate failed
+                # open on every queued post. The helper is a no-op for every
+                # non-miningtcup URL (same helper the post-page fetch uses).
+                async with session.get(_with_miningtcup_token(f"{instance}/r/{subreddit}/new?limit=100"),
+                                       headers=BROWSER_HEADERS,
+                                       timeout=aiohttp.ClientTimeout(total=10), allow_redirects=True) as resp:
+                    html = await resp.text() if resp.status == 200 and "html" in (resp.headers.get("Content-Type") or "").lower() else None
+            except Exception:
+                html = None
+            if html:
+                ids = _listing_post_ids(html)
+                if ids:
+                    # Keep the listing's oldest visible age with its IDs. A
+                    # missing age is intentional: round 38d then fails open.
+                    result = (ids, _listing_oldest_age(html))
+                    logging.info(f"MODQUEUE-LISTING: r/{subreddit} /new listing via html "
+                                 f"({len(ids)} entries).")
+                    break
+
     if result is None:
         logging.info(f"MODQUEUE-LISTING: r/{subreddit} /new listing unavailable "
-                     f"(all instances) — the mod-queue gate will fail open this run.")
+                     f"(all sources) — the mod-queue gate will fail open this run.")
     _mod_queue_listing_cache[subreddit] = result
     return result
 
