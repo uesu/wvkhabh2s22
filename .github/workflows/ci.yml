@@ -1,8 +1,8 @@
 name: CI — syntax + offline smoke test
 
 # Safety gate for Dependabot PRs (and any PR): proves the monitor scripts
-# still install and compile after a dependency bump BEFORE anything can be
-# merged to main. Runs on every PR + push to main.
+# still install and compile after a dependency or runtime bump BEFORE anything
+# can be merged to main. Runs on every PR + push to main.
 
 on:
   pull_request:
@@ -22,7 +22,8 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: '3.11'
+          # Exact stable CPython pin; update deliberately after CI validates it.
+          python-version: '3.14.7'
           cache: 'pip'
 
       - name: Install dependencies (a broken requirements.txt fails HERE, not in production)

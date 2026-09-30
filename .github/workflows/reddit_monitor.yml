@@ -50,7 +50,8 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: '3.11'
+          # Exact stable CPython pin; update deliberately after CI validates it.
+          python-version: '3.14.7'
           cache: 'pip'
 
       - name: Install dependencies
@@ -151,9 +152,48 @@ jobs:
         # ───────────────────────────────────────────────────────────────────
         run: python "testing area/reddit_main_v3.py"   # ← V3 (proxy media + native fallback)
 
-      - name: Commit and push updated caches (posted_reddit.json + proxy_health.json + pending_reddit.json)
+      - name: Persist updated caches (retry safely on a concurrent main update)
+        env:
+          CACHE_BRANCH: ${{ github.ref_name }}
         run: |
+          set -o pipefail
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add -f posted_reddit.json proxy_health.json pending_reddit.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "auto: update posted_reddit.json + proxy_health.json + pending_reddit.json caches" && git push)
+
+          if git diff --cached --quiet; then
+            echo "No cache changes to push."
+          else
+            if ! git commit -m "auto: update posted_reddit.json + proxy_health.json + pending_reddit.json caches"; then
+              echo "::error::CACHE COMMIT FAILED — dedup cache was not persisted; rerun this monitor after resolving the repository state."
+              exit 1
+            fi
+
+            cache_branch="${CACHE_BRANCH:-main}"
+            pushed=0
+            attempts=0
+            for attempt in 1 2 3; do
+              attempts="$attempt"
+              if git push origin "HEAD:${cache_branch}"; then
+                pushed=1
+                break
+              fi
+
+              # A remote cache commit may have landed between checkout and push.
+              # Rebase our single cache commit, then retry with bounded backoff.
+              if [ "$attempt" -lt 3 ]; then
+                echo "::warning::Cache push attempt $attempt/3 failed; rebasing ${cache_branch} before retry."
+                if ! git pull --rebase origin "$cache_branch"; then
+                  git rebase --abort || true
+                  echo "::error::CACHE PUSH RECOVERY FAILED — rebase could not complete; dedup cache was not persisted."
+                  break
+                fi
+                sleep "$((attempt * 15))"
+              fi
+            done
+
+            if [ "$pushed" -ne 1 ]; then
+              echo "::error::CACHE PUSH FAILED after ${attempts}/3 attempt(s) — dedup cache was not persisted; the next run may re-post. Rerun this monitor after GitHub recovers."
+              exit 1
+            fi
+          fi
