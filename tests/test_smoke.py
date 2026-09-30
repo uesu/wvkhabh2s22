@@ -2436,6 +2436,88 @@ _r38c_gi = next(i for i, c in enumerate(_r38c_c2) if c.get("type") == 12)
 check("r38c-hardening: a video-only card keeps its legacy divider before the tile",
       _r38c_gi > 0 and _r38c_c2[_r38c_gi - 1].get("type") == 14)
 
+# ---- Round 39 (2026-09-30): runtime + delivery + source-fleet guard ------
+# These are offline source-of-truth checks. Network availability is intentionally
+# not tested here; mirror health changes fast and is reviewed before the list is
+# changed. Parsing the literals avoids importing an additional engine again.
+import ast
+
+
+def _literal_list_constant(relpath, name):
+    with open(os.path.join(ROOT, relpath), encoding="utf-8") as _fh:
+        tree = ast.parse(_fh.read(), filename=relpath)
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == name):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"{name} missing from {relpath}")
+
+
+_r39_x_expected = [
+    "https://nitter.meowing.monster",
+    "https://nitter.netbub.com",
+    "https://shitter.thepixora.com",
+    "https://nitter.jaydenha.uk",
+]
+for _r39_rel, _r39_expected in (
+    ("testing area/twitter_v1.py", _r39_x_expected),
+    ("testing area/twitter_v2_button_outside.py", _r39_x_expected + ["https://nitter.miningtcup.me"]),
+    ("testing area/twitter_v3.py", _r39_x_expected + ["https://nitter.miningtcup.me"]),
+):
+    check(f"r39 source fleet: {_r39_rel} has the reviewed X RSS order",
+          _literal_list_constant(_r39_rel, "RSS_INSTANCES") == _r39_expected)
+
+_r39_reddit_expected = [
+    "https://www.reddit.com",
+    "https://old.reddit.com",
+    "https://redlib.catsarch.com",
+    "https://redlib.nadeko.net",
+    "https://redlib.privadency.com",
+    "https://safereddit.com",
+    "https://red.artemislena.eu",
+    "https://redlib.privacyredirect.com",
+]
+for _r39_rel, _r39_expected in (
+    ("testing area/reddit_main.py", _r39_reddit_expected),
+    ("testing area/reddit_main_v2_embedez.py", _r39_reddit_expected),
+    ("testing area/reddit_main_v3.py", _r39_reddit_expected[:2]
+     + ["https://redlib.miningtcup.me"] + _r39_reddit_expected[2:]),
+):
+    check(f"r39 source fleet: {_r39_rel} has the reviewed Reddit RSS order",
+          _literal_list_constant(_r39_rel, "REDDIT_RSS_INSTANCES") == _r39_expected)
+
+for _r39_wf in (".github/workflows/ci.yml", ".github/workflows/reddit_monitor.yml",
+                ".github/workflows/twitter_monitor.yml"):
+    with open(os.path.join(ROOT, _r39_wf), encoding="utf-8") as _fh:
+        _r39_source = _fh.read()
+    check(f"r39 runtime: {_r39_wf} pins CPython 3.14.7 exactly once",
+          _r39_source.count("python-version: '3.14.7'") == 1
+          and "python-version: '3.11'" not in _r39_source)
+
+for _r39_wf in (".github/workflows/reddit_monitor.yml", ".github/workflows/twitter_monitor.yml"):
+    with open(os.path.join(ROOT, _r39_wf), encoding="utf-8") as _fh:
+        _r39_source = _fh.read()
+    check(f"r39 cache persistence: {_r39_wf} uses staged-only no-change detection",
+          "git diff --cached --quiet" in _r39_source)
+    check(f"r39 cache persistence: {_r39_wf} retries an explicit detached-HEAD-safe push",
+          'for attempt in 1 2 3; do' in _r39_source
+          and 'git push origin "HEAD:${cache_branch}"' in _r39_source
+          and 'git pull --rebase origin "$cache_branch"' in _r39_source)
+    check(f"r39 cache persistence: {_r39_wf} fails loudly if a dedup cache cannot persist",
+          "::error::CACHE PUSH FAILED" in _r39_source
+          and "::error::CACHE PUSH RECOVERY FAILED" in _r39_source)
+
+with open(os.path.join(ROOT, ".github/workflows/dependabot_auto_merge.yml"), encoding="utf-8") as _fh:
+    _r39_merge = _fh.read()
+check("r39 Dependabot auto-merge waits for completed CI rather than an early PR event",
+      "workflow_run:" in _r39_merge
+      and 'workflows: ["CI — syntax + offline smoke test"]' in _r39_merge
+      and "types: [completed]" in _r39_merge
+      and "pull_request_target:" not in _r39_merge)
+check("r39 Dependabot auto-merge identifies the completed run's PR and never checks out PR code",
+      "run.pull_requests" in _r39_merge and "No checkout by design" in _r39_merge)
+
 print()
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
