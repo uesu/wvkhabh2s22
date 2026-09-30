@@ -440,24 +440,22 @@ def mod_queue_decision(page_html, listing_ids, post_id, listing_oldest_age=None)
     """Return ``pending approval`` only for an evidenced queue hold.
 
     Round 37 keeps its positive AutoModerator signal. Round 38d additionally
-    handles zero-comment native queue posts through negative space: a post
-    absent from /new is held only while its parsed age fits within the
-    listing's oldest visible age plus the conservative tail margin. Missing
-    page/listing data, missing ages, and malformed input always fail open.
+    handles zero-comment native queue posts through negative space. Round 41
+    ensures positive hold text/banners hold the post even if the /new listing
+    fetch timed out, only releasing once confirmed present in /new.
     """
-    if not page_html or not post_id or listing_ids is None:
+    if not page_html or not post_id:
         return None
-    if post_id.lower() in listing_ids:
+    if listing_ids is not None and post_id.lower() in listing_ids:
         return None  # Present in the public listing: it was released.
-    if MOD_QUEUE_REQUEST_RE.search(page_html):
-        return "pending approval"  # Round 37's positive-signal path.
+    if MOD_QUEUE_REQUEST_RE.search(page_html) or re.search(r"awaiting (?:moderator )?approval", page_html, re.I):
+        return "pending approval"  # Positive AutoMod/banner hold signal.
 
-    # Round 38d: no queue text (native queue, zero comments). The first age
-    # on a post page is the post header; a /new listing has no comments, so
-    # its oldest age bounds the visible listing span. Any uncertainty remains
-    # a fail-open result rather than an unbounded hold.
+    # Round 38d: no queue text (native queue, zero comments).
+    if listing_ids is None or listing_oldest_age is None:
+        return None
     post_ages = _redlib_ages_seconds(page_html)
-    if not post_ages or listing_oldest_age is None:
+    if not post_ages:
         return None
     if post_ages[0] < listing_oldest_age + MOD_QUEUE_TAIL_MARGIN_SECONDS:
         return "pending approval"
@@ -1664,8 +1662,9 @@ def _decode_yt_redirect_target(url: str) -> str | None:
 
 
 def _clean_url_texted_links(line: str) -> str:
-    """Round 33: see the header block. Only on CLEAN lines (no mangle
-    residue), mirroring round 22's guard."""
+    """Round 33 + Round 41: on a clean line, unwrap URL-labelled links
+    (including domain-only labels without http/https scheme) into bare URLs,
+    and decode youtube redirect wrappers."""
     if not _URL_TEXTED_RE.search(line):
         return line
     rest = _LINK_OK.sub("", line)
@@ -1676,6 +1675,10 @@ def _clean_url_texted_links(line: str) -> str:
         label, url = m.group(1), m.group(2)
         if re.match(r"https?://", label):
             return label
+        clean_url = re.sub(r"^https?://", "", url).rstrip("/")
+        clean_label = label.rstrip("/")
+        if clean_label == clean_url or re.match(r"^(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?:/[^\s]*)?$", label):
+            return url
         if "youtube.com/redirect?" in url:
             target = _decode_yt_redirect_target(url)
             if target:
@@ -1951,6 +1954,9 @@ def clean_rss_body(value: str | None) -> str:
     if not value:
         return ""
     text = value
+    # Round 41: ensure space before links attached directly to preceding text/punctuation
+    # (a leading `>` in the class keeps tag-to-tag adjacency like <strong><a> untouched)
+    text = re.sub(r"(?is)(?<=[^\s\[\(>])<a\s", " <a ", text)
     # [link]/[comments] nav spans first (before the generic anchor rule)
     text = re.sub(r"(?i)<span>\s*<a[^>]*>\[(?:link|comments)\]</a>\s*</span>", " ", text)
     # links stay clickable: <a href="U">T</a> -> [T](U)
