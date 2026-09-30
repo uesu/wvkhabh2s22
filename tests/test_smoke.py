@@ -2455,6 +2455,10 @@ def _literal_list_constant(relpath, name):
 
 
 _r39_x_expected = [
+    # Round 40 (2026-09-30): operator decision — nitter.cf + xitter.cf restored as
+    # the primary pair. DO NOT REMOVE without operator sign-off.
+    "https://nitter.cf",
+    "https://xitter.cf",
     "https://nitter.meowing.monster",
     "https://nitter.netbub.com",
     "https://shitter.thepixora.com",
