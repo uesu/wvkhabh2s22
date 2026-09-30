@@ -2208,7 +2208,12 @@ check("r37: queue request text is detected", v3.MOD_QUEUE_REQUEST_RE.search("Ple
 check("r37: listing ids are extracted", v3._listing_post_ids('<a href="/r/X/comments/abc111/t/">x</a>') == {"abc111"})
 check("r37: both signals hold", v3.mod_queue_decision("respond to this comment with", {"other"}, "abc111") == "pending approval")
 check("r37: visible on listing releases", v3.mod_queue_decision("respond to this comment with", {"abc111"}, "abc111") is None)
-check("r37: all uncertainty fails open", v3.mod_queue_decision(None, {"other"}, "abc111") is None and v3.mod_queue_decision("respond to this comment with", None, "abc111") is None)
+check("r37/r41: missing page fails open; positive hold text holds even on listing outage",
+      v3.mod_queue_decision(None, {"other"}, "abc111") is None
+      and v3.mod_queue_decision("respond to this comment with", None, "abc111") == "pending approval")
+check("r41: domain-only URL label unwraps to clean bare URL with spacing (1wtxc4m)",
+      v3.clean_rss_body('<p>extra Astrites!<a href="http://wuwa-share.kurogames-global.com/sr/xyz">wuwa-share.kurogames-global.com/sr/xyz</a></p>')
+      == "extra Astrites! http://wuwa-share.kurogames-global.com/sr/xyz")
 check("r37: empty gate defaults on", v3.MOD_QUEUE_GATE is True)
 check("r37: main loop wiring is after liveness", "mod_queue_reason(" in inspect.getsource(v3.main) and "MOD_QUEUE_WINDOW_SECONDS" in inspect.getsource(v3.main))
 
