@@ -782,6 +782,20 @@ async def fetch_proxy_post_memo(session, path: str, label: str = "", health=None
         return _proxy_post_cache[key]
     result = await reddit_proxy.fetch_proxy_post(session, path, label=label,
                                                  health=health, need_video=need_video)
+    # ROUND 47: a PROFILE post ("/user/<name>/comments/<id>/") is the same
+    # post as "/r/u_<name>/comments/<id>/", and the proxy services disagree
+    # about which route they serve. Only a profile post HAS an alias, so an
+    # ordinary subreddit post never makes this second call.
+    if not (isinstance(result, dict) and result.get("media")):
+        for alias in _path_aliases(path)[1:]:
+            alt = await reddit_proxy.fetch_proxy_post(session, alias, label=label,
+                                                      health=health,
+                                                      need_video=need_video)
+            if isinstance(alt, dict) and alt.get("media"):
+                logging.info(f"[{label or 'proxy'}] profile post resolved via "
+                             f"its subreddit alias {alias}")
+                result = alt
+                break
     if use_cache and result:
         _proxy_post_cache[key] = result
     return result
@@ -1118,9 +1132,69 @@ def _pending_throttle_skip(pending: dict, key: str, now: float, entry) -> bool:
     return now - last < interval
 
 
+# ---------------------------------------------------------------------------
+# ■ ROUND 47 (2026-10-01): PROFILE POSTS ("u/<name> posts", not subreddit ones)
+# LIVE INCIDENT. r/AnantaLeaks 1wuv547 was a crosspost of a PROFILE post,
+# https://www.reddit.com/user/aphotide/comments/1wuv4j8/ — a post that lives
+# on a user's own page, not in a subreddit. Every crosspost helper below only
+# recognised "/r/<sub>/comments/<id>/", so the original was never resolved:
+# the card fell back to the crosspost's external-preview.redd.it POSTER and
+# Discord showed a still image where a 1:26 video should have played.
+#
+# Reddit stores a profile post under the pseudo-subreddit "u_<name>", so
+# /user/<name>/comments/<id>/  ==  /r/u_<name>/comments/<id>/
+# Both forms are generated: mirrors and proxy services disagree about which
+# one they route, so the media fetchers try the canonical form first and the
+# alias second (see _path_aliases / fetch_proxy_post_memo).
+# ---------------------------------------------------------------------------
+PROFILE_POST_RE = re.compile(r"^/u(?:ser)?/([^/\s?]+)/comments/([a-zA-Z0-9]+)", re.I)
+SUBREDDIT_PROFILE_RE = re.compile(r"^/r/u_([^/\s?]+)/comments/([a-zA-Z0-9]+)", re.I)
+
+
 def normalize_reddit_path(link: str) -> str | None:
-    match = re.search(r"(/r/[^\s?]+)", link)
-    return match.group(1).rstrip("/") + "/" if match else None
+    """A reddit permalink -> '/r/<sub>/comments/<id>/...' or, for a profile
+    post, the canonical '/user/<name>/comments/<id>/...' (round 47)."""
+    match = re.search(r"(/r/[^\s?]+)", link or "")
+    if match:
+        return match.group(1).rstrip("/") + "/"
+    # Round 47: profile posts ("/user/<name>/comments/<id>/", or the short
+    # "/u/<name>/..." form some mirrors emit) are real posts too.
+    match = re.search(r"/u(?:ser)?/([^/\s?]+)/comments/([a-zA-Z0-9]+)(/[^\s?]*)?", link or "")
+    if match:
+        tail = (match.group(3) or "").rstrip("/")
+        return f"/user/{match.group(1)}/comments/{match.group(2)}{tail}/"
+    return None
+
+
+def is_profile_post_path(path: str | None) -> bool:
+    """True for a post that lives on a user's page instead of a subreddit."""
+    return bool(path) and bool(PROFILE_POST_RE.match(path or ""))
+
+
+def _path_aliases(path: str | None) -> list:
+    """Round 47: every equivalent route for one post, best-known first.
+
+    A profile post answers on BOTH '/user/<name>/comments/<id>/' (reddit.com,
+    redlib) and '/r/u_<name>/comments/<id>/' (the pseudo-subreddit Reddit
+    files it under, which several proxy services and Arctic Shift index).
+    Ordinary subreddit posts have exactly one route, so the list is a single
+    entry and no caller pays anything extra.
+    """
+    if not path:
+        return []
+    out = [path]
+    m = PROFILE_POST_RE.match(path)
+    if m:
+        alias = f"/r/u_{m.group(1)}/comments/{m.group(2)}/"
+        if alias not in out:
+            out.append(alias)
+        return out
+    m = SUBREDDIT_PROFILE_RE.match(path)
+    if m:
+        alias = f"/user/{m.group(1)}/comments/{m.group(2)}/"
+        if alias not in out:
+            out.append(alias)
+    return out
 
 
 def extract_subreddit(path: str) -> str | None:
@@ -1133,7 +1207,11 @@ def extract_post_id(path: str) -> str | None:
     return match.group(1) if match else None
 
 
-CROSSPOST_PERMALINK_RE = re.compile(r"/r/[^/\s?<>]+/comments/[a-zA-Z0-9]+/")
+# Round 47: profile posts ("/user/<name>/comments/<id>/") are crosspostable
+# originals too — r/AnantaLeaks 1wuv547 was one, and before this its
+# original (and therefore its video) was never found.
+CROSSPOST_PERMALINK_RE = re.compile(
+    r"/(?:r/[^/\s?<>]+|u(?:ser)?/[^/\s?<>]+)/comments/[a-zA-Z0-9]+/")
 
 
 def find_crosspost_original_path(text: str | None, own_path: str | None = None) -> str | None:
@@ -1150,7 +1228,9 @@ def find_crosspost_original_path(text: str | None, own_path: str | None = None) 
         p = m.group(0).rstrip("/")
         if p and p == own:
             continue  # the post's own permalink, not the original
-        return p + "/"
+        # Round 47: '/u/<name>/comments/...' is the same post as
+        # '/user/<name>/comments/...'; store the canonical form.
+        return normalize_reddit_path(p + "/") or (p + "/")
     return None
 
 
@@ -2895,6 +2975,18 @@ async def enrich_gallery_redlib(session: aiohttp.ClientSession, path: str,
     pages = await asyncio.gather(
         *[_fetch_redlib_post_page(session, inst, path) for inst in REDDIT_RSS_INSTANCES]
     )
+    # Round 47: profile posts route under BOTH /user/<name>/... and
+    # /r/u_<name>/...; try the alias when no mirror rendered the first form.
+    if not any(pages):
+        for alias in _path_aliases(path)[1:]:
+            pages = await asyncio.gather(
+                *[_fetch_redlib_post_page(session, inst, alias)
+                  for inst in REDDIT_RSS_INSTANCES]
+            )
+            if any(pages):
+                logging.info(f"[{label}] profile post pages via alias {alias}")
+                path = alias
+                break
     video_vid = None
     for instance, html in zip(REDDIT_RSS_INSTANCES, pages):
         if not html:
@@ -3205,7 +3297,8 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
         if original and not crosspost:
             original_path = original.get("permalink")
             if (isinstance(original_path, str)
-                    and re.fullmatch(r"/r/[^/]+/comments/[a-z0-9]+/[^?#]*", original_path)):
+                    and re.fullmatch(r"/(?:r|user)/[^/]+/comments/[a-z0-9]+/[^?#]*",
+                                     original_path)):
                 fetch_path = original_path
                 crosspost = {"url": f"https://www.reddit.com{fetch_path}", "path": fetch_path}
                 arctic = original
@@ -4314,7 +4407,13 @@ async def main():
                             except Exception:
                                 message_json = None
                         posted.add(unique_key)
-                        pending.pop(unique_key, None)  # posted — no longer pending
+                        # ROUND 48b: delivery telemetry. Every post logs how
+                        # long it took from Reddit creation to Discord, and —
+                        # when it had been held — what held it and for how
+                        # long. This is the only way to calibrate the gate
+                        # against a subreddit's real approval latency without
+                        # guessing (grep the Actions log for LATENCY).
+                        _pend_entry = pending.pop(unique_key, None)  # posted — no longer pending
                         if RETRACT_DEAD_POSTS and isinstance(message_json, dict) and message_json.get("id"):
                             posted_messages[unique_key] = {
                                 "subreddit": subreddit,
@@ -4326,8 +4425,16 @@ async def main():
                             }
                         kinds = ",".join(sorted({m["kind"] for m in data["media"]})) or "text"
                         mode = "full" if data["full_mode"] else "native"
+                        _latency = max(0.0, now - float(published_ts or now))
+                        _held_note = ""
+                        if isinstance(_pend_entry, dict):
+                            _first = float(_pend_entry.get("first_seen") or 0)
+                            _held = max(0.0, now - _first) if _first else 0.0
+                            _held_note = (f" | held {_held / 60:.1f}min as "
+                                          f"'{_pend_entry.get('reason')}'")
                         logging.info(f"Reddit V3 Posted: {unique_key} (media={kinds} | {mode} | "
-                                     f"{len(data['media'])} item(s))")
+                                     f"{len(data['media'])} item(s)) | LATENCY "
+                                     f"{_latency / 60:.1f}min after creation{_held_note}")
                         await create_discohook_share(session, payload, unique_key)
                         # round 13: YouTube posts get a SECOND, plain message
                         # containing ONLY the YouTube link (Discord shows the

@@ -418,10 +418,29 @@ def queue_verdict(*, strong_hold_text=False, weak_hold_text=False,
                   listing_oldest_age=None, page_age_seconds=None,
                   post_age_seconds=None, tail_margin_seconds=0,
                   weak_grace_seconds=0):
-    if listing_proves_release(in_listing, listing_source):
-        return None
+    """Decide whether a post must be HELD as awaiting moderator approval.
+
+    ROUND 48 (2026-10-01) — PRECEDENCE FIX. Round 46 asked the listing first:
+    a post present in an API-backed /new listing was treated as proof of
+    release, and the post page's own banner was never consulted. Live
+    incident r/HonkaiStarRail_leaks 1wuwjiw (created 19:06, delivered 19:16,
+    page still reading "Post is awaiting moderator approval") shows that
+    assumption is not safe: a queued post CAN be visible in a listing.
+
+    Direct evidence from the post's own page now wins. The banner is rendered
+    by Reddit for that specific post and says exactly one thing — it is in
+    the queue — while listing membership is only an inference. Order:
+
+      1. STRONG page text ("awaiting moderator approval" ...)  -> HOLD
+      2. an API-backed listing containing the post             -> release
+      3. WEAK text (AutoModerator source-rule comment) inside the grace -> HOLD
+      4. round-38d negative space (API-backed listings only)   -> HOLD
+      5. otherwise                                             -> release
+    """
     if strong_hold_text:
         return PENDING_APPROVAL
+    if listing_proves_release(in_listing, listing_source):
+        return None
     if weak_hold_text:
         try:
             age = float(post_age_seconds)

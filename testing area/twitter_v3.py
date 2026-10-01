@@ -182,6 +182,11 @@ IS_COMPONENTS_V2 = 1 << 15  # Flag for rich card layout
 # 191 MB confirmed plays, 405 MB confirmed fails -> 256 MiB sits safely
 # between them. Tune here if Discord changes its behaviour.
 # ---------------------------------------------------------------------------
+# ROUND 47 NOTE (2026-10-01): a ~295 MB 3840x2160 amplify_video mp4 was shown
+# by hand to embed, and Discord raised the NITRO UPLOAD limit 500 MB -> 1 GB
+# on 2026-09-29 — but that limit governs UPLOADED ATTACHMENTS, not the media
+# proxy that renders external urls, and one manual success is not a proven
+# ceiling. The cap therefore stays at the measured, proven value.
 VIDEO_SIZE_LIMIT = 256 * 1024 * 1024          # 256 MiB
 RISKY_DURATION_SECONDS = 300                   # > 5 min ...
 RISKY_MIN_PIXELS = 1920 * 1080                 # ... AND >= 1080p = risky when size unknown
@@ -207,6 +212,34 @@ GALLERY_VIDEO_LIMIT = 0
 # ■ TEXT LIMITS — a Discord text display component must be 1..2000 chars;
 # we chunk at 1900 for safety and allow up to 4 chunks (7600 chars) of body.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ■ ROUND 47 (2026-10-01): MEDIA SELF-HEAL — RE-EDIT A MESSAGE WHOSE VIDEO
+#   DID NOT RESOLVE
+# LIVE INCIDENT. Wuthering_Waves/2105598609827737874 posted with the gallery
+# item showing "Image failed to load". The stored message proved why:
+#     "media": {"url": ".../1920x1080/MKcWr_GC5zM6ZGX4.mp4?tag=29",
+#               "proxy_url": "https://images-ext-1.discordapp.net/external/...",
+#               "width": 0, "height": 0, "content_type": ""}
+# Discord had MINTED a proxy url but never finished fetching/probing the
+# asset, so it has no dimensions and no content type — the client then has
+# nothing to render. This is Discord's media proxy being cold on a URL it has
+# never seen (a fresh video.twimg.com rendition behind Cloudflare), not a bad
+# link: opening the message in Discohook and pressing EDIT with NO changes
+# made the same URL play, because an edit makes Discord re-resolve the media.
+#
+# So the monitor now does exactly that, by itself: after the run it re-sends
+# the IDENTICAL payload as a PATCH to any message whose media came back
+# unresolved. Nothing in the message changes — same text, same media, same
+# buttons — it only forces a second resolution pass.
+#
+# COST: zero added latency on the posting path. The heal pass runs AFTER every
+# tweet of the run has been posted, and only for messages that actually came
+# back unresolved (normally none).
+# ---------------------------------------------------------------------------
+MEDIA_HEAL = os.getenv("MEDIA_HEAL", "on").strip().lower() not in ("0", "off", "no", "false")
+MEDIA_HEAL_DELAY_SECONDS = int(os.getenv("MEDIA_HEAL_DELAY_SECONDS", "45"))
+MEDIA_HEAL_ATTEMPTS = int(os.getenv("MEDIA_HEAL_ATTEMPTS", "2"))
+
 TEXT_CHUNK_SIZE = 1900
 MAX_TEXT_COMPONENTS = 4
 QUOTE_TEXT_BUDGET = 1500  # quote text shares a component with the quote header
@@ -556,6 +589,85 @@ async def resolve_gif_image(session: aiohttp.ClientSession,
     if await _probe_image_url(session, gif_url):
         return gif_url, "fastgif"
     return None, ""
+
+
+def unresolved_media_items(message: dict | None) -> list:
+    """Round 47: the media items Discord did NOT finish resolving.
+
+    Walks a created/edited message's components tree and returns every media
+    gallery item whose `media` has no dimensions or no content type — the
+    exact shape of a tile that renders as "Image failed to load". An item
+    Discord resolved carries width/height > 0 and a content_type.
+    """
+    if not isinstance(message, dict):
+        return []
+    bad = []
+
+    def walk(node):
+        if isinstance(node, list):
+            for child in node:
+                walk(child)
+            return
+        if not isinstance(node, dict):
+            return
+        for item in node.get("items") or []:
+            media = (item or {}).get("media") or {}
+            if not media.get("url"):
+                continue
+            if (not media.get("content_type")
+                    or not media.get("width") or not media.get("height")):
+                bad.append(media.get("url"))
+        walk(node.get("components") or [])
+
+    walk(message.get("components") or [])
+    return bad
+
+
+async def heal_unresolved_media(session: aiohttp.ClientSession, pending: list) -> None:
+    """Round 47: re-edit messages whose media Discord left unresolved.
+
+    `pending` is a list of (webhook_url, message_id, payload, key) tuples
+    collected during the run. Each one is PATCHed with the IDENTICAL payload
+    after MEDIA_HEAL_DELAY_SECONDS — the same thing as opening the message in
+    Discohook and pressing Edit without changing anything, which is what was
+    proven to make a cold video.twimg.com rendition play.
+
+    Every message is healed CONCURRENTLY and only after the posting loop has
+    finished, so this never delays a post.
+    """
+    if not (MEDIA_HEAL and pending):
+        return
+
+    async def heal_one(webhook_url, message_id, payload, key):
+        url = f"{webhook_url}/messages/{message_id}?with_components=true"
+        for attempt in range(1, max(1, MEDIA_HEAL_ATTEMPTS) + 1):
+            await asyncio.sleep(MEDIA_HEAL_DELAY_SECONDS)
+            try:
+                async with session.patch(url, json=payload) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logging.error(f"MEDIA-HEAL {key}: edit HTTP {resp.status} "
+                                      f"({body[:200]})")
+                        return
+                    edited = await resp.json()
+            except Exception as e:
+                logging.error(f"MEDIA-HEAL {key}: edit error {e}")
+                return
+            still_bad = unresolved_media_items(edited)
+            if not still_bad:
+                logging.info(f"MEDIA-HEAL {key}: media resolved after edit "
+                             f"#{attempt} — the video now plays.")
+                return
+            logging.info(f"MEDIA-HEAL {key}: still unresolved after edit "
+                         f"#{attempt} ({len(still_bad)} item(s)).")
+        logging.warning(f"MEDIA-HEAL {key}: media still unresolved after "
+                        f"{MEDIA_HEAL_ATTEMPTS} edit(s) — Discord's proxy is "
+                        f"refusing this asset, not just cold.")
+
+    logging.info(f"MEDIA-HEAL: {len(pending)} message(s) posted with unresolved "
+                 f"media — re-editing each in {MEDIA_HEAL_DELAY_SECONDS}s.")
+    await asyncio.gather(*[heal_one(*item) for item in pending],
+                         return_exceptions=True)
 
 
 async def collect_media(session: aiohttp.ClientSession, tweet_like: dict) -> tuple[list, list]:
@@ -1086,6 +1198,10 @@ async def main():
                         + (f"; hot: " + ", ".join(f"{a}={n}" for a, n in sorted(_hot.items()))
                            if _hot else ""))
 
+    # Round 47: messages whose media Discord left unresolved; healed with an
+    # identical re-edit after the posting loop (see heal_unresolved_media).
+    heal_queue: list = []
+
     async with aiohttp.ClientSession() as session:
         feeds_tasks = [fetch_working_feed(session, acc) for acc in ACCOUNTS]
         feeds = await asyncio.gather(*feeds_tasks)
@@ -1271,15 +1387,37 @@ async def main():
                                            quote_components=quote_components, reply_line=reply_line,
                                            lead_gallery_items=lead_gallery,
                                            repost_account=repost_account)
-                target_url = f"{webhook_url}?with_components=true"
+                # Round 47: `wait=true` makes Discord return the CREATED
+                # message instead of 204. It costs no extra request and no
+                # measurable time (the webhook already round-trips), and it
+                # is the only way to see whether Discord's media proxy
+                # actually resolved the video — see unresolved_media_items.
+                target_url = f"{webhook_url}?with_components=true&wait=true"
                 async with session.post(target_url, json=payload) as resp:
                     if resp.status in (200, 204):
                         posted_urls.add(unique_key)
                         logging.info(f"V3 Posted: {unique_key} (lang={lang or 'en'}{' | article' if is_article else ''} | source={tweet_source})")
+                        created = None
+                        if resp.status == 200:
+                            try:
+                                created = await resp.json()
+                            except Exception:
+                                created = None
+                        unresolved = unresolved_media_items(created)
+                        if unresolved and created and created.get("id"):
+                            heal_queue.append((webhook_url, created["id"],
+                                               payload, unique_key))
+                            logging.info(f"MEDIA-HEAL queued for {unique_key}: "
+                                         f"Discord returned {len(unresolved)} "
+                                         f"media item(s) with no dimensions/"
+                                         f"content-type (cold media proxy).")
                         await asyncio.sleep(1.5)
                     else:
                         body = await resp.text()
                         logging.error(f"Discord error {resp.status} for {unique_key}: {body}")
+
+        # Round 47: self-heal AFTER every post of this run — never before.
+        await heal_unresolved_media(session, heal_queue)
 
     saved = save_posted_urls(posted_urls, frozenset(posted_urls - posted_urls_at_start))
     missing = (posted_urls - posted_urls_at_start) - saved
