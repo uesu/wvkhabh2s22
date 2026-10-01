@@ -69,6 +69,10 @@ jobs:
           # The next run picks it up, no code change.
           # Empty = the chain just skips that instance.
           NITTER_RSS_TOKEN: ${{ secrets.NITTER_RSS_TOKEN }}
+          # Round 34: per-account retention and global backstop. Empty
+          # Variables keep the defaults (250/account, 10,000 total).
+          MAX_CACHE_SIZE_PER_ACCOUNT: ${{ vars.MAX_CACHE_SIZE_PER_ACCOUNT }}
+          MAX_CACHE_SIZE_TOTAL: ${{ vars.MAX_CACHE_SIZE_TOTAL }}
           # Round 47 (2026-10-01): media self-heal. When Discord's media
           # proxy returns a gallery tile with no dimensions/content-type
           # (the "Image failed to load" case), the monitor re-sends the

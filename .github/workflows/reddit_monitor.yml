@@ -78,43 +78,30 @@ jobs:
           # specific post; DRY_RUN logs payloads without touching Discord.
           TEST_POST_ID: ${{ github.event.inputs.test_post }}
           DRY_RUN: ${{ github.event.inputs.dry_run == 'yes' }}
-          # OPTIONAL switches (repo Variables, all work with no Variable set):
-          # PROXY_MEDIA        — '0' disables the round-13 proxy media path
-          #                       (redditez -> vxreddit -> embeddit); native RSS only
-          # PROXY_WARMUP_POST  — <sub>/<post_id> used by the per-run proxy warm-up
-          #                       (default: HonkaiStarRail_leaks/1whbjbh)
-          # YOUTUBE_LINK_MESSAGE — '0' stops the 2nd plain YouTube-link message
-          # DISCOHOOK_PREVIEW  — '0' disables the per-card Discohook preview link
-          # REDDIT_OP_COMMENT  — '0' hides the OP-comment line (FULL MODE)
-          # YOUTUBE_MEDIA_EMBED — '1' also tries to PLAY youtube links (seaof.glass);
-          #                       default = thumbnail + spark button only
-          # FEEDTOKEN_JSON_STAGGER — seconds to wait between feed-token .json attempts
-          #                       (round 31: only while the probe runs — see
-          #                       REDDIT_JSON_PROBE below)
-          # PENDING_RECHECK_SECONDS — seconds between live re-checks of skipped
-          #                       (media-waiting) posts; default 1800 (30 min).
-          #                       (Round 32: removed posts are NEVER re-checked —
-          #                       they re-enter via RSS if a mod restores them;
-          #                       approval-queued posts re-check at
-          #                       APPROVAL_RECHECK_SECONDS instead.)
-          # PROXY_MEDIA: ${{ vars.PROXY_MEDIA }}
-          # PROXY_WARMUP_POST: ${{ vars.PROXY_WARMUP_POST }}
-          # YOUTUBE_LINK_MESSAGE: ${{ vars.YOUTUBE_LINK_MESSAGE }}
-          # DISCOHOOK_PREVIEW: ${{ vars.DISCOHOOK_PREVIEW }}
-          # REDDIT_OP_COMMENT: ${{ vars.REDDIT_OP_COMMENT }}
-          # YOUTUBE_MEDIA_EMBED: ${{ vars.YOUTUBE_MEDIA_EMBED }}
-          # FEEDTOKEN_JSON_STAGGER: ${{ vars.FEEDTOKEN_JSON_STAGGER }}
-          # PENDING_RECHECK_SECONDS: ${{ vars.PENDING_RECHECK_SECONDS }}
-          # APPROVAL_RECHECK_SECONDS — round 32: seconds between re-checks of
-          #                       approval-queued / transient sources-down
-          #                       posts; default 300 (5 min). Lower = a
-          #                       newly-approved post hits Discord sooner;
-          #                       higher = quieter runs.
-          # APPROVAL_RECHECK_SECONDS: ${{ vars.APPROVAL_RECHECK_SECONDS }}
-          # REDDIT_JSON_PROBE — round 31: feed-token .json FULL-MODE probe —
-          #   auto (default; unset/empty = auto) = only when the OAuth app
-          #   secrets below exist; force = always try (legacy, 65 s per run
-          #   with new posts); off = never.
+          # OPTIONAL switches (repo Variables, all work with no Variable set).
+          # Empty GitHub Variables are passed through as empty strings; each
+          # Python module restores its documented default for empty values.
+          # PROXY_MEDIA='0' disables proxy media; PROXY_WARMUP_POST selects the
+          # per-run public warm-up post; EMBEDDIT_INSTANCE overrides its host.
+          PROXY_MEDIA: ${{ vars.PROXY_MEDIA }}
+          PROXY_WARMUP_POST: ${{ vars.PROXY_WARMUP_POST }}
+          EMBEDDIT_INSTANCE: ${{ vars.EMBEDDIT_INSTANCE }}
+          # YOUTUBE_LINK_MESSAGE='0' disables the second bare YouTube message.
+          YOUTUBE_LINK_MESSAGE: ${{ vars.YOUTUBE_LINK_MESSAGE }}
+          DISCOHOOK_PREVIEW: ${{ vars.DISCOHOOK_PREVIEW }}
+          REDDIT_OP_COMMENT: ${{ vars.REDDIT_OP_COMMENT }}
+          YOUTUBE_MEDIA_EMBED: ${{ vars.YOUTUBE_MEDIA_EMBED }}
+          FEEDTOKEN_JSON_STAGGER: ${{ vars.FEEDTOKEN_JSON_STAGGER }}
+          # Media-waiting entries use PENDING_RECHECK_SECONDS (default 1800 s);
+          # approval-queued/transient entries use APPROVAL_RECHECK_SECONDS
+          # (default 300 s). Removed posts are never re-checked.
+          PENDING_RECHECK_SECONDS: ${{ vars.PENDING_RECHECK_SECONDS }}
+          APPROVAL_RECHECK_SECONDS: ${{ vars.APPROVAL_RECHECK_SECONDS }}
+          # Dedup retention and per-run flood cap (round 34; all optional).
+          MAX_CACHE_SIZE_PER_SUB: ${{ vars.MAX_CACHE_SIZE_PER_SUB }}
+          MAX_CACHE_SIZE_TOTAL: ${{ vars.MAX_CACHE_SIZE_TOTAL }}
+          MAX_POSTS_PER_RUN: ${{ vars.MAX_POSTS_PER_RUN }}
+          # REDDIT_JSON_PROBE: auto (default), force, or off.
           REDDIT_JSON_PROBE: ${{ vars.REDDIT_JSON_PROBE }}
           # Round 35: optional comma-separated author names / post IDs that
           # bypass the NSFW content gate. Empty means no exceptions.
