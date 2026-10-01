@@ -1051,13 +1051,34 @@ async def fetch_proxy_post(session, path: str, label: str = "",
                     decisive = True
                     break
                 # ROUND 48d: a reddit video post has exactly one video and the
-                # card shows one player, so no later answer can beat this.
+                # card shows one player, so no later answer can beat this —
+                # PROVIDED nothing still in flight outranks the winner.
+                #
+                # ROUND 50 FIX (incident 1wv12qb, 2026-10-01): a crosspost's
+                # media resolves against the ORIGINAL post, and on that
+                # second lookup vxreddit/redditez (rank 0/1, video WITH
+                # audio per the round-49 field table) were still pending
+                # when embeddit (rank 2, NO audio) answered with a video
+                # first and this check cancelled them mid-flight — the card
+                # posted silent. A video answer is only decisive once no
+                # pending task could still outrank it; otherwise it falls
+                # through to the existing bounded grace window below, same
+                # as an incomplete gallery, so a higher-priority video (if
+                # one arrives) replaces it via the normal _better_media
+                # tie-break before the chain gives up.
                 if need_video and any(m["kind"] == "video"
                                       for m in best_media_result["media"]):
-                    logging.info(f"[{label}] video resolved via {service} - "
-                                 f"chain complete (no gallery can beat it).")
-                    decisive = True
-                    break
+                    if any(rank[tasks[t]] < r for t in pending):
+                        logging.info(f"[{label}] video via {service} but a "
+                                     f"higher-priority service is still in "
+                                     f"flight — waiting up to "
+                                     f"{PROXY_GALLERY_GRACE}s for it before "
+                                     f"calling the chain complete.")
+                    else:
+                        logging.info(f"[{label}] video resolved via {service} - "
+                                     f"chain complete (no gallery can beat it).")
+                        decisive = True
+                        break
             if decisive or not pending:
                 break
             if not (wave1 & pending):
