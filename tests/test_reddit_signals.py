@@ -423,6 +423,111 @@ check("workflow wires REPOST_WINDOW_SECONDS", "REPOST_WINDOW_SECONDS" in _wf)
 check("workflow persists posted_messages", "posted_messages.json" in _wf)
 check("ci runs this suite", "python tests/test_reddit_signals.py" in _ci)
 
+
+# ---------------------------------------------------------------------------
+# ROUND 46 / 46b (2026-10-01) — listing provenance, the queued-post regression
+# 1wuqy6z (zero comments) and 1wurg8f (AutoModerator source-rule comment) were
+# mirrored ~8.5 min after creation while still awaiting moderator approval,
+# because they appeared in Reddit's /new.rss and that counted as released.
+# ---------------------------------------------------------------------------
+check("r46 release proof: an RSS listing hit never proves release",
+      signals.listing_proves_release(True, signals.LISTING_RSS) is False)
+check("r46 release proof: an API-backed listing hit does",
+      signals.listing_proves_release(True, signals.LISTING_HTML) is True)
+check("r46 release proof: pre-round-46 callers default to API-backed",
+      signals.listing_proves_release(True) is True)
+check("r46 release proof: absence never proves release",
+      signals.listing_proves_release(False, signals.LISTING_HTML) is False
+      and signals.listing_proves_release(None, signals.LISTING_HTML) is False)
+check("r46 verdict: 1wuqy6z — the banner holds even when RSS shows the post",
+      signals.queue_verdict(strong_hold_text=True, in_listing=True,
+                            listing_source=signals.LISTING_RSS)
+      == signals.PENDING_APPROVAL)
+check("r46 verdict: an API-backed listing outranks the banner (it was released)",
+      signals.queue_verdict(strong_hold_text=True, in_listing=True,
+                            listing_source=signals.LISTING_HTML) is None)
+check("r46 verdict: 1wurg8f — the AutoMod comment holds inside the grace",
+      signals.queue_verdict(weak_hold_text=True, in_listing=True,
+                            listing_source=signals.LISTING_RSS,
+                            post_age_seconds=510, weak_grace_seconds=900)
+      == signals.PENDING_APPROVAL)
+check("r46 verdict: the weak signal releases after the grace window",
+      signals.queue_verdict(weak_hold_text=True, in_listing=True,
+                            listing_source=signals.LISTING_RSS,
+                            post_age_seconds=1200, weak_grace_seconds=900) is None)
+check("r46 verdict: an unknown post age makes the weak signal hold (fail closed)",
+      signals.queue_verdict(weak_hold_text=True, in_listing=True,
+                            listing_source=signals.LISTING_RSS,
+                            post_age_seconds=None, weak_grace_seconds=900)
+      == signals.PENDING_APPROVAL)
+check("r46 verdict: negative space is refused on an RSS listing",
+      signals.queue_verdict(in_listing=False, listing_source=signals.LISTING_RSS,
+                            listing_oldest_age=12 * 3600, page_age_seconds=3600,
+                            tail_margin_seconds=6 * 3600) is None)
+check("r46 verdict: negative space still works on an API-backed listing (r38d)",
+      signals.queue_verdict(in_listing=False, listing_source=signals.LISTING_HTML,
+                            listing_oldest_age=12 * 3600, page_age_seconds=3600,
+                            tail_margin_seconds=6 * 3600) == signals.PENDING_APPROVAL)
+check("r46 verdict: an unreadable listing still fails OPEN (round 37 kept)",
+      signals.queue_verdict(in_listing=None, listing_source=signals.LISTING_HTML,
+                            listing_oldest_age=None, page_age_seconds=3600) is None)
+check("r46 verdict: a healthy post on an API-backed listing posts (no new wait)",
+      signals.queue_verdict(in_listing=True, listing_source=signals.LISTING_HTML,
+                            listing_oldest_age=12 * 3600, page_age_seconds=60) is None)
+
+_R46_PAGE_BANNER = ('<h1 class="post_title">Aventurine Waveflair</h1>'
+                    '<div>Post is awaiting moderator approval.</div>')
+_R46_PAGE_AUTOMOD = ('<h1 class="post_title">4.7 New Weekly Boss</h1>'
+                     '<div class="comment">AutoModerator Please respond to this '
+                     'comment with a mirror link and source link.</div>')
+_R46_PAGE_CLEAN = '<h1 class="post_title">normal</h1><span class="created">2h ago</span>'
+
+
+def _r46_gate(page, listing, age=510):
+    saved_page, saved_listing = v3._fetch_redlib_post_page, v3._fetch_new_listing
+
+    async def _page(*_a, **_kw):
+        return page
+
+    async def _listing(*_a, **_kw):
+        return listing
+
+    try:
+        v3._fetch_redlib_post_page = _page
+        v3._fetch_new_listing = _listing
+        return asyncio.run(v3.mod_queue_reason(
+            None, "HonkaiStarRail_leaks",
+            "/r/HonkaiStarRail_leaks/comments/1wuqy6z/x/", post_age_seconds=age))
+    finally:
+        v3._fetch_redlib_post_page = saved_page
+        v3._fetch_new_listing = saved_listing
+
+
+check("r46 wiring: 1wuqy6z is HELD when only the RSS listing shows it",
+      _r46_gate(_R46_PAGE_BANNER,
+                ({"1wuqy6z"}, 7200.0, signals.LISTING_RSS)) == "pending approval")
+check("r46 wiring: 1wurg8f is HELD on the AutoMod comment alone",
+      _r46_gate(_R46_PAGE_AUTOMOD,
+                ({"1wuqy6z"}, 7200.0, signals.LISTING_RSS)) == "pending approval")
+check("r46 wiring: an API-backed listing releases the same post",
+      _r46_gate(_R46_PAGE_AUTOMOD,
+                ({"1wuqy6z"}, 7200.0, signals.LISTING_HTML)) is None)
+check("r46 wiring: an ordinary post is not held (posting speed unchanged)",
+      _r46_gate(_R46_PAGE_CLEAN,
+                ({"1wuqy6z"}, 7200.0, signals.LISTING_RSS)) is None)
+check("r46b wiring: no renderable page + RSS-only listing HOLDS a young post",
+      _r46_gate(None, ({"1wuqy6z"}, 7200.0, signals.LISTING_RSS)) == "pending approval")
+check("r46b wiring: no renderable page but an API-backed listing shows it -> post",
+      _r46_gate(None, ({"1wuqy6z"}, 7200.0, signals.LISTING_HTML)) is None)
+check("r46b wiring: absent from a readable API-backed listing HOLDS (no page)",
+      _r46_gate(None, ({"other"}, 7200.0, signals.LISTING_HTML)) == "pending approval")
+check("r46b wiring: an older post with no page is not held for ever",
+      _r46_gate(None, ({"1wuqy6z"}, 7200.0, signals.LISTING_RSS),
+                age=v3.MOD_QUEUE_WEAK_GRACE_SECONDS + 1) is None)
+check("workflow wires MOD_QUEUE_WEAK_GRACE_SECONDS",
+      "MOD_QUEUE_WEAK_GRACE_SECONDS" in _wf)
+
+
 print()
 if failures:
     print(f"REDDIT SIGNAL TEST FAILURES ({len(failures)}): {failures}")

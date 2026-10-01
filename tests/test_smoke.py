@@ -2306,7 +2306,7 @@ try:
     v3._mod_queue_listing_cache.clear()
     _r38d_listing = asyncio.run(v3._fetch_new_listing(_R38dListingSession(), "QueueTest"))
     check("r38d: listing fetch caches IDs with its parsed oldest age",
-          _r38d_listing == ({"other1", "other2"}, 12 * 3600), str(_r38d_listing))
+          _r38d_listing == ({"other1", "other2"}, 12 * 3600, v3.reddit_signals.LISTING_HTML), str(_r38d_listing))
 finally:
     v3._mod_queue_listing_cache.clear()
     v3._mod_queue_listing_cache.update(_r38d_cache_before)
@@ -2400,13 +2400,17 @@ try:
     v3.REDDIT_FEED_TOKEN = "smoke token"
     _r38e_session = _R38eSession()
     _r38e_listing = asyncio.run(v3._fetch_new_listing(_r38e_session, "RssTest"))
-    _r38e_ids, _r38e_span = _r38e_listing
-    check("r38e: RSS listing is tried first and returns IDs plus a span",
+    _r38e_ids, _r38e_span, _r38e_source = _r38e_listing
+    _r38e_rss_urls = [u for u in _r38e_session.urls if "/new.rss" in u]
+    check("r38e: the RSS listing still answers when no HTML listing does",
           _r38e_ids == {"aaa111", "bbb222", "ccc333"}
           and _r38e_span is not None
-          and _r38e_session.urls[0].startswith("https://www.reddit.com/r/RssTest/new.rss")
-          and "feed=smoke%20token" in _r38e_session.urls[0],
+          and _r38e_rss_urls
+          and _r38e_rss_urls[0].startswith("https://www.reddit.com/r/RssTest/new.rss")
+          and "feed=smoke%20token" in _r38e_rss_urls[0],
           f"listing={_r38e_listing!r} urls={_r38e_session.urls}")
+    check("r46b: an RSS-sourced listing is TAGGED rss (it cannot prove release)",
+          _r38e_source == v3.reddit_signals.LISTING_RSS, str(_r38e_listing))
 finally:
     v3.REDDIT_FEED_TOKEN = _r38e_token_before
     v3._mod_queue_listing_cache.clear()
@@ -2592,6 +2596,146 @@ check("r44: wait=true is conditional on retraction", "&wait=true" in _r35_main_s
 check("r42: signal module is side-effect-free (no aiohttp import)", "aiohttp" not in inspect.getsource(signals))
 
 print()
+
+# ---- R46 / R46b (2026-10-01): the queued-post regression -------------------
+# LIVE INCIDENT. r/HonkaiStarRail_leaks 1wuqy6z (created 05:16:43Z, mirrored
+# 05:25Z, zero comments) and 1wurg8f (created 05:46:59Z, mirrored 05:55Z,
+# AutoModerator source-rule comment stickied) both reached Discord while the
+# post page still read "Post is awaiting moderator approval", because they
+# appeared in Reddit's /new.rss and the gate read that as proof of release.
+_r46_strong = '<div>Post is awaiting moderator approval.</div>'
+_r46_weak = ('<div class="comment"><a href="/u/AutoModerator">AutoModerator</a>'
+             ' Please respond to this comment with a mirror link and source link.'
+             ' Failure to do so will result in post removal.</div>')
+check("r46: the queue banner is a STRONG hold signal",
+      v3.MOD_QUEUE_STRONG_RE.search("Post is awaiting moderator approval.") is not None)
+check("r46: 1wuqy6z — a queued post present in the RSS listing is STILL held",
+      v3.mod_queue_decision(_r46_strong, {"1wuqy6z"}, "1wuqy6z",
+                            listing_oldest_age=12 * 3600,
+                            listing_source=v3.reddit_signals.LISTING_RSS,
+                            post_age_seconds=510) == "pending approval")
+check("r46: 1wurg8f — the AutoMod source-rule comment holds inside the grace",
+      v3.mod_queue_decision(_r46_weak, {"1wurg8f"}, "1wurg8f",
+                            listing_oldest_age=12 * 3600,
+                            listing_source=v3.reddit_signals.LISTING_RSS,
+                            post_age_seconds=510) == "pending approval")
+check("r46: that weak signal does NOT hold a post for ever",
+      v3.mod_queue_decision(_r46_weak, {"1wurg8f"}, "1wurg8f",
+                            listing_oldest_age=12 * 3600,
+                            listing_source=v3.reddit_signals.LISTING_RSS,
+                            post_age_seconds=v3.MOD_QUEUE_WEAK_GRACE_SECONDS + 1) is None)
+check("r46: an API-backed listing still releases immediately (speed preserved)",
+      v3.mod_queue_decision(_r46_weak, {"1wurg8f"}, "1wurg8f",
+                            listing_oldest_age=12 * 3600,
+                            listing_source=v3.reddit_signals.LISTING_HTML,
+                            post_age_seconds=10) is None)
+check("r46: an RSS listing can never drive the round-38d negative-space rule",
+      v3.mod_queue_decision('<span class="created">2h ago</span>', {"other1"}, "abc111",
+                            listing_oldest_age=12 * 3600,
+                            listing_source=v3.reddit_signals.LISTING_RSS,
+                            post_age_seconds=7200) is None)
+check("r46: an RSS listing never confirms a post for the settle fast path",
+      v3._listing_confirms_post(({"abc111"}, 7200, v3.reddit_signals.LISTING_RSS), "abc111")
+      is False
+      and v3._listing_confirms_post(({"abc111"}, 7200, v3.reddit_signals.LISTING_HTML),
+                                    "abc111") is True)
+check("r46: a 2-tuple listing still means API-backed (back-compatible)",
+      v3._listing_parts(({"a"}, 60)) == ({"a"}, 60, v3.reddit_signals.LISTING_HTML)
+      and v3._listing_parts(None) == (None, None, None))
+check("r46: the queue gate receives the post age for the weak-signal grace",
+      "post_age_seconds=now - published_ts" in inspect.getsource(v3.main))
+
+# ---- R46b: the API-backed listing must actually be OBTAINED ---------------
+# Round 46 shipped the provenance rules but still asked /new.rss first and
+# only fell back to HTML when RSS failed — and RSS practically never fails.
+# The monitor therefore always held an `rss` listing, which can prove
+# nothing: the 60 s fast settle never applied again and negative space could
+# never run. These checks pin the fix: every source starts at once, an
+# API-backed answer is preferred, and a dead redlib fleet costs the grace.
+_r46_listing_src = inspect.getsource(v3._fetch_new_listing)
+check("r46b: the listing step is bounded as a whole, not per instance",
+      "LISTING_TIMEOUT_SECONDS" in _r46_listing_src
+      and v3.LISTING_TIMEOUT_SECONDS == 8
+      and v3.LISTING_HTML_GRACE_SECONDS == 2)
+
+_r46_html_listing_html = ('<a href="/r/X/comments/live01/t/"><span class="created">10m ago</span></a>'
+                          '<a href="/r/X/comments/live02/t/"><span class="created">9h ago</span></a>')
+
+
+class _R46Resp:
+    def __init__(self, body, ctype):
+        self.status = 200
+        self.headers = {"Content-Type": ctype}
+        self._body = body
+
+    async def text(self):
+        return self._body
+
+
+class _R46Req:
+    def __init__(self, delay, body, ctype):
+        self._delay, self._body, self._ctype = delay, body, ctype
+
+    async def __aenter__(self):
+        if self._delay:
+            await asyncio.sleep(self._delay)
+        return _R46Resp(self._body, self._ctype)
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _R46Session:
+    """redlib hosts answer after `html_delay`; Reddit's RSS answers at once."""
+
+    def __init__(self, html_delay):
+        self.html_delay = html_delay
+        self.urls = []
+
+    def get(self, url, **kwargs):
+        self.urls.append(url)
+        if "/new.rss" in url:
+            return _R46Req(0, _r38e_fetch_rss, "application/rss+xml")
+        return _R46Req(self.html_delay, _r46_html_listing_html, "text/html")
+
+
+def _r46_time_listing(html_delay, grace=None, sub="TimedSub"):
+    saved_grace = v3.LISTING_HTML_GRACE_SECONDS
+    before = dict(v3._mod_queue_listing_cache)
+    try:
+        if grace is not None:
+            v3.LISTING_HTML_GRACE_SECONDS = grace
+        v3._mod_queue_listing_cache.clear()
+        session = _R46Session(html_delay)
+        started = time.monotonic()
+        listing = asyncio.run(v3._fetch_new_listing(session, sub))
+        return listing, time.monotonic() - started, session
+    finally:
+        v3.LISTING_HTML_GRACE_SECONDS = saved_grace
+        v3._mod_queue_listing_cache.clear()
+        v3._mod_queue_listing_cache.update(before)
+
+
+_r46_fast, _r46_fast_s, _r46_fast_session = _r46_time_listing(0.0)
+check("r46b measured: a healthy redlib fleet answers API-backed, immediately",
+      _r46_fast is not None and _r46_fast[2] == v3.reddit_signals.LISTING_HTML
+      and _r46_fast[0] == {"live01", "live02"} and _r46_fast_s < 0.5,
+      f"{_r46_fast!r} in {_r46_fast_s:.3f}s")
+check("r46b measured: HTML and RSS start together, not one after the other",
+      any("/new.rss" in u for u in _r46_fast_session.urls)
+      and any("/new?limit=100" in u for u in _r46_fast_session.urls))
+_r46_slow, _r46_slow_s, _ = _r46_time_listing(5.0, grace=0.3)
+check("r46b measured: a SLOW redlib fleet costs only the grace, not a timeout",
+      _r46_slow is not None and _r46_slow[2] == v3.reddit_signals.LISTING_RSS
+      and _r46_slow_s < 1.5,
+      f"{_r46_slow!r} in {_r46_slow_s:.3f}s (5s html delay, 0.3s grace)")
+_r46_pref, _r46_pref_s, _ = _r46_time_listing(0.2, grace=2)
+check("r46b measured: a slightly slower API-backed answer still WINS over RSS",
+      _r46_pref is not None and _r46_pref[2] == v3.reddit_signals.LISTING_HTML
+      and _r46_pref_s < 1.5,
+      f"{_r46_pref!r} in {_r46_pref_s:.3f}s")
+
+
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
     sys.exit(1)
