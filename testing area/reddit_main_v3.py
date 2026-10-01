@@ -212,11 +212,20 @@ import base64
 import asyncio
 import logging
 import html as html_lib
+import importlib.util
 import aiohttp
 import feedparser
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, unquote, urlparse
 from dotenv import load_dotenv
+
+try:
+    import reddit_signals
+except Exception:
+    _signals_path = os.path.join(os.path.dirname(__file__), "reddit_signals.py")
+    _signals_spec = importlib.util.spec_from_file_location("reddit_signals", _signals_path)
+    reddit_signals = importlib.util.module_from_spec(_signals_spec)
+    _signals_spec.loader.exec_module(reddit_signals)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 load_dotenv()
@@ -307,6 +316,12 @@ PENDING_MAX_AGE_SECONDS = 48 * 3600  # matches the 48h posting window
 NSFW_ALLOWLIST = [
     value.strip() for value in os.getenv("NSFW_ALLOWLIST", "").split(",") if value.strip()
 ]
+# Round 42/45: NSFW now fails closed by default. NSFW_FAIL_OPEN=1 restores
+# the pre-round-42 behavior; NSFW_PAGE_FALLBACK=0 disables the Redlib badge
+# fallback used only when Arctic has not indexed the post yet.
+NSFW_FAIL_OPEN = os.getenv("NSFW_FAIL_OPEN", "0").strip().lower() in ("1", "true", "yes", "on")
+NSFW_REQUIRE_SUBREDDIT = os.getenv("NSFW_REQUIRE_SUBREDDIT", "0").strip().lower() in ("1", "true", "yes", "on")
+NSFW_PAGE_FALLBACK = os.getenv("NSFW_PAGE_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off", "")
 
 # Round 32 (2026-09-20): SHORT re-check interval for states that can change
 # quickly — posts awaiting moderator approval ("pending approval" /
@@ -337,7 +352,8 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-POST_SETTLE_SECONDS = _env_int("POST_SETTLE_SECONDS", 300)  # 5 min
+POST_SETTLE_SECONDS = _env_int("POST_SETTLE_SECONDS", 300)  # 5 min when /new did not confirm it
+POST_SETTLE_VERIFIED_SECONDS = _env_int("POST_SETTLE_VERIFIED_SECONDS", 60)  # 1 min when visible in /new
 # Round 36: duplicate-media gate — skip a new post whose exact media
 # identity (a reused i.redd.it file or the same external destination URL) is
 # already on Discord from an earlier post in the SAME sub. Only a POSTED
@@ -352,6 +368,18 @@ DUP_MEDIA_GATE = os.getenv("DUP_MEDIA_GATE", "1").strip().lower() not in ("0", "
 # duplicate-media gate (leet post ids sort chronologically WITHIN a sub —
 # days of history on busy subs, months on quiet ones).
 DUP_MEDIA_POSTED_WINDOW = 120
+# Round 43: author re-upload gate — same subreddit + same author + same
+# normalized title as a post already delivered to Discord. Exact identity only;
+# no fuzzy matching. Empty value defaults ON, mirroring DUP_MEDIA_GATE.
+REPOST_GATE = os.getenv("REPOST_GATE", "1").strip().lower() not in ("0", "false", "no", "off")
+REPOST_WINDOW_SECONDS = _env_int("REPOST_WINDOW_SECONDS", 86400)
+
+# Round 44: delivered-post retraction/tombstone. Disabled by default; when on
+# the webhook is called with wait=true so Discord returns a message ID.
+RETRACT_DEAD_POSTS = os.getenv("RETRACT_DEAD_POSTS", "0").strip().lower() in ("1", "true", "yes", "on")
+RETRACT_MODE = os.getenv("RETRACT_MODE", "edit").strip().lower() or "edit"
+RETRACT_WINDOW_SECONDS = _env_int("RETRACT_WINDOW_SECONDS", 21600)
+POSTED_MESSAGES_FILE = "posted_messages.json"
 
 # Round 37: hold posts positively identified as awaiting moderator approval.
 MOD_QUEUE_GATE = os.getenv("MOD_QUEUE_GATE", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -380,6 +408,8 @@ _REDLIB_AGE_UNITS = {
     "d": 86400, "day": 86400, "days": 86400,
 }
 _mod_queue_listing_cache: dict = {}
+_redlib_post_page_cache: dict = {}
+_proxy_post_cache: dict = {}
 
 def _redlib_ages_seconds(page_html):
     """Return visible relative ages in seconds, in page order.
@@ -526,6 +556,13 @@ async def _fetch_new_listing(session, subreddit):
     _mod_queue_listing_cache[subreddit] = result
     return result
 
+def _listing_confirms_post(listing, post_id: str) -> bool:
+    if not listing or not post_id:
+        return False
+    listing_ids, _listing_oldest_age = listing
+    return listing_ids is not None and post_id.lower() in listing_ids
+
+
 async def mod_queue_reason(session, subreddit, path, label=""):
     pages = await asyncio.gather(*[_fetch_redlib_post_page(session, inst, path) for inst in REDDIT_RSS_INSTANCES])
     # Preserve the round-37 positive signal wherever it was rendered. For a
@@ -644,6 +681,25 @@ except Exception as _proxy_import_error:
     logging.warning(f"reddit_proxy module unavailable — native media only: {_proxy_import_error}")
 
 _proxy_health = None   # per-run warm-up result (set in main(), read in resolve_post_media)
+
+
+async def fetch_proxy_post_memo(session, path: str, label: str = "", health=None, need_video: bool = False):
+    """Per-run memo around reddit_proxy.fetch_proxy_post.
+
+    The live/liveness path and media resolver often need the same proxy chain.
+    Cache only successful results; failures remain retryable later in the run.
+    """
+    if reddit_proxy is None:
+        return None
+    key = (id(reddit_proxy), str(path or ""), bool(need_video))
+    use_cache = hasattr(reddit_proxy, "__file__")
+    if use_cache and key in _proxy_post_cache:
+        return _proxy_post_cache[key]
+    result = await reddit_proxy.fetch_proxy_post(session, path, label=label,
+                                                 health=health, need_video=need_video)
+    if use_cache and result:
+        _proxy_post_cache[key] = result
+    return result
 
 # Native reddit video ladder: v.redd.it DASH_<q>.mp4 files are self-contained
 # mp4s (h264 + AAC). 404s answer instantly, so the ladder is cheap.
@@ -853,6 +909,36 @@ def save_pending(pending: dict) -> None:
         logging.error(f"Error saving pending cache: {e}")
 
 
+def load_posted_messages() -> dict:
+    if not RETRACT_DEAD_POSTS:
+        return {}
+    try:
+        with open(POSTED_MESSAGES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logging.error(f"Error reading posted-message cache: {e}")
+        return {}
+
+
+def save_posted_messages(messages: dict) -> None:
+    if not RETRACT_DEAD_POSTS:
+        return
+    try:
+        now = time.time()
+        pruned = {
+            k: v for k, v in (messages or {}).items()
+            if isinstance(v, dict) and not v.get("retracted")
+            and now - float(v.get("delivered_at") or 0) <= RETRACT_WINDOW_SECONDS
+        }
+        with open(POSTED_MESSAGES_FILE, "w", encoding="utf-8") as f:
+            json.dump(dict(sorted(pruned.items())), f, indent=2)
+    except Exception as e:
+        logging.error(f"Error saving posted-message cache: {e}")
+
+
 def mark_pending(pending: dict, key: str, reason: str, now: float,
                  source: str | None = None, title: str | None = None,
                  published_ts: float | None = None) -> None:
@@ -917,12 +1003,14 @@ _NO_RECHECK_REASONS = frozenset({
     # An RSS reappearance still runs the gate again, just like the restore
     # path for removal notices.
     "nsfw_flag",
-    # Round 36: a same-media duplicate of an already-posted post is held for
-    # the 48 h window; an RSS reappearance re-runs the gate (the winner is
-    # re-checked against the posted cache), like the restore path above.
+    "nsfw_subreddit",
+    "nsfw_crosspost_source",
+    # Round 36/43: duplicates of an already-posted post are held for the 48 h
+    # window; RSS reappearance re-runs the gate against the posted cache.
     "duplicate_media",
+    "duplicate_repost",
 })
-_SHORT_RECHECK_REASONS = frozenset({"not_live", "sources_down", "pending approval"})
+_SHORT_RECHECK_REASONS = frozenset({"not_live", "sources_down", "pending approval", "nsfw_unknown"})
 
 
 def _pending_throttle_skip(pending: dict, key: str, now: float, entry) -> bool:
@@ -1091,23 +1179,72 @@ async def fetch_arctic_post(session, post_id: str, label: str = "") -> dict | No
         return None
 
 
-async def fetch_arctic_nsfw_flags(session, post_ids: list, label: str = "") -> dict:
-    """Return Reddit's two NSFW markers for up to 500 post IDs in one call.
+def _arctic_bool(*values):
+    for value in values:
+        if isinstance(value, bool):
+            return value
+    return None
 
-    Values are ``{"over_18": bool, "thumbnail": str, "url": str}``, or
-    ``None`` when
-    Arctic Shift is unavailable or has not archived an ID yet. Unknown must
-    fail open in the caller: a metadata outage must never hold a clean post.
-    The full records are requested because Arctic Shift does not expose
-    ``thumbnail`` as a selectable ``fields`` value.
+
+def _arctic_nsfw_markers(post: dict) -> dict:
+    markers = {
+        "archive_status": "found",
+        "over_18": post.get("over_18"),
+        "thumbnail": str(post.get("thumbnail") or "").strip().lower(),
+        # round 36/43: destination URL + title/author feed the duplicate gates.
+        "url": str(post.get("url_overridden_by_dest") or post.get("url") or ""),
+        "title": str(post.get("title") or ""),
+        "author": str(post.get("author") or ""),
+        "created_utc": post.get("created_utc"),
+    }
+    # Some archive/community shapes expose subreddit NSFW under different
+    # keys. Missing community records are tolerated unless
+    # NSFW_REQUIRE_SUBREDDIT=1; any positive marker still blocks.
+    markers["subreddit_over18"] = _arctic_bool(
+        post.get("subreddit_over18"),
+        post.get("subreddit_over_18"),
+        post.get("over18"),
+        (post.get("subreddit") or {}).get("over18") if isinstance(post.get("subreddit"), dict) else None,
+        (post.get("subreddit") or {}).get("over_18") if isinstance(post.get("subreddit"), dict) else None,
+    )
+    parent = arctic_crosspost_orig(post)
+    if isinstance(parent, dict):
+        markers["source_present"] = True
+        markers["source_over_18"] = parent.get("over_18")
+        markers["source_thumbnail"] = str(parent.get("thumbnail") or "").strip().lower()
+        markers["source_subreddit_over18"] = _arctic_bool(
+            parent.get("subreddit_over18"),
+            parent.get("subreddit_over_18"),
+            parent.get("over18"),
+            (parent.get("subreddit") or {}).get("over18") if isinstance(parent.get("subreddit"), dict) else None,
+            (parent.get("subreddit") or {}).get("over_18") if isinstance(parent.get("subreddit"), dict) else None,
+        )
+    else:
+        markers["source_present"] = False
+    if not isinstance(markers.get("over_18"), bool):
+        markers["malformed"] = True
+    if markers.get("source_present") and not isinstance(markers.get("source_over_18"), bool):
+        markers["malformed"] = True
+    return markers
+
+
+async def fetch_arctic_nsfw_flags(session, post_ids: list, label: str = "") -> dict:
+    """Return normalized NSFW metadata for up to 500 post IDs in one call.
+
+    Values are dictionaries consumed by ``nsfw_gate_reason``. A missing Arctic
+    record is ``{"archive_status": "missing"}``; an API/malformed lookup
+    failure is ``{"lookup_error": True}`` and therefore fails closed unless
+    NSFW_FAIL_OPEN=1.
     """
     global _arctic_fail_count
     requested = list(dict.fromkeys(str(post_id or "").lower() for post_id in post_ids))
-    flags = {post_id: None for post_id in requested if post_id}
+    flags = {post_id: {"archive_status": "missing"} for post_id in requested if post_id}
     ids = [post_id for post_id in requested
            if re.fullmatch(r"[a-z0-9]+", post_id or "")][:500]
-    if not ids or _arctic_fail_count >= 3:
+    if not ids:
         return flags
+    if _arctic_fail_count >= 3:
+        return {post_id: {"lookup_error": True} for post_id in flags}
     try:
         async with session.get(
             ARCTIC_POSTS_URL,
@@ -1126,99 +1263,74 @@ async def fetch_arctic_nsfw_flags(session, post_ids: list, label: str = "") -> d
             if not isinstance(post, dict):
                 continue
             post_id = str(post.get("id") or "").lower()
-            if post_id not in flags or not isinstance(post.get("over_18"), bool):
+            if post_id not in flags:
                 continue
-            flags[post_id] = {
-                "over_18": post["over_18"],
-                "thumbnail": str(post.get("thumbnail") or "").strip().lower(),
-                # round 36: destination URL — the duplicate-media gate's
-                # identity source (additive; the NSFW gate never reads it)
-                "url": str(post.get("url_overridden_by_dest") or post.get("url") or ""),
-            }
+            flags[post_id] = _arctic_nsfw_markers(post)
         return flags
     except Exception as exc:
         _arctic_fail_count += 1
         logging.info(f"[{label or 'nsfw-gate'}] Arctic Shift NSFW flag lookup "
-                     f"unavailable: {exc} — failing open for this run.")
-        return flags
+                     f"unavailable: {exc} — failing closed for this run.")
+        return {post_id: {"lookup_error": True} for post_id in flags}
 
 
 def _nsfw_allowlist_forms(value) -> set:
     """Case-insensitive allowlist forms for a post ID or Reddit author."""
-    raw = str(value or "").strip().casefold()
-    if not raw:
-        return set()
-    forms = {raw}
-    if raw.startswith("/u/"):
-        forms.add(raw[3:])
-    elif raw.startswith("u/"):
-        forms.add(raw[2:])
-    if raw.startswith("t3_"):
-        forms.add(raw[3:])
-    return forms
+    return reddit_signals.nsfw_allowlist_forms(value)
+
+
+def nsfw_from_post_page(page_html: str | None) -> bool | None:
+    return reddit_signals.nsfw_from_post_page(page_html)
 
 
 def nsfw_gate_reason(post_id: str, author: str, markers: dict | None) -> str | None:
-    """Return ``nsfw_flag`` only for Reddit's NSFW markers.
-
-    ``markers=None`` is an unavailable/not-yet-archived lookup and fails
-    open. Spoilers are intentionally irrelevant: Reddit stores them in the
-    separate ``spoiler`` field, which this decision never reads.
-    """
-    if not isinstance(markers, dict):
-        return None
-    flagged = (markers.get("over_18") is True
-               or str(markers.get("thumbnail") or "").casefold() == "nsfw")
-    if not flagged:
-        return None
-    candidates = _nsfw_allowlist_forms(post_id) | _nsfw_allowlist_forms(author)
-    allowed = set()
-    for value in NSFW_ALLOWLIST:
-        allowed.update(_nsfw_allowlist_forms(value))
-    return None if candidates & allowed else "nsfw_flag"
+    """Return the fail-closed NSFW hold reason, else None."""
+    return reddit_signals.nsfw_gate_reason(
+        post_id,
+        author,
+        markers,
+        allowlist=NSFW_ALLOWLIST,
+        fail_open=NSFW_FAIL_OPEN,
+        require_subreddit=NSFW_REQUIRE_SUBREDDIT,
+    )
 
 
-def settle_holds(published_ts: float, now: float) -> bool:
-    """Round 36 (2026-09-29): True when a NEW post must wait one more run —
-    its age is below the POST_SETTLE_SECONDS window. 0 = off. A RESTORED
-    post's age is its ORIGINAL publish time, so restores never wait here."""
-    return POST_SETTLE_SECONDS > 0 and (now - float(published_ts)) < POST_SETTLE_SECONDS
+def settle_holds(published_ts: float, now: float, confirmed_in_new: bool = False) -> bool:
+    """Evidence-based settle: 60 s when confirmed in /new, else 300 s."""
+    return reddit_signals.settle_holds(
+        published_ts,
+        now,
+        confirmed_in_new=confirmed_in_new,
+        verified_seconds=POST_SETTLE_VERIFIED_SECONDS,
+        unverified_seconds=POST_SETTLE_SECONDS,
+    )
+
+
+def settle_window_seconds(confirmed_in_new: bool = False) -> int:
+    return reddit_signals.settle_window_seconds(
+        confirmed_in_new,
+        verified_seconds=POST_SETTLE_VERIFIED_SECONDS,
+        unverified_seconds=POST_SETTLE_SECONDS,
+    )
 
 
 def media_identity(url) -> str | None:
     """Return a provable exact-media identity, or None to fail open."""
-    raw = str(url or "").strip()
-    if not raw.lower().startswith(("http://", "https://")):
-        return None
-    try:
-        parsed = urlparse(raw)
-    except Exception:
-        return None
-    host = (parsed.hostname or "").lower().rstrip(".")
-    path = parsed.path or ""
-    if not host or not path:
-        return None
-    if host in ("i.redd.it", "preview.redd.it"):
-        swapped = i_reddit_swap(raw)
-        if swapped:
-            return swapped
-        return "https://i.redd.it/" + path.lstrip("/")
-    if host in ("www.reddit.com", "old.reddit.com", "np.reddit.com",
-                "reddit.com", "api.reddit.com"):
-        return None
-    if host.endswith(".reddit.com") or host.endswith(".redditmedia.com"):
-        return None
-    return host + path.rstrip("/")
+    return reddit_signals.media_identity(url)
 
 
-async def fetch_arctic_urls(session, post_ids: list, label: str = "") -> dict:
-    """Fetch destination URLs for up to 500 IDs in one Arctic call."""
+def content_fingerprint(subreddit: str, author: str, title: str) -> str | None:
+    return reddit_signals.content_fingerprint(subreddit, author, title)
+
+
+async def fetch_arctic_post_metadata(session, post_ids: list, label: str = "") -> dict:
+    """Fetch duplicate-gate metadata (url/title/author/created) for IDs."""
     global _arctic_fail_count
-    urls: dict = {}
+    out: dict = {}
     ids = [p for p in dict.fromkeys(str(i or "").lower() for i in post_ids)
            if re.fullmatch(r"[a-z0-9]+", p)]
     if not ids or _arctic_fail_count >= 3:
-        return urls
+        return out
     try:
         async with session.get(ARCTIC_POSTS_URL, params={"ids": ",".join(ids[:500])},
                                headers=dict(BROWSER_HEADERS),
@@ -1233,21 +1345,33 @@ async def fetch_arctic_urls(session, post_ids: list, label: str = "") -> dict:
         for post in posts:
             if not isinstance(post, dict) or not post.get("id"):
                 continue
-            urls[str(post["id"]).lower()] = str(
-                post.get("url_overridden_by_dest") or post.get("url") or "")
-        return urls
+            out[str(post["id"]).lower()] = {
+                "url": str(post.get("url_overridden_by_dest") or post.get("url") or ""),
+                "title": str(post.get("title") or ""),
+                "author": str(post.get("author") or ""),
+                "created_utc": post.get("created_utc"),
+            }
+        return out
     except Exception as exc:
         _arctic_fail_count += 1
-        logging.info(f"[{label or 'dup-gate'}] Arctic Shift url lookup unavailable: "
-                     f"{exc} — duplicate gate fails open for this run.")
-        return urls
+        logging.info(f"[{label or 'dup-gate'}] Arctic Shift metadata lookup unavailable: "
+                     f"{exc} — duplicate/repost gates fail open for this run.")
+        return out
+
+
+async def fetch_arctic_urls(session, post_ids: list, label: str = "") -> dict:
+    """Fetch destination URLs for up to 500 IDs in one Arctic call."""
+    meta = await fetch_arctic_post_metadata(session, post_ids, label=label)
+    return {post_id: data.get("url", "") for post_id, data in meta.items()}
 
 
 def dup_media_hit(posted_map: dict | None, identity: str | None) -> str | None:
     """Return the posted winner key for identity, otherwise fail open."""
-    if not identity or not isinstance(posted_map, dict):
-        return None
-    return posted_map.get(identity)
+    return reddit_signals.dup_media_hit(posted_map, identity)
+
+
+def duplicate_repost_hit(posted_map: dict | None, fingerprint: str | None) -> str | None:
+    return reddit_signals.duplicate_repost_hit(posted_map, fingerprint)
 
 
 def arctic_crosspost_orig(post) -> dict | None:
@@ -1437,29 +1561,8 @@ _REMOVED_NOTICE_RES = (
 
 
 def removed_post_reason(title: str | None, body: str | None) -> str | None:
-    """Returns a short reason when the post looks soft-removed or deleted
-    (still pending approval), else None. Observed notices (2026-09-17 live
-    run): "[deleted]", "[removed]", "**[ Removed by moderator ]**",
-    "Sorry, this post has been removed by the moderators of r/...",
-    "Sorry, this post was deleted by the person who originally posted it",
-    "Post is awaiting moderator approval." (2026-09-20, post 1wl41aj).
-    Only the first 400 chars of the body are inspected — a legitimate post
-    that merely mentions a deletion later in its text must not be caught.
-    An EMPTY body is NOT treated as removed (legitimate image/link posts
-    have empty bodies)."""
-    t = str(title or "").strip()
-    if _REMOVED_TITLE_RE.match(t):
-        return "title marker"
-    b = re.sub(r"\s+", " ", str(body or "")).strip()
-    if not b:
-        return None
-    if len(b) <= 80 and _REMOVED_WHOLE_BODY_RE.match(b):
-        return "whole-body marker"
-    head = b[:400]
-    for rx, reason in _REMOVED_NOTICE_RES:
-        if rx.search(head):
-            return reason
-    return None
+    """Pure removal/pending classifier (implemented in reddit_signals)."""
+    return reddit_signals.removed_post_reason(title, body)
 
 
 def _arctic_media_hint(post) -> bool:
@@ -1753,7 +1856,7 @@ async def verify_archive_post_live(session, path: str, label: str = "",
         for s in ("redditez", "vxreddit", "embeddit")))
     if reddit_proxy is not None:
         try:
-            result = await reddit_proxy.fetch_proxy_post(session, path, label=label)
+            result = await fetch_proxy_post_memo(session, path, label=label)
         except Exception:
             result = None
         if result:
@@ -2669,15 +2772,32 @@ async def fetch_test_post_base(session: aiohttp.ClientSession, path: str,
 
 async def _fetch_redlib_post_page(session: aiohttp.ClientSession, instance: str,
                                   path: str, timeout: int = 10) -> str | None:
+    # Round 42: per-run memo. Successful page fetches are reused by the
+    # NSFW fallback, liveness gate, mod-queue gate and media enrichment; misses
+    # are deliberately not cached so a transient failure stays retryable.
+    key = (str(instance or ""), str(path or ""))
+    if key in _redlib_post_page_cache:
+        return _redlib_post_page_cache[key]
     try:
         async with session.get(_with_miningtcup_token(f"{instance}{path}"),
                                headers=BROWSER_HEADERS,
                                timeout=aiohttp.ClientTimeout(total=timeout),
                                allow_redirects=True) as resp:
             if resp.status == 200 and "html" in (resp.headers.get("Content-Type") or "").lower():
-                return await resp.text()
+                text = await resp.text()
+                if text:
+                    _redlib_post_page_cache[key] = text
+                return text
     except Exception:
         pass
+    return None
+
+
+async def fetch_first_redlib_post_page(session: aiohttp.ClientSession, path: str) -> str | None:
+    for instance in REDDIT_RSS_INSTANCES:
+        page = await _fetch_redlib_post_page(session, instance, path)
+        if page:
+            return page
     return None
 
 
@@ -3031,9 +3151,9 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
     redlib_items: list[dict] = []
     redlib_done = False
     if not post_json and PROXY_MEDIA and reddit_proxy is not None and fetch_path:
-        tasks = [reddit_proxy.fetch_proxy_post(session, fetch_path,
-                                               label=label, health=_proxy_health,
-                                               need_video=bool(has_video))]
+        tasks = [fetch_proxy_post_memo(session, fetch_path,
+                                       label=label, health=_proxy_health,
+                                       need_video=bool(has_video))]
         if not (base.get("vred_id") or base.get("redgifs_url")):
             tasks.append(enrich_gallery_redlib(session, fetch_path, label or "gallery"))
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -3394,6 +3514,89 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
             "components": [{"type": 17, "accent_color": 16729344, "components": inner}]}
 
 
+def tombstone_payload(payload: dict, reason: str | None = None) -> dict:
+    return reddit_signals.tombstone_payload(payload, reason)
+
+
+async def live_removal_reason(session, path: str, label: str = "") -> str | None:
+    """Return a live removal verdict, not just absence/outage."""
+    if reddit_proxy is not None:
+        try:
+            result = await fetch_proxy_post_memo(session, path, label=label)
+        except Exception:
+            result = None
+        if result:
+            reason = removed_post_reason(result.get("title"), result.get("body"))
+            if reason:
+                return reason
+    for instance in REDDIT_RSS_INSTANCES:
+        page = await _fetch_redlib_post_page(session, instance, path)
+        if not page:
+            continue
+        base = base_from_redlib_page(page, path)
+        if base:
+            reason = removed_post_reason(base.get("title"), base.get("body"))
+            if reason:
+                return reason
+    return None
+
+
+async def retract_dead_posts(session, posted_messages: dict, now: float) -> None:
+    if not RETRACT_DEAD_POSTS or not posted_messages:
+        return
+    for unique_key, record in list(posted_messages.items()):
+        if not isinstance(record, dict) or record.get("retracted"):
+            continue
+        if now - float(record.get("delivered_at") or 0) > RETRACT_WINDOW_SECONDS:
+            continue
+        subreddit = record.get("subreddit") or unique_key.rsplit("_", 1)[0]
+        path = record.get("path") or ""
+        post_id = extract_post_id(path) or unique_key.rsplit("_", 1)[-1]
+        listing = await _fetch_new_listing(session, subreddit)
+        listing_ids, listing_oldest_age = (None, None) if listing is None else listing
+        reason = await live_removal_reason(session, path, label=f"retract {unique_key}")
+        decision = reddit_signals.retraction_decision(
+            enabled=RETRACT_DEAD_POSTS,
+            mode=RETRACT_MODE,
+            post_id=post_id,
+            published_ts=float(record.get("published_ts") or record.get("delivered_at") or now),
+            now=now,
+            listing_ids=listing_ids,
+            listing_oldest_age=listing_oldest_age,
+            live_removal_reason=reason,
+            tail_margin_seconds=MOD_QUEUE_TAIL_MARGIN_SECONDS,
+        )
+        if not decision:
+            continue
+        webhook_url = get_webhook_for_subreddit(subreddit)
+        message_id = str(record.get("message_id") or "")
+        if not webhook_url or not message_id:
+            continue
+        try:
+            if decision == "delete":
+                async with session.delete(
+                    f"{webhook_url}/messages/{message_id}",
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status in (200, 204):
+                        record["retracted"] = True
+                        logging.warning(f"RETRACT: {unique_key} deleted dead Discord card ({reason}).")
+                continue
+            payload = tombstone_payload(record.get("payload") or {}, reason)
+            async with session.patch(
+                f"{webhook_url}/messages/{message_id}?with_components=true",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status in (200, 204):
+                    record["retracted"] = True
+                    logging.warning(f"RETRACT: {unique_key} tombstoned dead Discord card ({reason}).")
+                else:
+                    logging.error(f"RETRACT: Discord edit HTTP {resp.status} for {unique_key}: {(await resp.text())[:200]}")
+        except Exception as exc:
+            logging.error(f"RETRACT: failed for {unique_key}: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # ■ DISCOHOOK SHARE-LINK PREVIEW (optional, keyless, round 12)
 # ---------------------------------------------------------------------------
@@ -3483,7 +3686,10 @@ async def main():
 
     posted = load_posted()
     pending = load_pending()
+    posted_messages = load_posted_messages()
     _mod_queue_listing_cache.clear()
+    _redlib_post_page_cache.clear()
+    _proxy_post_cache.clear()
     is_first_run = len(posted) == 0
     now = time.time()
     # Round 34: remember the pre-run cache so every save can be verified
@@ -3599,9 +3805,12 @@ async def main():
         total_found = len(new_posts)
         if total_found == 0:
             logging.info("No new Reddit posts to post.")
+            if RETRACT_DEAD_POSTS and not DRY_RUN:
+                await retract_dead_posts(session, posted_messages, now)
             saved = save_posted(posted, frozenset(posted - posted_at_start))
             _verify_dedup_save(posted_at_start, posted, saved)
             save_pending(pending)
+            save_posted_messages(posted_messages)
             return
 
         logging.info(f"Found {total_found} new Reddit posts. Building V3 cards...")
@@ -3626,9 +3835,11 @@ async def main():
                 label="nsfw-gate",
             )
 
-        # Round 36: build exact-media maps from posted history, once per run.
+        # Round 36/43: build exact-media and author-title repost maps from
+        # posted history, once per run. One Arctic batch now feeds both gates.
         _dup_posted: dict = {}
-        if DUP_MEDIA_GATE and not TEST_POST_ID and new_posts:
+        _repost_posted: dict = {}
+        if (DUP_MEDIA_GATE or REPOST_GATE) and not TEST_POST_ID and new_posts:
             _hot_subs = sorted({post[0] for post in new_posts})
             _hist_ids = []
             for _sub in _hot_subs:
@@ -3636,16 +3847,30 @@ async def main():
                 _hist_ids.extend(k.rsplit("_", 1)[1] for k in _sub_keys[-DUP_MEDIA_POSTED_WINDOW:])
             if len(_hist_ids) > 500:
                 _hist_ids = _hist_ids[-500:]
-            if _hist_ids:
-                _hist_urls = await fetch_arctic_urls(session, _hist_ids, label="dup-gate")
-                for _sub in _hot_subs:
-                    _m = {}
-                    for _k in sorted(k for k in posted if k.rsplit("_", 1)[0] == _sub):
-                        _ident = media_identity(_hist_urls.get(_k.rsplit("_", 1)[1]))
+            _hist_meta = await fetch_arctic_post_metadata(session, _hist_ids, label="dup-gate") if _hist_ids else {}
+            for _sub in _hot_subs:
+                _m = {}
+                _r = {}
+                for _k in sorted(k for k in posted if k.rsplit("_", 1)[0] == _sub):
+                    _pid = _k.rsplit("_", 1)[1]
+                    _meta = _hist_meta.get(_pid) or {}
+                    if DUP_MEDIA_GATE:
+                        _ident = media_identity(_meta.get("url"))
                         if _ident and _ident not in _m:
                             _m[_ident] = _k
-                    if _m:
-                        _dup_posted[_sub] = _m
+                    if REPOST_GATE:
+                        _created = _meta.get("created_utc")
+                        try:
+                            _fresh = not _created or (now - float(_created) <= REPOST_WINDOW_SECONDS)
+                        except (TypeError, ValueError):
+                            _fresh = True
+                        _fp = content_fingerprint(_sub, _meta.get("author"), _meta.get("title")) if _fresh else None
+                        if _fp and _fp not in _r:
+                            _r[_fp] = _k
+                if _m:
+                    _dup_posted[_sub] = _m
+                if _r:
+                    _repost_posted[_sub] = _r
 
         for subreddit, path, unique_key, published_ts, activity_ts, entry in new_posts:
             # Round 34: double dedup (belt and braces) — collect() already
@@ -3678,13 +3903,13 @@ async def main():
                     and _pending_throttle_skip(pending, unique_key, now, entry)):
                 _pend = pending[unique_key]
                 if _pend.get("reason") in _NO_RECHECK_REASONS:
-                    if _pend.get("reason") == "nsfw_flag":
-                        logging.info(f"[{unique_key}] pending (nsfw_flag) — held by "
+                    if str(_pend.get("reason") or "").startswith("nsfw"):
+                        logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — held by "
                                      f"the NSFW content gate (entry expires at the "
                                      f"48 h window).")
-                    elif _pend.get("reason") == "duplicate_media":
-                        logging.info(f"[{unique_key}] pending (duplicate_media) — held by "
-                                     f"the round-36 duplicate-media gate (entry expires at "
+                    elif _pend.get("reason") in ("duplicate_media", "duplicate_repost"):
+                        logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — held by "
+                                     f"the duplicate/repost gate (entry expires at "
                                      f"the 48 h window).")
                     else:
                         logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — "
@@ -3700,48 +3925,71 @@ async def main():
                                  f"skipping recheck, due again in ~{_due_in}s.")
                 continue
 
-            # ---- round 35 (2026-09-28): NSFW content gate ---------------
-            # A post can reach RSS while still live and be removed seconds
-            # later, so the liveness gates cannot close this window. Check
-            # exactly Reddit's two NSFW markers before any media or webhook
-            # work. The separate `spoiler` field is deliberately untouched.
+            # ---- round 42/45: fail-closed NSFW content gate -------------
+            # Runs before any Discord payload, thumbnail or attachment is
+            # built. Unknown metadata is held, except when NSFW_FAIL_OPEN=1.
             if not TEST_POST_ID:
                 nsfw_post_id = (extract_post_id(path) or "").lower()
-                nsfw_markers = nsfw_flags.get(nsfw_post_id)
-                if nsfw_markers is None:
-                    logging.info(f"NSFW SCAN: {unique_key} over_18=unknown "
-                                 f"thumbnail_nsfw=unknown — proceeding (fail-open).")
-                else:
-                    over_18 = nsfw_markers.get("over_18") is True
-                    thumbnail_nsfw = nsfw_markers.get("thumbnail") == "nsfw"
-                    reason = nsfw_gate_reason(
-                        nsfw_post_id,
-                        str(getattr(entry, "author", "") or ""),
-                        nsfw_markers,
-                    )
-                    marker_log = (f"over_18={over_18} "
-                                  f"thumbnail_nsfw={thumbnail_nsfw}")
-                    if reason:
-                        mark_pending(pending, unique_key, reason, now)
-                        logging.warning(f"NSFW GATE: {unique_key} SKIPPED "
-                                        f"({marker_log}) — held 48 h "
-                                        f"({reason}), NOT posted to Discord.")
-                        continue
-                    if over_18 or thumbnail_nsfw:
-                        logging.info(f"NSFW SCAN: {unique_key} {marker_log} — "
-                                     f"allowlisted (NSFW_ALLOWLIST), proceeding.")
+                nsfw_markers = nsfw_flags.get(nsfw_post_id) or {"archive_status": "missing"}
+                if (NSFW_PAGE_FALLBACK and not NSFW_FAIL_OPEN
+                        and nsfw_markers.get("archive_status") == "missing"):
+                    page = await fetch_first_redlib_post_page(session, path)
+                    page_verdict = nsfw_from_post_page(page)
+                    nsfw_markers = dict(nsfw_markers)
+                    nsfw_markers["page_nsfw"] = page_verdict
+                    if page_verdict is None:
+                        logging.info(f"NSFW SCAN: {unique_key} not in the archive yet — "
+                                     f"live page unreadable (fail-closed).")
                     else:
-                        logging.info(f"NSFW SCAN: {unique_key} {marker_log} (PASS)")
+                        logging.info(f"NSFW SCAN: {unique_key} not in the archive yet — "
+                                     f"live page says over_18={page_verdict}")
+                reason = nsfw_gate_reason(
+                    nsfw_post_id,
+                    str(getattr(entry, "author", "") or ""),
+                    nsfw_markers,
+                )
+                over_18 = nsfw_markers.get("over_18") is True or nsfw_markers.get("page_nsfw") is True
+                thumbnail_nsfw = nsfw_markers.get("thumbnail") == "nsfw"
+                marker_log = (f"over_18={over_18} thumbnail_nsfw={thumbnail_nsfw} "
+                              f"source_over_18={nsfw_markers.get('source_over_18') is True}")
+                if reason:
+                    mark_pending(pending, unique_key, reason, now,
+                                 source=_entry_source36,
+                                 title=str(getattr(entry, "title", "") or "")[:200],
+                                 published_ts=published_ts)
+                    logging.warning(f"NSFW GATE: {unique_key} SKIPPED "
+                                    f"({marker_log}) — held 48 h "
+                                    f"({reason}), NOT posted to Discord.")
+                    continue
+                if over_18 or thumbnail_nsfw or nsfw_markers.get("source_over_18") is True:
+                    logging.info(f"NSFW SCAN: {unique_key} {marker_log} — "
+                                 f"allowlisted (NSFW_ALLOWLIST), proceeding.")
+                else:
+                    logging.info(f"NSFW SCAN: {unique_key} {marker_log} (PASS)")
 
-            # ---- round 36: settle window + duplicate-media gate ----------
-            if not TEST_POST_ID and not DRY_RUN and settle_holds(published_ts, now):
-                logging.info(f"SETTLE: {unique_key} age {int(now - published_ts)}s "
-                             f"< {POST_SETTLE_SECONDS}s — holding (survival check); "
-                             f"re-evaluated next run.")
-                continue
+            # ---- round 42: evidence-based settle + duplicate gates -------
+            _post_id = (extract_post_id(path) or "").lower()
+            _listing = None
+            _confirmed_in_new = False
+            if (not TEST_POST_ID and not DRY_RUN
+                    and POST_SETTLE_SECONDS > 0
+                    and (now - published_ts) < POST_SETTLE_SECONDS):
+                _listing = await _fetch_new_listing(session, subreddit)
+                _confirmed_in_new = _listing_confirms_post(_listing, _post_id)
+            if not TEST_POST_ID and not DRY_RUN:
+                _settle_window = settle_window_seconds(_confirmed_in_new)
+                if settle_holds(published_ts, now, _confirmed_in_new):
+                    _evidence = "confirmed in /new" if _confirmed_in_new else "not confirmed in /new"
+                    logging.info(f"SETTLE: {unique_key} age {int(now - published_ts)}s "
+                                 f"< {_settle_window}s ({_evidence}) — holding; "
+                                 f"re-evaluated next run.")
+                    continue
+                if (now - published_ts) < POST_SETTLE_SECONDS:
+                    _evidence = "confirmed in /new fast path" if _confirmed_in_new else "unverified slow path"
+                    logging.info(f"SETTLE: {unique_key} age {int(now - published_ts)}s "
+                                 f">= {_settle_window}s ({_evidence}) — proceeding.")
             if not TEST_POST_ID and not DRY_RUN and DUP_MEDIA_GATE:
-                _dup_pid = (extract_post_id(path) or "").lower()
-                _dup_identity = media_identity((nsfw_flags.get(_dup_pid) or {}).get("url") or "")
+                _dup_identity = media_identity((nsfw_flags.get(_post_id) or {}).get("url") or "")
                 _dup_winner = dup_media_hit(_dup_posted.get(subreddit), _dup_identity)
                 if _dup_winner:
                     mark_pending(pending, unique_key, "duplicate_media", now,
@@ -3756,6 +4004,24 @@ async def main():
                     logging.info(f"DUP SCAN: {unique_key} media unique (PASS)")
                 else:
                     logging.info(f"DUP SCAN: {unique_key} media identity unknown — "
+                                 f"proceeding (fail-open).")
+            if not TEST_POST_ID and not DRY_RUN and REPOST_GATE:
+                _fp_author = str(getattr(entry, "author", "") or (nsfw_flags.get(_post_id) or {}).get("author") or "")
+                _fp_title = str(getattr(entry, "title", "") or (nsfw_flags.get(_post_id) or {}).get("title") or "")
+                _fingerprint = content_fingerprint(subreddit, _fp_author, _fp_title)
+                _repost_winner = duplicate_repost_hit(_repost_posted.get(subreddit), _fingerprint)
+                if _repost_winner:
+                    mark_pending(pending, unique_key, "duplicate_repost", now,
+                                 source=_entry_source36,
+                                 title=_fp_title[:200], published_ts=published_ts)
+                    logging.warning(f"REPOST GATE: {unique_key} SKIPPED (same author/title as "
+                                    f"{_repost_winner}, already on Discord) — held 48 h "
+                                    f"(duplicate_repost), NOT posted to Discord.")
+                    continue
+                if _fingerprint:
+                    logging.info(f"REPOST SCAN: {unique_key} author/title unique (PASS)")
+                else:
+                    logging.info(f"REPOST SCAN: {unique_key} author/title identity unknown — "
                                  f"proceeding (fail-open).")
             if (unique_key in pending
                     and str(pending[unique_key].get("reason") or "") in _NO_RECHECK_REASONS
@@ -3797,9 +4063,9 @@ async def main():
                         # when no RSS/redlib source has the post — media is
                         # then resolved from the same service in
                         # resolve_post_media.
-                        proxy = await reddit_proxy.fetch_proxy_post(session, path,
-                                                                    label=TEST_POST_ID,
-                                                                    health=_proxy_health)
+                        proxy = await fetch_proxy_post_memo(session, path,
+                                                            label=TEST_POST_ID,
+                                                            health=_proxy_health)
                         if proxy and proxy.get("title"):
                             base = {
                                 "title": _clean_post_title(proxy["title"]),
@@ -3882,15 +4148,19 @@ async def main():
 
             if (not TEST_POST_ID and not DRY_RUN and entry is not None and MOD_QUEUE_GATE
                     and (now - published_ts) < MOD_QUEUE_WINDOW_SECONDS):
-                _mq = await mod_queue_reason(session, subreddit, path, unique_key)
-                if not _mq:
-                    logging.info(f"MODQUEUE: {unique_key} — no queue hold — proceeding")
-                if _mq:
-                    _mq_pending = mark_pending
-                    _mq_pending(pending, unique_key, _mq, now, source=_entry_source36,
-                                 title=str(base.get("title") or "")[:200], published_ts=published_ts)
-                    logging.info(f"MODQUEUE: {unique_key} age {int(now - published_ts)}s — awaiting moderator approval — holding")
-                    continue
+                if _confirmed_in_new:
+                    logging.info(f"MODQUEUE: {unique_key} — confirmed in /new; "
+                                 f"skipping mod-queue instance checks")
+                else:
+                    _mq = await mod_queue_reason(session, subreddit, path, unique_key)
+                    if not _mq:
+                        logging.info(f"MODQUEUE: {unique_key} — no queue hold — proceeding")
+                    if _mq:
+                        _mq_pending = mark_pending
+                        _mq_pending(pending, unique_key, _mq, now, source=_entry_source36,
+                                     title=str(base.get("title") or "")[:200], published_ts=published_ts)
+                        logging.info(f"MODQUEUE: {unique_key} age {int(now - published_ts)}s — awaiting moderator approval — holding")
+                        continue
 
             try:
                 data = await resolve_post_media(session, base, post_json,
@@ -3947,11 +4217,28 @@ async def main():
                     continue
 
                 target_url = f"{webhook_url}?with_components=true"
+                if RETRACT_DEAD_POSTS:
+                    target_url += "&wait=true"
                 async with session.post(target_url, json=payload,
                                         timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status in (200, 204):
+                        message_json = None
+                        if RETRACT_DEAD_POSTS and resp.status == 200:
+                            try:
+                                message_json = await resp.json(content_type=None)
+                            except Exception:
+                                message_json = None
                         posted.add(unique_key)
                         pending.pop(unique_key, None)  # posted — no longer pending
+                        if RETRACT_DEAD_POSTS and isinstance(message_json, dict) and message_json.get("id"):
+                            posted_messages[unique_key] = {
+                                "subreddit": subreddit,
+                                "path": path,
+                                "message_id": str(message_json["id"]),
+                                "delivered_at": int(now),
+                                "published_ts": int(published_ts),
+                                "payload": payload,
+                            }
                         kinds = ",".join(sorted({m["kind"] for m in data["media"]})) or "text"
                         mode = "full" if data["full_mode"] else "native"
                         logging.info(f"Reddit V3 Posted: {unique_key} (media={kinds} | {mode} | "
@@ -3986,12 +4273,16 @@ async def main():
             except Exception as e:
                 logging.error(f"Failed building/posting {unique_key}: {e}")
 
+        if RETRACT_DEAD_POSTS and not DRY_RUN:
+            await retract_dead_posts(session, posted_messages, now)
+
     if DRY_RUN:
         logging.info("DRY RUN finished: cache NOT saved, Discord NOT touched.")
     else:
         saved = save_posted(posted, frozenset(posted - posted_at_start))
         _verify_dedup_save(posted_at_start, posted, saved)
         save_pending(pending)
+        save_posted_messages(posted_messages)
         logging.info("Reddit V3 Monitor execution finished.")
 
 
