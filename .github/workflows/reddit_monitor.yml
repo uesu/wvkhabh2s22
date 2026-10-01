@@ -136,6 +136,16 @@ jobs:
           MOD_QUEUE_WEAK_GRACE_SECONDS: ${{ vars.MOD_QUEUE_WEAK_GRACE_SECONDS }}
           LISTING_HTML_GRACE_SECONDS: ${{ vars.LISTING_HTML_GRACE_SECONDS }}
           LISTING_TIMEOUT_SECONDS: ${{ vars.LISTING_TIMEOUT_SECONDS }}
+          # Round 49 (2026-10-01): the three media proxies are queried
+          # CONCURRENTLY instead of one after another (~1.5s -> ~0.4-0.8s per
+          # post). Defaults are tuned on the prod timings of 11:55 UTC and
+          # need no Variables; override only to retune.
+          #   PROXY_WAVE_DELAY=0.5       hold-back before the 3rd service
+          #   PROXY_GALLERY_GRACE=1.5    max wait for a more complete gallery
+          #   PROXY_MAX_CONCURRENCY=8    global in-flight proxy request cap
+          PROXY_WAVE_DELAY: ${{ vars.PROXY_WAVE_DELAY }}
+          PROXY_GALLERY_GRACE: ${{ vars.PROXY_GALLERY_GRACE }}
+          PROXY_MAX_CONCURRENCY: ${{ vars.PROXY_MAX_CONCURRENCY }}
           WEBHOOK_REDDIT_ZENLESSZONEZEROLEAKS_: ${{ secrets.WEBHOOK_REDDIT_ZENLESSZONEZEROLEAKS_ }}
           WEBHOOK_REDDIT_GENSHIN_IMPACT_LEAKS: ${{ secrets.WEBHOOK_REDDIT_GENSHIN_IMPACT_LEAKS }}
           WEBHOOK_REDDIT_HONKAISTARRAIL_LEAKS: ${{ secrets.WEBHOOK_REDDIT_HONKAISTARRAIL_LEAKS }}
