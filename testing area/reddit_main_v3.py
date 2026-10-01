@@ -385,6 +385,10 @@ POSTED_MESSAGES_FILE = "posted_messages.json"
 MOD_QUEUE_GATE = os.getenv("MOD_QUEUE_GATE", "1").strip().lower() not in ("0", "false", "no", "off")
 MOD_QUEUE_WINDOW_SECONDS = _env_int("MOD_QUEUE_WINDOW_SECONDS", 6 * 3600)
 MOD_QUEUE_REQUEST_RE = re.compile(r"respond to this comment with|temporarily sent to the moderators for review", re.I)
+MOD_QUEUE_STRONG_RE = re.compile(r"awaiting (?:moderator )?approval|pending (?:moderator )?approval|sent to the moderators for review|awaiting mod", re.I)
+MOD_QUEUE_WEAK_GRACE_SECONDS = _env_int("MOD_QUEUE_WEAK_GRACE_SECONDS", 900)
+LISTING_TIMEOUT_SECONDS = _env_int("LISTING_TIMEOUT_SECONDS", 8)
+LISTING_HTML_GRACE_SECONDS = _env_int("LISTING_HTML_GRACE_SECONDS", 2)
 MOD_QUEUE_LISTING_ID_RE = re.compile(r"/comments/([a-z0-9]+)/", re.I)
 
 # Round 38d (2026-09-29): a post can be natively queued with no AutoModerator
@@ -466,89 +470,141 @@ def _rss_oldest_age(xml, now=None):
             best = age
     return best
 
-def mod_queue_decision(page_html, listing_ids, post_id, listing_oldest_age=None):
-    """Return ``pending approval`` only for an evidenced queue hold.
-
-    Round 37 keeps its positive AutoModerator signal. Round 38d additionally
-    handles zero-comment native queue posts through negative space. Round 41
-    ensures positive hold text/banners hold the post even if the /new listing
-    fetch timed out, only releasing once confirmed present in /new.
-    """
+def mod_queue_decision(page_html, listing_ids, post_id, listing_oldest_age=None,
+                       listing_source=None, post_age_seconds=None):
     if not page_html or not post_id:
         return None
-    if listing_ids is not None and post_id.lower() in listing_ids:
-        return None  # Present in the public listing: it was released.
-    if MOD_QUEUE_REQUEST_RE.search(page_html) or re.search(r"awaiting (?:moderator )?approval", page_html, re.I):
-        return "pending approval"  # Positive AutoMod/banner hold signal.
+    return reddit_signals.queue_verdict(
+        strong_hold_text=bool(MOD_QUEUE_STRONG_RE.search(page_html)),
+        weak_hold_text=bool(MOD_QUEUE_REQUEST_RE.search(page_html)),
+        in_listing=None if listing_ids is None else post_id.lower() in listing_ids,
+        listing_source=listing_source or reddit_signals.LISTING_HTML,
+        listing_oldest_age=listing_oldest_age,
+        page_age_seconds=(_redlib_ages_seconds(page_html) or [None])[0],
+        post_age_seconds=post_age_seconds,
+        tail_margin_seconds=MOD_QUEUE_TAIL_MARGIN_SECONDS,
+        weak_grace_seconds=MOD_QUEUE_WEAK_GRACE_SECONDS)
 
-    # Round 38d: no queue text (native queue, zero comments).
-    if listing_ids is None or listing_oldest_age is None:
-        return None
-    post_ages = _redlib_ages_seconds(page_html)
-    if not post_ages:
-        return None
-    if post_ages[0] < listing_oldest_age + MOD_QUEUE_TAIL_MARGIN_SECONDS:
-        return "pending approval"
-    return None
+def _listing_parts(listing):
+    if not listing:
+        return None, None, None
+    return listing[0], listing[1] if len(listing) > 1 else None, listing[2] if len(listing) > 2 else reddit_signals.LISTING_HTML
 
 async def _fetch_new_listing(session, subreddit):
     if subreddit in _mod_queue_listing_cache:
         return _mod_queue_listing_cache[subreddit]
 
-    result = None
-    # Round 38e: try Reddit's token-authenticated RSS listing first. This is
-    # the same public-feed path already used by the monitor, but unlike the
-    # HTML /new pages it is reachable from the production runner often enough
-    # to provide a useful release signal. The cache keeps this to one listing
-    # lookup per subreddit per run.
-    for instance in _RSS_LISTING_INSTANCES:
-        xml = None
+    # ---- ROUND 46b (2026-10-01): GET AN API-BACKED LISTING, FAST ----------
+    # Round 46 made provenance decide what a listing may prove: Reddit's own
+    # /new.rss carries mod-queue posts, so only a redlib /new page (rendered
+    # from Reddit's public listing API, which excludes queued posts) can
+    # prove a post was released.
+    #
+    # But round 46 still ASKED the RSS feed first and only fell back to HTML
+    # when RSS failed — and RSS practically never fails. So the monitor
+    # almost always held an `rss` listing, which cannot confirm anything:
+    # the 60 s fast settle never applied again, the round-38d negative-space
+    # rule could never run, and every post inside the mod-queue window paid
+    # for the per-post page fetches. Safe, but needlessly slow.
+    #
+    # Now every source is started in ONE concurrent batch and the answer is
+    # taken as soon as the question is settled:
+    #   * the first API-backed (HTML) answer wins immediately;
+    #   * an RSS answer is held as a fallback and grants the HTML hosts only
+    #     LISTING_HTML_GRACE_SECONDS more to beat it;
+    #   * the whole step is capped by LISTING_TIMEOUT_SECONDS.
+    # A healthy redlib fleet therefore costs one round-trip, and a dead one
+    # costs the grace instead of a full timeout chain.
+    _timeout = aiohttp.ClientTimeout(total=LISTING_TIMEOUT_SECONDS)
+
+    async def _html_listing(instance):
+        try:
+            # Round 37 hotfix (2026-09-30): miningtcup sits behind its DogWAF
+            # and rejects untokenized requests. The helper is a no-op for
+            # every non-miningtcup URL (same helper the post page uses).
+            async with session.get(_with_miningtcup_token(f"{instance}/r/{subreddit}/new?limit=100"),
+                                   headers=BROWSER_HEADERS, timeout=_timeout,
+                                   allow_redirects=True) as resp:
+                if resp.status != 200 or "html" not in (resp.headers.get("Content-Type") or "").lower():
+                    return None
+                html = await resp.text()
+        except Exception:
+            return None
+        ids = _listing_post_ids(html or "")
+        if not ids:
+            return None
+        # Keep the listing's oldest visible age with its IDs. A missing age
+        # is intentional: round 38d then fails open.
+        return (ids, _listing_oldest_age(html), reddit_signals.LISTING_HTML)
+
+    async def _rss_listing(instance):
         try:
             url = f"{instance}/r/{subreddit}/new.rss?limit=100"
             if REDDIT_FEED_TOKEN:
                 # Feed tokens are credentials; quote them as a query value and
                 # never include the resulting URL in a log message.
                 url += f"&feed={quote(REDDIT_FEED_TOKEN, safe='')}"
-            async with session.get(url, headers=BROWSER_HEADERS,
-                                   timeout=aiohttp.ClientTimeout(total=10),
+            async with session.get(url, headers=BROWSER_HEADERS, timeout=_timeout,
                                    allow_redirects=True) as resp:
                 xml = await resp.text() if resp.status == 200 else None
         except Exception:
-            xml = None
-        if xml and _RSS_DOCUMENT_RE.search(xml):
-            ids = _listing_post_ids(xml)
-            if ids:
-                result = (ids, _rss_oldest_age(xml))
-                logging.info(f"MODQUEUE-LISTING: r/{subreddit} /new listing via rss "
-                             f"({len(ids)} entries).")
-                break
+            return None
+        if not xml or not _RSS_DOCUMENT_RE.search(xml):
+            return None
+        ids = _listing_post_ids(xml)
+        if not ids:
+            return None
+        return (ids, _rss_oldest_age(xml), reddit_signals.LISTING_RSS)
 
-    # Preserve the round-37/38d HTML fallback for instances that can answer
-    # the listing even when Reddit RSS is unavailable or rate-limited.
-    if result is None:
-        for instance in REDDIT_RSS_INSTANCES:
-            html = None
-            try:
-                # Round 37 hotfix (2026-09-30): miningtcup sits behind its DogWAF
-                # and rejects untokenized requests — without the token the /new
-                # listing was unreadable on EVERY instance and the gate failed
-                # open on every queued post. The helper is a no-op for every
-                # non-miningtcup URL (same helper the post-page fetch uses).
-                async with session.get(_with_miningtcup_token(f"{instance}/r/{subreddit}/new?limit=100"),
-                                       headers=BROWSER_HEADERS,
-                                       timeout=aiohttp.ClientTimeout(total=10), allow_redirects=True) as resp:
-                    html = await resp.text() if resp.status == 200 and "html" in (resp.headers.get("Content-Type") or "").lower() else None
-            except Exception:
-                html = None
-            if html:
-                ids = _listing_post_ids(html)
-                if ids:
-                    # Keep the listing's oldest visible age with its IDs. A
-                    # missing age is intentional: round 38d then fails open.
-                    result = (ids, _listing_oldest_age(html))
-                    logging.info(f"MODQUEUE-LISTING: r/{subreddit} /new listing via html "
-                                 f"({len(ids)} entries).")
-                    break
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + LISTING_TIMEOUT_SECONDS
+    html_tasks = {asyncio.ensure_future(_html_listing(inst))
+                  for inst in REDDIT_RSS_INSTANCES}
+    rss_tasks = {asyncio.ensure_future(_rss_listing(inst))
+                 for inst in _RSS_LISTING_INSTANCES}
+    pending = html_tasks | rss_tasks
+    result = None
+    fallback = None
+    fallback_deadline = None
+    try:
+        while pending:
+            now_t = loop.time()
+            budget = deadline - now_t
+            if fallback_deadline is not None:
+                budget = min(budget, fallback_deadline - now_t)
+            if budget <= 0:
+                break
+            done, pending = await asyncio.wait(
+                pending, timeout=budget, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                break                      # budget expired
+            for task in done:
+                try:
+                    answer = task.result()
+                except Exception:
+                    answer = None
+                if not answer:
+                    continue
+                if answer[2] == reddit_signals.LISTING_HTML:
+                    result = result or answer
+                elif fallback is None:
+                    fallback = answer
+                    fallback_deadline = loop.time() + LISTING_HTML_GRACE_SECONDS
+            if result is not None or not (pending & html_tasks):
+                break                      # settled, or no HTML can still land
+    finally:
+        for task in pending:
+            task.cancel()
+
+    if result is not None:
+        logging.info(f"MODQUEUE-LISTING: r/{subreddit} /new listing via html "
+                     f"({len(result[0])} entries) — API-backed, proves release.")
+    else:
+        result = fallback
+        if result is not None:
+            logging.info(f"MODQUEUE-LISTING: r/{subreddit} /new listing via rss "
+                         f"({len(result[0])} entries) — carries queued posts, "
+                         f"cannot prove release (round 46).")
 
     if result is None:
         logging.info(f"MODQUEUE-LISTING: r/{subreddit} /new listing unavailable "
@@ -559,11 +615,11 @@ async def _fetch_new_listing(session, subreddit):
 def _listing_confirms_post(listing, post_id: str) -> bool:
     if not listing or not post_id:
         return False
-    listing_ids, _listing_oldest_age = listing
-    return listing_ids is not None and post_id.lower() in listing_ids
+    listing_ids, _listing_oldest_age, listing_source = _listing_parts(listing)
+    return reddit_signals.listing_proves_release(listing_ids is not None and post_id.lower() in listing_ids, listing_source)
 
 
-async def mod_queue_reason(session, subreddit, path, label=""):
+async def mod_queue_reason(session, subreddit, path, label="", post_age_seconds=None):
     pages = await asyncio.gather(*[_fetch_redlib_post_page(session, inst, path) for inst in REDDIT_RSS_INSTANCES])
     # Preserve the round-37 positive signal wherever it was rendered. For a
     # zero-comment native queue post, prefer a page that actually exposes a
@@ -573,12 +629,41 @@ async def mod_queue_reason(session, subreddit, path, label=""):
         page = next((h for h in pages if h and _redlib_ages_seconds(h)), None)
     if page is None:
         page = next((h for h in pages if h), None)
-    if not page:
-        return None
     listing = await _fetch_new_listing(session, subreddit)
-    listing_ids, listing_oldest_age = (None, None) if listing is None else listing
-    return mod_queue_decision(page, listing_ids, extract_post_id(path) or "",
-                              listing_oldest_age=listing_oldest_age)
+    listing_ids, listing_oldest_age, listing_source = _listing_parts(listing)
+    post_id = extract_post_id(path) or ""
+
+    # ---- ROUND 46b: decide even when NO instance rendered the post page ---
+    # Before this, an unrenderable post was posted. But "no mirror can show
+    # this post" is itself meaningful while the post is young, and a queued
+    # post is exactly the kind a mirror cannot render.
+    if not page:
+        if reddit_signals.listing_proves_release(
+                listing_ids is not None and post_id.lower() in listing_ids,
+                listing_source):
+            return None                       # API-backed listing: it is public
+        if (listing_source == reddit_signals.LISTING_HTML
+                and listing_ids is not None and listing_oldest_age is not None
+                and post_age_seconds is not None
+                and post_age_seconds < float(listing_oldest_age)):
+            # A readable public listing that SHOULD still show this post does
+            # not: round 38d's negative space, without needing a page.
+            logging.info(f"MODQUEUE: {label} absent from a readable /new listing "
+                         f"and no mirror renders it — holding.")
+            return "pending approval"
+        if (MOD_QUEUE_WEAK_GRACE_SECONDS > 0
+                and (post_age_seconds is None
+                     or post_age_seconds < MOD_QUEUE_WEAK_GRACE_SECONDS)):
+            # No page and no listing that can prove release: hold this young
+            # post one more tick rather than guess. Bounded by the grace.
+            logging.info(f"MODQUEUE: {label} no post page and no API-backed "
+                         f"listing — holding (within the grace window).")
+            return "pending approval"
+        return None
+    return mod_queue_decision(page, listing_ids, post_id,
+                              listing_oldest_age=listing_oldest_age,
+                              listing_source=listing_source,
+                              post_age_seconds=post_age_seconds)
 
 # ---------------------------------------------------------------------------
 # ■ RSS SOURCES
@@ -3553,7 +3638,7 @@ async def retract_dead_posts(session, posted_messages: dict, now: float) -> None
         path = record.get("path") or ""
         post_id = extract_post_id(path) or unique_key.rsplit("_", 1)[-1]
         listing = await _fetch_new_listing(session, subreddit)
-        listing_ids, listing_oldest_age = (None, None) if listing is None else listing
+        listing_ids, listing_oldest_age, _listing_source = _listing_parts(listing)
         reason = await live_removal_reason(session, path, label=f"retract {unique_key}")
         decision = reddit_signals.retraction_decision(
             enabled=RETRACT_DEAD_POSTS,
@@ -4152,7 +4237,7 @@ async def main():
                     logging.info(f"MODQUEUE: {unique_key} — confirmed in /new; "
                                  f"skipping mod-queue instance checks")
                 else:
-                    _mq = await mod_queue_reason(session, subreddit, path, unique_key)
+                    _mq = await mod_queue_reason(session, subreddit, path, unique_key, post_age_seconds=now - published_ts)
                     if not _mq:
                         logging.info(f"MODQUEUE: {unique_key} — no queue hold — proceeding")
                     if _mq:

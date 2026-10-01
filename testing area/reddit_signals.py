@@ -402,3 +402,38 @@ def tombstone_payload(payload: dict, reason: str | None = None) -> dict:
         else:
             components.insert(0, {"type": 10, "content": notice})
     return out
+
+
+# Round 46: listing provenance. Reddit RSS includes posts awaiting moderation;
+# only an API-backed HTML listing can prove public release.
+LISTING_HTML = "html"
+LISTING_RSS = "rss"
+PENDING_APPROVAL = "pending approval"
+
+def listing_proves_release(in_listing, listing_source: str = LISTING_HTML) -> bool:
+    return in_listing is True and listing_source != LISTING_RSS
+
+def queue_verdict(*, strong_hold_text=False, weak_hold_text=False,
+                  in_listing=None, listing_source=LISTING_HTML,
+                  listing_oldest_age=None, page_age_seconds=None,
+                  post_age_seconds=None, tail_margin_seconds=0,
+                  weak_grace_seconds=0):
+    if listing_proves_release(in_listing, listing_source):
+        return None
+    if strong_hold_text:
+        return PENDING_APPROVAL
+    if weak_hold_text:
+        try:
+            age = float(post_age_seconds)
+        except (TypeError, ValueError):
+            age = None
+        if age is None or age < float(weak_grace_seconds or 0):
+            return PENDING_APPROVAL
+    if listing_source == LISTING_RSS or in_listing is None or listing_oldest_age is None:
+        return None
+    try:
+        page_age = float(page_age_seconds)
+        span = float(listing_oldest_age)
+    except (TypeError, ValueError):
+        return None
+    return PENDING_APPROVAL if page_age < span + float(tail_margin_seconds or 0) else None
