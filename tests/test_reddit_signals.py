@@ -406,6 +406,8 @@ with open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="
     _wf = fh.read()
 with open(os.path.join(ROOT, ".github/workflows/ci.yml"), encoding="utf-8") as fh:
     _ci = fh.read()
+with open(os.path.join(ROOT, ".github/workflows/twitter_monitor.yml"), encoding="utf-8") as fh:
+    _twitter_wf = fh.read()
 check("static signal module has no aiohttp", "aiohttp" not in inspect.getsource(signals))
 check("static V3 imports reddit_signals", "reddit_signals" in _v3_src)
 check("static verified settle variable", "POST_SETTLE_VERIFIED_SECONDS" in _v3_src)
@@ -421,6 +423,17 @@ check("workflow wires POST_SETTLE_VERIFIED_SECONDS", "POST_SETTLE_VERIFIED_SECON
 check("workflow wires NSFW_PAGE_FALLBACK", "NSFW_PAGE_FALLBACK" in _wf)
 check("workflow wires REPOST_WINDOW_SECONDS", "REPOST_WINDOW_SECONDS" in _wf)
 check("workflow persists posted_messages", "posted_messages.json" in _wf)
+for _r52_name in (
+    "PROXY_MEDIA", "PROXY_WARMUP_POST", "EMBEDDIT_INSTANCE",
+    "YOUTUBE_LINK_MESSAGE", "DISCOHOOK_PREVIEW", "REDDIT_OP_COMMENT",
+    "YOUTUBE_MEDIA_EMBED", "FEEDTOKEN_JSON_STAGGER",
+    "PENDING_RECHECK_SECONDS", "APPROVAL_RECHECK_SECONDS",
+    "MAX_CACHE_SIZE_PER_SUB", "MAX_CACHE_SIZE_TOTAL", "MAX_POSTS_PER_RUN",
+):
+    check(f"r52 workflow maps {_r52_name} as a Variable",
+          f"{_r52_name}: ${{{{ vars.{_r52_name} }}}}" in _wf)
+check("r52 X workflow maps MAX_CACHE_SIZE_PER_ACCOUNT as a Variable",
+      "MAX_CACHE_SIZE_PER_ACCOUNT: ${{ vars.MAX_CACHE_SIZE_PER_ACCOUNT }}" in _twitter_wf)
 check("ci runs this suite", "python tests/test_reddit_signals.py" in _ci)
 
 

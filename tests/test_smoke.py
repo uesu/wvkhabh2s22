@@ -3662,7 +3662,8 @@ _r49b_names = (
     "MEDIA_HEAL_DELAY_SECONDS", "MEDIA_HEAL_ATTEMPTS",
     "MAX_CACHE_SIZE_PER_SUB", "MAX_POSTS_PER_RUN",
     "PENDING_RECHECK_SECONDS", "APPROVAL_RECHECK_SECONDS",
-    "FEEDTOKEN_JSON_STAGGER",
+    "FEEDTOKEN_JSON_STAGGER", "PROXY_MEDIA", "YOUTUBE_LINK_MESSAGE",
+    "DISCOHOOK_PREVIEW", "REDDIT_OP_COMMENT", "NSFW_PAGE_FALLBACK",
 )
 check("r49b: no direct numeric os.getenv conversion remains",
       not any(re.search(r"(?:int|float)\(os\.getenv", open(os.path.join(ROOT, p)).read())
@@ -3693,6 +3694,13 @@ try:
            _r49b_reddit.APPROVAL_RECHECK_SECONDS) == (25, 1800, 300))
     check("r49b: reddit_main_v3 empty feed stagger uses default",
           _r49b_reddit.FEEDTOKEN_JSON_STAGGER == 65)
+    check("r52: empty true-by-default Variables keep their defaults",
+          (_r49b_reddit.PROXY_MEDIA,
+           _r49b_reddit.YOUTUBE_LINK_MESSAGE,
+           _r49b_reddit.DISCOHOOK_PREVIEW,
+           _r49b_reddit.INCLUDE_OP_COMMENT,
+           _r49b_reddit.NSFW_PAGE_FALLBACK)
+          == (True, True, True, True, True))
 finally:
     for _name, _value in _r49b_saved_env.items():
         if _value is None:
