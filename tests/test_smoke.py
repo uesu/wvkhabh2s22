@@ -284,6 +284,47 @@ check("proxy: og:video captured",
       str(meta.get("og:video:secure_url", "")).startswith("https://vxreddit.com/redditvideo.mp4"),
       str(meta.get("og:video:secure_url")))
 
+# r51: vxReddit sometimes returns an HTTP-200 shell for a crosspost's own
+# URL. Its media-less generic title is not post data and must fall through to
+# the next source; a real media result still remains usable.
+class _R51VxResponse:
+    status = 200
+
+    def __init__(self, page):
+        self.page = page
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def text(self, **kwargs):
+        return self.page
+
+
+class _R51VxSession:
+    def __init__(self, page):
+        self.page = page
+
+    def get(self, *args, **kwargs):
+        return _R51VxResponse(self.page)
+
+
+_r51_vx_placeholder = asyncio.run(proxy._fetch_vxreddit(
+    _R51VxSession('<meta property="og:title" content="  VxReDdIt  ">'),
+    "/r/u_aphotide/comments/1wuv4j8/title/", label="r51"))
+check("r51 proxy: media-less case-insensitive vxReddit title is a fetch miss",
+      _r51_vx_placeholder is None, str(_r51_vx_placeholder))
+_r51_vx_media = asyncio.run(proxy._fetch_vxreddit(
+    _R51VxSession('<meta property="og:title" content="vxReddit">'
+                  '<meta property="og:image" content="https://i.redd.it/real.jpg">'),
+    "/r/u_aphotide/comments/1wuv4j8/title/", label="r51"))
+check("r51 proxy: generic title with actual media stays usable",
+      _r51_vx_media is not None and _r51_vx_media["media"] == [
+          {"kind": "image", "url": "https://i.redd.it/real.jpg"}],
+      str(_r51_vx_media))
+
 # 7.3 stats-line parsing (both service formats)
 st = proxy.parse_icon_stats("💬 152  🔁 0  💜 573  👀 0")
 check("proxy: redditez icon stats", st == {"comments": 152, "ups": 573}, str(st))
@@ -1525,6 +1566,19 @@ check('r28 guard: V2 loop compares before showing the block',
       "translation_is_identical(original_text, translated_text)" in src_v2
       and "language mis-detection" in src_v2 and "posting as-is" in src_v2)
 
+# r51: TEST_TWEET_ID remains subject to the normal cache.  A matching cached
+# test ID must now explain its intentional skip, but must retain `continue`
+# so no already-posted tweet can be sent again.
+for _r51_label, _r51_source in (("V3", src_v3), ("V2", src_v2)):
+    _r51_cache_branch = _r51_source.split("if unique_key in posted_urls:", 1)[1] \
+                                     .split("published_parsed =", 1)[0]
+    check(f"r51 {_r51_label}: cached TEST_TWEET_ID logs an intentional skip",
+          "TEST_TWEET_ID is already in the" in _r51_cache_branch
+          and "posted cache — skipping by design" in _r51_cache_branch,
+          _r51_cache_branch)
+    check(f"r51 {_r51_label}: cached TEST_TWEET_ID keeps dedup continue",
+          _r51_cache_branch.rstrip().endswith("continue"), _r51_cache_branch)
+
 # 5b. non-ASCII hashtags get percent-encoded (clickable) URLs
 check('r28 linkify: pure-ASCII tag byte-identical (zero regression)',
       v3r.linkify_text("#Claret") == "[#Claret](https://x.com/hashtag/Claret)")
@@ -1650,6 +1704,23 @@ check("r29 header: no crosspost -> no 🔁 line",
           "AnantaLeaks", dict(_R29_BASE, crosspost=None),
           "https://www.reddit.com/r/AnantaLeaks/comments/1abc/", 1789749533)
           ["components"][0]["components"][0]["content"])
+
+# r51: Reddit profile crossposts have three public permalink shapes. They
+# must all advertise the canonical profile, while r/<sub> cards keep the
+# exact legacy behavior asserted above.
+_R51_PROFILE_LINE = ("*🔁 Crosspost of [u/aphotide]"
+                     "(https://www.reddit.com/user/aphotide/) Profile*")
+for _r51_name, _r51_crosspost in (
+    ("/user", {"url": "https://www.reddit.com/user/aphotide/comments/1wuv4j8/title/",
+                "path": "/user/aphotide/comments/1wuv4j8/title/"}),
+    ("/u", {"url": "https://www.reddit.com/u/aphotide/comments/1wuv4j8/title/",
+             "path": "/u/aphotide/comments/1wuv4j8/title/"}),
+    ("/r/u_", {"url": "https://www.reddit.com/r/u_aphotide/comments/1wuv4j8/title/",
+                "path": "/r/u_aphotide/comments/1wuv4j8/title/"}),
+):
+    check(f"r51 header: profile crosspost {_r51_name} uses canonical profile Markdown",
+          _R51_PROFILE_LINE in _r29_header(_r51_crosspost),
+          _r29_header(_r51_crosspost))
 
 
 # ---- round 30 (2026-09-19): pending-post recheck cache --------------------
