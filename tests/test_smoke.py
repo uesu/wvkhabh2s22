@@ -1714,7 +1714,7 @@ _r30_main = inspect.getsource(v3.main)
 check("r30 main: pending cache loaded next to the dedup cache",
       "pending = load_pending()" in _r30_main)
 _r30_throttle = _r30_main.split("pending-post recheck throttle", 1)[-1].split(
-    "# ---- round 35 (2026-09-28): NSFW content gate", 1)[0]
+    "# ---- round 42/45: fail-closed NSFW content gate", 1)[0]
 for _cond in ("not TEST_POST_ID", "not DRY_RUN", "unique_key in pending",
               "_pending_throttle_skip(pending, unique_key, now, entry)"):
     check(f"r30 throttle keeps condition: {_cond} (round 32: the due-decision "
@@ -1725,12 +1725,13 @@ check("r30 throttle: skips with `continue` and never caches as posted",
 check("r30 throttle runs BEFORE any network work (the whole point)",
       _r30_main.index("pending-post recheck throttle")
       < _r30_main.index("post_json = await fetch_post_json"))
-check("r30/r35/r36 gates: all six skip paths record a pending entry",
-      _r30_main.count("mark_pending(pending, unique_key") == 6
-      and "mark_pending(pending, unique_key, reason, now)" in _r30_main
+check("r30/r35/r36/r43 gates: all skip paths record a pending entry",
+      _r30_main.count("mark_pending(pending, unique_key") == 7
+      and "mark_pending(pending, unique_key, reason, now" in _r30_main
       and 'mark_pending(pending, unique_key, "media_wait", now)' in _r30_main
       and 'mark_pending(pending, unique_key, "partial_gallery", now)' in _r30_main
-      and 'mark_pending(pending, unique_key, "duplicate_media", now' in _r30_main,
+      and 'mark_pending(pending, unique_key, "duplicate_media", now' in _r30_main
+      and 'mark_pending(pending, unique_key, "duplicate_repost", now' in _r30_main,
       str(_r30_main.count("mark_pending(pending, unique_key")))
 check("r30 posted: a successful post clears the pending entry",
       "pending.pop(unique_key, None)" in _r30_main)
@@ -1847,14 +1848,15 @@ check("r32: media_wait keeps the round-30 30-min throttle (+60 s skipped, +30 mi
 check("r32: unknown/missing reason falls back to the round-30 30-min throttle",
       v3._pending_throttle_skip(_r32_pend(None), "k", 1060.0, _r32_arctic) is True
       and v3._pending_throttle_skip(_r32_pend(None), "k", 2800.0, _r32_arctic) is False)
-check("r32/r35/r36: no-recheck set is exactly removal/deletion + nsfw/duplicate reasons",
+check("r32/r35/r36/r43: no-recheck set is removal/deletion + proven nsfw/duplicate reasons",
       v3._NO_RECHECK_REASONS == frozenset({
           "removal_notice", "removal notice", "title marker", "whole-body marker",
           "removed by moderator", "removed by moderators/filters", "deleted by author",
-          "nsfw_flag", "duplicate_media"}))
-check("r32: the short-recheck set is exactly the approval/transient reasons",
+          "nsfw_flag", "nsfw_subreddit", "nsfw_crosspost_source",
+          "duplicate_media", "duplicate_repost"}))
+check("r32/r42: the short-recheck set includes approval/transient + nsfw_unknown",
       v3._SHORT_RECHECK_REASONS == frozenset(
-          {"not_live", "sources_down", "pending approval"}))
+          {"not_live", "sources_down", "pending approval", "nsfw_unknown"}))
 check("r32: the mod-queue banner is recognized as 'pending approval'",
       v3.removed_post_reason("Happy Birthday Caesar | Pink Pages",
                              "Post is awaiting moderator approval.") == "pending approval")
@@ -2019,9 +2021,10 @@ check("r34b: the X run verifies its save (a missing this-run key is a loud error
       in _r34t_main_src)
 
 # ---- R35: NSFW content gate (live BopLeaks spam 1ws8huc / 1ws99dp) ------
-# The gate checks exactly Reddit's over_18 flag and "nsfw" thumbnail
-# sentinel. Spoilers use a separate field and must pass. Unknown metadata
-# fails open; flagged posts are held in pending and never sent to Discord.
+# The gate checks Reddit's over_18 flag, "nsfw" thumbnail sentinel,
+# community/source markers, and the live Redlib badge fallback. Spoilers use a
+# separate field and must pass. Unknown metadata fails closed by default;
+# flagged posts are held in pending and never sent to Discord.
 _r35_over = {"over_18": True, "thumbnail": "nsfw"}
 _r35_thumb = {"over_18": False, "thumbnail": "nsfw"}
 _r35_clean_spoiler = {"over_18": False, "thumbnail": "spoiler", "spoiler": True}
@@ -2032,8 +2035,8 @@ check("r35: the nsfw thumbnail sentinel is held even when over_18=False",
 check("r35: a clean post passes",
       v3.nsfw_gate_reason("ccc333", "author", {"over_18": False,
                                                  "thumbnail": "default"}) is None)
-check("r35: unknown metadata fails OPEN",
-      v3.nsfw_gate_reason("ddd444", "author", None) is None)
+check("r42: unknown metadata fails CLOSED",
+      v3.nsfw_gate_reason("ddd444", "author", None) == "nsfw_unknown")
 check("r35: spoiler=True is a different field and passes untouched",
       v3.nsfw_gate_reason("ccc333", "author", _r35_clean_spoiler) is None)
 _r35_original_allowlist = v3.NSFW_ALLOWLIST
@@ -2101,14 +2104,14 @@ try:
     check("r35: spoiler metadata remains clean (not confused with NSFW)",
           v3.nsfw_gate_reason("ccc333", "author", _r35_flags["ccc333"]) is None,
           str(_r35_flags))
-    check("r35: an ID absent from Arctic is unknown (fail-open)",
-          _r35_flags["ddd444"] is None, str(_r35_flags))
+    check("r42: an ID absent from Arctic is marked missing for fail-closed/live-page fallback",
+          _r35_flags["ddd444"] == {"archive_status": "missing"}, str(_r35_flags))
 
     v3._arctic_fail_count = 0
     _r35_down = asyncio.run(v3.fetch_arctic_nsfw_flags(
         _R35Session(error=RuntimeError("network down")), ["aaa111", "ccc333"]))
-    check("r35: a failed lookup makes every requested ID unknown (fail-open)",
-          _r35_down == {"aaa111": None, "ccc333": None}, str(_r35_down))
+    check("r42: a failed lookup marks every requested ID as lookup_error (fail-closed)",
+          _r35_down == {"aaa111": {"lookup_error": True}, "ccc333": {"lookup_error": True}}, str(_r35_down))
 finally:
     v3._arctic_fail_count = _r35_original_fail_count
 
@@ -2125,13 +2128,13 @@ check("r35: a no-new-post run returns before making the new lookup",
 check("r35: TEST_POST_ID explicitly bypasses both lookup and decision",
       "if TEST_POST_ID:\n            nsfw_flags = {}" in _r35_main_src
       and "if not TEST_POST_ID:\n                nsfw_post_id" in _r35_main_src)
-check("r35: a flagged post is held and logged, then exits before Discord",
-      "mark_pending(pending, unique_key, reason, now)" in _r35_main_src
+check("r42: a flagged/unknown post is held and logged, then exits before Discord",
+      "mark_pending(pending, unique_key, reason, now" in _r35_main_src
       and "NSFW GATE:" in _r35_main_src
       and "NOT posted to Discord" in _r35_main_src)
-check("r35: pass and unknown paths are visible in NSFW SCAN logs",
-      "NSFW SCAN:" in _r35_main_src and "proceeding (fail-open)" in _r35_main_src
-      and "thumbnail_nsfw" in _r35_main_src)
+check("r42/r45: pass and fail-closed fallback paths are visible in NSFW SCAN logs",
+      "NSFW SCAN:" in _r35_main_src and "fail-closed" in _r35_main_src
+      and "thumbnail_nsfw" in _r35_main_src and "live page says over_18" in _r35_main_src)
 with open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8") as _r35_f:
     _r35_workflow = _r35_f.read()
 check("r35: the optional repository Variable is wired into the live workflow",
@@ -2174,7 +2177,7 @@ check("r36: the settle gate is wired in the loop and holds fresh posts one run",
 check("r36: a same-media duplicate of an already-posted post is held, not posted", "DUP GATE:" in _r36_main_src and 'mark_pending(pending, unique_key, "duplicate_media", now' in _r36_main_src)
 check("r36: every new post logs its media decision (wiring visible in the run log)", "DUP SCAN:" in _r36_main_src)
 check("r36: a restored no-recheck post re-entering via RSS is logged loudly", "RESTORED:" in _r36_main_src)
-check("r36: the posted-history lookup is wired before the posting loop", "fetch_arctic_urls(" in _r36_main_src and _r36_main_src.index("fetch_arctic_urls(") < _r36_main_src.index(_r35_loop))
+check("r36/r43: the posted-history metadata lookup is wired before the posting loop", "fetch_arctic_post_metadata(" in _r36_main_src and _r36_main_src.index("fetch_arctic_post_metadata(") < _r36_main_src.index(_r35_loop))
 with open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8") as _r36_f: _r36_workflow = _r36_f.read()
 check("r36: the two new repository Variables are wired into the live workflow", "POST_SETTLE_SECONDS: ${{ vars.POST_SETTLE_SECONDS }}" in _r36_workflow and "DUP_MEDIA_GATE: ${{ vars.DUP_MEDIA_GATE }}" in _r36_workflow)
 
@@ -2535,6 +2538,58 @@ check("r39 Dependabot auto-merge waits for completed CI rather than an early PR 
       and "pull_request_target:" not in _r39_merge)
 check("r39 Dependabot auto-merge identifies the completed run's PR and never checks out PR code",
       "run.pull_requests" in _r39_merge and "No checkout by design" in _r39_merge)
+
+# ---- R42-R45 smoke guards: signal core wiring and defaults ----------------
+signals = load_module("smoke_reddit_signals", "testing area/reddit_signals.py")
+check("r42: signal module imports independently", signals is not None)
+check("r42: verified settle window is 60 s", signals.settle_window_seconds(True) == 60)
+check("r42: unverified settle window remains 300 s", signals.settle_window_seconds(False) == 300)
+check("r42: verified fresh post still holds under 60 s", signals.settle_holds(950, 1000, confirmed_in_new=True))
+check("r42: verified post passes after 60 s", signals.settle_holds(939, 1000, confirmed_in_new=True) is False)
+check("r42: unverified post still holds under 300 s", signals.settle_holds(701, 1000, confirmed_in_new=False))
+check("r42: V3 default verified settle variable is 60", v3.POST_SETTLE_VERIFIED_SECONDS == 60)
+check("r45: Redlib NSFW badge is detected", signals.nsfw_from_post_page('<div class="post"><small class="nsfw">NSFW</small></div>') is True)
+check("r45: Redlib spoiler badge is not NSFW", signals.nsfw_from_post_page('<div class="post"><small class="spoiler">Spoiler</small></div>') is False)
+check("r45: readable unbadged Redlib page is clean", signals.nsfw_from_post_page('<div class="post"><a href="/r/x/comments/abc/t/">t</a></div>') is False)
+check("r45: unreadable page yields unknown", signals.nsfw_from_post_page('Too Many Requests') is None)
+check("r45: V3 exposes the live-page NSFW helper", v3.nsfw_from_post_page('<div class="post"><small class="nsfw">NSFW</small></div>') is True)
+check("r45: the fallback kill switch is wired", "NSFW_PAGE_FALLBACK" in _r35_workflow)
+check("r42: missing metadata is nsfw_unknown", signals.nsfw_gate_reason("p", "a", None) == "nsfw_unknown")
+check("r42: NSFW_FAIL_OPEN restores old pass", signals.nsfw_gate_reason("p", "a", None, fail_open=True) is None)
+check("r45: missing archive + clean live page passes", signals.nsfw_gate_reason("p", "a", {"archive_status": "missing", "page_nsfw": False}) is None)
+check("r45: missing archive + live NSFW badge blocks", signals.nsfw_gate_reason("p", "a", {"archive_status": "missing", "page_nsfw": True}) == "nsfw_flag")
+check("r42: over18 subreddit blocks", signals.nsfw_gate_reason("p", "a", {"over_18": False, "subreddit_over18": True}) == "nsfw_subreddit")
+check("r42: NSFW crosspost source blocks", signals.nsfw_gate_reason("p", "a", {"over_18": False, "source_present": True, "source_over_18": True}) == "nsfw_crosspost_source")
+check("r42: NSFW crosspost source subreddit blocks", signals.nsfw_gate_reason("p", "a", {"over_18": False, "source_present": True, "source_over_18": False, "source_subreddit_over18": True}) == "nsfw_crosspost_source")
+check("r42: malformed crosspost source fails closed", signals.nsfw_gate_reason("p", "a", {"over_18": False, "source_present": True}) == "nsfw_unknown")
+check("r42: require-subreddit makes missing community metadata unknown", signals.nsfw_gate_reason("p", "a", {"over_18": False}, require_subreddit=True) == "nsfw_unknown")
+check("r42: allowlist bypass remains available", signals.nsfw_gate_reason("t3_p", "a", None, allowlist=["p"]) is None)
+_fp1 = signals.content_fingerprint("Genshin_Impact_Leaks", "LeakAuthor", "Port: Belovodye!!")
+_fp2 = signals.content_fingerprint("genshin impact leaks", "leakauthor", "Port Belovodye")
+check("r43: fingerprint normalizes case/punctuation/underscores", _fp1 == _fp2)
+check("r43: fingerprint removes zero-width characters", signals.content_fingerprint("s", "a", "A\u200bB") == signals.content_fingerprint("s", "a", "AB"))
+check("r43: unknown author fails open", signals.content_fingerprint("s", "unknown", "title") is None)
+check("r43: deleted author fails open", signals.content_fingerprint("s", "[deleted]", "title") is None)
+check("r43: empty title fails open", signals.content_fingerprint("s", "author", "") is None)
+check("r43: different title does not collide", signals.content_fingerprint("s", "a", "one") != signals.content_fingerprint("s", "a", "two"))
+check("r43: duplicate_repost_hit finds the winner", signals.duplicate_repost_hit({_fp1: "Sub_old"}, _fp2) == "Sub_old")
+check("r43: duplicate_repost_hit fails open on unknown identity", signals.duplicate_repost_hit({_fp1: "Sub_old"}, None) is None)
+check("r44: listing absence can prove dead within listing span", signals.listing_absence_proves_dead("abc", 940, 1000, {"zzz"}, 120))
+check("r44: listing presence never proves dead", signals.listing_absence_proves_dead("abc", 940, 1000, {"abc"}, 120) is False)
+check("r44: old post outside listing span is not retracted", signals.listing_absence_proves_dead("abc", 0, 1000, {"zzz"}, 120) is False)
+check("r44: retraction decision returns edit only with both proofs", signals.retraction_decision(enabled=True, mode="edit", post_id="abc", published_ts=940, now=1000, listing_ids={"zzz"}, listing_oldest_age=120, live_removal_reason="removed") == "edit")
+check("r44: no live removal proof means no retraction", signals.retraction_decision(enabled=True, mode="edit", post_id="abc", published_ts=940, now=1000, listing_ids={"zzz"}, listing_oldest_age=120, live_removal_reason=None) is None)
+check("r44: disabled retraction stays off", signals.retraction_decision(enabled=False, mode="edit", post_id="abc", published_ts=940, now=1000, listing_ids={"zzz"}, listing_oldest_age=120, live_removal_reason="removed") is None)
+_tomb = signals.tombstone_payload({"components": [{"type": 17, "accent_color": 16729344, "components": [{"type": 10, "content": "header"}]}]}, "removed")
+check("r44: tombstone prepends a notice", "no longer live" in _tomb["components"][0]["components"][0]["content"])
+check("r44: tombstone greys the accent", _tomb["components"][0]["accent_color"] == 0x808080)
+with open(os.path.join(ROOT, ".github/workflows/ci.yml"), encoding="utf-8") as _fh:
+    _r42_ci = _fh.read()
+check("r42: CI runs the pure signal suite", "python tests/test_reddit_signals.py" in _r42_ci)
+check("r42: workflow wires NSFW_FAIL_OPEN", "NSFW_FAIL_OPEN: ${{ vars.NSFW_FAIL_OPEN }}" in _r35_workflow)
+check("r44: workflow persists posted_messages only when present", "posted_messages.json" in _r35_workflow and "-f posted_messages.json" in _r35_workflow)
+check("r44: wait=true is conditional on retraction", "&wait=true" in _r35_main_src and "RETRACT_DEAD_POSTS" in _r35_main_src)
+check("r42: signal module is side-effect-free (no aiohttp import)", "aiohttp" not in inspect.getsource(signals))
 
 print()
 if failures:
