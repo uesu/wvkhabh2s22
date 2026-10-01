@@ -25,6 +25,7 @@ Purpose (also used by CI as the safety gate for Dependabot PRs):
      wrapper URLs collapses to a single gallery tile.
 """
 import os
+import re
 import sys
 import json
 import time
@@ -3505,6 +3506,60 @@ finally:
         setattr(_r49_replay, "_fetch_" + _n, _f)
 check("r49 replay: the 20-tile card is exactly MEDIA_CAP_ITEMS, uncapped",
       len(_R49_CARDS["1wkj08n"]["urls"]) == _r49_replay.MEDIA_CAP_ITEMS)
+
+
+# ===========================================================================
+# ROUND 49b — GitHub repository Variables that are unset are injected as an
+# empty string. Every numeric setting must import safely and retain its default.
+# ===========================================================================
+_r49b_files = [
+    "testing area/reddit_proxy.py",
+    "testing area/twitter_v3.py",
+    "testing area/reddit_main_v3.py",
+]
+_r49b_names = (
+    "PROXY_WAVE_DELAY", "PROXY_GALLERY_GRACE", "PROXY_MAX_CONCURRENCY",
+    "MAX_CACHE_SIZE_PER_ACCOUNT", "MAX_CACHE_SIZE_TOTAL",
+    "MEDIA_HEAL_DELAY_SECONDS", "MEDIA_HEAL_ATTEMPTS",
+    "MAX_CACHE_SIZE_PER_SUB", "MAX_POSTS_PER_RUN",
+    "PENDING_RECHECK_SECONDS", "APPROVAL_RECHECK_SECONDS",
+    "FEEDTOKEN_JSON_STAGGER",
+)
+check("r49b: no direct numeric os.getenv conversion remains",
+      not any(re.search(r"(?:int|float)\(os\.getenv", open(os.path.join(ROOT, p)).read())
+              for p in _r49b_files))
+_r49b_saved_env = {name: os.environ.get(name) for name in _r49b_names}
+try:
+    os.environ.update({name: "" for name in _r49b_names})
+    _r49b_proxy = load_module("smoke_reddit_proxy_empty_env", _r49b_files[0])
+    check("r49b: reddit_proxy imports with empty numeric Variables", True)
+    check("r49b: reddit_proxy empty Variables use defaults",
+          (_r49b_proxy.PROXY_WAVE_DELAY, _r49b_proxy.PROXY_GALLERY_GRACE,
+           _r49b_proxy.PROXY_MAX_CONCURRENCY) == (0.5, 1.5, 8))
+    _r49b_twitter = load_module("smoke_twitter_v3_empty_env", _r49b_files[1])
+    check("r49b: twitter_v3 imports with empty numeric Variables", True)
+    check("r49b: twitter_v3 empty cache Variables use defaults",
+          (_r49b_twitter.MAX_CACHE_SIZE_PER_ACCOUNT,
+           _r49b_twitter.MAX_CACHE_SIZE_TOTAL) == (250, 10000))
+    check("r49b: twitter_v3 empty media-heal Variables use defaults",
+          (_r49b_twitter.MEDIA_HEAL_DELAY_SECONDS,
+           _r49b_twitter.MEDIA_HEAL_ATTEMPTS) == (45, 2))
+    _r49b_reddit = load_module("smoke_reddit_v3_empty_env", _r49b_files[2])
+    check("r49b: reddit_main_v3 imports with empty numeric Variables", True)
+    check("r49b: reddit_main_v3 empty cache Variables use defaults",
+          (_r49b_reddit.MAX_CACHE_SIZE_PER_SUB,
+           _r49b_reddit.MAX_CACHE_SIZE_TOTAL) == (250, 10000))
+    check("r49b: reddit_main_v3 empty scheduling Variables use defaults",
+          (_r49b_reddit.MAX_POSTS_PER_RUN, _r49b_reddit.PENDING_RECHECK_SECONDS,
+           _r49b_reddit.APPROVAL_RECHECK_SECONDS) == (25, 1800, 300))
+    check("r49b: reddit_main_v3 empty feed stagger uses default",
+          _r49b_reddit.FEEDTOKEN_JSON_STAGGER == 65)
+finally:
+    for _name, _value in _r49b_saved_env.items():
+        if _value is None:
+            os.environ.pop(_name, None)
+        else:
+            os.environ[_name] = _value
 
 
 if failures:
