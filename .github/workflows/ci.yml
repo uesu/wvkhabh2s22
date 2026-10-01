@@ -36,3 +36,6 @@ jobs:
 
       - name: Offline smoke test (no network, no secrets needed)
         run: python tests/test_smoke.py
+
+      - name: Reddit signal unit tests (pure, no network)
+        run: python tests/test_reddit_signals.py

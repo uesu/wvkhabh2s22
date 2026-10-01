@@ -119,9 +119,18 @@ jobs:
           # Round 35: optional comma-separated author names / post IDs that
           # bypass the NSFW content gate. Empty means no exceptions.
           NSFW_ALLOWLIST: ${{ vars.NSFW_ALLOWLIST }}
-          # Round 36: settle window and duplicate-media gate (empty = code defaults: 300 s / on).
+          # Round 42-45: evidence-based settle, fail-closed NSFW, repost gate and optional retraction.
+          POST_SETTLE_VERIFIED_SECONDS: ${{ vars.POST_SETTLE_VERIFIED_SECONDS }}
           POST_SETTLE_SECONDS: ${{ vars.POST_SETTLE_SECONDS }}
+          NSFW_FAIL_OPEN: ${{ vars.NSFW_FAIL_OPEN }}
+          NSFW_REQUIRE_SUBREDDIT: ${{ vars.NSFW_REQUIRE_SUBREDDIT }}
+          NSFW_PAGE_FALLBACK: ${{ vars.NSFW_PAGE_FALLBACK }}
           DUP_MEDIA_GATE: ${{ vars.DUP_MEDIA_GATE }}
+          REPOST_GATE: ${{ vars.REPOST_GATE }}
+          REPOST_WINDOW_SECONDS: ${{ vars.REPOST_WINDOW_SECONDS }}
+          RETRACT_DEAD_POSTS: ${{ vars.RETRACT_DEAD_POSTS }}
+          RETRACT_MODE: ${{ vars.RETRACT_MODE }}
+          RETRACT_WINDOW_SECONDS: ${{ vars.RETRACT_WINDOW_SECONDS }}
           MOD_QUEUE_GATE: ${{ vars.MOD_QUEUE_GATE }}
           MOD_QUEUE_WINDOW_SECONDS: ${{ vars.MOD_QUEUE_WINDOW_SECONDS }}
           WEBHOOK_REDDIT_ZENLESSZONEZEROLEAKS_: ${{ secrets.WEBHOOK_REDDIT_ZENLESSZONEZEROLEAKS_ }}
@@ -160,11 +169,14 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add -f posted_reddit.json proxy_health.json pending_reddit.json
+          if [ -f posted_messages.json ]; then
+            git add -f posted_messages.json
+          fi
 
           if git diff --cached --quiet; then
             echo "No cache changes to push."
           else
-            if ! git commit -m "auto: update posted_reddit.json + proxy_health.json + pending_reddit.json caches"; then
+            if ! git commit -m "auto: update reddit monitor caches"; then
               echo "::error::CACHE COMMIT FAILED — dedup cache was not persisted; rerun this monitor after resolving the repository state."
               exit 1
             fi
