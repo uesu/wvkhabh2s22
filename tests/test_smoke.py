@@ -745,9 +745,12 @@ proxy._fetch_redditez, proxy._fetch_vxreddit, proxy._fetch_embeddit = (
     _nv_rr, _r23_text_only, _r23_dead)
 _r23c = asyncio.run(proxy.fetch_proxy_post(None, "/r/Sub/comments/abc/",
                                            label="t", health={}))
-check("r23 all text-only: the FIRST text-only result is the body/stats fallback",
-      _r23c and _r23c["service"] == "redditez"
-      and _r23c["stats"] == {"ups": 1, "comments": 2}, str(_r23c))
+# Round 49: the services are asked concurrently, so "first" is no longer an
+# arrival order — the body/stats fallback is the HIGHEST-PRIORITY text-only
+# answer (vxreddit, which is also the one that parses author + stats).
+check("r49 all text-only: the highest-priority text-only result is the fallback",
+      _r23c and _r23c["service"] == "vxreddit"
+      and _r23c["stats"] == {"ups": 12, "comments": 3}, str(_r23c))
 
 proxy._fetch_redditez, proxy._fetch_vxreddit, proxy._fetch_embeddit = (_r23_dead,) * 3
 _r23d = asyncio.run(proxy.fetch_proxy_post(None, "/r/Sub/comments/abc/",
@@ -1404,36 +1407,43 @@ async def _r25_proxy_checks():
                                                need_video=need_video, health=health)
         return winner, calls, results
     try:
+        # ROUND 49: the services are dispatched CONCURRENTLY, so `calls`
+        # has no deterministic order any more — assert the SET of services
+        # that were actually asked, and the tie-break by PROXY_SERVICES rank.
         winner, calls, results = await run((1, 1, 13))
         check('r25 1wj0p83: embeddit wins with all 13 items',
-              winner == results[2] and len(winner['media']) == 13 and len(calls) == 3)
+              winner == results[2] and len(winner['media']) == 13
+              and sorted(calls) == sorted(names))
         check('r25 winner preserves source image order', winner['media'] == results[2]['media'])
         winner, calls, results = await run((0, 1, 13))
         check('r25 text/partial/full: embeddit wins after text-only redditez',
-              winner == results[2] and calls == list(names))
+              winner == results[2] and sorted(calls) == sorted(names))
         winner, _, results = await run((0, 2, 0), need_video=True)
-        check('r25 need_video: no video keeps first non-video fallback', winner is results[0])
+        check('r49 need_video: the fallback is the highest-priority non-video answer',
+              winner is results[1], str(winner))
         winner, calls, results = await run((25, 13, 1))
-        check('r25 over-cap: 25 items trimmed to 20 and chain stops',
+        check('r25 over-cap: 25 items trimmed to 20 and the chain stops',
               winner['service'] == 'redditez' and len(winner['media']) == 20
-              and calls == ['redditez'])
+              and 'embeddit' not in calls, str(calls))
         check('r25 cap preserves order and leaves original result untouched',
               winner is not results[0] and len(results[0]['media']) == 25
               and winner['media'] == results[0]['media'][:20]
               and winner['media'] is not results[0]['media'])
         winner, _, results = await run((2, 2, 1))
-        check('r25 equal counts preserve priority', winner == results[0])
+        check('r49 equal counts keep the higher-PRIORITY service (vxreddit)',
+              winner == results[1], str(winner))
         winner, _, results = await run((0, 0, 0))
-        check('r25 text-only fallback remains first', winner == results[0])
+        check('r49 text-only fallback is the highest-priority one', winner == results[1])
         winner, _, results = await run((13, 1, 20), video=True, need_video=True)
         check('r25 need_video: video beats larger thumbnail lists', winner == results[1])
         winner, calls, results = await run((20, 1, 13))
-        check('r25 capacity: later services never called',
-              winner == results[0] and calls == ['redditez'])
+        check('r25 capacity: the delayed service is never dispatched',
+              winner == results[0] and 'embeddit' not in calls, str(calls))
         winner, calls, results = await run((1, 2, 13), health={'embeddit': {'ok': False}})
         check('r25 health: marked-down service skipped', winner == results[1] and len(calls) == 2)
         winner, calls, results = await run((1, 2, 13), health={n: {'ok': False} for n in names})
-        check('r25 health: all down retries every service', winner == results[2] and len(calls) == 3)
+        check('r25 health: all down retries every service',
+              winner == results[2] and sorted(calls) == sorted(names))
     finally:
         for name, original in zip(names, saved):
             setattr(proxy, '_fetch_' + name, original)
@@ -2898,7 +2908,7 @@ check("r47: an ordinary post has exactly ONE route (no extra fetches)",
       == ["/r/AnantaLeaks/comments/1wuv547/"])
 check("r47: 1wuv547 — the crosspost's ORIGINAL profile post is now found",
       v3.find_crosspost_original_path(
-          'crossposted this from <a href="/user/aphotide/comments/1wuv4j8/musor_drop_via_aphiode/">'
+          'crossposted this from <a href="/user/aphotide/comments/1wuv4j8/musor_drop_via_aphotide/">'
           'u/aphotide</a>', "/r/AnantaLeaks/comments/1wuv547/")
       == "/user/aphotide/comments/1wuv4j8/")
 check("r47: a crosspost of a normal subreddit post still resolves (round 14 kept)",
@@ -2965,6 +2975,536 @@ check("r48b: every delivery logs its end-to-end latency",
 check("r48b: a held post also logs WHAT held it and for how long",
       "held {_held / 60:.1f}min as" in _r48b_src
       and "_pend_entry = pending.pop(unique_key, None)" in _r48b_src)
+
+
+# ===========================================================================
+# ROUND 48c (2026-10-01) — PROXY AUDIT for PROFILE POSTS (redditez chain)
+# You verified by hand that https://www.redditez.com/user/aphotide/comments/
+# 1wuv4j8/ and the vxreddit equivalent both render that post WITH its video.
+# This sandbox has no network egress, so these checks exercise the real
+# module against fake sessions: URL construction, parsing, the service
+# chain, need_video, and the health skip — for a PROFILE path specifically.
+# ===========================================================================
+import re as _r48c_re
+_r48c_proxy = load_module("smoke_reddit_proxy_r48c", "testing area/reddit_proxy.py")
+_R48C_PATH = "/user/aphotide/comments/1wuv4j8/musor_drop_via_aphotide/"
+_R48C_VIDEO = "https://embedez.com/api/v1/media/video/abc123.mp4"
+
+
+class _R48cResp:
+    def __init__(self, status=200, text="", payload=None):
+        self.status = status
+        self._text = text
+        self._payload = payload
+
+    async def text(self, *a, **kw):
+        return self._text
+
+    async def json(self, *a, **kw):
+        return self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def _r48c_og(video=None, images=(), title="musor drop via aphotide",
+             site_name="", description=""):
+    tags = [f'<meta property="og:title" content="{title}">']
+    if video:
+        tags.append(f'<meta property="og:video" content="{video}">')
+    for img in images:
+        tags.append(f'<meta property="og:image" content="{img}">')
+    if site_name:
+        tags.append(f'<meta property="og:site_name" content="{site_name}">')
+    if description:
+        tags.append(f'<meta property="og:description" content="{description}">')
+    return "<html><head>" + "".join(tags) + "</head></html>"
+
+
+class _R48cSession:
+    """Fake HTTP: records every URL, answers per service."""
+
+    def __init__(self, redditez="video", vxreddit="video", embeddit="video"):
+        self.urls = []
+        self.modes = {"redditez": redditez, "vxreddit": vxreddit,
+                      "embeddit": embeddit}
+
+    def get(self, url, params=None, headers=None, **kw):
+        self.urls.append((url, dict(params or {}), (headers or {}).get("User-Agent", "")))
+        mode_rez = self.modes["redditez"]
+        if "providers/search" in url:                      # redditez step 1
+            if mode_rez == "down":
+                return _R48cResp(503, "")
+            return _R48cResp(200, payload={"data": {"key": "k-1wuv4j8"}})
+        if "embedez.com/embed/" in url:                    # redditez step 2
+            if mode_rez == "fail-marker":
+                return _R48cResp(200, "<html>Failed to Get Post</html>")
+            if mode_rez == "text-only":
+                return _R48cResp(200, _r48c_og(description="a body"))
+            return _R48cResp(200, _r48c_og(video=_R48C_VIDEO))
+        if "vxreddit.com" in url:
+            mode = self.modes["vxreddit"]
+            if mode == "redirect":
+                return _R48cResp(302, "")
+            if mode == "down":
+                return _R48cResp(500, "")
+            return _R48cResp(200, _r48c_og(
+                video="https://www.vxreddit.com/redditvideo.mp4",
+                site_name="u/aphotide on r/u_aphotide - \u2b06\ufe0f 1 | \U0001f4ac 1"))
+        # embeddit
+        if self.modes["embeddit"] == "down":
+            return _R48cResp(500, "")
+        return _R48cResp(200, payload={
+            "content": "<p>musor drop via aphotide</p>",
+            "media_attachments": [{"type": "video",
+                                   "url": "https://embeddit.deltandy.me/v.mp4"}],
+            "account": {"username": "aphotide"},
+        })
+
+
+def _r48c_run(**kw):
+    sess = _R48cSession(**kw)
+    res = asyncio.run(_r48c_proxy.fetch_proxy_post(sess, _R48C_PATH,
+                                                   label="1wuv4j8",
+                                                   need_video=True))
+    return res, sess
+
+
+_r48c_res, _r48c_sess = _r48c_run()
+check("r49: wave 1 dispatches vxreddit AND redditez together, on the canonical path",
+      any(u.startswith(_r48c_proxy.VXREDDIT_BASE) and u.endswith(_R48C_PATH)
+          for u, _, _ in _r48c_sess.urls)
+      and any(u == _r48c_proxy.REDDITEZ_SEARCH_ENDPOINT
+              and p.get("url") == "https://www.reddit.com" + _R48C_PATH
+              for u, p, _ in _r48c_sess.urls),
+      str([u for u, _, _ in _r48c_sess.urls]))
+check("r48c: redditez is queried with Discord's bot UA (its embed pages need it)",
+      any("Discordbot" in ua for u, _, ua in _r48c_sess.urls
+          if u == _r48c_proxy.REDDITEZ_SEARCH_ENDPOINT))
+check("r49: with both healthy the TIE goes to vxreddit (the field-proven one)",
+      _r48c_res is not None and _r48c_res["service"] == "vxreddit"
+      and [m["kind"] for m in _r48c_res["media"]] == ["video"],
+      str(_r48c_res))
+check("r48d/r49: a resolved VIDEO ends the chain — embeddit is never dispatched",
+      not any("embeddit" in u or "deltandy" in u for u, _, _ in _r48c_sess.urls),
+      str([u for u, _, _ in _r48c_sess.urls]))
+check("r49 measured: a video post dispatches 2 services, never the third",
+      len({"vx" if "vxreddit" in u else "ez" if "embedez" in u else "em"
+           for u, _, _ in _r48c_sess.urls}) == 2,
+      str([u for u, _, _ in _r48c_sess.urls]))
+check("r25/r49: gallery posts still shop every service for the most complete set",
+      "need_video and any" in inspect.getsource(_r48c_proxy.fetch_proxy_post)
+      and "_better_media" in inspect.getsource(_r48c_proxy.fetch_proxy_post)
+      and 'len(candidate["media"]) > len(best["media"])'
+      in inspect.getsource(_r48c_proxy._better_media))
+
+_r48c_res2, _r48c_sess2 = _r48c_run(redditez="fail-marker")
+check("r48c: 'Failed to Get Post' is treated as a redditez outage, not a dead post",
+      _r48c_res2 is not None and _r48c_res2["service"] == "vxreddit"
+      and _r48c_res2["media"][0]["kind"] == "video")
+check("r48c: vxreddit is asked on the SAME profile path (no rewriting needed)",
+      any(u == _r48c_proxy.VXREDDIT_BASE + _R48C_PATH
+          for u, _, _ in _r48c_sess2.urls),
+      str([u for u, _, _ in _r48c_sess2.urls]))
+check("r48c: vxreddit's stats line is parsed for a profile post too",
+      _r48c_res2.get("author") == "aphotide"
+      and (_r48c_res2.get("stats") or {}).get("ups") == 1)
+
+_r48c_res3, _ = _r48c_run(redditez="text-only")
+check("r48c: a TEXT-ONLY redditez answer never wins a video post (round 23 rule)",
+      _r48c_res3 is not None and _r48c_res3["service"] == "vxreddit"
+      and any(m["kind"] == "video" for m in _r48c_res3["media"]))
+
+_r48c_res4, _ = _r48c_run(redditez="down", vxreddit="redirect")
+check("r48c: embeddit still answers from the post id alone (path-agnostic)",
+      _r48c_res4 is not None and _r48c_res4["service"] == "embeddit"
+      and any(m["kind"] == "video" for m in _r48c_res4["media"]),
+      str(_r48c_res4))
+
+_r48c_sess5 = _R48cSession(redditez="down", vxreddit="down", embeddit="down")
+_r48c_res5 = asyncio.run(_r48c_proxy.fetch_proxy_post(_r48c_sess5, _R48C_PATH,
+                                                      label="1wuv4j8",
+                                                      need_video=True))
+check("r48c: all three down -> None, and the caller falls back to the native path",
+      _r48c_res5 is None)
+
+_r48c_sess6 = _R48cSession()
+asyncio.run(_r48c_proxy.fetch_proxy_post(
+    _r48c_sess6, _R48C_PATH, label="1wuv4j8", need_video=True,
+    health={"redditez": {"ok": False, "detail": "warm-up failed"}}))
+check("r48c: a warm-up-dead redditez is skipped for the whole run",
+      not any("embedez.com" in u for u, _, _ in _r48c_sess6.urls),
+      str([u for u, _, _ in _r48c_sess6.urls]))
+
+_r48c_sess7 = _R48cSession()
+asyncio.run(_r48c_proxy.fetch_proxy_post(
+    _r48c_sess7, _R48C_PATH, label="1wuv4j8", need_video=True,
+    health={s: {"ok": False} for s in _r48c_proxy.PROXY_SERVICES}))
+check("r48c: when ALL are marked dead every service is retried anyway",
+      any("embedez.com" in u for u, _, _ in _r48c_sess7.urls))
+
+check("r48c: embeddit's id extraction works on a profile path",
+      _r48c_proxy.status_id_encode({"type": "post", "id": "1wuv4j8", "merge": True})
+      == _r48c_proxy.status_id_encode({"type": "post", "id": "1wuv4j8", "merge": True})
+      and _r48c_re.search(r"/comments/([a-zA-Z0-9]+)/", _R48C_PATH).group(1) == "1wuv4j8")
+check("r48c: an og:video is classified as video, og:image as image/gif",
+      _r48c_proxy._media_from_og({"og:video": "https://x/v.mp4",
+                                  "og:image": ["https://i.redd.it/a.png",
+                                               "https://i.redd.it/b.gif"]})
+      == [{"kind": "video", "url": "https://x/v.mp4"},
+          {"kind": "image", "url": "https://i.redd.it/a.png"},
+          {"kind": "gif", "url": "https://i.redd.it/b.gif"}])
+check("r48c: the committed warm-up record shows all three services healthy",
+      json.load(open(os.path.join(ROOT, "proxy_health.json"), encoding="utf-8"))
+      ["services"]["redditez"]["ok"] is True)
+
+
+
+# ===========================================================================
+# ROUND 49 (2026-10-01) — PARALLEL PROXY DISPATCH
+# Evidence (prod Actions log, repo 7jkxmy9nvbc, 2026-10-01 11:55:50-51 UTC):
+#   11:55:50.681  redditez had no usable data
+#   11:55:51.098  proxy media via vxreddit - 1 item(s)     (+0.417s)
+#   11:55:51.408  embeddit returned text only              (+0.310s)
+#   11:55:51.408  proxy media winner - 1 item(s)
+# The chain was strictly serial: ~1.5s of wall time per post, and it kept
+# querying after a winner existed. Round 49 dispatches concurrently while
+# keeping every decision rule from rounds 23, 25 and 48d.
+# ===========================================================================
+_r49 = load_module("smoke_reddit_proxy_r49", "testing area/reddit_proxy.py")
+_R49_LAT = 0.4            # per-service latency in these fakes
+
+
+def _r49_fakes(media_by_service, *, latency=None, record=None):
+    """Install fake per-service fetchers; returns the dispatch record list."""
+    record = [] if record is None else record
+    lat = latency or {}
+
+    def make(name):
+        async def fake(session, path, label=""):
+            record.append(name)
+            await asyncio.sleep(lat.get(name, _R49_LAT))
+            items = media_by_service.get(name)
+            if items is None:
+                return None
+            return {"service": name, "title": "T", "author": None,
+                    "subreddit": None, "body": "b", "stats": None,
+                    "media": [dict(m) for m in items]}
+        return fake
+
+    for name in ("redditez", "vxreddit", "embeddit"):
+        setattr(_r49, "_fetch_" + name, make(name))
+    return record
+
+
+_R49_VID = [{"kind": "video", "url": "https://v.redd.it/x/DASH_1080.mp4"}]
+_R49_ONE = [{"kind": "image", "url": "https://i.redd.it/1.jpg"}]
+_R49_MANY = [{"kind": "image", "url": f"https://i.redd.it/{i}.jpg"} for i in range(13)]
+
+_r49_saved = {n: getattr(_r49, "_fetch_" + n)
+              for n in ("redditez", "vxreddit", "embeddit")}
+try:
+    # ---- 1. MEASURED SPEED: the whole chain costs ONE round trip ----------
+    rec = _r49_fakes({"vxreddit": None, "redditez": None, "embeddit": _R49_ONE},
+                     latency={"vxreddit": _R49_LAT, "redditez": _R49_LAT,
+                              "embeddit": _R49_LAT})
+    _t0 = time.monotonic()
+    _r49_res = asyncio.run(_r49.fetch_proxy_post(None, "/r/Sub/comments/abc/",
+                                                 label="t", health={}))
+    _r49_dt = time.monotonic() - _t0
+    _r49_serial = 3 * _R49_LAT
+    check("r49 MEASURED: three 0.4s services resolve in ~0.7s, not the 1.2s serial cost",
+          _r49_res is not None and _r49_res["service"] == "embeddit"
+          and _r49_dt < _r49_serial - 0.25,
+          f"{_r49_dt:.3f}s vs {_r49_serial:.3f}s serial")
+    check("r49: the delayed third service is still dispatched when it is needed",
+          sorted(rec) == ["embeddit", "redditez", "vxreddit"], str(rec))
+
+    # ---- 1b. WAVE 2 STARTS EARLY WHEN WAVE 1 SETTLES WITHOUT A WINNER ----
+    rec = _r49_fakes({"vxreddit": None, "redditez": None, "embeddit": _R49_ONE},
+                     latency={"vxreddit": 0.05, "redditez": 0.05, "embeddit": 0.05})
+    _t0 = time.monotonic()
+    _r49_e = asyncio.run(_r49.fetch_proxy_post(None, "/r/Sub/comments/abc/",
+                                               label="t", health={}))
+    _r49_edt = time.monotonic() - _t0
+    check("r49: wave 2 does not sit out the full delay once wave 1 has settled",
+          _r49_e["service"] == "embeddit" and _r49_edt < _r49.PROXY_WAVE_DELAY,
+          f"{_r49_edt:.3f}s with a {_r49.PROXY_WAVE_DELAY}s wave delay")
+
+    # ---- 2. A VIDEO ANSWER CANCELS WAVE 2 BEFORE IT OPENS A SOCKET -------
+    rec = _r49_fakes({"vxreddit": _R49_VID, "redditez": _R49_VID,
+                      "embeddit": _R49_MANY},
+                     latency={"vxreddit": 0.01, "redditez": 0.01, "embeddit": 0.01})
+    _t0 = time.monotonic()
+    _r49_v = asyncio.run(_r49.fetch_proxy_post(None, "/r/Sub/comments/abc/",
+                                               label="t", health={},
+                                               need_video=True))
+    _r49_vdt = time.monotonic() - _t0
+    check("r49/r48d: a video post never dispatches embeddit (wave 2 is cancelled)",
+          "embeddit" not in rec and _r49_v["service"] == "vxreddit"
+          and _r49_vdt < _r49.PROXY_WAVE_DELAY,
+          f"{rec} in {_r49_vdt:.3f}s")
+
+    # ---- 3. ROUND 25 IS INTACT: the slow service with the FULL gallery wins
+    rec = _r49_fakes({"vxreddit": _R49_ONE, "redditez": _R49_ONE,
+                      "embeddit": _R49_MANY},
+                     latency={"vxreddit": 0.01, "redditez": 0.01, "embeddit": 0.05})
+    _r49_g = asyncio.run(_r49.fetch_proxy_post(None, "/r/Sub/comments/1wj0p83/",
+                                               label="t", health={}))
+    check("r49: 1wj0p83 — a late embeddit with 13 items still beats a fast 1-item answer",
+          _r49_g["service"] == "embeddit" and len(_r49_g["media"]) == 13,
+          str(_r49_g["service"]))
+
+    # ---- 4. THE GRACE WINDOW IS BOUNDED ----------------------------------
+    _r49_grace_saved = _r49.PROXY_GALLERY_GRACE
+    try:
+        _r49.PROXY_GALLERY_GRACE = 0.25
+        rec = _r49_fakes({"vxreddit": _R49_ONE, "redditez": None,
+                          "embeddit": _R49_MANY},
+                         latency={"vxreddit": 0.01, "redditez": 0.01,
+                                  "embeddit": 10.0})
+        _t0 = time.monotonic()
+        _r49_slow = asyncio.run(_r49.fetch_proxy_post(None, "/r/Sub/comments/abc/",
+                                                      label="t", health={}))
+        _r49_sdt = time.monotonic() - _t0
+        check("r49: a hung service cannot stall a post — grace expires and the best wins",
+              _r49_slow["service"] == "vxreddit" and _r49_sdt < 1.0,
+              f"{_r49_sdt:.3f}s")
+    finally:
+        _r49.PROXY_GALLERY_GRACE = _r49_grace_saved
+
+    # ---- 5. CONCURRENCY CEILING ------------------------------------------
+    _r49_inflight = {"now": 0, "max": 0}
+
+    def _busy(name):
+        async def fake(session, path, label=""):
+            _r49_inflight["now"] += 1
+            _r49_inflight["max"] = max(_r49_inflight["max"], _r49_inflight["now"])
+            await asyncio.sleep(0.05)
+            _r49_inflight["now"] -= 1
+            return None
+        return fake
+
+    for _n in ("redditez", "vxreddit", "embeddit"):
+        setattr(_r49, "_fetch_" + _n, _busy(_n))
+    _r49_cap_saved = _r49.PROXY_MAX_CONCURRENCY
+    try:
+        _r49.PROXY_MAX_CONCURRENCY = 2
+        _r49._proxy_gates.clear()
+
+        async def _r49_burst():
+            return await asyncio.gather(*[
+                _r49.fetch_proxy_post(None, f"/r/Sub/comments/p{i}/", label="t",
+                                      health={}) for i in range(6)])
+
+        asyncio.run(_r49_burst())
+        check("r49: the global semaphore caps in-flight proxy requests",
+              _r49_inflight["max"] <= 2, f"peak={_r49_inflight['max']}")
+    finally:
+        _r49.PROXY_MAX_CONCURRENCY = _r49_cap_saved
+        _r49._proxy_gates.clear()
+finally:
+    for _n, _f in _r49_saved.items():
+        setattr(_r49, "_fetch_" + _n, _f)
+
+# ---- 5b. WARM-UP LABELS CANNOT DRIFT FROM THE CALL ORDER ----------------
+# Regression guard for a bug round 49 introduced and this audit caught: the
+# warm-up gathered (redditez, vxreddit, embeddit) but zipped the results
+# against PROXY_SERVICES, so reordering PROXY_SERVICES swapped the redditez
+# and vxreddit health records — marking the WRONG service dead for a run.
+_r49_probe_order = []
+
+
+def _r49_probe(name):
+    async def fake(session, path, label=""):
+        _r49_probe_order.append(name)
+        if name == "vxreddit":
+            return None
+        return {"service": name, "title": "T", "author": None, "subreddit": None,
+                "body": "b", "stats": None,
+                "media": [{"kind": "image", "url": "https://i.redd.it/1.jpg"}]}
+    return fake
+
+
+_r49_saved2 = {n: getattr(_r49, "_fetch_" + n)
+               for n in ("redditez", "vxreddit", "embeddit")}
+_r49_saved_save = _r49.save_proxy_health
+try:
+    for _n in ("redditez", "vxreddit", "embeddit"):
+        setattr(_r49, "_fetch_" + _n, _r49_probe(_n))
+    _r49.save_proxy_health = lambda *a, **kw: None
+    _r49_health = asyncio.run(_r49.proxy_warmup(None, "Sub/abc123"))
+    check("r49: warm-up records each service's OWN result (no label drift)",
+          _r49_health["vxreddit"]["ok"] is False
+          and _r49_health["redditez"]["ok"] is True
+          and _r49_health["embeddit"]["ok"] is True, str(_r49_health))
+    check("r49: the warm-up probes are built from the dispatch map itself",
+          "probes = tuple(_PROXY_FETCHERS)" in inspect.getsource(_r49.proxy_warmup))
+finally:
+    for _n, _f in _r49_saved2.items():
+        setattr(_r49, "_fetch_" + _n, _f)
+    _r49.save_proxy_health = _r49_saved_save
+
+# ---- 6. SHARE LINKS: redditez is not asked a url it always rejects -------
+# User-verified: redditez.com/u/<name>/s/<id> and /r/<sub>/s/<id> both answer
+# "Could not find provider for this url. Malformed url?", while vxreddit
+# renders them. The share token is NOT a post id, so it cannot be rewritten.
+check("r49: a /s/ share link drops redditez but keeps the services that resolve it",
+      _r49.proxy_services_for("/r/HonkaiStarRail_leaks/s/8ovjUB7aK4")
+      == ["vxreddit", "embeddit"]
+      and _r49.proxy_services_for("/u/aphotide/s/8ovjUB7aK4") == ["vxreddit", "embeddit"])
+check("r49: a canonical /comments/ path still asks every service",
+      _r49.proxy_services_for("/user/aphotide/comments/1wuv4j8/")
+      == list(_r49.PROXY_SERVICES)
+      and _r49.proxy_services_for("/r/Sub/comments/abc/") == list(_r49.PROXY_SERVICES))
+check("r49: the tie-break order is vxreddit -> redditez -> embeddit (field-ranked)",
+      _r49.PROXY_SERVICES == ("vxreddit", "redditez", "embeddit"))
+
+# ---- 7. THE DUPLICATE LOG LINE IS GONE -----------------------------------
+# The serial chain logged BOTH "returned text only ... continuing the chain"
+# and "had no usable data - trying the next proxy" for the SAME attempt,
+# because the text-only branch fell through to the end of the loop body.
+_r49_src = inspect.getsource(_r49.fetch_proxy_post)
+_r49_code = "\n".join(l for l in _r49_src.split("\n") if "logging." in l)
+check("r49: each proxy attempt logs exactly one outcome line",
+      _r49_code.count("had no usable data") == 1
+      and _r49_code.count("returned text only") == 1
+      and "trying the next proxy" not in _r49_code
+      and "continuing the chain for the media" not in _r49_code,
+      _r49_code.count("had no usable data"))
+check("r49: ties are resolved by rank, not by task completion order",
+      "sorted(done, key=lambda t: rank[tasks[t]])" in _r49_src)
+
+# ---- 8. X: a SECTION ACCESSORY thumbnail is healed too -------------------
+# Round 47 only walked items[]; a type-11 accessory keeps its media outside
+# items[], so a failed thumbnail was invisible to the heal pass.
+_r49_acc_msg = {"id": "1", "components": [{"type": 17, "components": [
+    {"type": 9, "components": [{"type": 10, "content": "hi"}],
+     "accessory": {"type": 11, "media": {
+         "url": "https://pbs.twimg.com/media/thumb.jpg",
+         "proxy_url": "https://images-ext-1.discordapp.net/external/x",
+         "width": 0, "height": 0, "content_type": ""}}}]}]}
+check("r49: an unresolved SECTION ACCESSORY thumbnail is now detected",
+      _r47_x.unresolved_media_items(_r49_acc_msg)
+      == ["https://pbs.twimg.com/media/thumb.jpg"])
+check("r49: a resolved accessory thumbnail is still not flagged",
+      _r47_x.unresolved_media_items(
+          {"components": [{"type": 9, "accessory": {"type": 11, "media": {
+              "url": "https://pbs.twimg.com/media/t.jpg", "width": 400,
+              "height": 400, "content_type": "image/jpeg"}}}]}) == [])
+
+# ---- 9. REDLIB REACHABILITY TELEMETRY ------------------------------------
+# The prod run only said "all instances"/"all sources" failed, which gives no
+# way to tell a dead mirror from a flaky one. One line per run fixes that.
+v3._redlib_reach.clear()
+v3._redlib_reach.update({"https://redlib.catsarch.com": [0, 3],
+                         "https://www.reddit.com": [2, 2],
+                         "https://redlib.nadeko.net": [1, 4]})
+_r49_reach = v3.log_redlib_reachability()
+check("r49: the reachability line reports ok/total per instance, worst first",
+      _r49_reach.startswith("REDLIB-REACH: 2/3 instance(s) answered this run")
+      and _r49_reach.index("redlib.catsarch.com 0/3")
+      < _r49_reach.index("redlib.nadeko.net 1/4")
+      < _r49_reach.index("www.reddit.com 2/2"), _r49_reach)
+check("r49: a run that never touched redlib logs nothing",
+      (v3._redlib_reach.clear() or v3.log_redlib_reachability()) == "")
+check("r49: the counter is wired into the real page fetcher and main()",
+      "_redlib_reach.setdefault" in inspect.getsource(v3._fetch_redlib_post_page)
+      and "log_redlib_reachability()" in inspect.getsource(v3.main))
+
+
+# ===========================================================================
+# ROUND 49 REPLAY — nine REAL production cards, byte-for-byte
+# These are the exact media-gallery tile urls Discord accepted and rendered
+# for nine real gallery posts (captured from the live webhook payloads, see
+# tests/fixtures/posted_cards.py). They cover every shape that matters:
+#   7 tiles / one container          1wt8hdd, 1woqtu9 (i.redd.it + signed
+#                                    preview.redd.it urls with query strings)
+#   6 embedez redirect urls          1wsy39s (?path=content.media.N.source -
+#                                    they differ ONLY in the query, so dedupe
+#                                    must not collapse them)
+#   15 tiles, 11 of them GIFs        1wqkq60
+#   15 tiles, mixed jpg + gif        1wmxt0l
+#   15 / 19 tiles, two containers    1wov3r0, 1wp17bk, 1wtg5r3
+#   20 tiles - the FULL card         1wkj08n (exactly MEDIA_CAP_ITEMS)
+# Each set is replayed through the real round-49 fetch_proxy_post and the
+# real build_v3_payload, twice: once with the full set arriving FIRST, and
+# once with it arriving LAST from the lowest-priority service (the round-25
+# shape). Both must reproduce the original card exactly.
+# ===========================================================================
+sys.path.insert(0, os.path.join(ROOT, "tests", "fixtures"))
+from posted_cards import POSTED_CARDS as _R49_CARDS
+
+_r49_replay = load_module("smoke_reddit_proxy_replay", "testing area/reddit_proxy.py")
+
+
+def _r49_kinds(urls):
+    return [{"kind": "gif" if u.split("?")[0].lower().endswith(".gif") else "image",
+             "url": u} for u in urls]
+
+
+def _r49_replay_card(pid, card, late):
+    media = _r49_kinds(card["urls"])
+
+    async def full(session, path, label="", media=media):
+        if late:
+            await asyncio.sleep(0.05)
+        return {"service": "embeddit" if late else "vxreddit", "title": "T",
+                "author": "a", "subreddit": "S", "body": "", "stats": None,
+                "media": [dict(m) for m in media]}
+
+    async def partial(session, path, label=""):
+        return {"service": "vxreddit" if late else "embeddit", "title": "T",
+                "author": "a", "subreddit": "S", "body": "", "stats": None,
+                "media": [{"kind": "image", "url": "https://i.redd.it/partial.jpg"}]}
+
+    async def dead(session, path, label=""):
+        return None
+
+    if late:
+        _r49_replay._fetch_vxreddit = partial
+        _r49_replay._fetch_embeddit = full
+    else:
+        _r49_replay._fetch_vxreddit = full
+        _r49_replay._fetch_embeddit = partial
+    _r49_replay._fetch_redditez = dead
+    res = asyncio.run(_r49_replay.fetch_proxy_post(
+        None, f"/r/Sub/comments/{pid}/", label=pid, health={}))
+    data = {"title": "T", "author": "A", "body": "", "media": res["media"],
+            "stats": {"comments": 1, "ups": 2}, "crosspost": None,
+            "op_comment": None, "youtube_url": None, "full_mode": True}
+    payload = v3.build_v3_payload(
+        "Sub", data, f"https://www.reddit.com/r/Sub/comments/{pid}/", 1)
+    split, tiles = [], []
+    for container in payload["components"]:
+        for node in container["components"]:
+            if node.get("type") == 12:
+                split.append(len(node["items"]))
+                tiles += [i["media"]["url"] for i in node["items"]]
+    return tiles, split
+
+
+_r49_saved3 = {n: getattr(_r49_replay, "_fetch_" + n)
+               for n in ("redditez", "vxreddit", "embeddit")}
+try:
+    for _pid, _card in _R49_CARDS.items():
+        _dd = _r49_replay.dedupe_proxy_media(_r49_kinds(_card["urls"]))
+        check(f"r49 replay {_pid}: dedupe keeps all {len(_card['urls'])} real tiles",
+              [m["url"] for m in _dd] == _card["urls"], str(len(_dd)))
+        for _late in (False, True):
+            _tiles, _split = _r49_replay_card(_pid, _card, _late)
+            _when = "the full set arrives LAST" if _late else "the full set arrives FIRST"
+            check(f"r49 replay {_pid}: {_when} - card is byte-identical to production",
+                  _tiles == _card["urls"] and _split == _card["split"],
+                  f"{_split} vs {_card['split']}, {len(_tiles)} vs {len(_card['urls'])}")
+finally:
+    for _n, _f in _r49_saved3.items():
+        setattr(_r49_replay, "_fetch_" + _n, _f)
+check("r49 replay: the 20-tile card is exactly MEDIA_CAP_ITEMS, uncapped",
+      len(_R49_CARDS["1wkj08n"]["urls"]) == _r49_replay.MEDIA_CAP_ITEMS)
 
 
 if failures:
