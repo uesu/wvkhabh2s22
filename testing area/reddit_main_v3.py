@@ -330,7 +330,13 @@ NSFW_ALLOWLIST = [
 # fallback used only when Arctic has not indexed the post yet.
 NSFW_FAIL_OPEN = os.getenv("NSFW_FAIL_OPEN", "0").strip().lower() in ("1", "true", "yes", "on")
 NSFW_REQUIRE_SUBREDDIT = os.getenv("NSFW_REQUIRE_SUBREDDIT", "0").strip().lower() in ("1", "true", "yes", "on")
-NSFW_PAGE_FALLBACK = os.getenv("NSFW_PAGE_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off", "")
+# GitHub exposes an unset repository Variable as an empty environment value.
+# Keep the documented default (enabled) in that case.
+NSFW_PAGE_FALLBACK = os.getenv("NSFW_PAGE_FALLBACK")
+if not NSFW_PAGE_FALLBACK or NSFW_PAGE_FALLBACK.strip().lower() in ("1", "true", "yes", "on"):
+    NSFW_PAGE_FALLBACK = True
+else:
+    NSFW_PAGE_FALLBACK = NSFW_PAGE_FALLBACK.strip().lower() not in ("0", "false", "no", "off")
 
 # Round 32 (2026-09-20): SHORT re-check interval for states that can change
 # quickly — posts awaiting moderator approval ("pending approval" /
@@ -748,8 +754,11 @@ VIDEO_PROXY_VXREDDIT = ("https://vxreddit.com/redditvideo.mp4"
                         "?video_url={video_url}&audio_url={audio_url}")
 
 def _env_flag(name: str, default: str) -> bool:
-    """Env bool: anything in 0/false/no/off/"" is False, everything else True."""
-    return os.getenv(name, default).strip().lower() not in ("0", "false", "no", "off", "")
+    """Read a boolean option, treating an unset/empty GitHub Variable as default."""
+    value = (os.getenv(name) or "").strip().lower()
+    if not value:
+        value = default.strip().lower()
+    return value not in ("0", "false", "no", "off")
 
 
 # YouTube: default = thumbnail + animated starwardspark3 button (deterministic,
