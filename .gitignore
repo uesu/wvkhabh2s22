@@ -8,6 +8,8 @@ posted_tweets.json
 posted_reddit.json
 proxy_health.json
 pending_reddit.json
+# Created only when Reddit dead-post retraction is enabled; force-added by the workflow.
+posted_messages.json
 
 # Python bytecode & cache
 __pycache__/
