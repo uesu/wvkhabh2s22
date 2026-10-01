@@ -2624,6 +2624,23 @@ check("r46: that weak signal does NOT hold a post for ever",
                             listing_oldest_age=12 * 3600,
                             listing_source=v3.reddit_signals.LISTING_RSS,
                             post_age_seconds=v3.MOD_QUEUE_WEAK_GRACE_SECONDS + 1) is None)
+# ---- ROUND 48 (2026-10-01): the banner outranks the listing ---------------
+# r/HonkaiStarRail_leaks 1wuwjiw was DELIVERED at 19:16 while its page still
+# read "Post is awaiting moderator approval" — round 46 consulted the /new
+# listing FIRST and never looked at the banner. Direct page evidence now wins.
+_r48_page = ('<h1 class="post_title">4.7 Apoc Shadow Pom Pom mechanics information via Cyrleak</h1>'
+             '<div>Post is awaiting moderator approval.</div>')
+check("r48: 1wuwjiw — a queued post inside an API-backed listing is STILL held",
+      v3.mod_queue_decision(_r48_page, {"1wuwjiw"}, "1wuwjiw",
+                            listing_oldest_age=12 * 3600,
+                            listing_source=v3.reddit_signals.LISTING_HTML,
+                            post_age_seconds=600) == "pending approval")
+check("r48: a post with no banner is released by the listing exactly as before",
+      v3.mod_queue_decision('<span class="created">11m ago</span>',
+                            {"1wuwjiw"}, "1wuwjiw",
+                            listing_oldest_age=12 * 3600,
+                            listing_source=v3.reddit_signals.LISTING_HTML,
+                            post_age_seconds=600) is None)
 check("r46: an API-backed listing still releases immediately (speed preserved)",
       v3.mod_queue_decision(_r46_weak, {"1wurg8f"}, "1wurg8f",
                             listing_oldest_age=12 * 3600,
@@ -2734,6 +2751,220 @@ check("r46b measured: a slightly slower API-backed answer still WINS over RSS",
       _r46_pref is not None and _r46_pref[2] == v3.reddit_signals.LISTING_HTML
       and _r46_pref_s < 1.5,
       f"{_r46_pref!r} in {_r46_pref_s:.3f}s")
+
+
+
+# ===========================================================================
+# ROUND 47 (2026-10-01) — X: self-heal a message whose media Discord left
+# unresolved, and stop downgrading videos Discord can actually play.
+# ===========================================================================
+_r47_x = load_module("smoke_x_v3_r47", "testing area/twitter_v3.py")
+
+# The EXACT shape Discord returned for Wuthering_Waves/2105598609827737874:
+# a proxy_url was minted but width/height are 0 and content_type is empty,
+# which is what renders as "Image failed to load".
+_r47_broken_msg = {
+    "id": "2105600000000000000",
+    "components": [{
+        "id": 1, "type": 17,
+        "components": [
+            {"id": 2, "type": 10, "content": "### Wuthering Waves just tweeted:"},
+            {"id": 5, "type": 12, "items": [{"media": {
+                "url": "https://video.twimg.com/amplify_video/2105288774121074688/vid/avc1/1920x1080/MKcWr_GC5zM6ZGX4.mp4?tag=29",
+                "proxy_url": "https://images-ext-1.discordapp.net/external/F2rq/https/video.twimg.com/x.mp4",
+                "width": 0, "height": 0, "content_type": ""}}]},
+        ],
+    }],
+}
+_r47_ok_msg = {
+    "id": "2105600000000000000",
+    "components": [{
+        "id": 1, "type": 17,
+        "components": [{"id": 5, "type": 12, "items": [{"media": {
+            "url": "https://video.twimg.com/amplify_video/x/1920x1080/y.mp4?tag=29",
+            "proxy_url": "https://images-ext-1.discordapp.net/external/F2rq/https/video.twimg.com/y.mp4",
+            "width": 1920, "height": 1080, "content_type": "video/mp4"}}]}],
+    }],
+}
+check("r47: an unresolved media tile (width/height 0, no content_type) is detected",
+      _r47_x.unresolved_media_items(_r47_broken_msg)
+      == ["https://video.twimg.com/amplify_video/2105288774121074688/vid/avc1/1920x1080/MKcWr_GC5zM6ZGX4.mp4?tag=29"])
+check("r47: a resolved media tile is NOT flagged (no pointless edits)",
+      _r47_x.unresolved_media_items(_r47_ok_msg) == [])
+check("r47: a message with no media is never flagged",
+      _r47_x.unresolved_media_items({"components": [{"type": 10, "content": "hi"}]}) == []
+      and _r47_x.unresolved_media_items(None) == [])
+
+
+class _R47Resp:
+    def __init__(self, status, payload):
+        self.status = status
+        self._payload = payload
+
+    async def json(self):
+        return self._payload
+
+    async def text(self):
+        return json.dumps(self._payload)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _R47Session:
+    """Discord: the first edit resolves the media (what Discohook proved)."""
+
+    def __init__(self, heal_after=1, status=200):
+        self.patches = []
+        self.heal_after = heal_after
+        self.status = status
+
+    def patch(self, url, json=None, **kw):
+        self.patches.append((url, json))
+        payload = (_r47_ok_msg if len(self.patches) >= self.heal_after
+                   else _r47_broken_msg)
+        return _R47Resp(self.status, payload)
+
+
+_r47_payload = {"flags": 32768, "components": [{"type": 17, "components": []}]}
+_r47_saved_delay = _r47_x.MEDIA_HEAL_DELAY_SECONDS
+try:
+    _r47_x.MEDIA_HEAL_DELAY_SECONDS = 0
+    _r47_sess = _R47Session(heal_after=1)
+    _r47_started = time.monotonic()
+    asyncio.run(_r47_x.heal_unresolved_media(
+        _r47_sess, [("https://discord.com/api/webhooks/1/abc", "999", _r47_payload, "WW/2105")]))
+    _r47_elapsed = time.monotonic() - _r47_started
+    check("r47: an unresolved message is re-edited exactly once when that fixes it",
+          len(_r47_sess.patches) == 1, str(_r47_sess.patches))
+    check("r47: the edit is a PATCH to the webhook message, with_components kept",
+          _r47_sess.patches[0][0]
+          == "https://discord.com/api/webhooks/1/abc/messages/999?with_components=true")
+    check("r47: the edit re-sends the IDENTICAL payload (nothing added or removed)",
+          _r47_sess.patches[0][1] == _r47_payload)
+    # still broken -> bounded retries, never an infinite loop
+    _r47_sess2 = _R47Session(heal_after=99)
+    asyncio.run(_r47_x.heal_unresolved_media(
+        _r47_sess2, [("https://discord.com/api/webhooks/1/abc", "999", _r47_payload, "WW/2105")]))
+    check("r47: a permanently unresolvable asset is retried MEDIA_HEAL_ATTEMPTS times, then dropped",
+          len(_r47_sess2.patches) == _r47_x.MEDIA_HEAL_ATTEMPTS)
+    # nothing queued -> no work at all
+    _r47_sess3 = _R47Session()
+    asyncio.run(_r47_x.heal_unresolved_media(_r47_sess3, []))
+    check("r47 measured: a healthy run costs ZERO edits and no wait",
+          _r47_sess3.patches == [] and _r47_elapsed < 1.0,
+          f"{_r47_elapsed:.3f}s for the healed case")
+finally:
+    _r47_x.MEDIA_HEAL_DELAY_SECONDS = _r47_saved_delay
+
+_r47_src = open(os.path.join(ROOT, "testing area", "twitter_v3.py"), encoding="utf-8").read()
+check("r47: the webhook POST asks for the created message (wait=true) so media can be checked",
+      "?with_components=true&wait=true" in _r47_src)
+check("r47: healing runs AFTER the posting loop, so it never delays a post",
+      _r47_src.index("await heal_unresolved_media(session, heal_queue)")
+      > _r47_src.index("heal_queue.append("))
+check("r47: the heal pass is opt-outable and defaults ON",
+      _r47_x.MEDIA_HEAL is True and _r47_x.MEDIA_HEAL_ATTEMPTS >= 1
+      and 30 <= _r47_x.MEDIA_HEAL_DELAY_SECONDS <= 60)
+check("r47: the proven 256 MiB external-video cap is unchanged (no guessing)",
+      _r47_x.VIDEO_SIZE_LIMIT == 256 * 1024 * 1024,
+      f"limit={_r47_x.VIDEO_SIZE_LIMIT / (1024 * 1024):.0f} MiB")
+
+# ---- ROUND 47: Reddit profile posts + crossposts of them ------------------
+# LIVE INCIDENT: r/AnantaLeaks 1wuv547 is a crosspost of the PROFILE post
+# /user/aphotide/comments/1wuv4j8/ — the card showed the external-preview
+# poster image instead of the 1:26 video, because no helper recognised a
+# "/user/<name>/comments/<id>/" permalink as a post.
+check("r47: a profile-post permalink normalises to its canonical path",
+      v3.normalize_reddit_path("https://www.reddit.com/user/aphotide/comments/1wuv4j8/musor_drop_via_aphotide/")
+      == "/user/aphotide/comments/1wuv4j8/musor_drop_via_aphotide/")
+check("r47: the short /u/ form normalises to the same /user/ path",
+      v3.normalize_reddit_path("https://www.reddit.com/u/aphotide/comments/1wuv4j8/")
+      == "/user/aphotide/comments/1wuv4j8/")
+check("r47: ordinary subreddit permalinks are untouched",
+      v3.normalize_reddit_path("https://www.reddit.com/r/AnantaLeaks/comments/1wuv547/")
+      == "/r/AnantaLeaks/comments/1wuv547/")
+check("r47: a profile post is recognised as one",
+      v3.is_profile_post_path("/user/aphotide/comments/1wuv4j8/") is True
+      and v3.is_profile_post_path("/r/AnantaLeaks/comments/1wuv547/") is False)
+check("r47: a profile post also answers under its /r/u_<name>/ pseudo-subreddit",
+      v3._path_aliases("/user/aphotide/comments/1wuv4j8/")
+      == ["/user/aphotide/comments/1wuv4j8/", "/r/u_aphotide/comments/1wuv4j8/"])
+check("r47: an ordinary post has exactly ONE route (no extra fetches)",
+      v3._path_aliases("/r/AnantaLeaks/comments/1wuv547/")
+      == ["/r/AnantaLeaks/comments/1wuv547/"])
+check("r47: 1wuv547 — the crosspost's ORIGINAL profile post is now found",
+      v3.find_crosspost_original_path(
+          'crossposted this from <a href="/user/aphotide/comments/1wuv4j8/musor_drop_via_aphiode/">'
+          'u/aphotide</a>', "/r/AnantaLeaks/comments/1wuv547/")
+      == "/user/aphotide/comments/1wuv4j8/")
+check("r47: a crosspost of a normal subreddit post still resolves (round 14 kept)",
+      v3.find_crosspost_original_path(
+          'crosspost of <a href="/r/AnantaLeaks/comments/1abcdef/t/">r/AnantaLeaks</a>',
+          "/r/Other/comments/1wuv547/")
+      == "/r/AnantaLeaks/comments/1abcdef/")
+check("r47: an Arctic-reported profile permalink is accepted as the original",
+      'r"/(?:r|user)/[^/]+/comments/[a-z0-9]+/[^?#]*"'
+      in inspect.getsource(v3.resolve_post_media))
+
+
+class _R47Proxy:
+    """Proxy service that only knows the /r/u_<name>/ route (like the live
+    services that index profile posts under their pseudo-subreddit)."""
+
+    def __init__(self):
+        self.paths = []
+
+    async def fetch_proxy_post(self, session, path, label="", health=None,
+                               need_video=False):
+        self.paths.append(path)
+        if path.startswith("/r/u_"):
+            return {"service": "fake", "title": "musor drop via aphotide",
+                    "author": "aphotide", "body": "",
+                    "media": [{"kind": "video",
+                               "url": "https://v.redd.it/abc123/DASH_1080.mp4"}]}
+        return None
+
+
+_r47_saved_proxy = v3.reddit_proxy
+try:
+    _r47_proxy = _R47Proxy()
+    v3.reddit_proxy = _r47_proxy
+    v3._proxy_post_cache.clear()
+    _r47_res = asyncio.run(v3.fetch_proxy_post_memo(
+        None, "/user/aphotide/comments/1wuv4j8/", label="1wuv4j8"))
+    check("r47: the profile post's VIDEO is recovered via the subreddit alias",
+          isinstance(_r47_res, dict)
+          and _r47_res["media"][0]["url"].endswith("DASH_1080.mp4")
+          and _r47_proxy.paths == ["/user/aphotide/comments/1wuv4j8/",
+                                   "/r/u_aphotide/comments/1wuv4j8/"],
+          f"{_r47_res} paths={_r47_proxy.paths}")
+    _r47_proxy2 = _R47Proxy()
+    v3.reddit_proxy = _r47_proxy2
+    v3._proxy_post_cache.clear()
+    asyncio.run(v3.fetch_proxy_post_memo(None, "/r/AnantaLeaks/comments/1wuv547/",
+                                         label="1wuv547"))
+    check("r47: an ordinary post makes exactly ONE proxy call (speed unchanged)",
+          _r47_proxy2.paths == ["/r/AnantaLeaks/comments/1wuv547/"],
+          str(_r47_proxy2.paths))
+finally:
+    v3.reddit_proxy = _r47_saved_proxy
+    v3._proxy_post_cache.clear()
+
+
+
+# ---- ROUND 48b (2026-10-01): delivery latency telemetry ------------------
+# Calibrating the queue gate needs real numbers, so every delivery logs how
+# long it took from Reddit creation, and what held it if it was held.
+_r48b_src = inspect.getsource(v3.main)
+check("r48b: every delivery logs its end-to-end latency",
+      "LATENCY" in _r48b_src and "after creation" in _r48b_src)
+check("r48b: a held post also logs WHAT held it and for how long",
+      "held {_held / 60:.1f}min as" in _r48b_src
+      and "_pend_entry = pending.pop(unique_key, None)" in _r48b_src)
 
 
 if failures:

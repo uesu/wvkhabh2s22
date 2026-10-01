@@ -443,9 +443,10 @@ check("r46 verdict: 1wuqy6z — the banner holds even when RSS shows the post",
       signals.queue_verdict(strong_hold_text=True, in_listing=True,
                             listing_source=signals.LISTING_RSS)
       == signals.PENDING_APPROVAL)
-check("r46 verdict: an API-backed listing outranks the banner (it was released)",
+check("r48 verdict: the banner now outranks even an API-backed listing",
       signals.queue_verdict(strong_hold_text=True, in_listing=True,
-                            listing_source=signals.LISTING_HTML) is None)
+                            listing_source=signals.LISTING_HTML)
+      == signals.PENDING_APPROVAL)
 check("r46 verdict: 1wurg8f — the AutoMod comment holds inside the grace",
       signals.queue_verdict(weak_hold_text=True, in_listing=True,
                             listing_source=signals.LISTING_RSS,
@@ -526,6 +527,57 @@ check("r46b wiring: an older post with no page is not held for ever",
                 age=v3.MOD_QUEUE_WEAK_GRACE_SECONDS + 1) is None)
 check("workflow wires MOD_QUEUE_WEAK_GRACE_SECONDS",
       "MOD_QUEUE_WEAK_GRACE_SECONDS" in _wf)
+
+
+
+# ---------------------------------------------------------------------------
+# ROUND 48 (2026-10-01) — PRECEDENCE FIX after a live escape.
+# r/HonkaiStarRail_leaks 1wuwjiw: created 19:06:00 (+08), DELIVERED 19:16,
+# and at 19:17 the post page still read "Post is awaiting moderator approval"
+# with AutoModerator's stickied source-rule comment above the OP's reply.
+# Round 46 asked the listing FIRST, so a queued post that is nevertheless
+# visible in an API-backed /new listing was released without the page's own
+# banner ever being consulted. Direct page evidence now wins.
+# ---------------------------------------------------------------------------
+check("r48: 1wuwjiw — the banner holds the post whatever the listing says",
+      signals.queue_verdict(strong_hold_text=True, in_listing=True,
+                            listing_source=signals.LISTING_HTML,
+                            post_age_seconds=600) == signals.PENDING_APPROVAL
+      and signals.queue_verdict(strong_hold_text=True, in_listing=True,
+                                listing_source=signals.LISTING_RSS,
+                                post_age_seconds=600) == signals.PENDING_APPROVAL
+      and signals.queue_verdict(strong_hold_text=True, in_listing=False,
+                                listing_source=signals.LISTING_HTML)
+      == signals.PENDING_APPROVAL
+      and signals.queue_verdict(strong_hold_text=True, in_listing=None)
+      == signals.PENDING_APPROVAL)
+check("r48: with NO banner an API-backed listing still releases instantly (speed kept)",
+      signals.queue_verdict(strong_hold_text=False, in_listing=True,
+                            listing_source=signals.LISTING_HTML,
+                            post_age_seconds=5) is None)
+check("r48: the weak AutoMod signal still yields to an API-backed listing",
+      signals.queue_verdict(weak_hold_text=True, in_listing=True,
+                            listing_source=signals.LISTING_HTML,
+                            post_age_seconds=10, weak_grace_seconds=900) is None)
+check("r48: the banner is checked before anything else in queue_verdict",
+      inspect.getsource(signals.queue_verdict).index("if strong_hold_text:")
+      < inspect.getsource(signals.queue_verdict).index("if listing_proves_release("))
+
+_R48_PAGE = ('<h1 class="post_title">4.7 Apoc Shadow Pom Pom mechanics information via Cyrleak</h1>'
+             '<div>Post is awaiting moderator approval.</div>'
+             '<div class="comment">AutoModerator Please respond to this comment with a '
+             'mirror link and source link. Failure to do so will result in post removal.</div>')
+check("r48 wiring: 1wuwjiw is HELD even when the API-backed listing contains it",
+      v3.mod_queue_decision(_R48_PAGE, {"1wuwjiw"}, "1wuwjiw",
+                            listing_oldest_age=12 * 3600,
+                            listing_source=signals.LISTING_HTML,
+                            post_age_seconds=600) == "pending approval")
+check("r48 wiring: once the banner is gone the same post posts immediately",
+      v3.mod_queue_decision(
+          '<h1 class="post_title">4.7 Apoc Shadow Pom Pom</h1>'
+          '<span class="created">11m ago</span>',
+          {"1wuwjiw"}, "1wuwjiw", listing_oldest_age=12 * 3600,
+          listing_source=signals.LISTING_HTML, post_age_seconds=660) is None)
 
 
 print()
