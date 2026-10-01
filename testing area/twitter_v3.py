@@ -610,13 +610,23 @@ def unresolved_media_items(message: dict | None) -> list:
             return
         if not isinstance(node, dict):
             return
-        for item in node.get("items") or []:
-            media = (item or {}).get("media") or {}
-            if not media.get("url"):
-                continue
+        def check_media(media):
+            media = media or {}
+            if not isinstance(media, dict) or not media.get("url"):
+                return
             if (not media.get("content_type")
                     or not media.get("width") or not media.get("height")):
                 bad.append(media.get("url"))
+
+        for item in node.get("items") or []:
+            check_media((item or {}).get("media"))
+        # Round 49: a SECTION ACCESSORY (type 11 thumbnail) keeps its media
+        # outside items[], so round 47 never saw a thumbnail Discord failed
+        # to resolve. Same failure shape, same cure.
+        check_media(node.get("media"))
+        accessory = node.get("accessory")
+        if isinstance(accessory, dict):
+            check_media(accessory.get("media"))
         walk(node.get("components") or [])
 
     walk(message.get("components") or [])

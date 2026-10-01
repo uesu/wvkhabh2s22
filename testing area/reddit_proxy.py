@@ -37,6 +37,7 @@ import json
 import time
 import asyncio
 import logging
+import weakref
 import html as html_lib
 
 import aiohttp
@@ -47,9 +48,48 @@ PROXY_HEALTH_FILE = "proxy_health.json"
 # social-preview bots only (vxreddit redirects everyone else to reddit.com).
 PROXY_BOT_UA = "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
 
-# Priority order (user-specified): redditez first; vxreddit + embeddit are
-# the most uptime-reliable and are the fallbacks.
-PROXY_SERVICES = ("redditez", "vxreddit", "embeddit")
+# ---------------------------------------------------------------------------
+# ■ ROUND 49 (2026-10-01): PRIORITY ORDER + PARALLEL DISPATCH
+# Priority is now evidence-based instead of assumed. Field comparison of the
+# three services on the same posts (live screenshots + the prod Actions logs
+# of 2026-10-01 11:50 / 11:55):
+#   vxreddit  - most complete and most stable; resolves BOTH the canonical
+#               /comments/ form and the /s/ share-link form; served the video
+#               for HSR 1wurg8f and for the profile post 1wuv4j8.
+#   redditez  - intermittent. The 11:55 run logged "redditez: OK" at warm-up
+#               and then "redditez had no usable data" for BOTH posts seconds
+#               later. Also rejects /s/ share links ("Could not find provider
+#               for this url. Malformed url?").
+#   embeddit  - weakest: video without audio, GIFs broken. Last resort.
+# The order below is the TIE-BREAK order (equal media counts keep the
+# earlier service); it is no longer the order in which services are asked,
+# because round 49 asks them concurrently — see fetch_proxy_post.
+# ---------------------------------------------------------------------------
+PROXY_SERVICES = ("vxreddit", "redditez", "embeddit")
+
+# Round 49 dispatch tuning.
+# WAVE_DELAY: the third service is held back this long and is never even
+#   dispatched when the first two already answered - so the common case still
+#   costs two requests, exactly like the serial chain with the round-48d exit.
+# GALLERY_GRACE: once SOME media has been found, this is the longest we will
+#   wait for a straggler that might hold a MORE COMPLETE gallery (round 25).
+#   A decisive answer (video on a video post, or MEDIA_CAP_ITEMS items) ends
+#   the wait immediately and cancels whatever is still in flight.
+# MAX_CONCURRENCY: a global ceiling on in-flight proxy requests, so a run with
+#   many new posts cannot hammer one service.
+# 0.5 s is tuned on the prod timings of 2026-10-01 11:55 (vxreddit 0.42 s,
+# redditez 0.76 s, embeddit 0.31 s): a healthy vxreddit answers BEFORE the
+# delay elapses, so a video post never dispatches the third service at all.
+PROXY_WAVE_DELAY = float(os.getenv("PROXY_WAVE_DELAY", "0.5"))
+PROXY_GALLERY_GRACE = float(os.getenv("PROXY_GALLERY_GRACE", "1.5"))
+PROXY_MAX_CONCURRENCY = int(os.getenv("PROXY_MAX_CONCURRENCY", "8"))
+
+# A reddit SHARE link - /r/<sub>/s/<id> or /u/<name>/s/<id>. The <id> is a
+# share token, NOT a post id, so it cannot be rewritten into a /comments/
+# path without a network round-trip. redditez/EmbedEZ answers such a url with
+# "Could not find provider for this url. Malformed url?" (user-verified), so
+# round 49 simply does not spend a request on it; vxreddit resolves it fine.
+SHARE_LINK_RE = re.compile(r"^/(?:r|u|user)/[^/\s?]+/s/[^/\s?]+", re.I)
 
 # Round 25: two gallery containers x ten items; nothing more fits a card.
 MEDIA_CAP_ITEMS = 20
@@ -789,93 +829,234 @@ async def fetch_embeddit_stats(session, path: str, label: str = ""):
 # ---------------------------------------------------------------------------
 # ■ Fallback chain + warm-up
 # ---------------------------------------------------------------------------
+_PROXY_FETCHERS = {
+    "redditez": lambda s, p, l: _fetch_redditez(s, p, l),
+    "vxreddit": lambda s, p, l: _fetch_vxreddit(s, p, l),
+    "embeddit": lambda s, p, l: _fetch_embeddit(s, p, l),
+}
+
+# One semaphore per running event loop (tests call asyncio.run repeatedly).
+_proxy_gates: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _proxy_gate():
+    """Global ceiling on concurrent proxy requests for this event loop."""
+    loop = asyncio.get_running_loop()
+    gate = _proxy_gates.get(loop)
+    if gate is None:
+        gate = asyncio.Semaphore(max(1, PROXY_MAX_CONCURRENCY))
+        _proxy_gates[loop] = gate
+    return gate
+
+
+def proxy_services_for(path: str | None) -> list:
+    """Round 49: the services worth asking for THIS path, in tie-break order.
+
+    redditez/EmbedEZ cannot resolve a reddit SHARE link (/r/<sub>/s/<token>);
+    it answers "Could not find provider for this url. Malformed url?", so the
+    request is pure latency. It is dropped for share links unless it is the
+    only service left.
+    """
+    order = list(PROXY_SERVICES)
+    if path and SHARE_LINK_RE.match(path) and len(order) > 1:
+        order = [s for s in order if s != "redditez"]
+    return order
+
+
+def _better_media(candidate: dict, cand_rank: int,
+                  best: dict | None, best_rank: int) -> bool:
+    """Round 25 rule, made arrival-order independent (round 49).
+
+    Serially, "more items wins, ties keep the earlier service" fell out of the
+    loop order. Concurrently the results arrive in whatever order the network
+    returns them, so the tie-break is now explicit: more media wins; an equal
+    count keeps the service with the better PROXY_SERVICES rank.
+    """
+    if best is None:
+        return True
+    if len(candidate["media"]) != len(best["media"]):
+        return len(candidate["media"]) > len(best["media"])
+    return cand_rank < best_rank
+
+
 async def fetch_proxy_post(session, path: str, label: str = "",
                            health: dict | None = None,
                            need_video: bool = False) -> dict | None:
-    """Try the proxy services in priority order and return the normalized
-    result with the MOST media (photos / GIFs / video). Round 25:
-    partial results no longer stop the chain; ties keep service priority.
-    The winning media list is copied and capped at MEDIA_CAP_ITEMS.
-    A text/stats-only result never stops the chain (round 23, 2026-09-18):
-    a service can have the post's text but not (yet) its images — e.g. a
-    gallery post minutes after posting, when the og:image tags have not
-    been rendered yet (1wj38fc: vxreddit served the title + stats while
-    embeddit — never tried under the old rule — DID have both photos).
-    The first text-only result is kept as the body/stats fallback; if no
-    service produces media, that fallback is returned instead. Services
-    the warm-up proved dead this run are skipped — unless ALL of them
-    are dead, in which case every service gets a fresh try. Returns None
-    when nothing works (the caller uses the native path).
-    need_video (video posts): a result WITHOUT video media (thumbnails /
-    text only) cannot win — the first such result is kept as a body/stats
-    fallback while the chain keeps looking for the service that serves
-    the actual muxed video (with audio) before the arctic CMAF fallback."""
-    order = list(PROXY_SERVICES)
+    """Ask the proxy services for a post and return the normalized result
+    with the MOST media (photos / GIFs / video).
+
+    ROUND 49 (2026-10-01) — PARALLEL DISPATCH. The rules below are unchanged;
+    only the way the services are ASKED changed. The prod Actions log of
+    2026-10-01 11:55 shows the old serial chain costing ~1.5 s per post:
+
+        11:55:50.681  redditez had no usable data
+        11:55:51.098  proxy media via vxreddit - 1 item(s)   (+0.417 s)
+        11:55:51.408  embeddit returned text only            (+0.310 s)
+
+    Every service waited for the previous one to fail. Now:
+
+      * the two services that actually deliver (vxreddit, redditez) are
+        dispatched TOGETHER at t=0;
+      * embeddit is held back PROXY_WAVE_DELAY seconds and is CANCELLED
+        before it ever opens a socket when wave 1 already produced a DECISIVE
+        answer - which is the common case for a video post, so a video post
+        still costs two requests, exactly like the round-48d serial exit;
+      * the moment a DECISIVE answer lands (a video on a video post, per
+        round 48d, or MEDIA_CAP_ITEMS items) everything still in flight is
+        cancelled and the result is returned;
+      * otherwise, once SOME media exists, stragglers get at most
+        PROXY_GALLERY_GRACE seconds to produce a MORE COMPLETE gallery
+        (round 25), and are then cancelled.
+
+    Unchanged decision rules:
+      * round 23 - a text/stats-only answer never wins; it is kept as the
+        body/stats fallback and returned only if nobody produced media.
+      * round 23 - on a video post (need_video) a result without video media
+        cannot win; it becomes the fallback.
+      * round 25 - more media wins; ties keep the higher-priority service
+        (now resolved by explicit rank, since results arrive out of order).
+      * warm-up - services marked ok=false this run are skipped, unless ALL
+        of them are marked down, in which case everyone is retried.
+      * the winning media list is copied and capped at MEDIA_CAP_ITEMS.
+    Returns None when nothing worked (the caller uses the native path).
+    """
+    order = proxy_services_for(path)
     health = health or {}
     marked_down = [s for s in order
                    if isinstance(health.get(s), dict) and health[s].get("ok") is False]
     if len(marked_down) < len(order):
         order = [s for s in order if s not in marked_down]
+    if not order:
+        return None
+
+    rank = {service: i for i, service in enumerate(order)}
     fallback_result = None
+    fallback_rank = len(order)
     best_media_result = None
-    for service in order:
-        if service == "redditez":
-            result = await _fetch_redditez(session, path, label)
-        elif service == "vxreddit":
-            result = await _fetch_vxreddit(session, path, label)
-        else:
-            result = await _fetch_embeddit(session, path, label)
-        if result and (result["media"] or result.get("stats") or result.get("body")):
-            if need_video and not any(m["kind"] == "video" for m in result["media"]):
-                # video post, but this service only gave thumbnails/text:
-                # keep the first such result as fallback, try the next proxy
-                if fallback_result is None:
-                    fallback_result = result
-                logging.info(f"[{label}] {service} result has no video — "
-                             f"trying the next proxy.")
-                continue
-            if result["media"]:
-                # Round 25: keep looking for a more complete gallery (1wj0p83).
-                # Equal counts preserve the higher-priority service and its order.
-                if (best_media_result is None
-                        or len(result["media"]) > len(best_media_result["media"])):
+    best_rank = len(order)
+
+    wave1_settled = asyncio.Event()
+
+    async def run(service: str, delay: float):
+        if delay > 0:
+            # Wave 2 waits out the delay OR starts the instant wave 1 has
+            # settled without a decisive answer - whichever happens first.
+            try:
+                await asyncio.wait_for(wave1_settled.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+        async with _proxy_gate():
+            return service, await _PROXY_FETCHERS[service](session, path, label)
+
+    loop = asyncio.get_running_loop()
+    tasks = {}
+    wave1 = set()
+    for i, service in enumerate(order):
+        # wave 1 = the two best services, wave 2 = the rest, delayed.
+        delay = 0.0 if i < 2 else PROXY_WAVE_DELAY
+        task = asyncio.ensure_future(run(service, delay))
+        tasks[task] = service
+        if i < 2:
+            wave1.add(task)
+    pending = set(tasks)
+    grace_deadline = None
+    decisive = False
+
+    try:
+        while pending and not decisive:
+            timeout = None
+            if grace_deadline is not None:
+                timeout = max(0.0, grace_deadline - loop.time())
+            done, pending = await asyncio.wait(
+                pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                logging.info(f"[{label}] gallery grace expired - going with "
+                             f"{len(best_media_result['media'])} item(s) from "
+                             f"{best_media_result['service']}.")
+                break
+            # Deterministic tie-breaks: when several services answer within
+            # the same wait() batch, process them in PRIORITY order so the
+            # winner never depends on set iteration order (round 49).
+            for task in sorted(done, key=lambda t: rank[tasks[t]]):
+                try:
+                    service, result = task.result()
+                except asyncio.CancelledError:
+                    continue
+                except Exception as e:                      # pragma: no cover
+                    logging.info(f"[{label}] proxy task error: {e}")
+                    continue
+                r = rank[service]
+                if not (result and (result["media"] or result.get("stats")
+                                    or result.get("body"))):
+                    # Round 49: ONE line per attempt. The serial chain logged
+                    # both "returned text only" and "had no usable data" for
+                    # the same attempt (the text-only branch fell through).
+                    logging.info(f"[{label}] {service} had no usable data.")
+                    continue
+                if need_video and not any(m["kind"] == "video" for m in result["media"]):
+                    if r < fallback_rank:
+                        fallback_result, fallback_rank = result, r
+                    logging.info(f"[{label}] {service} result has no video - "
+                                 f"keeping it only as a text/stats fallback.")
+                    continue
+                if not result["media"]:
+                    if r < fallback_rank:
+                        fallback_result, fallback_rank = result, r
+                    logging.info(f"[{label}] {service} returned text only "
+                                 f"(no media) - still waiting for media.")
+                    continue
+                if _better_media(result, r, best_media_result, best_rank):
                     if best_media_result is not None:
                         logging.info(f"[{label}] {service} has "
                                      f"{len(result['media'])} media item(s) vs "
-                                     f"{len(best_media_result['media'])} — "
+                                     f"{len(best_media_result['media'])} from "
+                                     f"{best_media_result['service']} - "
                                      f"replacing the winner.")
-                    best_media_result = result
-                    logging.info(f"[{label}] proxy media via {service} — "
+                    best_media_result, best_rank = result, r
+                    logging.info(f"[{label}] proxy media via {service} - "
                                  f"{len(result['media'])} item(s) (best so far).")
-                    if len(best_media_result["media"]) >= MEDIA_CAP_ITEMS:
-                        logging.info(f"[{label}] media card capacity reached — "
-                                     f"chain complete.")
-                        break
                 else:
                     logging.info(f"[{label}] {service} media "
                                  f"({len(result['media'])} item(s)) not more "
                                  f"complete than the best so far "
-                                 f"({len(best_media_result['media'])}) — keeping "
-                                 f"the earlier service.")
-                continue
-            # round 23 (2026-09-18): text/stats-only — NOT a winner. A
-            # service can have the post's text but not (yet) its images
-            # (too-new gallery posts — 1wj38fc: vxreddit served title +
-            # stats minutes after posting while the og:image tags were
-            # still missing, and the old rule stopped the chain here,
-            # hiding embeddit, which DID have the photos). Keep the first
-            # such result as the body/stats fallback and let the remaining
-            # services have their shot at the media.
-            if fallback_result is None:
-                fallback_result = result
-            logging.info(f"[{label}] {service} returned text only (no media) — "
-                         f"continuing the chain for the media.")
-        logging.info(f"[{label}] {service} had no usable data — trying the next proxy.")
+                                 f"({len(best_media_result['media'])}) - keeping "
+                                 f"{best_media_result['service']}.")
+                if len(best_media_result["media"]) >= MEDIA_CAP_ITEMS:
+                    logging.info(f"[{label}] media card capacity reached - "
+                                 f"chain complete.")
+                    decisive = True
+                    break
+                # ROUND 48d: a reddit video post has exactly one video and the
+                # card shows one player, so no later answer can beat this.
+                if need_video and any(m["kind"] == "video"
+                                      for m in best_media_result["media"]):
+                    logging.info(f"[{label}] video resolved via {service} - "
+                                 f"chain complete (no gallery can beat it).")
+                    decisive = True
+                    break
+            if decisive or not pending:
+                break
+            if not (wave1 & pending):
+                wave1_settled.set()   # wave 2 may start now, no need to wait
+            if best_media_result is not None and grace_deadline is None:
+                # Round 25 is deliberately NOT short-circuited here: 1wj0p83
+                # proved that a LOWER-priority service can hold the complete
+                # gallery (embeddit had all 13 items while the others had 1),
+                # so "somebody returned media" is not a reason to stop. Only a
+                # DECISIVE answer (video / cap, handled above) ends the wait;
+                # everything else gets the bounded grace window.
+                grace_deadline = loop.time() + PROXY_GALLERY_GRACE
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
     if best_media_result is not None:
         # Cap a copy: never mutate the service's original result/list.
         best_media_result = dict(best_media_result)
         best_media_result["media"] = best_media_result["media"][:MEDIA_CAP_ITEMS]
-        logging.info(f"[{label}] proxy media winner — "
+        logging.info(f"[{label}] proxy media winner - "
                      f"{len(best_media_result['media'])} item(s).")
         return best_media_result
     return fallback_result
@@ -935,15 +1116,19 @@ async def proxy_warmup(session, post_id: str | None = None) -> dict:
     sub, pid = parts
     path = f"/r/{sub}/comments/{pid}/"
     label = "proxy warm-up"
-    logging.info(f"Probing proxy media services (redditez, vxreddit, embeddit) "
+    # ROUND 49 FIX: the probes are built FROM the dispatch map, so the result
+    # labels can never drift from the call order again. Before this, the
+    # gather was hard-coded (redditez, vxreddit, embeddit) while the zip used
+    # PROXY_SERVICES — reordering PROXY_SERVICES for the new tie-break would
+    # have swapped the redditez and vxreddit health records, marking the
+    # wrong service dead for the whole run.
+    probes = tuple(_PROXY_FETCHERS)
+    logging.info(f"Probing proxy media services ({', '.join(probes)}) "
                  f"with {raw}...")
     results = await asyncio.gather(
-        _fetch_redditez(session, path, label),
-        _fetch_vxreddit(session, path, label),
-        _fetch_embeddit(session, path, label),
-    )
+        *[_PROXY_FETCHERS[name](session, path, label) for name in probes])
     services = {}
-    for service, result in zip(PROXY_SERVICES, results):
+    for service, result in zip(probes, results):
         if result and (result["media"] or result.get("body") or result.get("stats")):
             services[service] = {"ok": True, "detail": f"{len(result['media'])} media item(s)"}
         else:

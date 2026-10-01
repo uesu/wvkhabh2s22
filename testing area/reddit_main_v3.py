@@ -413,6 +413,35 @@ _REDLIB_AGE_UNITS = {
 }
 _mod_queue_listing_cache: dict = {}
 _redlib_post_page_cache: dict = {}
+
+# ---------------------------------------------------------------------------
+# ■ ROUND 49 (2026-10-01): REDLIB REACHABILITY TELEMETRY
+# The prod run of 11:55 logged "redlib gallery enrichment failed (all
+# instances)" and "MODQUEUE-LISTING: r/AnantaLeaks /new listing unavailable
+# (all sources)" — every mirror failed from the GitHub runner. "all" tells us
+# nothing about WHICH mirrors are dead, so the instance list cannot be pruned
+# or refreshed on evidence. One counter per instance, one summary line per
+# run; zero extra requests, zero latency.
+# ---------------------------------------------------------------------------
+_redlib_reach: dict = {}
+
+
+def log_redlib_reachability() -> str:
+    """One REDLIB-REACH line per run: ok/total per instance, worst first."""
+    if not _redlib_reach:
+        return ""
+    parts = []
+    for instance, (ok, total) in sorted(_redlib_reach.items(),
+                                        key=lambda kv: (kv[1][0] / kv[1][1] if kv[1][1] else 0,
+                                                        kv[0])):
+        parts.append(f"{instance.replace('https://', '')} {ok}/{total}")
+    alive = sum(1 for ok, _t in _redlib_reach.values() if ok)
+    line = (f"REDLIB-REACH: {alive}/{len(_redlib_reach)} instance(s) answered "
+            f"this run — " + ", ".join(parts))
+    logging.info(line)
+    return line
+
+
 _proxy_post_cache: dict = {}
 
 def _redlib_ages_seconds(page_html):
@@ -2943,6 +2972,7 @@ async def _fetch_redlib_post_page(session: aiohttp.ClientSession, instance: str,
     key = (str(instance or ""), str(path or ""))
     if key in _redlib_post_page_cache:
         return _redlib_post_page_cache[key]
+    _redlib_reach.setdefault(str(instance or ""), [0, 0])[1] += 1
     try:
         async with session.get(_with_miningtcup_token(f"{instance}{path}"),
                                headers=BROWSER_HEADERS,
@@ -2952,6 +2982,7 @@ async def _fetch_redlib_post_page(session: aiohttp.ClientSession, instance: str,
                 text = await resp.text()
                 if text:
                     _redlib_post_page_cache[key] = text
+                    _redlib_reach.setdefault(str(instance or ""), [0, 0])[0] += 1
                 return text
     except Exception:
         pass
@@ -4467,6 +4498,8 @@ async def main():
 
         if RETRACT_DEAD_POSTS and not DRY_RUN:
             await retract_dead_posts(session, posted_messages, now)
+
+    log_redlib_reachability()   # round 49: which mirrors actually answered
 
     if DRY_RUN:
         logging.info("DRY RUN finished: cache NOT saved, Discord NOT touched.")
