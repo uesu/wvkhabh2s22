@@ -3635,7 +3635,18 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
         _cp_sub = re.search(r"/r/([^/]+)/", _cp.get("path") or "")
         if not _cp_sub:
             _cp_sub = re.search(r"/r/([^/]+)/", _cp_url)
-        if not _cp_sub and _cp.get("subreddit"):
+        _cp_profile = (re.search(r"/u(?:ser)?/([^/\s?]+)/comments/", _cp.get("path") or "")
+                       or re.search(r"reddit\.com/u(?:ser)?/([^/\s?]+)/comments/", _cp_url))
+        if not _cp_profile and _cp_sub and _cp_sub.group(1).lower().startswith("u_"):
+            _cp_profile_name = _cp_sub.group(1)[2:]
+        elif _cp_profile:
+            _cp_profile_name = _cp_profile.group(1)
+        else:
+            _cp_profile_name = None
+        if _cp_profile_name:
+            header += (f"\n*🔁 Crosspost of [u/{_cp_profile_name}]"
+                       f"(https://www.reddit.com/user/{_cp_profile_name}/) Profile*")
+        elif not _cp_sub and _cp.get("subreddit"):
             # round 29: notice-only detection (no permalink available anywhere)
             _sub = _cp["subreddit"]
             header += (f"\n*🔁 Crosspost of [r/{_sub}]"

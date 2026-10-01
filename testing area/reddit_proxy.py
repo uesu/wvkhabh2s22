@@ -790,6 +790,16 @@ async def _fetch_vxreddit(session, path: str, label: str = ""):
             return None
         meta = _og_meta(page)
         media = dedupe_proxy_media(_media_from_og(meta))
+        title = meta.get("og:title")
+        # A vxReddit bot page for a crosspost's own permalink can return HTTP
+        # 200 without the failure markers while exposing only its generic
+        # site title. With no media, that placeholder must not become the
+        # Reddit post title (for example, a profile-post crosspost).
+        if not media and (title or "").strip().lower() == "vxreddit":
+            logging.info(f"[{label}] vxreddit returned only its generic "
+                         f"placeholder title (\"vxReddit\") and no media — "
+                         f"treated as a fetch miss.")
+            return None
         stats = None
         author = None
         sm = VXREDDIT_STATS_RE.search(meta.get("og:site_name") or "")
@@ -801,7 +811,7 @@ async def _fetch_vxreddit(session, path: str, label: str = ""):
             }
         return {
             "service": "vxreddit",
-            "title": meta.get("og:title"),
+            "title": title,
             "author": author,
             "subreddit": None,
             "body": clean_proxy_body(meta.get("og:description") or ""),

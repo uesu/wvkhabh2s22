@@ -1009,6 +1009,11 @@ async def main():
                 tweet_id = match.group(1)
                 unique_key = f"{account}_{tweet_id}"
                 if unique_key in posted_urls:
+                    if (test_tweet_id and t_account and t_id
+                            and account.lower() == t_account.lower()
+                            and tweet_id == t_id):
+                        logging.info(f"[{unique_key}] TEST_TWEET_ID is already in the "
+                                     f"posted cache — skipping by design.")
                     continue
 
                 published_parsed = entry.get("published_parsed")
