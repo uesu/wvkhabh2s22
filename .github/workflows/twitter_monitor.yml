@@ -69,6 +69,18 @@ jobs:
           # The next run picks it up, no code change.
           # Empty = the chain just skips that instance.
           NITTER_RSS_TOKEN: ${{ secrets.NITTER_RSS_TOKEN }}
+          # Round 47 (2026-10-01): media self-heal. When Discord's media
+          # proxy returns a gallery tile with no dimensions/content-type
+          # (the "Image failed to load" case), the monitor re-sends the
+          # IDENTICAL payload as an edit after MEDIA_HEAL_DELAY_SECONDS,
+          # which makes Discord resolve the asset. Runs AFTER the posting
+          # loop, so posting speed is unchanged. Optional Variables:
+          #   MEDIA_HEAL=off              disable it
+          #   MEDIA_HEAL_DELAY_SECONDS=45 wait before each re-edit
+          #   MEDIA_HEAL_ATTEMPTS=2       max re-edits per message
+          MEDIA_HEAL: ${{ vars.MEDIA_HEAL }}
+          MEDIA_HEAL_DELAY_SECONDS: ${{ vars.MEDIA_HEAL_DELAY_SECONDS }}
+          MEDIA_HEAL_ATTEMPTS: ${{ vars.MEDIA_HEAL_ATTEMPTS }}
         # ───────────────────────────────────────────────────────────────────
         # TESTING AREA (how updates ship):
         # • A new/changed script lives in "testing area/" FIRST (e.g.
