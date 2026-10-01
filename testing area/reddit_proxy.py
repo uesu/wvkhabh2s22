@@ -80,9 +80,33 @@ PROXY_SERVICES = ("vxreddit", "redditez", "embeddit")
 # 0.5 s is tuned on the prod timings of 2026-10-01 11:55 (vxreddit 0.42 s,
 # redditez 0.76 s, embeddit 0.31 s): a healthy vxreddit answers BEFORE the
 # delay elapses, so a video post never dispatches the third service at all.
-PROXY_WAVE_DELAY = float(os.getenv("PROXY_WAVE_DELAY", "0.5"))
-PROXY_GALLERY_GRACE = float(os.getenv("PROXY_GALLERY_GRACE", "1.5"))
-PROXY_MAX_CONCURRENCY = int(os.getenv("PROXY_MAX_CONCURRENCY", "8"))
+# ---------------------------------------------------------------------------
+# ■ GHA-SAFE ENV READERS (round 49b, 2026-10-01)
+# A repository Variable wired as `VAR: ${{ vars.VAR }}` arrives as an EMPTY
+# STRING when it is not set, so int("")/float("") raises at import. That is
+# exactly what killed the 20:10 UTC production runs:
+#   reddit_proxy  -> "reddit_proxy module unavailable - native media only:
+#                     could not convert string to float: ''"  (proxy chain OFF)
+#   twitter_v3    -> ValueError: invalid literal for int() with base 10: ''
+# Round 36 already learned this for reddit_main_v3 (_env_int); these are the
+# same guard for this module. Empty / blank / garbage -> the documented default.
+# ---------------------------------------------------------------------------
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int((os.getenv(name) or "").strip() or str(default))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float((os.getenv(name) or "").strip() or str(default))
+    except ValueError:
+        return default
+
+PROXY_WAVE_DELAY = _env_float("PROXY_WAVE_DELAY", 0.5)
+PROXY_GALLERY_GRACE = _env_float("PROXY_GALLERY_GRACE", 1.5)
+PROXY_MAX_CONCURRENCY = _env_int("PROXY_MAX_CONCURRENCY", 8)
 
 # A reddit SHARE link - /r/<sub>/s/<id> or /u/<name>/s/<id>. The <id> is a
 # share token, NOT a post id, so it cannot be rewritten into a /comments/

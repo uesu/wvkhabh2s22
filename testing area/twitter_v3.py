@@ -116,8 +116,32 @@ CACHE_FILE = "posted_tweets.json"
 # Retention is now PER-ACCOUNT, newest-first (numeric tweet ids sort
 # chronologically within an account), with a generous global backstop.
 # Both are overridable via repo Variables.
-MAX_CACHE_SIZE_PER_ACCOUNT = int(os.getenv("MAX_CACHE_SIZE_PER_ACCOUNT", "250"))
-MAX_CACHE_SIZE_TOTAL = int(os.getenv("MAX_CACHE_SIZE_TOTAL", "10000"))
+# ---------------------------------------------------------------------------
+# ■ GHA-SAFE ENV READERS (round 49b, 2026-10-01)
+# A repository Variable wired as `VAR: ${{ vars.VAR }}` arrives as an EMPTY
+# STRING when it is not set, so int("")/float("") raises at import. That is
+# exactly what killed the 20:10 UTC production runs:
+#   reddit_proxy  -> "reddit_proxy module unavailable - native media only:
+#                     could not convert string to float: ''"  (proxy chain OFF)
+#   twitter_v3    -> ValueError: invalid literal for int() with base 10: ''
+# Round 36 already learned this for reddit_main_v3 (_env_int); these are the
+# same guard for this module. Empty / blank / garbage -> the documented default.
+# ---------------------------------------------------------------------------
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int((os.getenv(name) or "").strip() or str(default))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float((os.getenv(name) or "").strip() or str(default))
+    except ValueError:
+        return default
+
+MAX_CACHE_SIZE_PER_ACCOUNT = _env_int("MAX_CACHE_SIZE_PER_ACCOUNT", 250)
+MAX_CACHE_SIZE_TOTAL = _env_int("MAX_CACHE_SIZE_TOTAL", 10000)
 # Round 34: retired pre-round-34 global cap (kept so old references still
 # resolve; the save no longer uses it).
 MAX_CACHE_SIZE = 500
@@ -237,8 +261,8 @@ GALLERY_VIDEO_LIMIT = 0
 # back unresolved (normally none).
 # ---------------------------------------------------------------------------
 MEDIA_HEAL = os.getenv("MEDIA_HEAL", "on").strip().lower() not in ("0", "off", "no", "false")
-MEDIA_HEAL_DELAY_SECONDS = int(os.getenv("MEDIA_HEAL_DELAY_SECONDS", "45"))
-MEDIA_HEAL_ATTEMPTS = int(os.getenv("MEDIA_HEAL_ATTEMPTS", "2"))
+MEDIA_HEAL_DELAY_SECONDS = _env_int("MEDIA_HEAL_DELAY_SECONDS", 45)
+MEDIA_HEAL_ATTEMPTS = _env_int("MEDIA_HEAL_ATTEMPTS", 2)
 
 TEXT_CHUNK_SIZE = 1900
 MAX_TEXT_COMPONENTS = 4

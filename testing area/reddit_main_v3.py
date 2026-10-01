@@ -281,8 +281,17 @@ CACHE_FILE = "posted_reddit.json"
 # 1wriz86 on every 5-min cron run). Retention is now PER-SUBREDDIT,
 # newest-first (leet post ids sort chronologically WITHIN a subreddit), with
 # a generous global backstop. All three are overridable via repo Variables.
-MAX_CACHE_SIZE_PER_SUB = int(os.getenv("MAX_CACHE_SIZE_PER_SUB", "250"))
-MAX_CACHE_SIZE_TOTAL = int(os.getenv("MAX_CACHE_SIZE_TOTAL", "10000"))
+# Round 36 hotfix / round 49b: an unset repo Variable arrives as "",
+# so every numeric env read goes through this guard.
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int((os.getenv(name) or "").strip() or str(default))
+    except ValueError:
+        return default
+
+
+MAX_CACHE_SIZE_PER_SUB = _env_int("MAX_CACHE_SIZE_PER_SUB", 250)
+MAX_CACHE_SIZE_TOTAL = _env_int("MAX_CACHE_SIZE_TOTAL", 10000)
 # Round 34: retired pre-round-34 global cap (kept so old references — e.g.
 # tests/README — still resolve; the save no longer uses it).
 MAX_CACHE_SIZE = 500
@@ -290,7 +299,7 @@ MAX_CACHE_SIZE = 500
 # (the newest ones); the rest retry next run inside the 48 h window. A loud
 # log line instead of a mass re-post storm if the dedup cache ever loses
 # keys again.
-MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "25"))
+MAX_POSTS_PER_RUN = _env_int("MAX_POSTS_PER_RUN", 25)
 
 # Wide window (48h) so posts approved from a subreddit's moderator queue a day
 # or more later are still caught (approval bumps the RSS "updated" stamp).
@@ -307,7 +316,7 @@ MAX_AGE_SECONDS = 48 * 3600
 # (2.5-3.5 min) and the window in which overlapping runs could double-post.
 # ---------------------------------------------------------------------------
 PENDING_FILE = "pending_reddit.json"
-PENDING_RECHECK_SECONDS = int(os.getenv("PENDING_RECHECK_SECONDS", "1800"))  # 30 min
+PENDING_RECHECK_SECONDS = _env_int("PENDING_RECHECK_SECONDS", 1800)  # 30 min
 PENDING_MAX_AGE_SECONDS = 48 * 3600  # matches the 48h posting window
 
 # Round 35 (2026-09-28): optional escape list for the NSFW content gate.
@@ -330,7 +339,7 @@ NSFW_PAGE_FALLBACK = os.getenv("NSFW_PAGE_FALLBACK", "1").strip().lower() not in
 # instead of waiting up to 30 min. Removed/deleted posts are NEVER
 # re-checked (they re-enter via RSS if restored — see _NO_RECHECK_REASONS
 # below); media-waiting posts keep the 30-min interval.
-APPROVAL_RECHECK_SECONDS = int(os.getenv("APPROVAL_RECHECK_SECONDS", "300"))  # 5 min
+APPROVAL_RECHECK_SECONDS = _env_int("APPROVAL_RECHECK_SECONDS", 300)  # 5 min
 
 # Round 36 (2026-09-29): settle window — a NEW post younger than this many
 # seconds is NOT posted this run: no state is written (it simply stays
@@ -345,13 +354,6 @@ APPROVAL_RECHECK_SECONDS = int(os.getenv("APPROVAL_RECHECK_SECONDS", "300"))  # 
 # returns "" instead of None, so the "300" default never applied) — the first
 # prod deploy crashed at import with int(""). Empty, blank, and non-numeric
 # values now fall back to the default; a valid number still overrides.
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int((os.getenv(name) or "").strip() or str(default))
-    except ValueError:
-        return default
-
-
 POST_SETTLE_SECONDS = _env_int("POST_SETTLE_SECONDS", 300)  # 5 min when /new did not confirm it
 POST_SETTLE_VERIFIED_SECONDS = _env_int("POST_SETTLE_VERIFIED_SECONDS", 60)  # 1 min when visible in /new
 # Round 36: duplicate-media gate — skip a new post whose exact media
@@ -836,7 +838,7 @@ DASH_QUALITIES = (720, 1080, 480, 360)
 # Feed-token .json attempt: anonymous .json is ~1 req/min from datacenters, so
 # this is the polite sleep before each attempt (lower it ONLY if your token
 # reliably works on .json).
-FEEDTOKEN_JSON_STAGGER = int(os.getenv("FEEDTOKEN_JSON_STAGGER", "65"))
+FEEDTOKEN_JSON_STAGGER = _env_int("FEEDTOKEN_JSON_STAGGER", 65)
 
 # ---------------------------------------------------------------------------
 # ■ ROUND 31 (2026-09-20): FEED-TOKEN .json FULL-MODE PROBE GATE
