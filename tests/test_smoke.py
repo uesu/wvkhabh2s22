@@ -3418,6 +3418,74 @@ check("r49: the counter is wired into the real page fetcher and main()",
 
 
 # ===========================================================================
+# ROUND 50 (2026-10-01) — A VIDEO WIN NO LONGER CANCELS A PENDING
+# HIGHER-PRIORITY SERVICE
+# Incident 1wv12qb (prod, repo 7jkxmy9nvbc, run 36923059079): a crosspost
+# resolves media against the ORIGINAL post (AnantaStation 1wv0oiq). On that
+# lookup vxreddit/redditez (rank 0/1 — video WITH audio per the round-49
+# field table) were still in flight when embeddit (rank 2 — NO audio per the
+# same table) answered first with a video. The round-48d decisive-exit fired
+# on ANY video answer and cancelled the still-pending higher-priority tasks,
+# so the card posted silent even though vxreddit could serve the same video
+# with audio. The fix: a video answer is decisive only when nothing still
+# pending could outrank it; otherwise it falls into the existing bounded
+# grace window (same mechanism round 25 already uses for galleries) so a
+# higher-priority video, if one arrives, replaces it first.
+# ===========================================================================
+try:
+    # ---- 1. A slower, higher-priority video REPLACES a fast low-rank one -
+    rec = _r49_fakes({"vxreddit": _R49_VID, "redditez": None, "embeddit": _R49_VID},
+                     latency={"vxreddit": 0.9, "redditez": 0.01, "embeddit": 0.05})
+    _t0 = time.monotonic()
+    _r50_v = asyncio.run(_r49.fetch_proxy_post(None, "/r/Sub/comments/abc/",
+                                               label="t", health={},
+                                               need_video=True))
+    _r50_dt = time.monotonic() - _t0
+    check("r50/1wv12qb: vxreddit (rank 0, in flight) wins over a faster embeddit video",
+          _r50_v is not None and _r50_v["service"] == "vxreddit"
+          and _r50_dt >= 0.85,
+          f"winner={_r50_v and _r50_v['service']} in {_r50_dt:.3f}s")
+
+    # ---- 2. If the higher-priority service never arrives, the bounded grace
+    #         window still lets the low-rank video win (no hang) -----------
+    _r50_grace_saved = _r49.PROXY_GALLERY_GRACE
+    try:
+        _r49.PROXY_GALLERY_GRACE = 0.3
+        rec = _r49_fakes({"vxreddit": _R49_VID, "redditez": None, "embeddit": _R49_VID},
+                         latency={"vxreddit": 10.0, "redditez": 0.01, "embeddit": 0.05})
+        _t0 = time.monotonic()
+        _r50_g = asyncio.run(_r49.fetch_proxy_post(None, "/r/Sub/comments/abc/",
+                                                   label="t", health={},
+                                                   need_video=True))
+        _r50_gdt = time.monotonic() - _t0
+        check("r50: a hung higher-priority service cannot stall a video post — "
+              "grace expires and embeddit's video still posts",
+              _r50_g is not None and _r50_g["service"] == "embeddit"
+              and _r50_gdt < 2.0,
+              f"winner={_r50_g and _r50_g['service']} in {_r50_gdt:.3f}s")
+    finally:
+        _r49.PROXY_GALLERY_GRACE = _r50_grace_saved
+
+    # ---- 3. Unchanged: a same-wave decisive video (round 49 test 2) is still
+    #         instant — nothing with a BETTER rank is pending in that case --
+    rec = _r49_fakes({"vxreddit": _R49_VID, "redditez": _R49_VID,
+                      "embeddit": _R49_MANY},
+                     latency={"vxreddit": 0.01, "redditez": 0.01, "embeddit": 0.01})
+    _t0 = time.monotonic()
+    _r50_fast = asyncio.run(_r49.fetch_proxy_post(None, "/r/Sub/comments/abc/",
+                                                  label="t", health={},
+                                                  need_video=True))
+    _r50_fastdt = time.monotonic() - _t0
+    check("r50: wave-1 video still exits instantly when nothing outranks it",
+          "embeddit" not in rec and _r50_fast["service"] == "vxreddit"
+          and _r50_fastdt < _r49.PROXY_WAVE_DELAY,
+          f"{rec} in {_r50_fastdt:.3f}s")
+finally:
+    for _n, _f in _r49_saved.items():
+        setattr(_r49, "_fetch_" + _n, _f)
+
+
+# ===========================================================================
 # ROUND 49 REPLAY — nine REAL production cards, byte-for-byte
 # These are the exact media-gallery tile urls Discord accepted and rendered
 # for nine real gallery posts (captured from the live webhook payloads, see
