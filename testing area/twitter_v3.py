@@ -280,11 +280,32 @@ MEDIA_HEAL_ATTEMPTS = _env_int("MEDIA_HEAL_ATTEMPTS", 2)
 # video.twimg.com host — which keeps X "GIF" tweet_video mp4s covered,
 # since they use the same player). Converted GIFs (.gif/.webp image files)
 # and photos are left alone. If an image tile is ever SEEN broken in
-# production, set the repo Variable MEDIA_HEAL_SCOPE=all to restore the
-# round-47 behaviour for every media type — no code change needed.
+# production, set the repo Variable MEDIA_HEAL_SCOPE=on (or all) to restore
+# the round-47 behaviour for every media type — no code change needed.
+# Accepted Variable values (56b): video (default) | on/all | off.
 # See docs/ROUND_56.md for the full decision record.
 # ---------------------------------------------------------------------------
-MEDIA_HEAL_SCOPE = (os.getenv("MEDIA_HEAL_SCOPE") or "video").strip().lower() or "video"
+
+
+def media_heal_scope(raw) -> str:
+    """Round 56b: normalise the MEDIA_HEAL_SCOPE Variable to one of three
+    modes. Unset/empty/unknown values fall back to the safe default.
+
+      on / all                       -> "all"   heal every media type (r47)
+      off / none / no / 0 / false /
+      disable / disabled             -> "off"   never re-edit anything
+      video / videos (or anything
+      else, incl. unset/empty)       -> "video" heal video renditions only
+    """
+    v = str(raw or "").strip().lower()
+    if v in ("all", "on", "everything", "full"):
+        return "all"
+    if v in ("off", "none", "no", "0", "false", "disable", "disabled"):
+        return "off"
+    return "video"
+
+
+MEDIA_HEAL_SCOPE = media_heal_scope(os.getenv("MEDIA_HEAL_SCOPE"))
 
 TEXT_CHUNK_SIZE = 1900
 MAX_TEXT_COMPONENTS = 4
@@ -698,8 +719,11 @@ def heal_eligible_items(message: dict | None) -> list:
     Default scope ('video'): only video renditions, because the only broken
     tile ever confirmed in production was a video (round 47) and cold image
     tiles were observed rendering fine without an edit (2026-10-02).
-    MEDIA_HEAL_SCOPE=all restores round-47 behaviour for every media type.
+    MEDIA_HEAL_SCOPE=all restores round-47 behaviour for every media type;
+    MEDIA_HEAL_SCOPE=off disables the heal pass entirely (round 56b).
     """
+    if MEDIA_HEAL_SCOPE == "off":
+        return []
     items = unresolved_media_items(message)
     if MEDIA_HEAL_SCOPE == "all":
         return items
@@ -718,7 +742,7 @@ async def heal_unresolved_media(session: aiohttp.ClientSession, pending: list) -
     Every message is healed CONCURRENTLY and only after the posting loop has
     finished, so this never delays a post.
     """
-    if not (MEDIA_HEAL and pending):
+    if not (MEDIA_HEAL and MEDIA_HEAL_SCOPE != "off" and pending):
         return
 
     async def heal_one(webhook_url, message_id, payload, key):
