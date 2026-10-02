@@ -265,6 +265,26 @@ GALLERY_VIDEO_LIMIT = 0
 MEDIA_HEAL = os.getenv("MEDIA_HEAL", "on").strip().lower() not in ("0", "off", "no", "false")
 MEDIA_HEAL_DELAY_SECONDS = _env_int("MEDIA_HEAL_DELAY_SECONDS", 45)
 MEDIA_HEAL_ATTEMPTS = _env_int("MEDIA_HEAL_ATTEMPTS", 2)
+# ---------------------------------------------------------------------------
+# ■ ROUND 56 (2026-10-02): MEDIA-HEAL SCOPE — VIDEOS ONLY BY DEFAULT
+# The only confirmed broken tile in production was a VIDEO (round 47,
+# Wuthering_Waves/2105598609827737874 — "Image failed to load" on an mp4).
+# On 2026-10-02 the heal also re-edited three PHOTO posts (PomPom_HonkaiSR
+# 2105885490486427815 + 2105870388106322223, TYPEII_EN 2105870393584074977)
+# whose image tiles came back from Discord with width/height 0 and no
+# content_type — but the photos rendered FINE in the client before the edit
+# (owner-verified on the live messages). An image tile renders from its
+# raw/proxy URL even while Discord's probe is still cold; only the mp4
+# PLAYER refuses to start without resolved metadata. So the heal pass now
+# targets video renditions only (.mp4/.m4v/.mov/.webm/.m3u8 or a
+# video.twimg.com host — which keeps X "GIF" tweet_video mp4s covered,
+# since they use the same player). Converted GIFs (.gif/.webp image files)
+# and photos are left alone. If an image tile is ever SEEN broken in
+# production, set the repo Variable MEDIA_HEAL_SCOPE=all to restore the
+# round-47 behaviour for every media type — no code change needed.
+# See docs/ROUND_56.md for the full decision record.
+# ---------------------------------------------------------------------------
+MEDIA_HEAL_SCOPE = (os.getenv("MEDIA_HEAL_SCOPE") or "video").strip().lower() or "video"
 
 TEXT_CHUNK_SIZE = 1900
 MAX_TEXT_COMPONENTS = 4
@@ -659,6 +679,33 @@ def unresolved_media_items(message: dict | None) -> list:
     return bad
 
 
+# Round 56: video renditions are the media that NEEDS the heal — the player
+# will not start on a tile Discord left unresolved, while image tiles render
+# from their raw/proxy URL regardless. tweet_video mp4s (X "GIFs") count as
+# video; converted .gif/.webp image files do not.
+_VIDEO_URL_RE = re.compile(r"\.(?:mp4|m4v|mov|webm|m3u8)(?:[?#]|$)", re.I)
+
+
+def is_video_media_url(url) -> bool:
+    """Round 56: True when a media URL is a video rendition (player-rendered)."""
+    u = str(url or "")
+    return bool(_VIDEO_URL_RE.search(u)) or "video.twimg.com" in u.lower()
+
+
+def heal_eligible_items(message: dict | None) -> list:
+    """Round 56: the unresolved media items the heal pass should act on.
+
+    Default scope ('video'): only video renditions, because the only broken
+    tile ever confirmed in production was a video (round 47) and cold image
+    tiles were observed rendering fine without an edit (2026-10-02).
+    MEDIA_HEAL_SCOPE=all restores round-47 behaviour for every media type.
+    """
+    items = unresolved_media_items(message)
+    if MEDIA_HEAL_SCOPE == "all":
+        return items
+    return [u for u in items if is_video_media_url(u)]
+
+
 async def heal_unresolved_media(session: aiohttp.ClientSession, pending: list) -> None:
     """Round 47: re-edit messages whose media Discord left unresolved.
 
@@ -689,10 +736,10 @@ async def heal_unresolved_media(session: aiohttp.ClientSession, pending: list) -
             except Exception as e:
                 logging.error(f"MEDIA-HEAL {key}: edit error {e}")
                 return
-            still_bad = unresolved_media_items(edited)
+            still_bad = heal_eligible_items(edited)
             if not still_bad:
                 logging.info(f"MEDIA-HEAL {key}: media resolved after edit "
-                             f"#{attempt} — the video now plays.")
+                             f"#{attempt} — the media now renders.")
                 return
             logging.info(f"MEDIA-HEAL {key}: still unresolved after edit "
                          f"#{attempt} ({len(still_bad)} item(s)).")
@@ -1444,14 +1491,18 @@ async def main():
                                 created = await resp.json()
                             except Exception:
                                 created = None
-                        unresolved = unresolved_media_items(created)
+                        unresolved = heal_eligible_items(created)
+                        # Round 56: only heal-eligible media (videos by
+                        # default) queue an edit — cold image tiles render
+                        # fine on their own and are left untouched.
                         if unresolved and created and created.get("id"):
                             heal_queue.append((webhook_url, created["id"],
                                                payload, unique_key))
                             logging.info(f"MEDIA-HEAL queued for {unique_key}: "
                                          f"Discord returned {len(unresolved)} "
-                                         f"media item(s) with no dimensions/"
-                                         f"content-type (cold media proxy).")
+                                         f"heal-eligible media item(s) with no "
+                                         f"dimensions/content-type (cold media "
+                                         f"proxy; scope={MEDIA_HEAL_SCOPE}).")
                         await asyncio.sleep(1.5)
                     else:
                         body = await resp.text()
