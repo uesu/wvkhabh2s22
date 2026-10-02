@@ -413,6 +413,21 @@ PENDING_APPROVAL = "pending approval"
 def listing_proves_release(in_listing, listing_source: str = LISTING_HTML) -> bool:
     return in_listing is True and listing_source != LISTING_RSS
 
+
+def page_is_post_page(page_html, post_id) -> bool:
+    """True only when ``page_html`` plausibly renders the post ``post_id``.
+
+    A successful HTTP response is not sufficient evidence: mirrors can return
+    Cloudflare interstitials, JavaScript shells, or rate-limit pages with a
+    200 status.  A rendered Reddit post page carries its own permalink marker.
+    """
+    h = str(page_html or "")
+    pid = str(post_id or "").strip().lower()
+    if not h or not pid:
+        return False
+    return bool(re.search(r"/comments/%s(?![0-9a-z])" % re.escape(pid), h, re.I))
+
+
 def queue_verdict(*, strong_hold_text=False, weak_hold_text=False,
                   in_listing=None, listing_source=LISTING_HTML,
                   listing_oldest_age=None, page_age_seconds=None,

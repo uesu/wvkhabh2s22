@@ -661,6 +661,12 @@ def _listing_confirms_post(listing, post_id: str) -> bool:
 
 async def mod_queue_reason(session, subreddit, path, label="", post_age_seconds=None):
     pages = await asyncio.gather(*[_fetch_redlib_post_page(session, inst, path) for inst in REDDIT_RSS_INSTANCES])
+    post_id = extract_post_id(path) or ""
+    # Round 55: a 200 shell (Cloudflare interstitial, JS stub, or rate-limit
+    # page) is not evidence that this post rendered.  Only a page containing
+    # this post's own /comments/<id> marker may feed the queue verdict.
+    if post_id:
+        pages = [h for h in pages if reddit_signals.page_is_post_page(h, post_id)]
     # Preserve the round-37 positive signal wherever it was rendered. For a
     # zero-comment native queue post, prefer a page that actually exposes a
     # relative post age over a generic/JS shell from an earlier instance.
