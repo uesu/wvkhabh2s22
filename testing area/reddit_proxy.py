@@ -39,6 +39,7 @@ import asyncio
 import logging
 import weakref
 import html as html_lib
+import urllib.parse
 
 import aiohttp
 
@@ -104,6 +105,33 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         return default
 
+
+# ---------------------------------------------------------------------------
+# ■ ROUND 53 (2026-10-01): THE SAME GUARD FOR *STRING* VARIABLES
+# Round 49b fixed the numeric readers but left the two STRING Variables on
+# bare os.getenv(name, default) — and that form only uses the default when the
+# variable is ABSENT. A workflow line `EMBEDDIT_INSTANCE: ${{ vars.X }}` with
+# no Variable set exports an EMPTY STRING, which is present, so the default
+# never applied:
+#
+#   EMBEDDIT_BASE  = ""  -> every request went to the RELATIVE url
+#                           "/api/v1/statuses/<id>", which aiohttp rejects with
+#                           InvalidURL before a socket is ever opened. The prod
+#                           log of 2026-10-01 23:13 shows exactly that:
+#                           "embeddit error: /api/v1/statuses/4f1y49…" for
+#                           EVERY post — Embeddit was effectively dead, not the
+#                           instance (the same status id returns valid JSON
+#                           when prefixed with the default host).
+#   WARMUP_POST_ID = ""  -> "PROXY_WARMUP_POST '' is invalid … Warm-up skipped"
+#                           on every run, so proxy_health.json was never
+#                           refreshed and dead services were never skipped.
+#
+# _env_str() treats unset AND empty/whitespace as "not configured".
+# ---------------------------------------------------------------------------
+def _env_str(name: str, default: str) -> str:
+    """GHA-safe string option: unset, empty and blank all mean the default."""
+    return (os.getenv(name) or "").strip() or default
+
 PROXY_WAVE_DELAY = _env_float("PROXY_WAVE_DELAY", 0.5)
 PROXY_GALLERY_GRACE = _env_float("PROXY_GALLERY_GRACE", 1.5)
 PROXY_MAX_CONCURRENCY = _env_int("PROXY_MAX_CONCURRENCY", 8)
@@ -139,7 +167,135 @@ VXREDDIT_STATS_RE = re.compile(r"u/(\S+) on r/(\S+) - ⬆️ (\d+)(?: \| 💬 (\
 # Mastodon-spoof API: GET /api/v1/statuses/<encoded-id> -> JSON. The encoded
 # id is Embeddit's idEncode of {"type": "post", "id": <post_id>, "merge":
 # true} (merge=true => the video comes back WITH audio, under ~50 MB).
-EMBEDDIT_BASE = os.getenv("EMBEDDIT_INSTANCE", "https://embeddit.deltandy.me").rstrip("/")
+EMBEDDIT_DEFAULT_BASE = "https://embeddit.deltandy.me"
+
+
+def _normalize_instance(raw: str, default: str, variable: str) -> str:
+    """Round 53: turn an operator-supplied instance value into a usable base
+    URL, or fall back to the documented default with ONE clear log line.
+
+    Accepted: "https://host", "http://host", "host", "host/" and any of those
+    with surrounding whitespace (the REDDIT_MIRROR Variable in this repo is
+    stored bare, as `embeddit.deltandy.me`, so a bare host must work here).
+    Rejected (-> default): empty, whitespace, a scheme other than http(s),
+    an embedded space, or anything with no host part.
+    """
+    value = (raw or "").strip().rstrip("/")
+    if not value:
+        return default
+    if (re.match(r"^[a-z][a-z0-9+.-]*:", value, re.I)
+            and not re.match(r"^[a-z][a-z0-9+.-]*:\d+(?:/|$)", value, re.I)):
+        candidate = value               # has an explicit scheme — keep it
+    else:
+        # bare host (possibly host:port — "localhost:3000" is a port, not a
+        # scheme) — assume https
+        candidate = f"https://{value}"
+    parts = urllib.parse.urlsplit(candidate)
+    if (parts.scheme.lower() not in ("http", "https") or not parts.netloc
+            or re.search(r"\s", candidate)):
+        logging.warning(
+            f"{variable} '{raw}' is not a usable http(s) host — "
+            f"falling back to {default}.")
+        return default
+    return candidate.rstrip("/")
+
+
+# EMBEDDIT_INSTANCE (repo Variable) overrides the host; empty/unset/invalid
+# keeps the public default instance (round 53).
+EMBEDDIT_BASE = _normalize_instance(
+    _env_str("EMBEDDIT_INSTANCE", EMBEDDIT_DEFAULT_BASE),
+    EMBEDDIT_DEFAULT_BASE, "EMBEDDIT_INSTANCE")
+EMBEDDIT_HOST = EMBEDDIT_BASE.split("://", 1)[-1]
+
+# ---------------------------------------------------------------------------
+# ■ ROUND 53: RUN-SCOPED EMBEDDIT AVAILABILITY
+# ■ ROUND 54: COMPONENT-EMBED READINESS (Embeddit rewrite auto-adaptation)
+# The Embeddit rewrite (DeltAndy123/Embeddit, branch `rewrite`, sources read
+# 2026-10-02) is a full rewrite to Bun + Hono that REMOVES the Mastodon spoof:
+# the rewrite's router has no /api/v1/statuses route at all (src/index.ts:
+# only /r/*, /u/*, /user/*, /test). Instead, the post page itself — the SAME
+# /r/<sub>/comments/<id>/<title> path this module already builds — serves
+# bots (botOnly middleware, our Discordbot UA qualifies) an HTML shell whose
+# only payload is
+#     <script id="discord:component-embed" type="application/json">
+#       {"component": {<Discord Components-V2 container>}}
+#     </script>
+# (src/views/EmbedPage.tsx + JsonScript.tsx). That JSON holds everything the
+# Mastodon JSON held: header "-# in **[r/sub](…)**  •  by **[u/author](…)**",
+# title "### <title>", a MediaGallery (images / gallery with captions / the
+# video fallback_url), the selftext body, a stats line
+# "**<:u:…>  N   •   <:c:…>  M**" and the footer (src/embed/builders/post.ts,
+# src/embed/parts.ts, src/embed/components.ts).
+#
+# The adaptation is a run-scoped three-state machine:
+#   mastodon (default)  — today's behavior, byte-for-byte: the status API is
+#                         asked first; timeouts/429/5xx/parse misses stay
+#                         per-post misses exactly as before.
+#   component           — entered automatically when the status API answers
+#                         ROUTE-GONE evidence (404/410/501, or a 200 that is
+#                         not JSON — the live pre-rewrite instance answers an
+#                         unknown/dead POST with Cloudflare 502, verified
+#                         2026-10-01, never 404) AND the component page for
+#                         the same post parses. One WARNING line, then every
+#                         later embeddit lookup this run goes straight to the
+#                         component page. Notes: the rewrite's video is the
+#                         DASH fallback stream (no audio — unchanged from the
+#                         Mastodon era, embeddit stays last-resort for video)
+#                         and galleries cap at 10 items (MAX_GALLERY_ITEMS).
+#   unavailable         — route gone AND the component page did not parse
+#                         either: the round-53 behavior — one WARNING, then
+#                         embeddit is dropped from the dispatch order for the
+#                         rest of the run (never below one service).
+# A new process (= every monitor run) starts back at "mastodon", so the probe
+# order re-verifies the instance each run with zero extra requests in the
+# common case.
+# ---------------------------------------------------------------------------
+_embeddit_unavailable: "str | None" = None
+_embeddit_component_mode = False
+
+
+def embeddit_unavailable_reason() -> "str | None":
+    """Why Embeddit is skipped for the rest of this run (None = available)."""
+    return _embeddit_unavailable
+
+
+def embeddit_component_mode() -> bool:
+    """True when this run auto-switched to the rewrite's Component-Embed
+    page after detecting that the Mastodon status API is gone (round 54)."""
+    return _embeddit_component_mode
+
+
+def reset_embeddit_availability():
+    """Clear the run-scoped state (used by the tests; a new process starts
+    clean anyway)."""
+    global _embeddit_unavailable, _embeddit_component_mode
+    _embeddit_unavailable = None
+    _embeddit_component_mode = False
+
+
+def _mark_embeddit_unavailable(reason: str):
+    global _embeddit_unavailable
+    if _embeddit_unavailable is None:
+        _embeddit_unavailable = reason
+        logging.warning(
+            f"embeddit: {EMBEDDIT_HOST} serves neither the Mastodon status "
+            f"API ({reason}) nor a parseable Component-Embed page — skipping "
+            f"embeddit for the rest of this run (redditez/vxreddit/native "
+            f"media are unaffected). Set the EMBEDDIT_INSTANCE Variable to a "
+            f"working instance, or leave it unset once the service is back.")
+
+
+def _mark_embeddit_component_mode(reason: str):
+    global _embeddit_component_mode
+    if not _embeddit_component_mode:
+        _embeddit_component_mode = True
+        logging.warning(
+            f"embeddit: {EMBEDDIT_HOST} no longer serves the Mastodon status "
+            f"API ({reason}) but DOES serve the rewrite's Component-Embed "
+            f"page (the Embeddit rewrite) — switched to the component parser for "
+            f"the rest of this run. Caveats unchanged from the field table: "
+            f"video is the audio-less fallback stream and galleries cap at "
+            f"10 items, so embeddit remains the last-resort service.")
 EMBEDDIT_ENCODE_CHARS = "1234567890abcdefghijklmnopqrstuvwxyz"
 # Footer line inside the content HTML: "⬆️ 305 • 💬 21"
 # (compact numbers occur too: "⬆️ 1.1K • 💬 108")
@@ -162,12 +318,32 @@ def _compact_int(s: str) -> int:
 # account.display_name = "u/<author> (@ r/<subreddit>)"
 EMBEDDIT_AUTHOR_RE = re.compile(r"u/(\S+) \(@ (r/[^\s)]+)")
 
+# --- embeddit rewrite Component-Embed page (round 54) ------------------------
+# The bot page's only payload. Attribute order is as emitted by EmbedPage.tsx
+# today, but the regex tolerates any order/quoting around the id.
+EMBEDDIT_COMPONENT_SCRIPT_RE = re.compile(
+    r"<script\b[^>]*\bid=(?P<q>[\"'])discord:component-embed(?P=q)[^>]*>"
+    r"(?P<json>.*?)</script>", re.I | re.S)
+# Discord Components V2 type ids (discord-api-types/v10) used by the rewrite.
+DC_ACTION_ROW, DC_SECTION, DC_TEXT = 1, 9, 10
+DC_THUMBNAIL, DC_GALLERY, DC_SEPARATOR, DC_CONTAINER = 11, 12, 14, 17
+# Custom-emoji markup inside the stats line: "<:u:…>  168   •   <:c:…>  56"
+DISCORD_CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
+# The stats TextDisplay once the emoji markup is stripped — the WHOLE line
+# must match, so a body line that merely contains "•" can never be eaten.
+COMPONENT_STATS_LINE_RE = re.compile(
+    r"^\*\*\s*(\d[\d,]*(?:\.\d+)?[KkMm]?)\s*•\s*(\d[\d,]*(?:\.\d+)?[KkMm]?)\s*\*\*$")
+# Header small line: "-# in **[r/sub](…)**  •  by **[u/author](…)**"
+COMPONENT_SUB_RE = re.compile(r"\[(r/[^\]\s]+)\]\(")
+COMPONENT_AUTHOR_RE = re.compile(r"\[u/([^\]\s]+)\]\(")
+
 # Icon-style stats (redditez): "💬 152 🔁 0 💜 573 👀 0"
 STATS_ICONS_RE = re.compile(r"💬\s*(\d[\d,]*)\s*🔁\s*(\d[\d,]*)\s*💜\s*(\d[\d,]*)")
 
 # Warm-up: one known-good single-image post used to probe all three
 # services once per run (override: PROXY_WARMUP_POST=<subreddit>/<post_id>).
-WARMUP_POST_ID = os.getenv("PROXY_WARMUP_POST", "HonkaiStarRail_leaks/1whbjbh").strip()
+DEFAULT_WARMUP_POST = "HonkaiStarRail_leaks/1whbjbh"
+WARMUP_POST_ID = _env_str("PROXY_WARMUP_POST", DEFAULT_WARMUP_POST)
 
 PROXY_TIMEOUT = aiohttp.ClientTimeout(total=20)
 
@@ -687,6 +863,117 @@ def parse_embeddit_post(data: dict):
     }
 
 
+def _component_media_kind(url: str) -> str:
+    """Media kind from a rewrite gallery/thumbnail URL. The rewrite's video
+    post puts the v.redd.it DASH fallback mp4 in the gallery."""
+    base = (url or "").split("?")[0].lower()
+    if base.endswith(".gif"):
+        return "gif"
+    if base.endswith((".mp4", ".webm", ".mov")) or "v.redd.it" in base:
+        return "video"
+    return "image"
+
+
+def parse_embeddit_component_page(page_html: str):
+    """Embeddit-rewrite bot page -> the SAME normalized dict every
+    other parser in this module emits (or None).
+
+    The page is an HTML shell whose only payload is the
+    <script id="discord:component-embed" type="application/json"> JSON:
+    {"component": {type:17 Container, components:[…]}} — see the round-54
+    header. Walked recursively; only component types the rewrite actually
+    emits are read, unknown types are skipped (forward-compatible). Pure —
+    unit-testable offline.
+    """
+    m = EMBEDDIT_COMPONENT_SCRIPT_RE.search(page_html or "")
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group("json"))
+    except ValueError:
+        return None
+    component = data.get("component") if isinstance(data, dict) else None
+    if not isinstance(component, dict):
+        return None
+
+    texts: list = []
+    media: list = []
+
+    def walk(node):
+        if not isinstance(node, dict):
+            return
+        ntype = node.get("type")
+        if ntype == DC_TEXT:
+            content = node.get("content")
+            if isinstance(content, str) and content.strip():
+                texts.append(content.strip())
+        elif ntype == DC_GALLERY:
+            for item in node.get("items") or []:
+                if isinstance(item, dict):
+                    url = (item.get("media") or {}).get("url")
+                    if url:
+                        media.append({"kind": _component_media_kind(url),
+                                      "url": url})
+        elif ntype == DC_SECTION:
+            for child in node.get("components") or []:
+                walk(child)
+            accessory = node.get("accessory")
+            if isinstance(accessory, dict) and accessory.get("type") == DC_THUMBNAIL:
+                url = (accessory.get("media") or {}).get("url")
+                if url:   # link-post preview thumbnail
+                    media.append({"kind": _component_media_kind(url),
+                                  "url": url})
+        elif ntype in (DC_CONTAINER, DC_ACTION_ROW):
+            for child in node.get("components") or []:
+                walk(child)
+        # Separators, buttons, thumbnails outside sections, and any FUTURE
+        # component type carry no post data for the card — skipped.
+
+    walk(component)
+    if not texts and not media:
+        return None
+
+    title = None
+    author = None
+    subreddit = None
+    stats = None
+    body_lines = []
+    for text in texts:
+        if title is None and text.startswith("### "):
+            title = text[4:].strip()
+            continue
+        if text.startswith("-#"):
+            # Small gray lines: the "in r/sub by u/author" header and the
+            # "Posted <t:…:R>" footer. Metadata, never card body.
+            if subreddit is None:
+                sm = COMPONENT_SUB_RE.search(text)
+                if sm:
+                    subreddit = sm.group(1)[2:]
+            if author is None:
+                am = COMPONENT_AUTHOR_RE.search(text)
+                if am:
+                    author = am.group(1)
+            continue
+        plain = DISCORD_CUSTOM_EMOJI_RE.sub("", text).strip()
+        if stats is None:
+            fm = COMPONENT_STATS_LINE_RE.match(plain)
+            if fm:
+                stats = {"ups": _compact_int(fm.group(1)),
+                         "comments": _compact_int(fm.group(2))}
+                continue
+        body_lines.append(text)
+
+    return {
+        "service": "embeddit",
+        "title": title,
+        "author": author,
+        "subreddit": subreddit,
+        "body": "\n".join(body_lines).strip(),
+        "stats": stats,
+        "media": media,
+    }
+
+
 def _media_from_og(meta: dict) -> list:
     """og: tags -> media list. og:video (muxed mp4 with audio) first, then
     every og:image in order (galleries emit one per photo)."""
@@ -823,10 +1110,68 @@ async def _fetch_vxreddit(session, path: str, label: str = ""):
         return None
 
 
+async def _fetch_embeddit_component(session, path: str, label: str = "",
+                                    probing: bool = False):
+    """Round 54: the rewrite's bot page (same /comments/ path, Discordbot UA)
+    -> parse_embeddit_component_page. `probing=True` quiets the per-attempt
+    log lines while _fetch_embeddit is only TESTING whether the instance
+    runs the rewrite."""
+    if not re.search(r"/comments/([a-zA-Z0-9]+)/", path or ""):
+        return None
+    try:
+        async with session.get(
+            f"{EMBEDDIT_BASE}{path}",
+            headers={"User-Agent": PROXY_BOT_UA},
+            timeout=PROXY_TIMEOUT,
+        ) as resp:
+            if resp.status != 200:
+                if not probing:
+                    logging.info(f"[{label}] embeddit component page HTTP "
+                                 f"{resp.status} from {EMBEDDIT_HOST}.")
+                return None
+            page = await resp.text()
+    except Exception as e:
+        if not probing:
+            logging.info(f"[{label}] embeddit component page error "
+                         f"({type(e).__name__}) for {EMBEDDIT_HOST}: {e}")
+        return None
+    result = parse_embeddit_component_page(page)
+    if not result and not probing:
+        logging.info(f"[{label}] embeddit component page had no parseable "
+                     f"embed data.")
+    return result
+
+
+async def _embeddit_route_gone(session, path: str, label: str, reason: str):
+    """Round 54: the Mastodon status API just answered route-gone evidence.
+    Probe the rewrite's Component-Embed page with the SAME post: parseable ->
+    switch this run to component mode and return the result; otherwise ->
+    round-53 unavailable (dropped from the dispatch order for the run)."""
+    result = None
+    try:
+        result = await _fetch_embeddit_component(session, path, label,
+                                                 probing=True)
+    except Exception:                                   # pragma: no cover
+        result = None
+    if result is not None:
+        _mark_embeddit_component_mode(reason)
+        return result
+    _mark_embeddit_unavailable(reason)
+    return None
+
+
 async def _fetch_embeddit(session, path: str, label: str = ""):
     """Mastodon-spoof JSON API — no bot UA needed, no redirects. The status
     id is computed from the post id alone (encode {"type":"post",...}), so
-    the subreddit in the path is irrelevant here."""
+    the subreddit in the path is irrelevant here.
+
+    Round 54: when this run already proved the instance migrated to the
+    rewrite, the Component-Embed page is fetched instead; when it
+    already proved the instance serves neither, this is a no-op."""
+    if _embeddit_unavailable is not None:
+        return None
+    if _embeddit_component_mode:
+        return await _fetch_embeddit_component(session, path, label)
     m = re.search(r"/comments/([a-zA-Z0-9]+)/", path or "")
     if not m:
         return None
@@ -839,11 +1184,29 @@ async def _fetch_embeddit(session, path: str, label: str = ""):
             timeout=PROXY_TIMEOUT,
         ) as resp:
             if resp.status != 200:
-                logging.info(f"[{label}] embeddit HTTP {resp.status}.")
+                # Round 53/54: 404/410/501 = the route itself is gone on
+                # this instance (a dead POST answers 502 here) — either the
+                # rewrite landed (switch) or the instance is broken (drop).
+                if resp.status in (404, 410, 501):
+                    return await _embeddit_route_gone(
+                        session, path, label, f"HTTP {resp.status}")
+                logging.info(
+                    f"[{label}] embeddit HTTP {resp.status} from {EMBEDDIT_HOST}.")
                 return None
-            data = await resp.json(content_type=None)
+            try:
+                data = await resp.json(content_type=None)
+            except Exception as e:
+                return await _embeddit_route_gone(
+                    session, path, label,
+                    f"non-JSON 200 response ({type(e).__name__})")
     except Exception as e:
-        logging.info(f"[{label}] embeddit error: {e}")
+        # Round 53: name the host and the exception CLASS. The old line
+        # printed only str(e), which for aiohttp's InvalidURL is just the url
+        # — the 2026-10-01 incident looked like a remote failure when it was
+        # an empty EMBEDDIT_INSTANCE Variable building a relative url.
+        logging.info(
+            f"[{label}] embeddit error ({type(e).__name__}) "
+            f"for {EMBEDDIT_HOST}: {e}")
         return None
     result = parse_embeddit_post(data)
     if not result:
@@ -894,6 +1257,11 @@ def proxy_services_for(path: str | None) -> list:
     order = list(PROXY_SERVICES)
     if path and SHARE_LINK_RE.match(path) and len(order) > 1:
         order = [s for s in order if s != "redditez"]
+    # Round 53: an instance without the Mastodon status API stays dropped for
+    # the rest of the run (never to empty — a last remaining service is still
+    # asked, same rule the share-link drop uses).
+    if _embeddit_unavailable is not None and len(order) > 1:
+        order = [s for s in order if s != "embeddit"]
     return order
 
 
@@ -1162,13 +1530,23 @@ async def proxy_warmup(session, post_id: str | None = None) -> dict:
     skips services marked ok=false (unless all are dead). Any failure here
     only marks the service down for this run; posting never depends on the
     warm-up succeeding."""
-    raw = post_id or WARMUP_POST_ID
-    parts = raw.split("/", 1)
-    if len(parts) != 2 or not parts[0] or not parts[1]:
+    raw = (post_id or WARMUP_POST_ID or "").strip()
+
+    def _valid(value: str) -> bool:
+        parts = value.split("/", 1)
+        return len(parts) == 2 and bool(parts[0].strip()) and bool(parts[1].strip())
+
+    if not _valid(raw):
+        # Round 53: a malformed value no longer costs the whole warm-up — the
+        # built-in known-good post is used instead, so proxy_health.json stays
+        # fresh and dead services keep being skipped.
         logging.warning(f"PROXY_WARMUP_POST '{raw}' is invalid — use "
-                        f"<subreddit>/<post_id>. Warm-up skipped.")
-        return {}
-    sub, pid = parts
+                        f"<subreddit>/<post_id>. Falling back to "
+                        f"{DEFAULT_WARMUP_POST}.")
+        raw = DEFAULT_WARMUP_POST
+        if not _valid(raw):                                  # pragma: no cover
+            return {}
+    sub, pid = (p.strip() for p in raw.split("/", 1))
     path = f"/r/{sub}/comments/{pid}/"
     label = "proxy warm-up"
     # ROUND 49 FIX: the probes are built FROM the dispatch map, so the result

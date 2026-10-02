@@ -233,7 +233,10 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # ■ SUBREDDITS TO TRACK
 # ---------------------------------------------------------------------------
-SUBREDDITS_STR = os.getenv("SUBREDDITS", "Zenlesszonezeroleaks_,Genshin_Impact_Leaks,HonkaiStarRail_leaks,WutheringWavesLeaks,HonkaiNexusAnimaLeaks,AnantaLeaks")
+# Round 53: an unset-but-wired GitHub secret/Variable arrives as an EMPTY
+# STRING, which os.getenv(name, default) treats as a real value — the
+# documented default then never applies. Empty means "not configured" here.
+SUBREDDITS_STR = (os.getenv("SUBREDDITS") or "").strip() or "Zenlesszonezeroleaks_,Genshin_Impact_Leaks,HonkaiStarRail_leaks,WutheringWavesLeaks,HonkaiNexusAnimaLeaks,AnantaLeaks"
 SUBREDDITS = [s.strip() for s in SUBREDDITS_STR.split(",") if s.strip()]
 
 DEFAULT_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")

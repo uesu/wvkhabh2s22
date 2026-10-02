@@ -59,7 +59,8 @@ from dotenv import load_dotenv
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 load_dotenv()
 
-SUBREDDITS_STR = os.getenv("SUBREDDITS", "Zenlesszonezeroleaks_,Genshin_Impact_Leaks,HonkaiStarRail_leaks,WutheringWavesLeaks,HonkaiNexusAnimaLeaks,AnantaLeaks")
+# Round 54 parity: an unset-but-wired secret arrives as an EMPTY string — empty keeps the default list (same guard as V3).
+SUBREDDITS_STR = (os.getenv("SUBREDDITS") or "").strip() or "Zenlesszonezeroleaks_,Genshin_Impact_Leaks,HonkaiStarRail_leaks,WutheringWavesLeaks,HonkaiNexusAnimaLeaks,AnantaLeaks"
 SUBREDDITS = [s.strip() for s in SUBREDDITS_STR.split(",") if s.strip()]
 
 DEFAULT_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")

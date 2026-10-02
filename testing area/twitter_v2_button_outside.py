@@ -88,7 +88,8 @@ except Exception as e:  # only when the file is absent from the repo
     twitter_proxy = None
     logging.warning(f"twitter_proxy unavailable ({e}) — using direct FxTwitter only.")
 
-ACCOUNTS_STR = os.getenv("ACCOUNTS", "TYPEII_EN,PomPom_HonkaiSR,Wuthering_Waves,HonkaiNA,Ananta_EN")
+# Round 54 parity: an unset-but-wired secret arrives as an EMPTY string — empty keeps the default list (same guard as V3).
+ACCOUNTS_STR = (os.getenv("ACCOUNTS") or "").strip() or "TYPEII_EN,PomPom_HonkaiSR,Wuthering_Waves,HonkaiNA,Ananta_EN"
 ACCOUNTS = [acc.strip() for acc in ACCOUNTS_STR.split(",") if acc.strip()]
 
 DEFAULT_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
