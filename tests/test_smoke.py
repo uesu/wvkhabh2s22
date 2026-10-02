@@ -2877,6 +2877,58 @@ check("r47: a message with no media is never flagged",
       _r47_x.unresolved_media_items({"components": [{"type": 10, "content": "hi"}]}) == []
       and _r47_x.unresolved_media_items(None) == [])
 
+# ---------------------------------------------------------------------------
+# ROUND 56 — media heal targets VIDEOS only by default.
+# The only confirmed broken tile was a video (round 47); cold PHOTO tiles
+# (PomPom/TYPEII 2026-10-02) rendered fine without an edit, so images, GIFs
+# and webp are no longer heal-eligible unless MEDIA_HEAL_SCOPE=all.
+# ---------------------------------------------------------------------------
+check("r56: video rendition URLs are heal-eligible",
+      _r47_x.is_video_media_url(
+          "https://video.twimg.com/amplify_video/1/vid/avc1/1920x1080/x.mp4?tag=29") is True
+      and _r47_x.is_video_media_url("https://video.twimg.com/tweet_video/gifgif.mp4") is True
+      and _r47_x.is_video_media_url("https://example.com/clip.M3U8") is True
+      and _r47_x.is_video_media_url("https://example.com/a/b/movie.webm#t=1") is True)
+check("r56: photo/gif/webp URLs are NOT heal-eligible",
+      _r47_x.is_video_media_url("https://pbs.twimg.com/media/Gxyz.jpg?name=orig") is False
+      and _r47_x.is_video_media_url("https://pbs.twimg.com/media/Gxyz.png") is False
+      and _r47_x.is_video_media_url("https://gif.fxtwitter.com/tweet_video/abc.gif") is False
+      and _r47_x.is_video_media_url("https://gif.fxtwitter.com/tweet_video/abc.webp") is False
+      and _r47_x.is_video_media_url("") is False and _r47_x.is_video_media_url(None) is False)
+
+_r56_vid_url = "https://video.twimg.com/amplify_video/9/vid/avc1/1280x720/v.mp4?tag=29"
+_r56_img_url = "https://pbs.twimg.com/media/PomPomCoffee.jpg?name=orig"
+def _r56_msg(*urls):
+    return {"id": "1", "components": [{"id": 1, "type": 17, "components": [
+        {"id": 5, "type": 12, "items": [
+            {"media": {"url": u, "proxy_url": "https://images-ext-1.discordapp.net/x",
+                       "width": 0, "height": 0, "content_type": ""}} for u in urls]}]}]}
+check("r56: default scope heals ONLY the video item of a mixed cold message",
+      _r47_x.heal_eligible_items(_r56_msg(_r56_vid_url, _r56_img_url)) == [_r56_vid_url])
+check("r56: a photos-only cold message queues NO heal (the 2026-10-02 case)",
+      _r47_x.heal_eligible_items(_r56_msg(_r56_img_url)) == [])
+check("r56: a cold video still queues exactly as in round 47",
+      _r47_x.heal_eligible_items(_r56_msg(_r56_vid_url)) == [_r56_vid_url])
+_r56_saved_scope = _r47_x.MEDIA_HEAL_SCOPE
+try:
+    _r47_x.MEDIA_HEAL_SCOPE = "all"
+    check("r56: MEDIA_HEAL_SCOPE=all restores round-47 behaviour (photos too)",
+          _r47_x.heal_eligible_items(_r56_msg(_r56_vid_url, _r56_img_url))
+          == [_r56_vid_url, _r56_img_url])
+finally:
+    _r47_x.MEDIA_HEAL_SCOPE = _r56_saved_scope
+check("r56: unresolved_media_items itself is unchanged (still detects both)",
+      _r47_x.unresolved_media_items(_r56_msg(_r56_vid_url, _r56_img_url))
+      == [_r56_vid_url, _r56_img_url])
+check("r56: default scope is video (safe when the Variable is unset or empty)",
+      _r47_x.MEDIA_HEAL_SCOPE == "video")
+# Round 42 pattern (NSFW_FAIL_OPEN): the prod workflow passes env vars
+# EXPLICITLY, so an unwired Variable would silently strand the escape hatch.
+with open(os.path.join(ROOT, ".github/workflows/twitter_monitor.yml"), encoding="utf-8") as _r56_f:
+    _r56_workflow = _r56_f.read()
+check("r56: workflow wires MEDIA_HEAL_SCOPE",
+      "MEDIA_HEAL_SCOPE: ${{ vars.MEDIA_HEAL_SCOPE }}" in _r56_workflow)
+
 
 class _R47Resp:
     def __init__(self, status, payload):
