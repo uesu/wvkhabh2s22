@@ -3987,6 +3987,65 @@ try:
           _r54r is None and not _r53_proxy.embeddit_component_mode()
           and _r53_proxy.embeddit_unavailable_reason() is None)
     _r53_proxy.reset_embeddit_availability()
+
+    # =======================================================================
+    # ROUND 55 — mod-queue page evidence must render THIS post.
+    # A 200 shell must not be accepted as evidence for a queued post.
+    # =======================================================================
+    _r55_saved_fetch = v3._fetch_redlib_post_page
+    _r55_saved_listing = v3._fetch_new_listing
+    _r55_path = "/r/WutheringWavesLeaks/comments/1wvlsz0/back_to_solaris/"
+    _r55_shell = ("<html><head><title>Just a moment...</title></head>"
+                  "<body>Checking your browser before accessing.</body></html>")
+    _r55_real = ('<a href="/r/WutheringWavesLeaks/comments/1wvlsz0/back_to_solaris/">'
+                 'permalink</a>')
+    try:
+        async def _r55_fetch(*_args, **_kwargs):
+            return _r55_shell
+
+        async def _r55_listing(*_args, **_kwargs):
+            return None
+
+        v3._fetch_redlib_post_page = _r55_fetch
+        v3._fetch_new_listing = _r55_listing
+        _r55_result = _r53_asyncio.run(v3.mod_queue_reason(
+            None, "WutheringWavesLeaks", _r55_path, post_age_seconds=300))
+        check("r55: shell pages + unavailable listing hold a young post",
+              _r55_result == "pending approval", repr(_r55_result))
+
+        # The hold stays bounded: past the weak grace the post releases.
+        _r55_result = _r53_asyncio.run(v3.mod_queue_reason(
+            None, "WutheringWavesLeaks", _r55_path,
+            post_age_seconds=v3.MOD_QUEUE_WEAK_GRACE_SECONDS + 60))
+        check("r55: shells past the weak grace release (hold stays bounded)",
+              _r55_result is None, repr(_r55_result))
+
+        # A real rendered page with the AutoModerator sticky still holds
+        # (rounds 37/48 behaviour is intact behind the identity gate).
+        async def _r55_fetch_sticky(*_args, **_kwargs):
+            return (_r55_real + "<p>It has not been deleted, but it has been "
+                    "temporarily sent to the moderators for review.</p>")
+        v3._fetch_redlib_post_page = _r55_fetch_sticky
+        _r55_result = _r53_asyncio.run(v3.mod_queue_reason(
+            None, "WutheringWavesLeaks", _r55_path, post_age_seconds=300))
+        check("r55: real page + AutoModerator sticky still holds (r37/48 intact)",
+              _r55_result == "pending approval", repr(_r55_result))
+
+        async def _r55_fetch_real(*_args, **_kwargs):
+            return _r55_real
+
+        async def _r55_listing_public(*_args, **_kwargs):
+            return ({"1wvlsz0"}, 12 * 3600, v3.reddit_signals.LISTING_HTML)
+
+        v3._fetch_redlib_post_page = _r55_fetch_real
+        v3._fetch_new_listing = _r55_listing_public
+        _r55_result = _r53_asyncio.run(v3.mod_queue_reason(
+            None, "WutheringWavesLeaks", _r55_path, post_age_seconds=300))
+        check("r55: rendered post in API-backed listing releases",
+              _r55_result is None, repr(_r55_result))
+    finally:
+        v3._fetch_redlib_post_page = _r55_saved_fetch
+        v3._fetch_new_listing = _r55_saved_listing
 finally:
     for _name, _value in _r53_saved_env.items():
         if _value is None:

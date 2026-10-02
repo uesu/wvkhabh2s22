@@ -55,6 +55,26 @@ v3 = load_module("reddit_v3_unit", "testing area/reddit_main_v3.py")
 check("import: reddit_signals", signals is not None)
 check("import: reddit_main_v3", v3 is not None)
 
+# Round 55: only a page that identifies the requested post is valid queue
+# evidence.  HTTP 200 shells and pages for another post must be ignored.
+_r55_real = ('<h1>Back to Solaris</h1>'
+             '<a href="/r/WutheringWavesLeaks/comments/1wvlsz0/back_to_solaris/">'
+             'permalink</a>')
+_r55_shell = '<title>Just a moment...</title>Checking your browser before accessing'
+check("r55: rendered post page passes identity check",
+      signals.page_is_post_page(_r55_real, "1wvlsz0") is True)
+check("r55: identity check is case-insensitive",
+      signals.page_is_post_page(_r55_real.upper(), "1WVLSZ0") is True)
+check("r55: Cloudflare/JS shell is not page evidence",
+      signals.page_is_post_page(_r55_shell, "1wvlsz0") is False)
+check("r55: different post is not page evidence",
+      signals.page_is_post_page(_r55_real, "1wvlsz1") is False)
+check("r55: post-id prefixes do not match",
+      signals.page_is_post_page('/comments/1wvlsz0abc/title', "1wvlsz0") is False)
+check("r55: empty page and id are not evidence",
+      signals.page_is_post_page('', "1wvlsz0") is False
+      and signals.page_is_post_page(_r55_real, '') is False)
+
 # 18 removal cases ---------------------------------------------------------
 _removal_cases = [
     ("[removed]", "body", "title marker"),
@@ -489,12 +509,19 @@ check("r46 verdict: a healthy post on an API-backed listing posts (no new wait)"
       signals.queue_verdict(in_listing=True, listing_source=signals.LISTING_HTML,
                             listing_oldest_age=12 * 3600, page_age_seconds=60) is None)
 
+# Real rendered pages carry the requested post's permalink.  Keep this in
+# every fixture so the round-55 identity gate tests the queue logic rather
+# than accidentally treating a fixture as a shell.
+_R46_PERMALINK = '<a href="/r/HonkaiStarRail_leaks/comments/1wuqy6z/x/">permalink</a>'
 _R46_PAGE_BANNER = ('<h1 class="post_title">Aventurine Waveflair</h1>'
-                    '<div>Post is awaiting moderator approval.</div>')
+                    '<div>Post is awaiting moderator approval.</div>'
+                    + _R46_PERMALINK)
 _R46_PAGE_AUTOMOD = ('<h1 class="post_title">4.7 New Weekly Boss</h1>'
                      '<div class="comment">AutoModerator Please respond to this '
-                     'comment with a mirror link and source link.</div>')
-_R46_PAGE_CLEAN = '<h1 class="post_title">normal</h1><span class="created">2h ago</span>'
+                     'comment with a mirror link and source link.</div>'
+                     + _R46_PERMALINK)
+_R46_PAGE_CLEAN = ('<h1 class="post_title">normal</h1><span class="created">2h ago</span>'
+                   + _R46_PERMALINK)
 
 
 def _r46_gate(page, listing, age=510):
