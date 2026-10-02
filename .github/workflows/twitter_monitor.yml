@@ -82,11 +82,13 @@ jobs:
           #   MEDIA_HEAL=off              disable it
           #   MEDIA_HEAL_DELAY_SECONDS=45 wait before each re-edit
           #   MEDIA_HEAL_ATTEMPTS=2       max re-edits per message
-          #   MEDIA_HEAL_SCOPE=all        round 56: also heal photos/gif/webp
-          #                               (default 'video' — only video
-          #                               renditions are re-edited, the one
+          #   MEDIA_HEAL_SCOPE=video      round 56 default: only video
+          #                               renditions are re-edited — the one
           #                               media type whose tile actually
-          #                               breaks when Discord's proxy is cold)
+          #                               breaks when Discord's proxy is cold
+          #   MEDIA_HEAL_SCOPE=on (/all)  also heal photos/gif/webp (full
+          #                               round-47 scope)
+          #   MEDIA_HEAL_SCOPE=off        never re-edit any media
           MEDIA_HEAL: ${{ vars.MEDIA_HEAL }}
           MEDIA_HEAL_DELAY_SECONDS: ${{ vars.MEDIA_HEAL_DELAY_SECONDS }}
           MEDIA_HEAL_ATTEMPTS: ${{ vars.MEDIA_HEAL_ATTEMPTS }}
