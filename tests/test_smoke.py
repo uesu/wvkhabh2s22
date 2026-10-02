@@ -2922,6 +2922,34 @@ check("r56: unresolved_media_items itself is unchanged (still detects both)",
       == [_r56_vid_url, _r56_img_url])
 check("r56: default scope is video (safe when the Variable is unset or empty)",
       _r47_x.MEDIA_HEAL_SCOPE == "video")
+# Round 56b: the Variable accepts on (=all) / off / video, any casing,
+# and every malformed state falls back to the safe default.
+check("r56b: scope parsing — on/all mean all, any casing",
+      _r47_x.media_heal_scope("on") == "all"
+      and _r47_x.media_heal_scope("ON") == "all"
+      and _r47_x.media_heal_scope(" All ") == "all")
+check("r56b: scope parsing — off/none/0/false/disabled mean off",
+      _r47_x.media_heal_scope("off") == "off"
+      and _r47_x.media_heal_scope("OFF") == "off"
+      and _r47_x.media_heal_scope("none") == "off"
+      and _r47_x.media_heal_scope("0") == "off"
+      and _r47_x.media_heal_scope("false") == "off"
+      and _r47_x.media_heal_scope("disabled") == "off")
+check("r56b: scope parsing — video/unset/empty/garbage mean video",
+      _r47_x.media_heal_scope("video") == "video"
+      and _r47_x.media_heal_scope("VIDEO") == "video"
+      and _r47_x.media_heal_scope(None) == "video"
+      and _r47_x.media_heal_scope("") == "video"
+      and _r47_x.media_heal_scope("   ") == "video"
+      and _r47_x.media_heal_scope("bananas") == "video")
+_r56b_saved_scope = _r47_x.MEDIA_HEAL_SCOPE
+try:
+    _r47_x.MEDIA_HEAL_SCOPE = "off"
+    check("r56b: scope off never queues a heal — even for a cold video",
+          _r47_x.heal_eligible_items(_r56_msg(_r56_vid_url)) == []
+          and _r47_x.heal_eligible_items(_r56_msg(_r56_vid_url, _r56_img_url)) == [])
+finally:
+    _r47_x.MEDIA_HEAL_SCOPE = _r56b_saved_scope
 # Round 42 pattern (NSFW_FAIL_OPEN): the prod workflow passes env vars
 # EXPLICITLY, so an unwired Variable would silently strand the escape hatch.
 with open(os.path.join(ROOT, ".github/workflows/twitter_monitor.yml"), encoding="utf-8") as _r56_f:
