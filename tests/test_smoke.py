@@ -4174,6 +4174,83 @@ finally:
             os.environ[_name] = _value
 
 
+# ---- Round 60 (2026-10-03): YouTube link-post destination-first ----------
+# Replay of Zenlesszonezeroleaks_ 1wwgk5e.  Reddit renders a link post's
+# destination as its trailing [link] anchor, after body text that may contain
+# unrelated YouTube credit links (the live post's Song AMV).
+_r60_main = "https://www.youtube.com/watch?v=QvhE_9XgImw"
+_r60_song_esc = ("https://www.youtube.com/watch?v=SBQprWeOx8g&amp;"
+                 "list=PLjNlQ2vXx1xbt30X8TcUfNzw_akVISXEu&amp;index=67")
+_r60_song = _r60_song_esc.replace("&amp;", "&")
+_r60_link_post = (
+    '<table><tr><td><div class="md"><p>TC standard builds (34 subs)...</p>'
+    f'<p>Song: <a href="{_r60_song_esc}">{_r60_song_esc}</a></p>'
+    '</div></td></tr></table>&#32;submitted by&#32;'
+    '<a href="https://www.reddit.com/user/Altruistic-Lock-2582">'
+    '/u/Altruistic-Lock-2582</a>&#32;'
+    f'<a href="{_r60_main}">[link]</a>&#32;'
+    '<a href="https://www.reddit.com/r/Zenlesszonezeroleaks_/comments/'
+    '1wwgk5e/x/">[comments]</a>')
+_r60_text_post = (
+    '<table><tr><td><div class="md"><p>Watch: '
+    f'<a href="{_r60_song_esc}">{_r60_song_esc}</a></p>'
+    '</div></td></tr></table>&#32;submitted by&#32;'
+    '<a href="https://www.reddit.com/user/x">/u/x</a>&#32;'
+    '<a href="https://www.reddit.com/r/Zenlesszonezeroleaks_/comments/'
+    'zzz999/x/">[comments]</a>&#32;'
+    '<a href="https://www.reddit.com/r/Zenlesszonezeroleaks_/comments/'
+    'zzz999/x/">[link]</a>')
+
+check("r60: extract_outbound_url finds the link-post destination",
+      v3.extract_outbound_url(_r60_link_post) == _r60_main,
+      repr(v3.extract_outbound_url(_r60_link_post)))
+check("r60: extract_outbound_url ignores Reddit-domain link anchors",
+      v3.extract_outbound_url(_r60_text_post) is None,
+      repr(v3.extract_outbound_url(_r60_text_post)))
+check("r60: selector prefers the destination over body YouTube matches",
+      v3.select_youtube_url(v3.extract_outbound_url(_r60_link_post),
+                            _r60_link_post) == _r60_main)
+check("r60: text posts keep the body YouTube URL, HTML-unescaped",
+      v3.select_youtube_url(v3.extract_outbound_url(_r60_text_post),
+                            _r60_text_post) == _r60_song)
+check("r60: extract_youtube_url never leaks escaped ampersands",
+      v3.extract_youtube_url(_r60_link_post.split("[link]")[0]) == _r60_song)
+
+_r60_base = v3.entry_to_base_data(_FakeEntry(
+    "/r/Zenlesszonezeroleaks_/comments/1wwgk5e/showcase/", "Showcase",
+    "Altruistic-Lock-2582", _r60_link_post))
+check("r60: native RSS base feeds the destination-first selection downstream",
+      _r60_base["youtube_url"] == _r60_main, repr(_r60_base["youtube_url"]))
+
+# FULL MODE receives the same RSS base plus authoritative post_json["url"].
+# Stub the thumbnail/media resolver so this remains a fast, offline assertion
+# of the selected video rather than an availability test of a third party.
+_r60_saved_resolve_youtube = v3.resolve_youtube_media
+
+
+async def _r60_resolve_youtube(_session, video_id, _is_live):
+    return None, f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+
+try:
+    v3.resolve_youtube_media = _r60_resolve_youtube
+    # Deliberately model a previously body-derived RSS value.  FULL MODE must
+    # still replace it with the authoritative destination in post_json["url"].
+    _r60_full_base = dict(_r60_base, youtube_url=_r60_song)
+    _r60_full = asyncio.run(v3.resolve_post_media(
+        None, _r60_full_base,
+        {"title": "Showcase", "author": "Altruistic-Lock-2582",
+         "selftext": f"Song: {_r60_song_esc}", "url": _r60_main,
+         "num_comments": 0, "ups": 0},
+        path="/r/Zenlesszonezeroleaks_/comments/1wwgk5e/showcase/"))
+    check("r60: FULL MODE destination overrides the RSS body credit URL",
+          _r60_full["youtube_url"] == _r60_main
+          and _r60_full["youtube_id"] == "QvhE_9XgImw",
+          repr((_r60_full["youtube_url"], _r60_full["youtube_id"])))
+finally:
+    v3.resolve_youtube_media = _r60_saved_resolve_youtube
+
+
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
     sys.exit(1)
