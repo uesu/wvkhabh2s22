@@ -2433,13 +2433,61 @@ async def fetch_working_reddit_feed(session: aiohttp.ClientSession, subreddit: s
     return None
 
 
+# Round 60 (2026-10-03): Reddit link posts can now contain body text, so the
+# RSS body can carry credit URLs before the post destination.  The destination
+# itself is the trailing ``[link]`` anchor.  Keep this deliberately scoped to
+# that anchor: other anchors in a post body must never become an outbound URL.
+_OUTBOUND_LINK_RE = re.compile(
+    r"<a\b(?P<attrs>[^>]*)>\s*\[link\]\s*</a\s*>", re.IGNORECASE | re.DOTALL)
+_HREF_ATTR_RE = re.compile(
+    r"(?<![\w-])href\s*=\s*(?:\"(?P<double>[^\"]*)\"|'(?P<single>[^']*)')",
+    re.IGNORECASE)
+
+
+def extract_outbound_url(content_html: str | None) -> str | None:
+    """Return a link post's RSS ``[link]`` destination, if it is external.
+
+    Text posts use the same anchor for their own Reddit permalink, which is
+    intentionally returned as ``None`` so they retain the existing body-first
+    YouTube selection behaviour.
+    """
+    # The RSS navigation anchor is trailing.  Choosing the last match avoids
+    # treating a user-authored body link literally labelled "[link]" as the
+    # post destination.
+    anchors = list(_OUTBOUND_LINK_RE.finditer(content_html or ""))
+    if not anchors:
+        return None
+    href = _HREF_ATTR_RE.search(anchors[-1].group("attrs"))
+    if not href:
+        return None
+    url = html_lib.unescape(href.group("double") or href.group("single") or "")
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    if host in {"reddit.com", "redd.it"} or host.endswith((".reddit.com", ".redd.it")):
+        return None
+    return url or None
+
+
 def extract_youtube_url(*html_parts: str | None) -> str | None:
-    """Finds a YouTube link (watch / shorts / youtu.be / live) in HTML text."""
+    """Find a YouTube link and return its HTML-unescaped URL.
+
+    RSS content is entity-escaped.  Unescaping here keeps ``&amp;`` out of
+    every downstream consumer (button, thumbnail lookup, and follow-up link).
+    """
     for html in html_parts:
         match = YOUTUBE_RE.search(html or "")
         if match:
-            return match.group(0)
+            return html_lib.unescape(match.group(0))
     return None
+
+
+def select_youtube_url(outbound_url: str | None,
+                       *html_parts: str | None) -> str | None:
+    """Prefer a YouTube link-post destination over YouTube URLs in its body."""
+    destination = extract_youtube_url(outbound_url)
+    video_id, _ = extract_youtube_id(destination)
+    if video_id:
+        return destination
+    return extract_youtube_url(*html_parts)
 
 
 def extract_youtube_id(url: str | None) -> tuple[str | None, bool]:
@@ -3147,7 +3195,10 @@ def entry_to_base_data(entry) -> dict:
             content_html, normalize_reddit_path(str(getattr(entry, "link", "")))),
         "vred_id": extract_vreddit_id(content_html),
         "redgifs_url": extract_redgifs_url(content_html),
-        "youtube_url": extract_youtube_url(content_html),
+        # Round 60: a link post's destination is the main video; body links
+        # are often credits and must not outrank it.
+        "youtube_url": select_youtube_url(extract_outbound_url(content_html),
+                                          content_html),
     }
 
 
@@ -3254,9 +3305,13 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                 vid = extract_vreddit_id(fallback_url)
         if not vid:
             vid = base["vred_id"] or extract_vreddit_id(str(post_json.get("url") or ""))
-        if not yt_url:
-            yt_url = extract_youtube_url(str(post_json.get("selftext") or ""),
-                                         str(post_json.get("url") or ""))
+        # Round 60: post_json["url"] is the link-post destination.  It
+        # outranks a YouTube credit URL that RSS or selftext exposed first.
+        _dest_yt = extract_youtube_url(str(post_json.get("url") or ""))
+        if _dest_yt:
+            yt_url = _dest_yt
+        elif not yt_url:
+            yt_url = extract_youtube_url(str(post_json.get("selftext") or ""))
         yt_vid_early, _ = extract_youtube_id(yt_url)
         has_video = bool(vid or yt_vid_early or base.get("redgifs_url"))
         if post_json.get("crosspost_post_link"):
