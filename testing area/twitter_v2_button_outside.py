@@ -113,12 +113,17 @@ RSS_INSTANCES = [
     # DO NOT REMOVE without operator sign-off.
     "https://nitter.cf",
     "https://xitter.cf",
+    # Round 59 (2026-10-03): body-audited serving mirrors first; known
+    # interstitial-walled hosts are retained as last-resort probes.
+    "https://nitter.kareem.one",
+    "https://tw.eir-nya.gay",
     "https://nitter.meowing.monster",
-    "https://nitter.netbub.com",
     "https://shitter.thepixora.com",
-    "https://nitter.jaydenha.uk",
     # Token-gated fallback; harmlessly skipped without NITTER_RSS_TOKEN.
     "https://nitter.miningtcup.me",
+    # Round 59: demoted, not deleted; these currently serve challenge walls.
+    "https://nitter.netbub.com",
+    "https://nitter.jaydenha.uk",
 ]
 
 # round 12 (backported from V3, 2026-09-17): token-gated instances.

@@ -722,6 +722,12 @@ async def mod_queue_reason(session, subreddit, path, label="", post_age_seconds=
 # registry marks it Cloudflare-fronted. Every response is validated for Reddit
 # permalinks before it is accepted, so a challenge or HTML shell fails closed.
 # ---------------------------------------------------------------------------
+# Round 59 (2026-10-03): body-audit record. The exact /r/<sub>/new.rss
+# response was read for each public Redlib candidate. Current responses are
+# RSS-disabled, challenge-walled, or unavailable; no confirmed replacement
+# was found, so the list is intentionally unchanged and fails closed via
+# permalink validation. Re-audit bodies rather than trusting status codes or
+# the instance registry before promoting a mirror.
 REDDIT_RSS_INSTANCES = [
     "https://www.reddit.com",
     "https://old.reddit.com",
