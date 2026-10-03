@@ -29,13 +29,15 @@ permissions:
 jobs:
   auto-merge:
     runs-on: ubuntu-latest
+    # Round 57: hard cap — single API script; seconds normally.
+    timeout-minutes: 5
     # Gate 0: only runs when the variable is set to "yes" (empty = off).
     if: vars.AUTO_MERGE_DEPENDABOT == 'yes'
     steps:
       # No checkout by design: workflow_run uses the trusted default-branch
       # workflow definition, and this job never executes PR-supplied code.
       - name: Evaluate + merge eligible Dependabot PR
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9 — SHA-pinned (round 57)
         with:
           script: |
             const run = context.payload.workflow_run;

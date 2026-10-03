@@ -43,12 +43,14 @@ permissions:
 jobs:
   check-reddit:
     runs-on: ubuntu-latest
+    # Round 57: hard cap — a hung network call otherwise blocks the concurrency queue for GitHub's 6 h default.
+    timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7   # v7 = Node 24 runtime (v4/v5 ran on deprecated Node 20)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7 — SHA-pinned (round 57, immutable supply chain); v7 = Node 24 runtime
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7 — SHA-pinned (round 57)
         with:
           # Exact stable CPython pin; update deliberately after CI validates it.
           python-version: '3.14.7'
