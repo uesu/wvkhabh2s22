@@ -2957,6 +2957,36 @@ with open(os.path.join(ROOT, ".github/workflows/twitter_monitor.yml"), encoding=
 check("r56: workflow wires MEDIA_HEAL_SCOPE",
       "MEDIA_HEAL_SCOPE: ${{ vars.MEDIA_HEAL_SCOPE }}" in _r56_workflow)
 
+# ---------------------------------------------------------------------------
+# ROUND 57 (2026-10-03): workflow hardening guards.
+# 57a — supply chain: every `uses:` in the monitor workflows must be pinned
+#       to an immutable 40-hex commit SHA, never a mutable tag (the 2025
+#       tj-actions/changed-files compromise repointed v1..v45 tags to a
+#       malicious commit; CVE-2025-30066).
+# 57b — outage cap: both monitor jobs must declare timeout-minutes. Without
+#       it a hung network call holds the job for GitHub's 6 h default and —
+#       because the P0 concurrency guard queues instead of cancelling —
+#       blocks every subsequent cron tick behind it.
+# Also guards the P0 double-post fix itself: the concurrency group with
+# cancel-in-progress: false must never silently disappear.
+# ---------------------------------------------------------------------------
+import re as _r57_re
+_r57_uses_re = _r57_re.compile(r"^\s*(?:-\s+)?uses:\s*(\S+)", _r57_re.M)
+_r57_sha_re = _r57_re.compile(r"@[0-9a-f]{40}(\s|$)")
+for _r57_name in ("reddit_monitor.yml", "twitter_monitor.yml"):
+    _r57_path = os.path.join(ROOT, ".github", "workflows", _r57_name)
+    with open(_r57_path, encoding="utf-8") as _r57_f:
+        _r57_src = _r57_f.read()
+    _r57_uses = _r57_uses_re.findall(_r57_src)
+    check(f"r57a: {_r57_name} — every uses: is SHA-pinned (no mutable tags)",
+          len(_r57_uses) >= 2
+          and all(_r57_sha_re.search(u) for u in _r57_uses))
+    check(f"r57b: {_r57_name} — job declares timeout-minutes (hung-run cap)",
+          "timeout-minutes:" in _r57_src)
+    check(f"r57: {_r57_name} — P0 concurrency guard intact (queue, never cancel)",
+          "concurrency:" in _r57_src
+          and "cancel-in-progress: false" in _r57_src)
+
 
 class _R47Resp:
     def __init__(self, status, payload):
