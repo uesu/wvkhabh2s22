@@ -2,12 +2,18 @@ name: Reddit Feed Monitor
 
 concurrency:
   # P0 DOUBLE-POST FIX (2026-09-19): only ONE run per branch at a time.
-  # A 2nd trigger while one is running QUEUES and starts later — it then
-  # checks out the NEWEST main (with the first run's fresh
-  # posted_reddit.json) and the dedup cache skips everything already
-  # posted. The 2026-09-19 double post (AnantaLeaks_1wkld9d /
+  # The 2026-09-19 double post (AnantaLeaks_1wkld9d /
   # WutheringWavesLeaks_1wkldhu / AnantaLeaks_1wkle5u, runs #48 + #49)
   # happened because two runs shared the same pre-post base commit.
+  # A 2nd trigger while one is running QUEUES and starts later. ROUND 61
+  # CORRECTION (2026-10-04): a queued workflow_dispatch run does NOT check
+  # out the newest main by itself — GITHUB_SHA is pinned at DISPATCH time,
+  # so the queued run starts on a STALE tip missing the previous run's
+  # fresh posted_reddit.json (live double post 2026-10-03: run #4014
+  # checked out dd756a5 six seconds after commit 2de1491 — which already
+  # contained Genshin_Impact_Leaks_1wwyure — and posted it again). The
+  # "Sync to the live branch tip" step below closes that gap; the
+  # concurrency group is still required so two runs never execute at once.
   # cancel-in-progress MUST stay false: a run can sit between
   # "Discord posted" and "cache committed" — cancelling it there would
   # lose the cache update and allow a re-post.
@@ -48,6 +54,19 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7 — SHA-pinned (round 57, immutable supply chain); v7 = Node 24 runtime
+
+      # Round 61 (2026-10-04): workflow_dispatch pins GITHUB_SHA at dispatch
+      # time, so a run queued behind another starts on a STALE tip — without
+      # the previous run's fresh dedup cache (the 2026-10-03 double post).
+      # Fast-forward to the LIVE tip before anything reads the caches; a run
+      # that was never queued is already there and this is a no-op.
+      - name: Sync to the live branch tip
+        env:
+          CACHE_BRANCH: ${{ github.ref_name }}
+        run: |
+          git fetch origin "${CACHE_BRANCH:-main}"
+          git reset --hard FETCH_HEAD
+          echo "Now at $(git log -1 --format=%H) (live ${CACHE_BRANCH:-main} tip)."
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7 — SHA-pinned (round 57)
@@ -184,6 +203,15 @@ jobs:
             fi
 
             cache_branch="${CACHE_BRANCH:-main}"
+            # Round 61 (2026-10-04): save OUR freshly-written caches aside —
+            # the recovery below resets to the live tip and re-merges them
+            # SEMANTICALLY (git merges lines; these files carry meaning. The
+            # 2026-10-03 run #4014 lost its dedup state to a line conflict
+            # in pending_reddit.json that a JSON merge resolves trivially).
+            ours_dir="$(mktemp -d)"
+            for f in posted_reddit.json proxy_health.json pending_reddit.json posted_messages.json; do
+              if [ -f "$f" ]; then cp "$f" "$ours_dir/$f"; fi
+            done
             pushed=0
             attempts=0
             for attempt in 1 2 3; do
@@ -193,13 +221,32 @@ jobs:
                 break
               fi
 
-              # A remote cache commit may have landed between checkout and push.
-              # Rebase our single cache commit, then retry with bounded backoff.
+              # A remote cache commit landed between our sync and this push.
+              # Reset to the live tip, semantically merge our caches onto it
+              # (union of dedup keys — a lost key is a double post; an extra
+              # key is merely re-evicted by the round-34 caps), then retry.
               if [ "$attempt" -lt 3 ]; then
-                echo "::warning::Cache push attempt $attempt/3 failed; rebasing ${cache_branch} before retry."
-                if ! git pull --rebase origin "$cache_branch"; then
-                  git rebase --abort || true
-                  echo "::error::CACHE PUSH RECOVERY FAILED — rebase could not complete; dedup cache was not persisted."
+                echo "::warning::Cache push attempt $attempt/3 failed; merging the live ${cache_branch} tip semantically before retry."
+                if ! git fetch origin "$cache_branch"; then
+                  echo "::error::CACHE PUSH RECOVERY FAILED — could not fetch the live tip; dedup cache was not persisted."
+                  break
+                fi
+                git reset --hard FETCH_HEAD
+                if ! python .github/scripts/merge_monitor_caches.py "$ours_dir" . posted_reddit.json proxy_health.json pending_reddit.json posted_messages.json; then
+                  echo "::error::CACHE PUSH RECOVERY FAILED — semantic merge failed; dedup cache was not persisted."
+                  break
+                fi
+                git add -f posted_reddit.json proxy_health.json pending_reddit.json
+                if [ -f posted_messages.json ]; then
+                  git add -f posted_messages.json
+                fi
+                if git diff --cached --quiet; then
+                  echo "Live tip already contains our cache state — nothing left to push."
+                  pushed=1
+                  break
+                fi
+                if ! git commit -m "auto: update reddit monitor caches"; then
+                  echo "::error::CACHE PUSH RECOVERY FAILED — merge commit failed; dedup cache was not persisted."
                   break
                 fi
                 sleep "$((attempt * 15))"
