@@ -1848,6 +1848,49 @@ def _drop_youtube_line(body: str, youtube_url: str | None) -> str:
     return _collapse_blanks(kept)
 
 
+def _drop_gallery_media_lines(body: str, media: list) -> str:
+    """Round 62 (2026-10-04, live 1wx9c77): a selftext whose only content is
+    an inline image link rendered the SAME picture twice on the card — once
+    as a raw preview.redd.it URL line in the body text, once in the media
+    gallery right below it. Any body line that is ONLY a redd.it media link
+    (bare URL, or a self-labelled [url](url) markdown link) whose file
+    identity (_reddit_media_key: preview.redd.it/<slug>-v0-<id> and
+    i.redd.it/<id> collapse to one key) is ALREADY a gallery item is
+    dropped. Prose lines, caption-labelled links, and media links NOT in
+    the gallery stay byte-identical; a body left empty simply omits the
+    text component (the card keeps header/gallery/stats as before)."""
+    if not body or not media:
+        return body
+    gallery_keys = {
+        _reddit_media_key(str(m.get("url") or ""))
+        for m in media if m.get("url")
+    }
+    if not gallery_keys:
+        return body
+
+    def _line_key(line: str) -> str | None:
+        candidate = html_lib.unescape(line.strip())
+        link = re.fullmatch(r"\[([^\]]+)\]\((https?://[^\s]+)\)", candidate)
+        if link:
+            label = html_lib.unescape(link.group(1).strip())
+            url = link.group(2).strip()
+            # self-labelled link ([url](url)) or both halves pointing at the
+            # same media file — anything with a REAL caption is kept
+            if label != url and not (
+                    REDDIT_MEDIA_URL_RE.fullmatch(label.rstrip(".,;"))
+                    and _reddit_media_key(label) == _reddit_media_key(url)):
+                return None
+            candidate = url
+        candidate = candidate.rstrip(".,;")
+        if REDDIT_MEDIA_URL_RE.fullmatch(candidate):
+            return _reddit_media_key(candidate)
+        return None
+
+    kept = [line for line in body.splitlines()
+            if _line_key(line) not in gallery_keys]
+    return _collapse_blanks(kept)
+
+
 def strip_html(value: str | None) -> str:
     """Removes tags from HTML-ish strings (used for JSON selftext etc.)."""
     if not value:
@@ -3759,8 +3802,11 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
     # Char budget: Discord caps TOTAL text at 4000 across all components.
     op_line = op_comment_text(data["op_comment"]) if data.get("op_comment") else ""
     body_budget = max(300, 3800 - len(header) - len(op_line) - len(stats_line))
-    body_out = data["body"][:body_budget]
-    if len(data["body"]) > body_budget:
+    # Round 62: an inline-image link that is ALSO a gallery item never
+    # renders twice — the raw-URL body line is scrubbed (live 1wx9c77)
+    body_src = _drop_gallery_media_lines(data["body"], media)
+    body_out = body_src[:body_budget]
+    if len(body_src) > body_budget:
         body_out = body_out.rsplit(" ", 1)[0].rstrip() + "…"
 
     def gallery(items: list) -> dict:
