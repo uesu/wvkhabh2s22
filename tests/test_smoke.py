@@ -2617,10 +2617,15 @@ for _r39_wf in (".github/workflows/reddit_monitor.yml", ".github/workflows/twitt
         _r39_source = _fh.read()
     check(f"r39 cache persistence: {_r39_wf} uses staged-only no-change detection",
           "git diff --cached --quiet" in _r39_source)
+    # r61 (2026-10-04) UPDATE: the recovery between retries changed from
+    # `git pull --rebase` (conflict-fragile — the 2026-10-03 double post's
+    # accomplice) to the semantic JSON merge (fetch + reset + merge script).
+    # The detached-HEAD-safe push and the 3-attempt loop are unchanged.
     check(f"r39 cache persistence: {_r39_wf} retries an explicit detached-HEAD-safe push",
           'for attempt in 1 2 3; do' in _r39_source
           and 'git push origin "HEAD:${cache_branch}"' in _r39_source
-          and 'git pull --rebase origin "$cache_branch"' in _r39_source)
+          and 'git fetch origin "$cache_branch"' in _r39_source
+          and "merge_monitor_caches.py" in _r39_source)
     check(f"r39 cache persistence: {_r39_wf} fails loudly if a dedup cache cannot persist",
           "::error::CACHE PUSH FAILED" in _r39_source
           and "::error::CACHE PUSH RECOVERY FAILED" in _r39_source)
@@ -4249,6 +4254,104 @@ try:
           repr((_r60_full["youtube_url"], _r60_full["youtube_id"])))
 finally:
     v3.resolve_youtube_media = _r60_saved_resolve_youtube
+
+
+# ---------------------------------------------------------------------------
+# ROUND 61 (2026-10-04): stale-tip double post + conflict-fragile cache push.
+# Live incident 2026-10-03: prod run #4014 was dispatched while another run
+# was executing; workflow_dispatch pins GITHUB_SHA at DISPATCH time, so the
+# queued run started on the stale tip dd756a5 — six seconds after cache
+# commit 2de1491 (already containing Genshin_Impact_Leaks_1wwyure) — and
+# posted 1wwyure a second time. Its own cache push then died on a git LINE
+# conflict in pending_reddit.json that a semantic JSON merge resolves
+# trivially. Two fixes, both guarded here:
+#   (1) a "Sync to the live branch tip" step in BOTH monitor workflows;
+#   (2) the persist step recovers via .github/scripts/merge_monitor_caches.py
+#       (semantic union merge) instead of `git pull --rebase`.
+# ---------------------------------------------------------------------------
+import importlib.util as _r61_ilu
+import subprocess as _r61_sp
+import tempfile as _r61_tmp
+
+_r61_script = os.path.join(ROOT, ".github", "scripts", "merge_monitor_caches.py")
+check("r61: merge_monitor_caches.py exists", os.path.isfile(_r61_script))
+
+_r61_spec = _r61_ilu.spec_from_file_location("_r61_merge", _r61_script)
+_r61_mod = _r61_ilu.module_from_spec(_r61_spec)
+_r61_spec.loader.exec_module(_r61_mod)
+
+# (a) EXACT INCIDENT REPLAY — both sides appended the same key, evictions
+# diverged, pending last_checked collided on the same entry.
+_r61_theirs_posted = ["A_1", "B_2", "Genshin_Impact_Leaks_1wwyure"]
+_r61_ours_posted = ["A_1", "B_2", "Genshin_Impact_Leaks_1wwyure", "C_3"]
+_r61_posted = _r61_mod.merge_lists(_r61_theirs_posted, _r61_ours_posted)
+check("r61: posted merge is a strict union (no dedup key ever lost)",
+      set(_r61_posted) == set(_r61_theirs_posted) | set(_r61_ours_posted))
+check("r61: posted merge never duplicates a key (double-add collapses to one)",
+      _r61_posted.count("Genshin_Impact_Leaks_1wwyure") == 1
+      and len(_r61_posted) == len(set(_r61_posted)))
+_r61_pending = _r61_mod.merge_dicts(
+    {"HNA_1wwnu46": {"first_seen": 1.0, "last_checked": 100.0, "reason": "media_wait"},
+     "only_theirs": {"first_seen": 2.0, "last_checked": 2.0, "reason": "removal_notice"}},
+    {"HNA_1wwnu46": {"first_seen": 1.0, "last_checked": 200.0, "reason": "media_wait"},
+     "only_ours": {"first_seen": 3.0, "last_checked": 3.0, "reason": "removal_notice"}})
+check("r61: pending merge keeps both one-sided entries and newest last_checked",
+      _r61_pending["HNA_1wwnu46"]["last_checked"] == 200.0
+      and "only_theirs" in _r61_pending and "only_ours" in _r61_pending)
+
+# (b) End-to-end through the CLI exactly as the workflow invokes it, plus
+# the hygiene rule (pending keys covered by the merged posted list drop out)
+# and the loud failure on invalid JSON (a half-merge must never be pushed).
+with _r61_tmp.TemporaryDirectory() as _r61_d:
+    _r61_ours = os.path.join(_r61_d, "ours"); os.mkdir(_r61_ours)
+    _r61_repo = os.path.join(_r61_d, "repo"); os.mkdir(_r61_repo)
+    with open(os.path.join(_r61_repo, "posted_reddit.json"), "w") as _f:
+        json.dump(_r61_theirs_posted, _f)
+    with open(os.path.join(_r61_ours, "posted_reddit.json"), "w") as _f:
+        json.dump(_r61_ours_posted, _f)
+    with open(os.path.join(_r61_repo, "pending_reddit.json"), "w") as _f:
+        json.dump({"Genshin_Impact_Leaks_1wwyure": {"first_seen": 1.0,
+                   "last_checked": 1.0, "reason": "media_wait"}}, _f)
+    with open(os.path.join(_r61_ours, "pending_reddit.json"), "w") as _f:
+        json.dump({"D_4": {"first_seen": 4.0, "last_checked": 4.0,
+                   "reason": "media_wait"}}, _f)
+    _r61_run = _r61_sp.run(
+        [sys.executable, _r61_script, _r61_ours, _r61_repo,
+         "posted_reddit.json", "proxy_health.json", "pending_reddit.json",
+         "posted_messages.json"],
+        capture_output=True, text=True)
+    with open(os.path.join(_r61_repo, "pending_reddit.json")) as _f:
+        _r61_cli_pending = json.load(_f)
+    check("r61: CLI merge succeeds with the workflow's exact argument shape",
+          _r61_run.returncode == 0, _r61_run.stderr[:200])
+    check("r61: hygiene — a pending key already in the merged posted list drops",
+          "Genshin_Impact_Leaks_1wwyure" not in _r61_cli_pending
+          and "D_4" in _r61_cli_pending)
+    with open(os.path.join(_r61_repo, "pending_reddit.json"), "w") as _f:
+        _f.write("{broken")
+    _r61_bad = _r61_sp.run(
+        [sys.executable, _r61_script, _r61_ours, _r61_repo,
+         "pending_reddit.json"], capture_output=True, text=True)
+    check("r61: invalid JSON fails LOUDLY (non-zero, no half-merge pushed)",
+          _r61_bad.returncode != 0 and "SEMANTIC MERGE FAILED" in _r61_bad.stderr,
+          _r61_bad.stderr[:200])
+
+# (c) Both monitor workflows carry the sync-to-tip step and the semantic
+# recovery, and the old conflict-fragile rebase recovery is gone.
+for _r61_wf in (".github/workflows/reddit_monitor.yml",
+                ".github/workflows/twitter_monitor.yml"):
+    with open(os.path.join(ROOT, _r61_wf), encoding="utf-8") as _f:
+        _r61_src = _f.read()
+    _r61_base = os.path.basename(_r61_wf)
+    check(f"r61: {_r61_base} — sync-to-tip step present (stale GITHUB_SHA fix)",
+          "Sync to the live branch tip" in _r61_src
+          and "git reset --hard FETCH_HEAD" in _r61_src)
+    check(f"r61: {_r61_base} — persist recovery is the semantic merge",
+          "merge_monitor_caches.py" in _r61_src)
+    check(f"r61: {_r61_base} — conflict-fragile rebase recovery removed",
+          "git pull --rebase" not in _r61_src)
+    check(f"r61: {_r61_base} — dispatch-time SHA pinning documented",
+          "GITHUB_SHA" in _r61_src and "dispatch" in _r61_src.lower())
 
 
 if failures:
