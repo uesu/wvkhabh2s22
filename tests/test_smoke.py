@@ -4354,6 +4354,59 @@ for _r61_wf in (".github/workflows/reddit_monitor.yml",
           "GITHUB_SHA" in _r61_src and "dispatch" in _r61_src.lower())
 
 
+# ---- round 62 (2026-10-04): body/gallery duplicate media line scrub ----
+# Live 1wx9c77 (r/Zenlesszonezeroleaks_): a selftext whose only content is
+# the inline image link rendered the SAME picture twice — once as a raw
+# preview.redd.it URL text line, once in the media gallery below it. A body
+# line that is ONLY a redd.it media link already in the gallery is dropped;
+# prose, captioned links, and non-gallery media stay byte-identical.
+_r62_url = ("https://preview.redd.it/jex8yf7dheth1.png?width=527&format=png"
+            "&auto=webp&s=2e9caf96e4f015b42496b9c43d8bd0e7a891d8e1")
+_r62_media = [{"kind": "image", "url": _r62_url}]
+check("r62: bare gallery-dup URL line dropped",
+      v3._drop_gallery_media_lines(_r62_url, _r62_media) == "")
+check("r62: html-escaped (&amp;) variant still matches",
+      v3._drop_gallery_media_lines(_r62_url.replace("&", "&amp;"), _r62_media) == "")
+check("r62: self-labelled [url](url) link dropped",
+      v3._drop_gallery_media_lines(f"[{_r62_url}]({_r62_url})", _r62_media) == "")
+check("r62: preview body vs i.redd.it gallery rendition collapses",
+      v3._drop_gallery_media_lines(
+          _r62_url, [{"kind": "image", "url": "https://i.redd.it/jex8yf7dheth1.png"}]) == "")
+check("r62: -v0- slug form collapses",
+      v3._drop_gallery_media_lines(
+          "https://preview.redd.it/slug-v0-jex8yf7dheth1.png?width=640&s=a",
+          [{"kind": "image", "url": "https://i.redd.it/jex8yf7dheth1.png"}]) == "")
+check("r62: prose+URL line kept byte-identical",
+      v3._drop_gallery_media_lines(f"look at this {_r62_url}", _r62_media)
+      == f"look at this {_r62_url}")
+check("r62: caption-labelled link kept",
+      v3._drop_gallery_media_lines(f"[the banner]({_r62_url})", _r62_media)
+      == f"[the banner]({_r62_url})")
+check("r62: media NOT in gallery kept",
+      v3._drop_gallery_media_lines(
+          "https://preview.redd.it/zzzz.png?width=1&s=x", _r62_media)
+      == "https://preview.redd.it/zzzz.png?width=1&s=x")
+check("r62: mixed body keeps prose, drops dup, collapses blanks",
+      v3._drop_gallery_media_lines(
+          f"Seele Leaks says STC.\n\n{_r62_url}\n\nMore in comments.", _r62_media)
+      == "Seele Leaks says STC.\n\nMore in comments.")
+check("r62: no media / no body = no-op",
+      v3._drop_gallery_media_lines(_r62_url, []) == _r62_url
+      and v3._drop_gallery_media_lines("", _r62_media) == "")
+_r62_card = v3.build_v3_payload(
+    "Zenlesszonezeroleaks_",
+    {"title": "[ZZZ x HSR collab] Kafka and Robin", "author": "natarawilliams19",
+     "body": _r62_url, "media": _r62_media, "crosspost": None,
+     "stats": {"comments": 17, "ups": 31}, "youtube_url": None, "op_comment": None},
+    "https://www.reddit.com/r/Zenlesszonezeroleaks_/comments/1wx9c77/x/", 1791097875)
+_r62_texts = [c["content"] for c in _r62_card["components"][0]["components"]
+              if c.get("type") == 10]
+_r62_kinds = [c["type"] for c in _r62_card["components"][0]["components"]]
+check("r62: 1wx9c77 card — no raw-URL text component",
+      all("preview.redd.it" not in t for t in _r62_texts), str(_r62_texts))
+check("r62: 1wx9c77 card — gallery intact, header+stats only",
+      12 in _r62_kinds and _r62_kinds.count(10) == 2, str(_r62_kinds))
+
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
     sys.exit(1)
