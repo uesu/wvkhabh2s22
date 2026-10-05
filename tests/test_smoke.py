@@ -1807,13 +1807,15 @@ check("r30 throttle: skips with `continue` and never caches as posted",
 check("r30 throttle runs BEFORE any network work (the whole point)",
       _r30_main.index("pending-post recheck throttle")
       < _r30_main.index("post_json = await fetch_post_json"))
-check("r30/r35/r36/r43 gates: all skip paths record a pending entry",
-      _r30_main.count("mark_pending(pending, unique_key") == 7
-      and "mark_pending(pending, unique_key, reason, now" in _r30_main
+check("r30/round-18/round-20/32/r63 gates: all skip paths record a pending entry "
+      "(settle/mod-queue/dup-media/repost gates removed round 63 -- only "
+      "removed-post-reason, archive-liveness, and media-wait/partial-gallery "
+      "skips remain)",
+      _r30_main.count("mark_pending(pending, unique_key") == 5
+      and "mark_pending(pending, unique_key, _removed, now" in _r30_main
+      and "mark_pending(pending, unique_key,\n" in _r30_main
       and 'mark_pending(pending, unique_key, "media_wait", now)' in _r30_main
-      and 'mark_pending(pending, unique_key, "partial_gallery", now)' in _r30_main
-      and 'mark_pending(pending, unique_key, "duplicate_media", now' in _r30_main
-      and 'mark_pending(pending, unique_key, "duplicate_repost", now' in _r30_main,
+      and 'mark_pending(pending, unique_key, "partial_gallery", now)' in _r30_main,
       str(_r30_main.count("mark_pending(pending, unique_key")))
 check("r30 posted: a successful post clears the pending entry",
       "pending.pop(unique_key, None)" in _r30_main)
@@ -1916,13 +1918,13 @@ check("r32: removed post that RE-APPEARS via RSS bypasses the skip (restore path
       v3._pending_throttle_skip(_r32_pend("removal_notice"), "k", 4600.0, _r32_rss) is False)
 check("r32: title-marker (deleted) post from the Arctic backup is skipped too",
       v3._pending_throttle_skip(_r32_pend("title marker"), "k", 4600.0, _r32_arctic) is True)
-check("r32: approval-queued post (not_live) is skipped before the short interval (+60 s)",
+check("r32: approval-queued post (not_live) is skipped before the round-30 throttle (+60 s)",
       v3._pending_throttle_skip(_r32_pend("not_live"), "k", 1060.0, _r32_arctic) is True)
-check("r32: approval-queued post (not_live) is DUE at the short interval (+300 s)",
-      v3._pending_throttle_skip(_r32_pend("not_live"), "k", 1300.0, _r32_arctic) is False)
-check("r32: 'pending approval' (banner) re-checks on the short interval (+300 s due)",
-      v3._pending_throttle_skip(_r32_pend("pending approval"), "k", 1300.0, _r32_arctic) is False)
-check("r32: sources_down (transient) re-checks on the short interval (+60 s skipped)",
+check("r32: approval-queued post (not_live) is DUE at the round-30 throttle (+30 min)",
+      v3._pending_throttle_skip(_r32_pend("not_live"), "k", 2800.0, _r32_arctic) is False)
+check("r32: 'pending approval' (banner) re-checks on the round-30 throttle (+30 min due)",
+      v3._pending_throttle_skip(_r32_pend("pending approval"), "k", 2800.0, _r32_arctic) is False)
+check("r32: sources_down (transient) re-checks on the round-30 throttle (+60 s skipped)",
       v3._pending_throttle_skip(_r32_pend("sources_down"), "k", 1060.0, _r32_arctic) is True)
 check("r32: media_wait keeps the round-30 30-min throttle (+60 s skipped, +30 min due)",
       v3._pending_throttle_skip(_r32_pend("media_wait"), "k", 1060.0, _r32_arctic) is True
@@ -1930,16 +1932,15 @@ check("r32: media_wait keeps the round-30 30-min throttle (+60 s skipped, +30 mi
 check("r32: unknown/missing reason falls back to the round-30 30-min throttle",
       v3._pending_throttle_skip(_r32_pend(None), "k", 1060.0, _r32_arctic) is True
       and v3._pending_throttle_skip(_r32_pend(None), "k", 2800.0, _r32_arctic) is False)
-check("r32/r35/r36/r43: no-recheck set is removal/deletion + proven nsfw/duplicate reasons",
+check("r32/r35 (round 63: duplicate/repost reasons removed): no-recheck set is "
+      "removal/deletion + proven nsfw reasons",
       v3._NO_RECHECK_REASONS == frozenset({
           "removal_notice", "removal notice", "title marker", "whole-body marker",
           "removed by moderator", "removed by moderators/filters", "deleted by author",
-          "nsfw_flag", "nsfw_subreddit", "nsfw_crosspost_source",
-          "duplicate_media", "duplicate_repost"}))
-check("r32/r42: the short-recheck set includes approval/transient + nsfw_unknown",
-      v3._SHORT_RECHECK_REASONS == frozenset(
-          {"not_live", "sources_down", "pending approval", "nsfw_unknown"}))
-check("r32: the mod-queue banner is recognized as 'pending approval'",
+          "nsfw_flag", "nsfw_subreddit", "nsfw_crosspost_source"}))
+check("r32: the mod-queue-era banner text still classifies as 'pending approval' "
+      "(removed_post_reason is a content classifier used by the retraction "
+      "seatbelt, not a gate)",
       v3.removed_post_reason("Happy Birthday Caesar | Pink Pages",
                              "Post is awaiting moderator approval.") == "pending approval")
 check("r32: clean post text is NOT flagged (no false positive)",
@@ -2222,285 +2223,23 @@ with open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="
 check("r35: the optional repository Variable is wired into the live workflow",
       "NSFW_ALLOWLIST: ${{ vars.NSFW_ALLOWLIST }}" in _r35_workflow)
 
-# ---- R36: settle window + duplicate-media gate + pending audit fields ----
-check("r36: duplicate_media uses the archive no-recheck pending path", "duplicate_media" in v3._NO_RECHECK_REASONS)
-_r36_orig_settle = v3.POST_SETTLE_SECONDS
-v3.POST_SETTLE_SECONDS = 300
-check("r36: settle holds a post 100 s old (window 300 s)", v3.settle_holds(900.0, 1000.0) is True)
-check("r36: settle passes a post 500 s old (window 300 s)", v3.settle_holds(500.0, 1000.0) is False)
-v3.POST_SETTLE_SECONDS = 0
-check("r36: settle is off with POST_SETTLE_SECONDS=0", v3.settle_holds(999.0, 1000.0) is False)
-v3.POST_SETTLE_SECONDS = _r36_orig_settle
-check("r36: a bare i.redd.it URL is its own identity", v3.media_identity("https://i.redd.it/07k97gjymdsh1.jpeg") == "https://i.redd.it/07k97gjymdsh1.jpeg")
-check("r36: a signed/slug preview.redd.it URL collapses to the i.redd.it file", v3.media_identity("https://preview.redd.it/aha-splash-v0-xeqyq5flmdsh1.jpg?width=1080&s=x") == "https://i.redd.it/xeqyq5flmdsh1.jpg")
-check("r36: a preview.redd.it png collapses hosts (same file)", v3.media_identity("https://preview.redd.it/xyz.png?width=1280&s=x") == "https://i.redd.it/xyz.png")
-check("r36: an external destination URL normalizes (host case + query stripped)", v3.media_identity("HTTPS://Hsr.Nanoka.cc/Item/71/?ref=rss") == "hsr.nanoka.cc/Item/71")
-check("r36: external path case is kept (no false-positive collisions)", v3.media_identity("https://Example.COM/Path/Case") == "example.com/Path/Case")
-check("r36: a gallery URL is never an identity (re-galleries get new ids)", v3.media_identity("https://www.reddit.com/gallery/1wsyy4e") is None)
-check("r36: a post permalink is never an identity (unique per post)", v3.media_identity("https://www.reddit.com/r/x/comments/id/t/") is None)
-check("r36: an empty/unknown URL is never an identity (fail-open)", v3.media_identity("") is None and v3.media_identity(None) is None)
-_r36_payload = {"data": [{"id":"aaa111","url_overridden_by_dest":"https://hsr.nanoka.cc/item/71/","url":"x"},{"id":"bbb222","url":"https://i.redd.it/x.jpeg"}]}
-_r36_urls = asyncio.run(v3.fetch_arctic_urls(_R35Session(_R35Response(_r36_payload)), ["aaa111","bbb222","ddd444"]))
-check("r36: the url lookup prefers url_overridden_by_dest", _r36_urls.get("aaa111") == "https://hsr.nanoka.cc/item/71/")
-check("r36: the url lookup falls back to url", _r36_urls.get("bbb222") == "https://i.redd.it/x.jpeg")
-check("r36: an ID absent from Arctic is unknown (fail-open)", _r36_urls.get("ddd444") is None)
-_r36_down = asyncio.run(v3.fetch_arctic_urls(_R35Session(error=RuntimeError("network down")), ["aaa111"]))
-check("r36: a failed url lookup returns {} (fail-open, never a hold)", _r36_down == {})
-check("r36: a posted same-identity post is the duplicate's winner", v3.dup_media_hit({"a":"Sub_x"}, "a") == "Sub_x")
-check("r36: no posted map -> no hit", v3.dup_media_hit(None, "a") is None)
-check("r36: an unknown identity never hits (fail-open)", v3.dup_media_hit({"a":"Sub_x"}, None) is None)
-check("r36: a different identity never hits", v3.dup_media_hit({"a":"Sub_x"}, "b") is None)
+# ---- R36 (round 63: settle window + duplicate-media gate removed; the
+# pending-cache audit fields they introduced are still used by the
+# surviving gates) ----
 _r36_pend = {}; v3.mark_pending(_r36_pend, "Sub_abc111", "media_wait", 1000.0)
 check("r36: the legacy mark_pending call shape still works", _r36_pend["Sub_abc111"] == {"first_seen":1000.0,"last_checked":1000.0,"reason":"media_wait"})
 v3.mark_pending(_r36_pend, "Sub_abc111", "removal_notice", 2000.0, source="rss", title="Aha kit", published_ts=1234.0)
 check("r36: mark_pending stores the round-36 audit fields (additive)", _r36_pend["Sub_abc111"]["source"] == "rss" and _r36_pend["Sub_abc111"]["published_ts"] == 1234)
-_r36_main_src = inspect.getsource(v3.main)
-check("r36: the settle gate is wired in the loop and holds fresh posts one run", "settle_holds(" in _r36_main_src and "SETTLE:" in _r36_main_src)
-check("r36: a same-media duplicate of an already-posted post is held, not posted", "DUP GATE:" in _r36_main_src and 'mark_pending(pending, unique_key, "duplicate_media", now' in _r36_main_src)
-check("r36: every new post logs its media decision (wiring visible in the run log)", "DUP SCAN:" in _r36_main_src)
-check("r36: a restored no-recheck post re-entering via RSS is logged loudly", "RESTORED:" in _r36_main_src)
-check("r36/r43: the posted-history metadata lookup is wired before the posting loop", "fetch_arctic_post_metadata(" in _r36_main_src and _r36_main_src.index("fetch_arctic_post_metadata(") < _r36_main_src.index(_r35_loop))
-with open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8") as _r36_f: _r36_workflow = _r36_f.read()
-check("r36: the two new repository Variables are wired into the live workflow", "POST_SETTLE_SECONDS: ${{ vars.POST_SETTLE_SECONDS }}" in _r36_workflow and "DUP_MEDIA_GATE: ${{ vars.DUP_MEDIA_GATE }}" in _r36_workflow)
+check("r36: a restored no-recheck post re-entering via RSS is logged loudly", "RESTORED:" in inspect.getsource(v3.main))
+check("r63: the settle window, mod-queue gate and duplicate/repost gates are gone from the main loop",
+      not any(sym in inspect.getsource(v3.main) for sym in
+              ("settle_holds(", "POST_SETTLE_SECONDS", "DUP_MEDIA_GATE", "REPOST_GATE",
+               "MOD_QUEUE_GATE", "mod_queue_reason(")))
 
-# ---- R36 hotfix (2026-09-29): GHA passes UNSET Variables as empty strings ----
-# (wired via vars.X, an unset repo Variable arrives as "" — the round-36 first
-# deploy crashed at import with int(""). Empty/blank/garbage must fall back
-# to the code defaults, never break the run.)
-_r36_saved_settle = os.environ.get("POST_SETTLE_SECONDS")
-try:
-    os.environ.pop("POST_SETTLE_SECONDS", None)
-    check("r36-hotfix: an unset POST_SETTLE_SECONDS uses the 300 s default",
-          v3._env_int("POST_SETTLE_SECONDS", 300) == 300)
-    os.environ["POST_SETTLE_SECONDS"] = ""
-    check("r36-hotfix: an EMPTY value (the live GHA crash) uses the 300 s default, not a crash",
-          v3._env_int("POST_SETTLE_SECONDS", 300) == 300)
-    os.environ["POST_SETTLE_SECONDS"] = "   "
-    check("r36-hotfix: a blank value uses the 300 s default",
-          v3._env_int("POST_SETTLE_SECONDS", 300) == 300)
-    os.environ["POST_SETTLE_SECONDS"] = "not-a-number"
-    check("r36-hotfix: a garbage value uses the 300 s default, not a crash",
-          v3._env_int("POST_SETTLE_SECONDS", 300) == 300)
-    os.environ["POST_SETTLE_SECONDS"] = "450"
-    check("r36-hotfix: a valid numeric override is still honored",
-          v3._env_int("POST_SETTLE_SECONDS", 300) == 450)
-finally:
-    if _r36_saved_settle is None:
-        os.environ.pop("POST_SETTLE_SECONDS", None)
-    else:
-        os.environ["POST_SETTLE_SECONDS"] = _r36_saved_settle
-_r36_dup_line = next(l for l in inspect.getsource(v3).splitlines() if l.startswith("DUP_MEDIA_GATE = "))
-check("r36-hotfix: an empty DUP_MEDIA_GATE value does NOT disable the gate (default on)",
-      '""' not in _r36_dup_line and 'not in ("0", "false", "no", "off")' in _r36_dup_line)
-check("r36-hotfix: the gate is ON in a clean environment (smoke default)",
-      v3.DUP_MEDIA_GATE is True)
-
-
-
-# ---- R37: mod-queue gate ----
-check("r37: queue request text is detected", v3.MOD_QUEUE_REQUEST_RE.search("Please respond to this comment with a mirror link") is not None)
-check("r37: listing ids are extracted", v3._listing_post_ids('<a href="/r/X/comments/abc111/t/">x</a>') == {"abc111"})
-check("r37: both signals hold", v3.mod_queue_decision("respond to this comment with", {"other"}, "abc111") == "pending approval")
-check("r37: visible on listing releases", v3.mod_queue_decision("respond to this comment with", {"abc111"}, "abc111") is None)
-check("r37/r41: missing page fails open; positive hold text holds even on listing outage",
-      v3.mod_queue_decision(None, {"other"}, "abc111") is None
-      and v3.mod_queue_decision("respond to this comment with", None, "abc111") == "pending approval")
+# ---- R41: domain-only URL label unwraps to a clean bare URL (1wtxc4m) ------
 check("r41: domain-only URL label unwraps to clean bare URL with spacing (1wtxc4m)",
       v3.clean_rss_body('<p>extra Astrites!<a href="http://wuwa-share.kurogames-global.com/sr/xyz">wuwa-share.kurogames-global.com/sr/xyz</a></p>')
       == "extra Astrites! http://wuwa-share.kurogames-global.com/sr/xyz")
-check("r37: empty gate defaults on", v3.MOD_QUEUE_GATE is True)
-check("r37: main loop wiring is after liveness", "mod_queue_reason(" in inspect.getsource(v3.main) and "MOD_QUEUE_WINDOW_SECONDS" in inspect.getsource(v3.main))
-
-# ---- R37 hotfix (2026-09-30): the /new listing fetch must carry the
-# miningtcup token, and both gate outcomes must be visible in the log ----
-_r37_listing_src = inspect.getsource(v3._fetch_new_listing)
-check("r37-hotfix: the /new listing fetch carries the miningtcup token",
-      "_with_miningtcup_token" in _r37_listing_src)
-check("r37-hotfix: an unreadable /new listing is logged (blind fail-open is visible)",
-      "MODQUEUE-LISTING" in _r37_listing_src)
-check("r37-hotfix: a cleared queue check logs it (proceeding is visible)",
-      "no queue hold" in inspect.getsource(v3.main))
-
-# ---- R38d (2026-09-29): native/zero-comment mod-queue detection ----------
-# A post that is natively queued can have no AutoModerator comment. It is
-# therefore absent from /new but carries no positive queue text. Hold only if
-# both the post age and listing span are parseable; every missing signal must
-# retain round 37's fail-open behavior.
-_r38d_page = '<span class="created" title="x">2h ago</span><div>plain post body</div>'
-_r38d_listing_ids = {"other1", "other2"}
-check("r38d: absent + no queue text + inside listing span holds",
-      v3.mod_queue_decision(_r38d_page, _r38d_listing_ids, "abc111",
-                            listing_oldest_age=12 * 3600) == "pending approval")
-check("r38d: the round-37 positive queue-text path remains unchanged",
-      v3.mod_queue_decision("respond to this comment with", {"other"}, "abc111")
-      == "pending approval")
-check("r38d: a post present in /new releases even with a parsed age",
-      v3.mod_queue_decision(_r38d_page, {"abc111"}, "abc111",
-                            listing_oldest_age=12 * 3600) is None)
-check("r38d: a blind listing fails open",
-      v3.mod_queue_decision(_r38d_page, None, "abc111", listing_oldest_age=12 * 3600)
-      is None)
-check("r38d: an unparseable post age fails open",
-      v3.mod_queue_decision('<span class="created">just now</span>', _r38d_listing_ids,
-                            "abc111", listing_oldest_age=12 * 3600) is None)
-check("r38d: a missing listing age fails open",
-      v3.mod_queue_decision(_r38d_page, _r38d_listing_ids, "abc111") is None)
-check("r38d: a post older than the safe listing span fails open",
-      v3.mod_queue_decision('<span class="created">40h ago</span>', _r38d_listing_ids,
-                            "abc111", listing_oldest_age=12 * 3600) is None)
-check("r38d: the window-sized margin preserves a conservative tail",
-      v3.mod_queue_decision('<span class="created">5h ago</span>', _r38d_listing_ids,
-                            "abc111", listing_oldest_age=4 * 3600) == "pending approval")
-_r38d_listing_html = ('<a href="/r/X/comments/other1/t/"><span class="created">10m ago</span></a>'
-                      '<a href="/r/X/comments/other2/t/"><span class="created">12h ago</span></a>')
-check("r38d: listing span uses the oldest visible age",
-      v3._listing_oldest_age(_r38d_listing_html) == 12 * 3600)
-check("r38d: word-form redlib ages are parsed",
-      v3._redlib_ages_seconds('<span class="created">2 hours ago</span>') == [2 * 3600])
-check("r38d: bare relative-age markup is a safe fallback",
-      v3._redlib_ages_seconds('<time>3h ago</time>') == [3 * 3600])
-check("r38d: a listing without a parseable age has no safe span",
-      v3._listing_oldest_age('<a href="/r/X/comments/other1/t/">no age</a>') is None)
-
-class _R38dListingResponse:
-    status = 200
-    headers = {"Content-Type": "text/html; charset=utf-8"}
-
-    async def text(self):
-        return _r38d_listing_html
-
-
-class _R38dListingRequest:
-    async def __aenter__(self):
-        return _R38dListingResponse()
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-
-class _R38dListingSession:
-    def get(self, *args, **kwargs):
-        return _R38dListingRequest()
-
-
-_r38d_cache_before = dict(v3._mod_queue_listing_cache)
-try:
-    v3._mod_queue_listing_cache.clear()
-    _r38d_listing = asyncio.run(v3._fetch_new_listing(_R38dListingSession(), "QueueTest"))
-    check("r38d: listing fetch caches IDs with its parsed oldest age",
-          _r38d_listing == ({"other1", "other2"}, 12 * 3600, v3.reddit_signals.LISTING_HTML), str(_r38d_listing))
-finally:
-    v3._mod_queue_listing_cache.clear()
-    v3._mod_queue_listing_cache.update(_r38d_cache_before)
-
-_r38d_original_page_fetch = v3._fetch_redlib_post_page
-_r38d_original_listing_fetch = v3._fetch_new_listing
-async def _r38d_post_page(_session, instance, _path):
-    # A generic first-party shell must not mask a later redlib page that has
-    # the relative post age required by the negative-space decision.
-    return "<html>generic shell</html>" if instance == v3.REDDIT_RSS_INSTANCES[0] else _r38d_page
-async def _r38d_listing_fetch(*args, **kwargs):
-    return _r38d_listing_ids, 12 * 3600
-try:
-    v3._fetch_redlib_post_page = _r38d_post_page
-    v3._fetch_new_listing = _r38d_listing_fetch
-    check("r38d: mod_queue_reason selects a parseable page and passes the listing age",
-          asyncio.run(v3.mod_queue_reason(object(), "QueueTest", "/r/X/comments/abc111/t/"))
-          == "pending approval")
-finally:
-    v3._fetch_redlib_post_page = _r38d_original_page_fetch
-    v3._fetch_new_listing = _r38d_original_listing_fetch
-
-check("r38d: the tail margin is tied to the existing window (no new workflow Variable)",
-      v3.MOD_QUEUE_TAIL_MARGIN_SECONDS == v3.MOD_QUEUE_WINDOW_SECONDS)
-
-# ---- R38e (2026-09-30): token-authenticated RSS is the primary listing signal
-# for native moderator-queue posts. Keep the fixture deterministic: the
-# parser receives an explicit clock, while the fetch test verifies live URL
-# construction and preserves the existing HTML fallback through R38d above.
-from email.utils import parsedate_to_datetime as _r38e_pdt
-
-_r38e_rss = ('<?xml version="1.0"?><rss><channel>'
-             '<item><title>a</title><link>https://www.reddit.com/r/X/comments/aaa111/t/</link>'
-             '<pubDate>Wed, 30 Sep 2026 05:00:00 GMT</pubDate></item>'
-             '<item><title>b</title><link>https://old.reddit.com/r/X/comments/bbb222/t/</link>'
-             '<pubDate><![CDATA[Wed, 30 Sep 2026 06:30:00 GMT]]></pubDate></item>'
-             '<item><title>c</title><link>https://www.reddit.com/r/X/comments/ccc333/t/</link>'
-             '<pubDate>not a date</pubDate></item>'
-             '</channel></rss>')
-_r38e_clock = _r38e_pdt("Wed, 30 Sep 2026 08:00:00 GMT").timestamp()
-_r38e_expected = 3 * 3600
-# Keep the network-shaped fixture safely in the past even when the smoke test
-# runs before the hand-written 2026 dates above (the parser test itself uses
-# its explicit clock and remains deterministic).
-_r38e_fetch_rss = _r38e_rss.replace("30 Sep 2026", "30 Sep 2000")
-check("r38e: RSS entry links yield the listing IDs",
-      v3._listing_post_ids(_r38e_rss) == {"aaa111", "bbb222", "ccc333"})
-check("r38e: the oldest parseable pubDate defines the span",
-      v3._rss_oldest_age(_r38e_rss, now=_r38e_clock) == _r38e_expected)
-check("r38e: malformed and future pubDates fail open rather than narrowing the span",
-      v3._rss_oldest_age("<rss><pubDate>not a date</pubDate></rss>", now=_r38e_clock) is None
-      and v3._rss_oldest_age("<rss><pubDate>Thu, 01 Oct 2099 00:00:00 GMT</pubDate></rss>",
-                              now=_r38e_clock) is None)
-_r38e_page = '<span class="created">2h ago</span><div>native queued post</div>'
-check("r38e: an absent native post inside the RSS span is held",
-      v3.mod_queue_decision(_r38e_page, {"other1"}, "queued1",
-                            listing_oldest_age=12 * 3600) == "pending approval")
-check("r38e: an RSS-visible post is released immediately",
-      v3.mod_queue_decision(_r38e_page, {"queued1"}, "queued1",
-                            listing_oldest_age=12 * 3600) is None)
-
-class _R38eResponse:
-    status = 200
-    headers = {"Content-Type": "application/rss+xml"}
-
-    async def text(self):
-        return _r38e_fetch_rss
-
-
-class _R38eRequest:
-    async def __aenter__(self):
-        return _R38eResponse()
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-
-class _R38eSession:
-    def __init__(self):
-        self.urls = []
-
-    def get(self, url, **kwargs):
-        self.urls.append(url)
-        return _R38eRequest()
-
-
-_r38e_cache_before = dict(v3._mod_queue_listing_cache)
-_r38e_token_before = v3.REDDIT_FEED_TOKEN
-try:
-    v3._mod_queue_listing_cache.clear()
-    v3.REDDIT_FEED_TOKEN = "smoke token"
-    _r38e_session = _R38eSession()
-    _r38e_listing = asyncio.run(v3._fetch_new_listing(_r38e_session, "RssTest"))
-    _r38e_ids, _r38e_span, _r38e_source = _r38e_listing
-    _r38e_rss_urls = [u for u in _r38e_session.urls if "/new.rss" in u]
-    check("r38e: the RSS listing still answers when no HTML listing does",
-          _r38e_ids == {"aaa111", "bbb222", "ccc333"}
-          and _r38e_span is not None
-          and _r38e_rss_urls
-          and _r38e_rss_urls[0].startswith("https://www.reddit.com/r/RssTest/new.rss")
-          and "feed=smoke%20token" in _r38e_rss_urls[0],
-          f"listing={_r38e_listing!r} urls={_r38e_session.urls}")
-    check("r46b: an RSS-sourced listing is TAGGED rss (it cannot prove release)",
-          _r38e_source == v3.reddit_signals.LISTING_RSS, str(_r38e_listing))
-finally:
-    v3.REDDIT_FEED_TOKEN = _r38e_token_before
-    v3._mod_queue_listing_cache.clear()
-    v3._mod_queue_listing_cache.update(_r38e_cache_before)
-
-check("r38e: the RSS listing source uses the existing feed token and no new setting",
-      "REDDIT_FEED_TOKEN" in inspect.getsource(v3._fetch_new_listing)
-      and "new.rss?limit=100" in inspect.getsource(v3._fetch_new_listing))
 
 # ---- R38a (2026-09-30): link posts carry the YouTube URL as the destination ----
 check("r38a: a link post's YouTube destination is picked up from the final body",
@@ -2640,15 +2379,9 @@ check("r39 Dependabot auto-merge waits for completed CI rather than an early PR 
 check("r39 Dependabot auto-merge identifies the completed run's PR and never checks out PR code",
       "run.pull_requests" in _r39_merge and "No checkout by design" in _r39_merge)
 
-# ---- R42-R45 smoke guards: signal core wiring and defaults ----------------
+# ---- R42/R45 smoke guards: NSFW signal core wiring and defaults -----------
 signals = load_module("smoke_reddit_signals", "testing area/reddit_signals.py")
 check("r42: signal module imports independently", signals is not None)
-check("r42: verified settle window is 60 s", signals.settle_window_seconds(True) == 60)
-check("r42: unverified settle window remains 300 s", signals.settle_window_seconds(False) == 300)
-check("r42: verified fresh post still holds under 60 s", signals.settle_holds(950, 1000, confirmed_in_new=True))
-check("r42: verified post passes after 60 s", signals.settle_holds(939, 1000, confirmed_in_new=True) is False)
-check("r42: unverified post still holds under 300 s", signals.settle_holds(701, 1000, confirmed_in_new=False))
-check("r42: V3 default verified settle variable is 60", v3.POST_SETTLE_VERIFIED_SECONDS == 60)
 check("r45: Redlib NSFW badge is detected", signals.nsfw_from_post_page('<div class="post"><small class="nsfw">NSFW</small></div>') is True)
 check("r45: Redlib spoiler badge is not NSFW", signals.nsfw_from_post_page('<div class="post"><small class="spoiler">Spoiler</small></div>') is False)
 check("r45: readable unbadged Redlib page is clean", signals.nsfw_from_post_page('<div class="post"><a href="/r/x/comments/abc/t/">t</a></div>') is False)
@@ -2665,22 +2398,28 @@ check("r42: NSFW crosspost source subreddit blocks", signals.nsfw_gate_reason("p
 check("r42: malformed crosspost source fails closed", signals.nsfw_gate_reason("p", "a", {"over_18": False, "source_present": True}) == "nsfw_unknown")
 check("r42: require-subreddit makes missing community metadata unknown", signals.nsfw_gate_reason("p", "a", {"over_18": False}, require_subreddit=True) == "nsfw_unknown")
 check("r42: allowlist bypass remains available", signals.nsfw_gate_reason("t3_p", "a", None, allowlist=["p"]) is None)
-_fp1 = signals.content_fingerprint("Genshin_Impact_Leaks", "LeakAuthor", "Port: Belovodye!!")
-_fp2 = signals.content_fingerprint("genshin impact leaks", "leakauthor", "Port Belovodye")
-check("r43: fingerprint normalizes case/punctuation/underscores", _fp1 == _fp2)
-check("r43: fingerprint removes zero-width characters", signals.content_fingerprint("s", "a", "A\u200bB") == signals.content_fingerprint("s", "a", "AB"))
-check("r43: unknown author fails open", signals.content_fingerprint("s", "unknown", "title") is None)
-check("r43: deleted author fails open", signals.content_fingerprint("s", "[deleted]", "title") is None)
-check("r43: empty title fails open", signals.content_fingerprint("s", "author", "") is None)
-check("r43: different title does not collide", signals.content_fingerprint("s", "a", "one") != signals.content_fingerprint("s", "a", "two"))
-check("r43: duplicate_repost_hit finds the winner", signals.duplicate_repost_hit({_fp1: "Sub_old"}, _fp2) == "Sub_old")
-check("r43: duplicate_repost_hit fails open on unknown identity", signals.duplicate_repost_hit({_fp1: "Sub_old"}, None) is None)
+check("r63: title-only 'nsfw' with an explicit over_18=false marker does NOT false-positive "
+      "(Reddit auto-marks a literal 'nsfw' title as over_18 itself -- the gate reads the "
+      "flag, never the title text)",
+      signals.nsfw_gate_reason("p", "a", {"over_18": False, "thumbnail": "default"}) is None)
+
+# ---- R44 / round 63: retraction seatbelt (dead/edit/delete/outside-window) -
 check("r44: listing absence can prove dead within listing span", signals.listing_absence_proves_dead("abc", 940, 1000, {"zzz"}, 120))
 check("r44: listing presence never proves dead", signals.listing_absence_proves_dead("abc", 940, 1000, {"abc"}, 120) is False)
 check("r44: old post outside listing span is not retracted", signals.listing_absence_proves_dead("abc", 0, 1000, {"zzz"}, 120) is False)
 check("r44: retraction decision returns edit only with both proofs", signals.retraction_decision(enabled=True, mode="edit", post_id="abc", published_ts=940, now=1000, listing_ids={"zzz"}, listing_oldest_age=120, live_removal_reason="removed") == "edit")
 check("r44: no live removal proof means no retraction", signals.retraction_decision(enabled=True, mode="edit", post_id="abc", published_ts=940, now=1000, listing_ids={"zzz"}, listing_oldest_age=120, live_removal_reason=None) is None)
 check("r44: disabled retraction stays off", signals.retraction_decision(enabled=False, mode="edit", post_id="abc", published_ts=940, now=1000, listing_ids={"zzz"}, listing_oldest_age=120, live_removal_reason="removed") is None)
+check("r63: retraction OFF (default) means retraction_decision NEVER returns a verdict, "
+      "regardless of mode or evidence",
+      signals.retraction_decision(enabled=False, mode="edit", post_id="abc", published_ts=0, now=100000, listing_ids=set(), listing_oldest_age=120, live_removal_reason="removed") is None
+      and signals.retraction_decision(enabled=False, mode="delete", post_id="abc", published_ts=0, now=100000, listing_ids=set(), listing_oldest_age=120, live_removal_reason="removed") is None)
+check("r63: retraction ON + delete mode returns 'delete' with both proofs",
+      signals.retraction_decision(enabled=True, mode="delete", post_id="abc", published_ts=940, now=1000, listing_ids={"zzz"}, listing_oldest_age=120, live_removal_reason="removed") == "delete")
+check("r63: retraction ON but OUTSIDE the listing span (not provably dead) takes no action",
+      signals.retraction_decision(enabled=True, mode="edit", post_id="abc", published_ts=0, now=1000, listing_ids={"zzz"}, listing_oldest_age=120, live_removal_reason="removed") is None)
+check("r63: an invalid mode never retracts even with both proofs",
+      signals.retraction_decision(enabled=True, mode="bogus", post_id="abc", published_ts=940, now=1000, listing_ids={"zzz"}, listing_oldest_age=120, live_removal_reason="removed") is None)
 _tomb = signals.tombstone_payload({"components": [{"type": 17, "accent_color": 16729344, "components": [{"type": 10, "content": "header"}]}]}, "removed")
 check("r44: tombstone prepends a notice", "no longer live" in _tomb["components"][0]["components"][0]["content"])
 check("r44: tombstone greys the accent", _tomb["components"][0]["accent_color"] == 0x808080)
@@ -2691,165 +2430,251 @@ check("r42: workflow wires NSFW_FAIL_OPEN", "NSFW_FAIL_OPEN: ${{ vars.NSFW_FAIL_
 check("r44: workflow persists posted_messages only when present", "posted_messages.json" in _r35_workflow and "-f posted_messages.json" in _r35_workflow)
 check("r44: wait=true is conditional on retraction", "&wait=true" in _r35_main_src and "RETRACT_DEAD_POSTS" in _r35_main_src)
 check("r42: signal module is side-effect-free (no aiohttp import)", "aiohttp" not in inspect.getsource(signals))
+check("r63: retraction defaults are OFF / edit / 6h, as specified",
+      v3.RETRACT_DEAD_POSTS is False and v3.RETRACT_MODE == "edit" and v3.RETRACT_WINDOW_SECONDS == 21600)
 
-print()
-
-# ---- R46 / R46b (2026-10-01): the queued-post regression -------------------
-# LIVE INCIDENT. r/HonkaiStarRail_leaks 1wuqy6z (created 05:16:43Z, mirrored
-# 05:25Z, zero comments) and 1wurg8f (created 05:46:59Z, mirrored 05:55Z,
-# AutoModerator source-rule comment stickied) both reached Discord while the
-# post page still read "Post is awaiting moderator approval", because they
-# appeared in Reddit's /new.rss and the gate read that as proof of release.
-_r46_strong = '<div>Post is awaiting moderator approval.</div>'
-_r46_weak = ('<div class="comment"><a href="/u/AutoModerator">AutoModerator</a>'
-             ' Please respond to this comment with a mirror link and source link.'
-             ' Failure to do so will result in post removal.</div>')
-check("r46: the queue banner is a STRONG hold signal",
-      v3.MOD_QUEUE_STRONG_RE.search("Post is awaiting moderator approval.") is not None)
-check("r46: 1wuqy6z — a queued post present in the RSS listing is STILL held",
-      v3.mod_queue_decision(_r46_strong, {"1wuqy6z"}, "1wuqy6z",
-                            listing_oldest_age=12 * 3600,
-                            listing_source=v3.reddit_signals.LISTING_RSS,
-                            post_age_seconds=510) == "pending approval")
-check("r46: 1wurg8f — the AutoMod source-rule comment holds inside the grace",
-      v3.mod_queue_decision(_r46_weak, {"1wurg8f"}, "1wurg8f",
-                            listing_oldest_age=12 * 3600,
-                            listing_source=v3.reddit_signals.LISTING_RSS,
-                            post_age_seconds=510) == "pending approval")
-check("r46: that weak signal does NOT hold a post for ever",
-      v3.mod_queue_decision(_r46_weak, {"1wurg8f"}, "1wurg8f",
-                            listing_oldest_age=12 * 3600,
-                            listing_source=v3.reddit_signals.LISTING_RSS,
-                            post_age_seconds=v3.MOD_QUEUE_WEAK_GRACE_SECONDS + 1) is None)
-# ---- ROUND 48 (2026-10-01): the banner outranks the listing ---------------
-# r/HonkaiStarRail_leaks 1wuwjiw was DELIVERED at 19:16 while its page still
-# read "Post is awaiting moderator approval" — round 46 consulted the /new
-# listing FIRST and never looked at the banner. Direct page evidence now wins.
-_r48_page = ('<h1 class="post_title">4.7 Apoc Shadow Pom Pom mechanics information via Cyrleak</h1>'
-             '<div>Post is awaiting moderator approval.</div>')
-check("r48: 1wuwjiw — a queued post inside an API-backed listing is STILL held",
-      v3.mod_queue_decision(_r48_page, {"1wuwjiw"}, "1wuwjiw",
-                            listing_oldest_age=12 * 3600,
-                            listing_source=v3.reddit_signals.LISTING_HTML,
-                            post_age_seconds=600) == "pending approval")
-check("r48: a post with no banner is released by the listing exactly as before",
-      v3.mod_queue_decision('<span class="created">11m ago</span>',
-                            {"1wuwjiw"}, "1wuwjiw",
-                            listing_oldest_age=12 * 3600,
-                            listing_source=v3.reddit_signals.LISTING_HTML,
-                            post_age_seconds=600) is None)
-check("r46: an API-backed listing still releases immediately (speed preserved)",
-      v3.mod_queue_decision(_r46_weak, {"1wurg8f"}, "1wurg8f",
-                            listing_oldest_age=12 * 3600,
-                            listing_source=v3.reddit_signals.LISTING_HTML,
-                            post_age_seconds=10) is None)
-check("r46: an RSS listing can never drive the round-38d negative-space rule",
-      v3.mod_queue_decision('<span class="created">2h ago</span>', {"other1"}, "abc111",
-                            listing_oldest_age=12 * 3600,
-                            listing_source=v3.reddit_signals.LISTING_RSS,
-                            post_age_seconds=7200) is None)
-check("r46: an RSS listing never confirms a post for the settle fast path",
-      v3._listing_confirms_post(({"abc111"}, 7200, v3.reddit_signals.LISTING_RSS), "abc111")
-      is False
-      and v3._listing_confirms_post(({"abc111"}, 7200, v3.reddit_signals.LISTING_HTML),
-                                    "abc111") is True)
-check("r46: a 2-tuple listing still means API-backed (back-compatible)",
-      v3._listing_parts(({"a"}, 60)) == ({"a"}, 60, v3.reddit_signals.LISTING_HTML)
-      and v3._listing_parts(None) == (None, None, None))
-check("r46: the queue gate receives the post age for the weak-signal grace",
-      "post_age_seconds=now - published_ts" in inspect.getsource(v3.main))
-
-# ---- R46b: the API-backed listing must actually be OBTAINED ---------------
-# Round 46 shipped the provenance rules but still asked /new.rss first and
-# only fell back to HTML when RSS failed — and RSS practically never fails.
-# The monitor therefore always held an `rss` listing, which can prove
-# nothing: the 60 s fast settle never applied again and negative space could
-# never run. These checks pin the fix: every source starts at once, an
-# API-backed answer is preferred, and a dead redlib fleet costs the grace.
-_r46_listing_src = inspect.getsource(v3._fetch_new_listing)
-check("r46b: the listing step is bounded as a whole, not per instance",
-      "LISTING_TIMEOUT_SECONDS" in _r46_listing_src
-      and v3.LISTING_TIMEOUT_SECONDS == 8
-      and v3.LISTING_HTML_GRACE_SECONDS == 2)
-
-_r46_html_listing_html = ('<a href="/r/X/comments/live01/t/"><span class="created">10m ago</span></a>'
-                          '<a href="/r/X/comments/live02/t/"><span class="created">9h ago</span></a>')
-
-
-class _R46Resp:
-    def __init__(self, body, ctype):
-        self.status = 200
-        self.headers = {"Content-Type": ctype}
-        self._body = body
+# ---- R63 end-to-end: retract_dead_posts actually drives the Discord call --
+class _R63Resp:
+    def __init__(self, status=200):
+        self.status = status
 
     async def text(self):
-        return self._body
+        return ""
+
+    async def json(self, content_type=None):
+        return {}
 
 
-class _R46Req:
-    def __init__(self, delay, body, ctype):
-        self._delay, self._body, self._ctype = delay, body, ctype
+class _R63Req:
+    def __init__(self, status=200):
+        self._status = status
 
     async def __aenter__(self):
-        if self._delay:
-            await asyncio.sleep(self._delay)
-        return _R46Resp(self._body, self._ctype)
+        return _R63Resp(self._status)
 
     async def __aexit__(self, *a):
         return False
 
 
-class _R46Session:
-    """redlib hosts answer after `html_delay`; Reddit's RSS answers at once."""
+class _R63Session:
+    """No listing sources answer and no live page is reachable — the dead
+    proof comes entirely from live_removal_reason via a stubbed proxy, so
+    these end-to-end checks monkeypatch the two network-facing helpers and
+    just prove retract_dead_posts issues (or withholds) the right HTTP verb.
+    """
 
-    def __init__(self, html_delay):
-        self.html_delay = html_delay
-        self.urls = []
+    def __init__(self):
+        self.calls = []
 
-    def get(self, url, **kwargs):
-        self.urls.append(url)
-        if "/new.rss" in url:
-            return _R46Req(0, _r38e_fetch_rss, "application/rss+xml")
-        return _R46Req(self.html_delay, _r46_html_listing_html, "text/html")
+    def get(self, *a, **k):
+        return _R63Req(404)
+
+    def patch(self, url, json=None, **k):
+        self.calls.append(("PATCH", url, json))
+        return _R63Req(200)
+
+    def delete(self, url, **k):
+        self.calls.append(("DELETE", url, None))
+        return _R63Req(204)
+
+    def post(self, *a, **k):
+        self.calls.append(("POST", a[0] if a else None, k.get("json")))
+        return _R63Req(200)
 
 
-def _r46_time_listing(html_delay, grace=None, sub="TimedSub"):
-    saved_grace = v3.LISTING_HTML_GRACE_SECONDS
-    before = dict(v3._mod_queue_listing_cache)
+def _r63_record(now):
+    return {
+        "RetractSub_abc111": {
+            "subreddit": "RetractSub",
+            "path": "/r/RetractSub/comments/abc111/t/",
+            "message_id": "999",
+            "delivered_at": int(now - 100),
+            "published_ts": int(now - 100),
+            "payload": {"components": [{"type": 17, "components": [{"type": 10, "content": "hi"}]}]},
+        }
+    }
+
+
+async def _r63_run(mode, enabled, window, now, listing_result, live_reason):
+    saved = (v3.RETRACT_DEAD_POSTS, v3.RETRACT_MODE, v3.RETRACT_WINDOW_SECONDS,
+             v3._fetch_new_listing, v3.live_removal_reason, v3.get_webhook_for_subreddit)
     try:
-        if grace is not None:
-            v3.LISTING_HTML_GRACE_SECONDS = grace
-        v3._mod_queue_listing_cache.clear()
-        session = _R46Session(html_delay)
-        started = time.monotonic()
-        listing = asyncio.run(v3._fetch_new_listing(session, sub))
-        return listing, time.monotonic() - started, session
+        v3.RETRACT_DEAD_POSTS = enabled
+        v3.RETRACT_MODE = mode
+        v3.RETRACT_WINDOW_SECONDS = window
+
+        async def _fake_listing(session, subreddit):
+            return listing_result
+
+        async def _fake_live_removal_reason(session, path, label=""):
+            return live_reason
+
+        v3._fetch_new_listing = _fake_listing
+        v3.live_removal_reason = _fake_live_removal_reason
+        v3.get_webhook_for_subreddit = lambda sub: "https://discord.test/api/webhooks/1/tok"
+        session = _R63Session()
+        records = _r63_record(now)
+        await v3.retract_dead_posts(session, records, now)
+        return session, records
     finally:
-        v3.LISTING_HTML_GRACE_SECONDS = saved_grace
-        v3._mod_queue_listing_cache.clear()
-        v3._mod_queue_listing_cache.update(before)
+        (v3.RETRACT_DEAD_POSTS, v3.RETRACT_MODE, v3.RETRACT_WINDOW_SECONDS,
+         v3._fetch_new_listing, v3.live_removal_reason, v3.get_webhook_for_subreddit) = saved
 
 
-_r46_fast, _r46_fast_s, _r46_fast_session = _r46_time_listing(0.0)
-check("r46b measured: a healthy redlib fleet answers API-backed, immediately",
-      _r46_fast is not None and _r46_fast[2] == v3.reddit_signals.LISTING_HTML
-      and _r46_fast[0] == {"live01", "live02"} and _r46_fast_s < 0.5,
-      f"{_r46_fast!r} in {_r46_fast_s:.3f}s")
-check("r46b measured: HTML and RSS start together, not one after the other",
-      any("/new.rss" in u for u in _r46_fast_session.urls)
-      and any("/new?limit=100" in u for u in _r46_fast_session.urls))
-_r46_slow, _r46_slow_s, _ = _r46_time_listing(5.0, grace=0.3)
-check("r46b measured: a SLOW redlib fleet costs only the grace, not a timeout",
-      _r46_slow is not None and _r46_slow[2] == v3.reddit_signals.LISTING_RSS
-      and _r46_slow_s < 1.5,
-      f"{_r46_slow!r} in {_r46_slow_s:.3f}s (5s html delay, 0.3s grace)")
-_r46_pref, _r46_pref_s, _ = _r46_time_listing(0.2, grace=2)
-check("r46b measured: a slightly slower API-backed answer still WINS over RSS",
-      _r46_pref is not None and _r46_pref[2] == v3.reddit_signals.LISTING_HTML
-      and _r46_pref_s < 1.5,
-      f"{_r46_pref!r} in {_r46_pref_s:.3f}s")
+_r63_now = 1_000_000.0
+_r63_dead_listing = ({"zzz_other"}, 7200)   # post absent, inside the listing span
 
+_r63_sess, _ = asyncio.run(_r63_run("edit", False, 21600, _r63_now, _r63_dead_listing, "removed by moderator"))
+check("r63 retraction OFF: no retraction request is EVER issued",
+      _r63_sess.calls == [], str(_r63_sess.calls))
 
+_r63_sess, _r63_rec = asyncio.run(_r63_run("edit", True, 21600, _r63_now, _r63_dead_listing, "removed by moderator"))
+check("r63 retraction ON+edit: a delivered post that dies inside the window is PATCHed with the tombstone payload",
+      len(_r63_sess.calls) == 1 and _r63_sess.calls[0][0] == "PATCH"
+      and "no longer live" in _r63_sess.calls[0][2]["components"][0]["components"][0]["content"],
+      str(_r63_sess.calls))
+check("r63 retraction ON+edit: the record is marked retracted (dedup-safe)",
+      _r63_rec["RetractSub_abc111"].get("retracted") is True)
+
+_r63_sess, _ = asyncio.run(_r63_run("delete", True, 21600, _r63_now, _r63_dead_listing, "removed by moderator"))
+check("r63 retraction ON+delete: the Discord message is DELETEd instead of edited",
+      len(_r63_sess.calls) == 1 and _r63_sess.calls[0][0] == "DELETE", str(_r63_sess.calls))
+
+_r63_sess, _ = asyncio.run(_r63_run("edit", True, 10, _r63_now, _r63_dead_listing, "removed by moderator"))
+check("r63 retraction ON+edit but OUTSIDE the retraction window: no action",
+      _r63_sess.calls == [], str(_r63_sess.calls))
+
+_r63_sess, _ = asyncio.run(_r63_run("edit", True, 21600, _r63_now, ({"abc111"}, 7200), "removed by moderator"))
+check("r63 retraction ON+edit but the post is STILL in the listing (not provably dead): no action",
+      _r63_sess.calls == [], str(_r63_sess.calls))
+
+_r63_retract_src = inspect.getsource(v3.retract_dead_posts)
+check("r63: a retracted post can never re-post — retract_dead_posts never touches the "
+      "dedup cache (it only edits/deletes the Discord message), so the post's "
+      "unique_key stays in posted_reddit.json forever",
+      "posted.discard(" not in _r63_retract_src
+      and "posted.remove(" not in _r63_retract_src
+      and "posted_messages" in _r63_retract_src)
+check("r63: the main loop never removes a key from the dedup cache for any reason "
+      "(posted keys are additive-only; retraction cannot un-dedup a post)",
+      "posted.discard(" not in inspect.getsource(v3.main)
+      and "posted.remove(" not in inspect.getsource(v3.main))
+
+print()
+
+# ===========================================================================
+# ROUND 64 (2026-10-05) — Pristine Listing Protocol.
+# A post delivers only once a cache-busted, pristine read of the subreddit's
+# /new listing proves it is live RIGHT NOW, plus a stateless flat age floor
+# computed from the post's own timestamp. See tests/test_reddit_signals.py
+# for the full end-to-end main() coverage (D.2-D.8 + addendum); this block
+# covers D.1 (pristine request shape), D.8 (env parsing/defaults) and D.9
+# (the absence-of-AutoModerator-detection guard).
+# ===========================================================================
+
+# ---- D.1: every listing request is pristine (unique cache-buster + no-cache
+# headers), and the buster differs between two consecutive requests --------
+class _R64Resp:
+    status = 200
+    headers = {"Content-Type": "text/html"}
+    async def text(self):
+        return '<a href="/r/TestSub/comments/abc123/t/">t</a>'
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *args):
+        return False
+
+class _R64Session:
+    def __init__(self):
+        self.calls = []
+    def get(self, url, headers=None, timeout=None, allow_redirects=True):
+        self.calls.append((url, dict(headers or {})))
+        return _R64Resp()
+
+async def _r64_fetch_twice():
+    v3._listing_cache.clear()
+    sess = _R64Session()
+    _real_time = v3.time.time
+    _r64_ticks = iter([1000000.000, 1000000.001])
+    v3.time.time = lambda: next(_r64_ticks, _real_time())
+    try:
+        await v3._fetch_new_listing(sess, "TestSub1")
+        v3._listing_cache.clear()
+        await v3._fetch_new_listing(sess, "TestSub2")
+        v3._listing_cache.clear()
+    finally:
+        v3.time.time = _real_time
+    return sess.calls
+_r64_calls = asyncio.run(_r64_fetch_twice())
+_r64_fresh_values = []
+for _url, _hdrs in _r64_calls:
+    _m = re.search(r"[?&]_fresh=(\d+)", _url)
+    if _m:
+        _r64_fresh_values.append(_m.group(1))
+check("r64: every listing request URL carries a _fresh= cache-buster",
+      len(_r64_calls) > 0 and len(_r64_fresh_values) == len(_r64_calls))
+check("r64: the cache-buster differs between two separate _fetch_new_listing() calls",
+      len(set(_r64_fresh_values)) >= 2 or len(_r64_calls) < 2)
+check("r64: every listing request sends Cache-Control/Pragma no-cache headers",
+      all(_hdrs.get("Cache-Control") == "no-cache, no-store" and _hdrs.get("Pragma") == "no-cache"
+          for _url, _hdrs in _r64_calls))
+v3._listing_cache.clear()
+
+# ---- D.8: FRESH_HOLD_SECONDS / LISTING_CONFIRM parse from env, with the
+# documented defaults, and are empty-string-safe like every other Variable --
+_r64_names = ("FRESH_HOLD_SECONDS", "LISTING_CONFIRM")
+_r64_saved_env = {name: os.environ.get(name) for name in _r64_names}
+try:
+    os.environ.update({name: "" for name in _r64_names})
+    _r64_default = load_module("smoke_reddit_v3_r64_default_env", "testing area/reddit_main_v3.py")
+    check("r64: FRESH_HOLD_SECONDS empty env defaults to 30",
+          _r64_default.FRESH_HOLD_SECONDS == 30)
+    check("r64: LISTING_CONFIRM empty env defaults to True",
+          _r64_default.LISTING_CONFIRM is True)
+    os.environ["FRESH_HOLD_SECONDS"] = "60"
+    os.environ["LISTING_CONFIRM"] = "0"
+    _r64_custom = load_module("smoke_reddit_v3_r64_custom_env", "testing area/reddit_main_v3.py")
+    check("r64: FRESH_HOLD_SECONDS=60 parses to 60",
+          _r64_custom.FRESH_HOLD_SECONDS == 60)
+    check("r64: LISTING_CONFIRM=0 parses to False",
+          _r64_custom.LISTING_CONFIRM is False)
+    os.environ["FRESH_HOLD_SECONDS"] = "0"
+    _r64_off = load_module("smoke_reddit_v3_r64_off_env", "testing area/reddit_main_v3.py")
+    check("r64: FRESH_HOLD_SECONDS=0 parses to 0 (floor disabled)",
+          _r64_off.FRESH_HOLD_SECONDS == 0)
+finally:
+    for _name, _value in _r64_saved_env.items():
+        if _value is None:
+            os.environ.pop(_name, None)
+        else:
+            os.environ[_name] = _value
+
+# ---- D.9: absence guard — no AutoModerator / sticky-comment detection of
+# any kind exists anywhere in the Reddit engine (no phrase matching, no
+# inference, no tracker state). The only two mentions of "AutoModerator" in
+# the whole engine are prose that explicitly EXCLUDES its footer text from
+# an unrelated removal-reason check — never a detection mechanism. ---------
+_r64_src_files = {
+    "reddit_main_v3.py": inspect.getsource(v3),
+    "reddit_signals.py": inspect.getsource(signals),
+}
+_r64_forbidden_always = ("mirror link and source link", "queue-request", "sticky")
+_r64_forbidden_comparisons = (
+    '== "automoderator"', "== 'automoderator'",
+    '.lower() == "automoderator"', ".lower() == 'automoderator'",
+    'in ("automoderator"', "in ('automoderator'",
+    'in ["automoderator"', "in ['automoderator'",
+    'r"automoderator"', "r'automoderator'",
+)
+for _fname, _fsrc in _r64_src_files.items():
+    _lower = _fsrc.lower()
+    check(f"r64: {_fname} has no sticky/queue-request/mirror-link phrase matching",
+          all(phrase not in _lower for phrase in _r64_forbidden_always))
+    check(f"r64: {_fname} never compares/matches against the literal 'automoderator' "
+          f"as a detection mechanism (mentions, if any, are prose only)",
+          all(pattern not in _lower for pattern in _r64_forbidden_comparisons))
+
+print()
 
 # ===========================================================================
 # ROUND 47 (2026-10-01) — X: self-heal a message whose media Discord left
@@ -3786,7 +3611,7 @@ _r49b_names = (
     "MAX_CACHE_SIZE_PER_ACCOUNT", "MAX_CACHE_SIZE_TOTAL",
     "MEDIA_HEAL_DELAY_SECONDS", "MEDIA_HEAL_ATTEMPTS",
     "MAX_CACHE_SIZE_PER_SUB", "MAX_POSTS_PER_RUN",
-    "PENDING_RECHECK_SECONDS", "APPROVAL_RECHECK_SECONDS",
+    "PENDING_RECHECK_SECONDS",
     "FEEDTOKEN_JSON_STAGGER", "PROXY_MEDIA", "YOUTUBE_LINK_MESSAGE",
     "DISCOHOOK_PREVIEW", "REDDIT_OP_COMMENT", "NSFW_PAGE_FALLBACK",
 )
@@ -3815,8 +3640,8 @@ try:
           (_r49b_reddit.MAX_CACHE_SIZE_PER_SUB,
            _r49b_reddit.MAX_CACHE_SIZE_TOTAL) == (250, 10000))
     check("r49b: reddit_main_v3 empty scheduling Variables use defaults",
-          (_r49b_reddit.MAX_POSTS_PER_RUN, _r49b_reddit.PENDING_RECHECK_SECONDS,
-           _r49b_reddit.APPROVAL_RECHECK_SECONDS) == (25, 1800, 300))
+          (_r49b_reddit.MAX_POSTS_PER_RUN, _r49b_reddit.PENDING_RECHECK_SECONDS)
+          == (25, 1800))
     check("r49b: reddit_main_v3 empty feed stagger uses default",
           _r49b_reddit.FEEDTOKEN_JSON_STAGGER == 65)
     check("r52: empty true-by-default Variables keep their defaults",
@@ -4113,64 +3938,6 @@ try:
           and _r53_proxy.embeddit_unavailable_reason() is None)
     _r53_proxy.reset_embeddit_availability()
 
-    # =======================================================================
-    # ROUND 55 — mod-queue page evidence must render THIS post.
-    # A 200 shell must not be accepted as evidence for a queued post.
-    # =======================================================================
-    _r55_saved_fetch = v3._fetch_redlib_post_page
-    _r55_saved_listing = v3._fetch_new_listing
-    _r55_path = "/r/WutheringWavesLeaks/comments/1wvlsz0/back_to_solaris/"
-    _r55_shell = ("<html><head><title>Just a moment...</title></head>"
-                  "<body>Checking your browser before accessing.</body></html>")
-    _r55_real = ('<a href="/r/WutheringWavesLeaks/comments/1wvlsz0/back_to_solaris/">'
-                 'permalink</a>')
-    try:
-        async def _r55_fetch(*_args, **_kwargs):
-            return _r55_shell
-
-        async def _r55_listing(*_args, **_kwargs):
-            return None
-
-        v3._fetch_redlib_post_page = _r55_fetch
-        v3._fetch_new_listing = _r55_listing
-        _r55_result = _r53_asyncio.run(v3.mod_queue_reason(
-            None, "WutheringWavesLeaks", _r55_path, post_age_seconds=300))
-        check("r55: shell pages + unavailable listing hold a young post",
-              _r55_result == "pending approval", repr(_r55_result))
-
-        # The hold stays bounded: past the weak grace the post releases.
-        _r55_result = _r53_asyncio.run(v3.mod_queue_reason(
-            None, "WutheringWavesLeaks", _r55_path,
-            post_age_seconds=v3.MOD_QUEUE_WEAK_GRACE_SECONDS + 60))
-        check("r55: shells past the weak grace release (hold stays bounded)",
-              _r55_result is None, repr(_r55_result))
-
-        # A real rendered page with the AutoModerator sticky still holds
-        # (rounds 37/48 behaviour is intact behind the identity gate).
-        async def _r55_fetch_sticky(*_args, **_kwargs):
-            return (_r55_real + "<p>It has not been deleted, but it has been "
-                    "temporarily sent to the moderators for review.</p>")
-        v3._fetch_redlib_post_page = _r55_fetch_sticky
-        _r55_result = _r53_asyncio.run(v3.mod_queue_reason(
-            None, "WutheringWavesLeaks", _r55_path, post_age_seconds=300))
-        check("r55: real page + AutoModerator sticky still holds (r37/48 intact)",
-              _r55_result == "pending approval", repr(_r55_result))
-
-        async def _r55_fetch_real(*_args, **_kwargs):
-            return _r55_real
-
-        async def _r55_listing_public(*_args, **_kwargs):
-            return ({"1wvlsz0"}, 12 * 3600, v3.reddit_signals.LISTING_HTML)
-
-        v3._fetch_redlib_post_page = _r55_fetch_real
-        v3._fetch_new_listing = _r55_listing_public
-        _r55_result = _r53_asyncio.run(v3.mod_queue_reason(
-            None, "WutheringWavesLeaks", _r55_path, post_age_seconds=300))
-        check("r55: rendered post in API-backed listing releases",
-              _r55_result is None, repr(_r55_result))
-    finally:
-        v3._fetch_redlib_post_page = _r55_saved_fetch
-        v3._fetch_new_listing = _r55_saved_listing
 finally:
     for _name, _value in _r53_saved_env.items():
         if _value is None:
