@@ -341,50 +341,6 @@ if not NSFW_PAGE_FALLBACK or NSFW_PAGE_FALLBACK.strip().lower() in ("1", "true",
 else:
     NSFW_PAGE_FALLBACK = NSFW_PAGE_FALLBACK.strip().lower() not in ("0", "false", "no", "off")
 
-# Round 32 (2026-09-20): SHORT re-check interval for states that can change
-# quickly — posts awaiting moderator approval ("pending approval" /
-# "not_live") and transient "all live sources are down" misses. A
-# newly-approved post then posts on the next cron tick (default 300 s)
-# instead of waiting up to 30 min. Removed/deleted posts are NEVER
-# re-checked (they re-enter via RSS if restored — see _NO_RECHECK_REASONS
-# below); media-waiting posts keep the 30-min interval.
-APPROVAL_RECHECK_SECONDS = _env_int("APPROVAL_RECHECK_SECONDS", 300)  # 5 min
-
-# Round 36 (2026-09-29): settle window — a NEW post younger than this many
-# seconds is NOT posted this run: no state is written (it simply stays
-# "new"), the next run re-evaluates it with every existing gate, and a post
-# that got removed in the meantime (auto-removal / Reddit filter / author
-# self-delete / fast mod action) is then held as a removal notice instead
-# of posted. 0 = off. Posts first seen already older than the window —
-# including RESTORED posts, whose age is the original publish time — post at
-# zero delay.
-# Round 36 hotfix (2026-09-29): a GHA workflow that wires a repo Variable
-# passes it as an EMPTY STRING when the Variable is unset (os.getenv() then
-# returns "" instead of None, so the "300" default never applied) — the first
-# prod deploy crashed at import with int(""). Empty, blank, and non-numeric
-# values now fall back to the default; a valid number still overrides.
-POST_SETTLE_SECONDS = _env_int("POST_SETTLE_SECONDS", 300)  # 5 min when /new did not confirm it
-POST_SETTLE_VERIFIED_SECONDS = _env_int("POST_SETTLE_VERIFIED_SECONDS", 60)  # 1 min when visible in /new
-# Round 36: duplicate-media gate — skip a new post whose exact media
-# identity (a reused i.redd.it file or the same external destination URL) is
-# already on Discord from an earlier post in the SAME sub. Only a POSTED
-# post can be the winner, so a skip never costs a unique post. 0 = off.
-# (Re-uploaded files get NEW i.redd.it URLs and re-created galleries get new
-# gallery ids — those are NOT caught by design: same URL = same content is
-# provable, and the gate never guesses.)
-# Round 36 hotfix (2026-09-29): an empty value (unset GHA Variable) is the
-# DEFAULT (on), not an off switch — only an explicit off value disables it.
-DUP_MEDIA_GATE = os.getenv("DUP_MEDIA_GATE", "1").strip().lower() not in ("0", "false", "no", "off")
-# Round 36: how many of the sub's NEWEST posted keys are compared by the
-# duplicate-media gate (leet post ids sort chronologically WITHIN a sub —
-# days of history on busy subs, months on quiet ones).
-DUP_MEDIA_POSTED_WINDOW = 120
-# Round 43: author re-upload gate — same subreddit + same author + same
-# normalized title as a post already delivered to Discord. Exact identity only;
-# no fuzzy matching. Empty value defaults ON, mirroring DUP_MEDIA_GATE.
-REPOST_GATE = os.getenv("REPOST_GATE", "1").strip().lower() not in ("0", "false", "no", "off")
-REPOST_WINDOW_SECONDS = _env_int("REPOST_WINDOW_SECONDS", 86400)
-
 # Round 44: delivered-post retraction/tombstone. Disabled by default; when on
 # the webhook is called with wait=true so Discord returns a message ID.
 RETRACT_DEAD_POSTS = os.getenv("RETRACT_DEAD_POSTS", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -392,24 +348,43 @@ RETRACT_MODE = os.getenv("RETRACT_MODE", "edit").strip().lower() or "edit"
 RETRACT_WINDOW_SECONDS = _env_int("RETRACT_WINDOW_SECONDS", 21600)
 POSTED_MESSAGES_FILE = "posted_messages.json"
 
-# Round 37: hold posts positively identified as awaiting moderator approval.
-MOD_QUEUE_GATE = os.getenv("MOD_QUEUE_GATE", "1").strip().lower() not in ("0", "false", "no", "off")
-MOD_QUEUE_WINDOW_SECONDS = _env_int("MOD_QUEUE_WINDOW_SECONDS", 6 * 3600)
-MOD_QUEUE_REQUEST_RE = re.compile(r"respond to this comment with|temporarily sent to the moderators for review", re.I)
-MOD_QUEUE_STRONG_RE = re.compile(r"awaiting (?:moderator )?approval|pending (?:moderator )?approval|sent to the moderators for review|awaiting mod", re.I)
-MOD_QUEUE_WEAK_GRACE_SECONDS = _env_int("MOD_QUEUE_WEAK_GRACE_SECONDS", 900)
-LISTING_TIMEOUT_SECONDS = _env_int("LISTING_TIMEOUT_SECONDS", 8)
-LISTING_HTML_GRACE_SECONDS = _env_int("LISTING_HTML_GRACE_SECONDS", 2)
-MOD_QUEUE_LISTING_ID_RE = re.compile(r"/comments/([a-z0-9]+)/", re.I)
+# ---------------------------------------------------------------------------
+# ■ ROUND 64 ("Pristine Listing Protocol", 2026-10-05)
+# A new post is delivered only when a pristine, cache-busted read of the
+# subreddit's /new listing proves it is actually live on the subreddit RIGHT
+# NOW, plus a flat minimum age computed from the post's own creation
+# timestamp. Both are stateless: neither writes a pending entry, and
+# "not there yet" is a this-tick skip, never a permanent block — the first
+# tick where the post appears (and clears the age floor) it posts instantly.
+# No AutoModerator comment detection of any kind: no phrase matching, no
+# inference, no tracker state.
+#   FRESH_HOLD_SECONDS — section A: flat minimum post age (seconds) before a
+#     candidate is even considered; 0 disables the floor entirely.
+#   LISTING_CONFIRM — section B: 1 (default) requires the pristine /new
+#     listing to confirm the candidate before it posts; 0 disables the
+#     listing-confirmation gate (the FRESH_HOLD_SECONDS floor still applies
+#     independently; set both to 0 to fully restore pre-round-64 delivery).
+# ---------------------------------------------------------------------------
+FRESH_HOLD_SECONDS = _env_int("FRESH_HOLD_SECONDS", 30)
+_LISTING_CONFIRM_RAW = os.getenv("LISTING_CONFIRM")
+if not _LISTING_CONFIRM_RAW or _LISTING_CONFIRM_RAW.strip().lower() in ("1", "true", "yes", "on"):
+    LISTING_CONFIRM = True
+else:
+    LISTING_CONFIRM = _LISTING_CONFIRM_RAW.strip().lower() not in ("0", "false", "no", "off")
 
-# Round 38d (2026-09-29): a post can be natively queued with no AutoModerator
-# comment at all, so round 37 has no positive text signal to inspect. A post
-# absent from a readable /new listing is held only when its own relative age
-# is demonstrably inside that listing's visible age span. The tail margin is
-# deliberately tied to the existing gate window: this adds no new workflow
-# setting, remains conservative when the window is changed, and keeps the
-# normal window as the hard fail-open cap.
-MOD_QUEUE_TAIL_MARGIN_SECONDS = MOD_QUEUE_WINDOW_SECONDS
+# Round 63 ("The Great Simplification"): the settle window, the mod-queue
+# gate, the duplicate-media gate, the repost gate and the page-identity
+# check are gone. A native Reddit post is delivered as-is — the only things
+# that can still stop a card are the dedup cache (below), the fail-closed
+# NSFW gate, and the opt-in retraction seatbelt above. Delivery latency is
+# now simply cron interval + runtime overhead.
+#
+# The /new listing fetch below is kept ONLY for the retraction seatbelt
+# (it needs to know whether a delivered post has dropped out of the
+# subreddit's listing). It uses one plain, hardcoded aiohttp timeout — no
+# Variable, no HTML-vs-RSS "outage vs information" racing (that complexity
+# existed solely to feed the now-removed mod-queue gate's release proof).
+_LISTING_TIMEOUT_SECONDS = 8
 _REDLIB_AGE_TEXT = r"(\d+)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)\s+ago"
 _REDLIB_CREATED_AGE_RE = re.compile(
     rf"class\s*=\s*[\"'][^\"']*\bcreated\b[^\"']*[\"'][^>]*>\s*{_REDLIB_AGE_TEXT}",
@@ -422,7 +397,8 @@ _REDLIB_AGE_UNITS = {
     "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
     "d": 86400, "day": 86400, "days": 86400,
 }
-_mod_queue_listing_cache: dict = {}
+_LISTING_ID_RE = re.compile(r"/comments/([a-z0-9]+)/", re.I)
+_listing_cache: dict = {}
 _redlib_post_page_cache: dict = {}
 
 # ---------------------------------------------------------------------------
@@ -460,8 +436,7 @@ def _redlib_ages_seconds(page_html):
 
     Redlib normally labels them with a ``created`` class. A bare-element
     fallback supports the equivalent markup emitted by other listing sources.
-    Parsing never guesses: an unparseable page returns no age and the queue
-    gate fails open.
+    Parsing never guesses: an unparseable page simply returns no age.
     """
     html = page_html or ""
     pairs = _REDLIB_CREATED_AGE_RE.findall(html)
@@ -475,14 +450,14 @@ def _listing_oldest_age(page_html):
     return max(ages) if ages else None
 
 def _listing_post_ids(page_html):
-    return set(m.lower() for m in MOD_QUEUE_LISTING_ID_RE.findall(page_html or ""))
+    return set(m.lower() for m in _LISTING_ID_RE.findall(page_html or ""))
 
-# Round 38e (2026-09-30): use the token-authenticated public RSS listing as
-# the primary negative-space signal for native moderator-queue posts. GitHub
-# Actions datacenter IPs frequently cannot read the HTML /new pages, while
-# the monitor's normal RSS path already works with REDDIT_FEED_TOKEN. RSS
-# entry links carry the same /comments/<id>/ shape and pubDate gives an
-# exact listing-span boundary without parsing relative-age text.
+# The token-authenticated public RSS listing is a fallback source for the
+# retraction seatbelt's /new snapshot. GitHub Actions datacenter IPs
+# frequently cannot read the HTML /new pages, while the monitor's normal RSS
+# path already works with REDDIT_FEED_TOKEN. RSS entry links carry the same
+# /comments/<id>/ shape and pubDate gives an exact listing-span boundary
+# without parsing relative-age text.
 _RSS_LISTING_INSTANCES = ("https://www.reddit.com", "https://old.reddit.com")
 _RSS_DOCUMENT_RE = re.compile(r"<(?:rss|feed|rdf:rdf)\b", re.I)
 _RSS_PUBDATE_RE = re.compile(
@@ -495,8 +470,8 @@ def _rss_oldest_age(xml, now=None):
     """Return the oldest usable RSS entry age in seconds.
 
     A missing, malformed, or future-dated pubDate returns ``None`` so the
-    queue gate retains its fail-open behavior. ``now`` is injectable for the
-    offline smoke test; production callers use the current wall clock.
+    retraction seatbelt fails open. ``now`` is injectable for the offline
+    smoke test; production callers use the current wall clock.
     """
     clock = time.time() if now is None else now
     best = None
@@ -510,60 +485,46 @@ def _rss_oldest_age(xml, now=None):
             best = age
     return best
 
-def mod_queue_decision(page_html, listing_ids, post_id, listing_oldest_age=None,
-                       listing_source=None, post_age_seconds=None):
-    if not page_html or not post_id:
-        return None
-    return reddit_signals.queue_verdict(
-        strong_hold_text=bool(MOD_QUEUE_STRONG_RE.search(page_html)),
-        weak_hold_text=bool(MOD_QUEUE_REQUEST_RE.search(page_html)),
-        in_listing=None if listing_ids is None else post_id.lower() in listing_ids,
-        listing_source=listing_source or reddit_signals.LISTING_HTML,
-        listing_oldest_age=listing_oldest_age,
-        page_age_seconds=(_redlib_ages_seconds(page_html) or [None])[0],
-        post_age_seconds=post_age_seconds,
-        tail_margin_seconds=MOD_QUEUE_TAIL_MARGIN_SECONDS,
-        weak_grace_seconds=MOD_QUEUE_WEAK_GRACE_SECONDS)
-
-def _listing_parts(listing):
-    if not listing:
-        return None, None, None
-    return listing[0], listing[1] if len(listing) > 1 else None, listing[2] if len(listing) > 2 else reddit_signals.LISTING_HTML
-
 async def _fetch_new_listing(session, subreddit):
-    if subreddit in _mod_queue_listing_cache:
-        return _mod_queue_listing_cache[subreddit]
+    """Return ``(post_ids, oldest_age_seconds)`` for r/<subreddit>/new.
 
-    # ---- ROUND 46b (2026-10-01): GET AN API-BACKED LISTING, FAST ----------
-    # Round 46 made provenance decide what a listing may prove: Reddit's own
-    # /new.rss carries mod-queue posts, so only a redlib /new page (rendered
-    # from Reddit's public listing API, which excludes queued posts) can
-    # prove a post was released.
-    #
-    # But round 46 still ASKED the RSS feed first and only fell back to HTML
-    # when RSS failed — and RSS practically never fails. So the monitor
-    # almost always held an `rss` listing, which cannot confirm anything:
-    # the 60 s fast settle never applied again, the round-38d negative-space
-    # rule could never run, and every post inside the mod-queue window paid
-    # for the per-post page fetches. Safe, but needlessly slow.
-    #
-    # Now every source is started in ONE concurrent batch and the answer is
-    # taken as soon as the question is settled:
-    #   * the first API-backed (HTML) answer wins immediately;
-    #   * an RSS answer is held as a fallback and grants the HTML hosts only
-    #     LISTING_HTML_GRACE_SECONDS more to beat it;
-    #   * the whole step is capped by LISTING_TIMEOUT_SECONDS.
-    # A healthy redlib fleet therefore costs one round-trip, and a dead one
-    # costs the grace instead of a full timeout chain.
-    _timeout = aiohttp.ClientTimeout(total=LISTING_TIMEOUT_SECONDS)
+    Round 63: the only remaining consumer was the retraction seatbelt
+    (``listing_absence_proves_dead``) — it just needs a snapshot of which
+    post IDs are currently listed and how far back that listing reaches.
+    Every mirror/RSS source is tried concurrently and the first usable
+    answer wins; one flat, hardcoded timeout bounds the whole step. There is
+    no HTML-vs-RSS provenance distinction any more — that existed solely to
+    feed the mod-queue gate's release proof, which round 63 removed.
+
+    Round 64 ("Pristine Listing Protocol"): this is now ALSO the proof
+    the main delivery loop's listing-confirmation gate relies on, so every
+    request here is made PRISTINE — a unique ``_fresh=<unix ms>`` cache-buster
+    query param (CDN cache keys include the query string, so a unique value
+    guarantees an uncached read) plus ``Cache-Control``/``Pragma`` no-cache
+    request headers, on every mirror/RSS attempt. The per-subreddit,
+    once-per-run memoization below is unchanged — a fresh process (one per
+    cron tick) means that memo is itself never reused across runs.
+    """
+    if subreddit in _listing_cache:
+        return _listing_cache[subreddit]
+
+    _timeout = aiohttp.ClientTimeout(total=_LISTING_TIMEOUT_SECONDS)
+    # Round 64: one cache-buster value per _fetch_new_listing() call — every
+    # mirror/RSS attempt this call makes shares it (they fire within
+    # milliseconds of each other), but it is freshly computed on every call,
+    # so two listing reads (different subreddits, or different cron ticks)
+    # never share a value and no CDN/proxy can serve a cached response.
+    _fresh = int(time.time() * 1000)
+    _pristine_headers = {**BROWSER_HEADERS, "Cache-Control": "no-cache, no-store",
+                         "Pragma": "no-cache"}
 
     async def _html_listing(instance):
         try:
-            # Round 37 hotfix (2026-09-30): miningtcup sits behind its DogWAF
-            # and rejects untokenized requests. The helper is a no-op for
-            # every non-miningtcup URL (same helper the post page uses).
-            async with session.get(_with_miningtcup_token(f"{instance}/r/{subreddit}/new?limit=100"),
-                                   headers=BROWSER_HEADERS, timeout=_timeout,
+            # miningtcup sits behind its DogWAF and rejects untokenized
+            # requests. The helper is a no-op for every non-miningtcup URL
+            # (same helper the post page uses).
+            url = _with_miningtcup_token(f"{instance}/r/{subreddit}/new?limit=100&_fresh={_fresh}")
+            async with session.get(url, headers=_pristine_headers, timeout=_timeout,
                                    allow_redirects=True) as resp:
                 if resp.status != 200 or "html" not in (resp.headers.get("Content-Type") or "").lower():
                     return None
@@ -573,18 +534,16 @@ async def _fetch_new_listing(session, subreddit):
         ids = _listing_post_ids(html or "")
         if not ids:
             return None
-        # Keep the listing's oldest visible age with its IDs. A missing age
-        # is intentional: round 38d then fails open.
-        return (ids, _listing_oldest_age(html), reddit_signals.LISTING_HTML)
+        return (ids, _listing_oldest_age(html))
 
     async def _rss_listing(instance):
         try:
-            url = f"{instance}/r/{subreddit}/new.rss?limit=100"
+            url = f"{instance}/r/{subreddit}/new.rss?limit=100&_fresh={_fresh}"
             if REDDIT_FEED_TOKEN:
                 # Feed tokens are credentials; quote them as a query value and
                 # never include the resulting URL in a log message.
                 url += f"&feed={quote(REDDIT_FEED_TOKEN, safe='')}"
-            async with session.get(url, headers=BROWSER_HEADERS, timeout=_timeout,
+            async with session.get(url, headers=_pristine_headers, timeout=_timeout,
                                    allow_redirects=True) as resp:
                 xml = await resp.text() if resp.status == 200 else None
         except Exception:
@@ -594,24 +553,16 @@ async def _fetch_new_listing(session, subreddit):
         ids = _listing_post_ids(xml)
         if not ids:
             return None
-        return (ids, _rss_oldest_age(xml), reddit_signals.LISTING_RSS)
+        return (ids, _rss_oldest_age(xml))
 
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + LISTING_TIMEOUT_SECONDS
-    html_tasks = {asyncio.ensure_future(_html_listing(inst))
-                  for inst in REDDIT_RSS_INSTANCES}
-    rss_tasks = {asyncio.ensure_future(_rss_listing(inst))
-                 for inst in _RSS_LISTING_INSTANCES}
-    pending = html_tasks | rss_tasks
+    deadline = loop.time() + _LISTING_TIMEOUT_SECONDS
+    pending = {asyncio.ensure_future(_html_listing(inst)) for inst in REDDIT_RSS_INSTANCES}
+    pending |= {asyncio.ensure_future(_rss_listing(inst)) for inst in _RSS_LISTING_INSTANCES}
     result = None
-    fallback = None
-    fallback_deadline = None
     try:
         while pending:
-            now_t = loop.time()
-            budget = deadline - now_t
-            if fallback_deadline is not None:
-                budget = min(budget, fallback_deadline - now_t)
+            budget = deadline - loop.time()
             if budget <= 0:
                 break
             done, pending = await asyncio.wait(
@@ -623,93 +574,22 @@ async def _fetch_new_listing(session, subreddit):
                     answer = task.result()
                 except Exception:
                     answer = None
-                if not answer:
-                    continue
-                if answer[2] == reddit_signals.LISTING_HTML:
-                    result = result or answer
-                elif fallback is None:
-                    fallback = answer
-                    fallback_deadline = loop.time() + LISTING_HTML_GRACE_SECONDS
-            if result is not None or not (pending & html_tasks):
-                break                      # settled, or no HTML can still land
+                if answer:
+                    result = answer
+            if result is not None:
+                break
     finally:
         for task in pending:
             task.cancel()
 
     if result is not None:
-        logging.info(f"MODQUEUE-LISTING: r/{subreddit} /new listing via html "
-                     f"({len(result[0])} entries) — API-backed, proves release.")
+        logging.info(f"LISTING: r/{subreddit} pristine /new ({len(result[0])} entries).")
     else:
-        result = fallback
-        if result is not None:
-            logging.info(f"MODQUEUE-LISTING: r/{subreddit} /new listing via rss "
-                         f"({len(result[0])} entries) — carries queued posts, "
-                         f"cannot prove release (round 46).")
-
-    if result is None:
-        logging.info(f"MODQUEUE-LISTING: r/{subreddit} /new listing unavailable "
-                     f"(all sources) — the mod-queue gate will fail open this run.")
-    _mod_queue_listing_cache[subreddit] = result
+        logging.info(f"LISTING: r/{subreddit} pristine /new listing unavailable this run "
+                     f"(all sources) — an outage, not absence: the round-64 listing-confirmation "
+                     f"gate and the retraction seatbelt both fail open (skip/retry next tick).")
+    _listing_cache[subreddit] = result
     return result
-
-def _listing_confirms_post(listing, post_id: str) -> bool:
-    if not listing or not post_id:
-        return False
-    listing_ids, _listing_oldest_age, listing_source = _listing_parts(listing)
-    return reddit_signals.listing_proves_release(listing_ids is not None and post_id.lower() in listing_ids, listing_source)
-
-
-async def mod_queue_reason(session, subreddit, path, label="", post_age_seconds=None):
-    pages = await asyncio.gather(*[_fetch_redlib_post_page(session, inst, path) for inst in REDDIT_RSS_INSTANCES])
-    post_id = extract_post_id(path) or ""
-    # Round 55: a 200 shell (Cloudflare interstitial, JS stub, or rate-limit
-    # page) is not evidence that this post rendered.  Only a page containing
-    # this post's own /comments/<id> marker may feed the queue verdict.
-    if post_id:
-        pages = [h for h in pages if reddit_signals.page_is_post_page(h, post_id)]
-    # Preserve the round-37 positive signal wherever it was rendered. For a
-    # zero-comment native queue post, prefer a page that actually exposes a
-    # relative post age over a generic/JS shell from an earlier instance.
-    page = next((h for h in pages if h and MOD_QUEUE_REQUEST_RE.search(h)), None)
-    if page is None:
-        page = next((h for h in pages if h and _redlib_ages_seconds(h)), None)
-    if page is None:
-        page = next((h for h in pages if h), None)
-    listing = await _fetch_new_listing(session, subreddit)
-    listing_ids, listing_oldest_age, listing_source = _listing_parts(listing)
-    post_id = extract_post_id(path) or ""
-
-    # ---- ROUND 46b: decide even when NO instance rendered the post page ---
-    # Before this, an unrenderable post was posted. But "no mirror can show
-    # this post" is itself meaningful while the post is young, and a queued
-    # post is exactly the kind a mirror cannot render.
-    if not page:
-        if reddit_signals.listing_proves_release(
-                listing_ids is not None and post_id.lower() in listing_ids,
-                listing_source):
-            return None                       # API-backed listing: it is public
-        if (listing_source == reddit_signals.LISTING_HTML
-                and listing_ids is not None and listing_oldest_age is not None
-                and post_age_seconds is not None
-                and post_age_seconds < float(listing_oldest_age)):
-            # A readable public listing that SHOULD still show this post does
-            # not: round 38d's negative space, without needing a page.
-            logging.info(f"MODQUEUE: {label} absent from a readable /new listing "
-                         f"and no mirror renders it — holding.")
-            return "pending approval"
-        if (MOD_QUEUE_WEAK_GRACE_SECONDS > 0
-                and (post_age_seconds is None
-                     or post_age_seconds < MOD_QUEUE_WEAK_GRACE_SECONDS)):
-            # No page and no listing that can prove release: hold this young
-            # post one more tick rather than guess. Bounded by the grace.
-            logging.info(f"MODQUEUE: {label} no post page and no API-backed "
-                         f"listing — holding (within the grace window).")
-            return "pending approval"
-        return None
-    return mod_queue_decision(page, listing_ids, post_id,
-                              listing_oldest_age=listing_oldest_age,
-                              listing_source=listing_source,
-                              post_age_seconds=post_age_seconds)
 
 # ---------------------------------------------------------------------------
 # ■ RSS SOURCES
@@ -1124,26 +1004,15 @@ def pending_due(pending: dict, key: str, now: float) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# ■ ROUND 32 (2026-09-20): REASON-AWARE PENDING RE-CHECK
-# Live-verified both sides on 2026-09-20:
-#   * production logs: ~19 mod-removed posts resurfacing from the Arctic
-#     backup every run, re-verified through the full proxy chain (~13 s
-#     each) on every 30-min cycle — 15-20 min runs posting nothing until
-#     the 48 h window expired them;
-#   * queued post 1wl41aj ("Post is awaiting moderator approval."):
-#     invisible to ALL live sources (redditez/vxreddit/embeddit 404) — it
-#     sits in the pending cache and re-checks on the short interval,
-#     posting the moment a live source can see it.
-# Treatment by reason:
-#   * removed/deleted (the no-recheck set): NEVER re-checked while the
-#     entry exists (self-expires at the 48 h window). A removed post
-#     cannot change state while removed; if a mod RESTORES it, it
-#     re-enters via RSS with a fresh "updated" stamp — an RSS entry
-#     bypasses the skip and the full pipeline posts it.
-#   * approval-pending / transient-sources-down: the SHORT
-#     APPROVAL_RECHECK_SECONDS interval (default 300 s).
-#   * media_wait / partial_gallery / unknown: the round-30
-#     PENDING_RECHECK_SECONDS (30 min) throttle, unchanged.
+# ■ ROUND 32 (2026-09-20), simplified in round 63: REASON-AWARE PENDING
+# RE-CHECK. Removed/deleted posts (the no-recheck set) are NEVER re-checked
+# while the entry exists (self-expires at the 48 h window) — a removed post
+# cannot change state while removed; if a mod RESTORES it, it re-enters via
+# RSS with a fresh "updated" stamp, which bypasses the skip and the full
+# pipeline posts it. Everything else (approval-pending, transient source
+# outages, media-wait, NSFW-unknown, ...) shares the single round-30
+# PENDING_RECHECK_SECONDS throttle — round 63 removed the mod-queue gate
+# that justified a separate short interval.
 # ---------------------------------------------------------------------------
 _NO_RECHECK_REASONS = frozenset({
     "removal_notice",             # round-20 gate: proxy body had the notice
@@ -1159,12 +1028,7 @@ _NO_RECHECK_REASONS = frozenset({
     "nsfw_flag",
     "nsfw_subreddit",
     "nsfw_crosspost_source",
-    # Round 36/43: duplicates of an already-posted post are held for the 48 h
-    # window; RSS reappearance re-runs the gate against the posted cache.
-    "duplicate_media",
-    "duplicate_repost",
 })
-_SHORT_RECHECK_REASONS = frozenset({"not_live", "sources_down", "pending approval", "nsfw_unknown"})
 
 
 def _pending_throttle_skip(pending: dict, key: str, now: float, entry) -> bool:
@@ -1181,10 +1045,8 @@ def _pending_throttle_skip(pending: dict, key: str, now: float, entry) -> bool:
         # Arctic resurface -> skip (never re-verified); RSS re-appearance
         # (a restore, fresh "updated" stamp) -> run the full pipeline.
         return isinstance(entry, _ArcticEntry)
-    interval = (APPROVAL_RECHECK_SECONDS if reason in _SHORT_RECHECK_REASONS
-                else PENDING_RECHECK_SECONDS)
     last = float(pend.get("last_checked") or 0) if isinstance(pend, dict) else 0.0
-    return now - last < interval
+    return now - last < PENDING_RECHECK_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -1513,85 +1375,6 @@ def nsfw_gate_reason(post_id: str, author: str, markers: dict | None) -> str | N
         fail_open=NSFW_FAIL_OPEN,
         require_subreddit=NSFW_REQUIRE_SUBREDDIT,
     )
-
-
-def settle_holds(published_ts: float, now: float, confirmed_in_new: bool = False) -> bool:
-    """Evidence-based settle: 60 s when confirmed in /new, else 300 s."""
-    return reddit_signals.settle_holds(
-        published_ts,
-        now,
-        confirmed_in_new=confirmed_in_new,
-        verified_seconds=POST_SETTLE_VERIFIED_SECONDS,
-        unverified_seconds=POST_SETTLE_SECONDS,
-    )
-
-
-def settle_window_seconds(confirmed_in_new: bool = False) -> int:
-    return reddit_signals.settle_window_seconds(
-        confirmed_in_new,
-        verified_seconds=POST_SETTLE_VERIFIED_SECONDS,
-        unverified_seconds=POST_SETTLE_SECONDS,
-    )
-
-
-def media_identity(url) -> str | None:
-    """Return a provable exact-media identity, or None to fail open."""
-    return reddit_signals.media_identity(url)
-
-
-def content_fingerprint(subreddit: str, author: str, title: str) -> str | None:
-    return reddit_signals.content_fingerprint(subreddit, author, title)
-
-
-async def fetch_arctic_post_metadata(session, post_ids: list, label: str = "") -> dict:
-    """Fetch duplicate-gate metadata (url/title/author/created) for IDs."""
-    global _arctic_fail_count
-    out: dict = {}
-    ids = [p for p in dict.fromkeys(str(i or "").lower() for i in post_ids)
-           if re.fullmatch(r"[a-z0-9]+", p)]
-    if not ids or _arctic_fail_count >= 3:
-        return out
-    try:
-        async with session.get(ARCTIC_POSTS_URL, params={"ids": ",".join(ids[:500])},
-                               headers=dict(BROWSER_HEADERS),
-                               timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                raise ValueError(f"HTTP {resp.status}")
-            data = await resp.json(content_type=None)
-        posts = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(posts, list):
-            raise ValueError("invalid archive response")
-        _arctic_fail_count = 0
-        for post in posts:
-            if not isinstance(post, dict) or not post.get("id"):
-                continue
-            out[str(post["id"]).lower()] = {
-                "url": str(post.get("url_overridden_by_dest") or post.get("url") or ""),
-                "title": str(post.get("title") or ""),
-                "author": str(post.get("author") or ""),
-                "created_utc": post.get("created_utc"),
-            }
-        return out
-    except Exception as exc:
-        _arctic_fail_count += 1
-        logging.info(f"[{label or 'dup-gate'}] Arctic Shift metadata lookup unavailable: "
-                     f"{exc} — duplicate/repost gates fail open for this run.")
-        return out
-
-
-async def fetch_arctic_urls(session, post_ids: list, label: str = "") -> dict:
-    """Fetch destination URLs for up to 500 IDs in one Arctic call."""
-    meta = await fetch_arctic_post_metadata(session, post_ids, label=label)
-    return {post_id: data.get("url", "") for post_id, data in meta.items()}
-
-
-def dup_media_hit(posted_map: dict | None, identity: str | None) -> str | None:
-    """Return the posted winner key for identity, otherwise fail open."""
-    return reddit_signals.dup_media_hit(posted_map, identity)
-
-
-def duplicate_repost_hit(posted_map: dict | None, fingerprint: str | None) -> str | None:
-    return reddit_signals.duplicate_repost_hit(posted_map, fingerprint)
 
 
 def arctic_crosspost_orig(post) -> dict | None:
@@ -3900,7 +3683,7 @@ async def retract_dead_posts(session, posted_messages: dict, now: float) -> None
         path = record.get("path") or ""
         post_id = extract_post_id(path) or unique_key.rsplit("_", 1)[-1]
         listing = await _fetch_new_listing(session, subreddit)
-        listing_ids, listing_oldest_age, _listing_source = _listing_parts(listing)
+        listing_ids, listing_oldest_age = listing if listing else (None, None)
         reason = await live_removal_reason(session, path, label=f"retract {unique_key}")
         decision = reddit_signals.retraction_decision(
             enabled=RETRACT_DEAD_POSTS,
@@ -3911,7 +3694,7 @@ async def retract_dead_posts(session, posted_messages: dict, now: float) -> None
             listing_ids=listing_ids,
             listing_oldest_age=listing_oldest_age,
             live_removal_reason=reason,
-            tail_margin_seconds=MOD_QUEUE_TAIL_MARGIN_SECONDS,
+            tail_margin_seconds=RETRACT_WINDOW_SECONDS,
         )
         if not decision:
             continue
@@ -4034,7 +3817,7 @@ async def main():
     posted = load_posted()
     pending = load_pending()
     posted_messages = load_posted_messages()
-    _mod_queue_listing_cache.clear()
+    _listing_cache.clear()
     _redlib_post_page_cache.clear()
     _proxy_post_cache.clear()
     is_first_run = len(posted) == 0
@@ -4182,43 +3965,6 @@ async def main():
                 label="nsfw-gate",
             )
 
-        # Round 36/43: build exact-media and author-title repost maps from
-        # posted history, once per run. One Arctic batch now feeds both gates.
-        _dup_posted: dict = {}
-        _repost_posted: dict = {}
-        if (DUP_MEDIA_GATE or REPOST_GATE) and not TEST_POST_ID and new_posts:
-            _hot_subs = sorted({post[0] for post in new_posts})
-            _hist_ids = []
-            for _sub in _hot_subs:
-                _sub_keys = sorted(k for k in posted if k.rsplit("_", 1)[0] == _sub)
-                _hist_ids.extend(k.rsplit("_", 1)[1] for k in _sub_keys[-DUP_MEDIA_POSTED_WINDOW:])
-            if len(_hist_ids) > 500:
-                _hist_ids = _hist_ids[-500:]
-            _hist_meta = await fetch_arctic_post_metadata(session, _hist_ids, label="dup-gate") if _hist_ids else {}
-            for _sub in _hot_subs:
-                _m = {}
-                _r = {}
-                for _k in sorted(k for k in posted if k.rsplit("_", 1)[0] == _sub):
-                    _pid = _k.rsplit("_", 1)[1]
-                    _meta = _hist_meta.get(_pid) or {}
-                    if DUP_MEDIA_GATE:
-                        _ident = media_identity(_meta.get("url"))
-                        if _ident and _ident not in _m:
-                            _m[_ident] = _k
-                    if REPOST_GATE:
-                        _created = _meta.get("created_utc")
-                        try:
-                            _fresh = not _created or (now - float(_created) <= REPOST_WINDOW_SECONDS)
-                        except (TypeError, ValueError):
-                            _fresh = True
-                        _fp = content_fingerprint(_sub, _meta.get("author"), _meta.get("title")) if _fresh else None
-                        if _fp and _fp not in _r:
-                            _r[_fp] = _k
-                if _m:
-                    _dup_posted[_sub] = _m
-                if _r:
-                    _repost_posted[_sub] = _r
-
         for subreddit, path, unique_key, published_ts, activity_ts, entry in new_posts:
             # Round 34: double dedup (belt and braces) — collect() already
             # skips keys in the loaded cache, but a key can surface twice in
@@ -4254,23 +4000,57 @@ async def main():
                         logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — held by "
                                      f"the NSFW content gate (entry expires at the "
                                      f"48 h window).")
-                    elif _pend.get("reason") in ("duplicate_media", "duplicate_repost"):
-                        logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — held by "
-                                     f"the duplicate/repost gate (entry expires at "
-                                     f"the 48 h window).")
                     else:
                         logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — "
                                      f"not re-checking (removed posts re-enter via RSS "
                                      f"when restored; entry expires at the 48 h window).")
                 else:
-                    _interval = (APPROVAL_RECHECK_SECONDS
-                                 if _pend.get("reason") in _SHORT_RECHECK_REASONS
-                                 else PENDING_RECHECK_SECONDS)
-                    _due_in = int(_interval
+                    _due_in = int(PENDING_RECHECK_SECONDS
                                   - (now - float(_pend.get("last_checked") or 0)))
                     logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — "
                                  f"skipping recheck, due again in ~{_due_in}s.")
                 continue
+
+            # ---- round 64: stateless 30s fresh hold (section A) ---------
+            # A flat floor computed from the post's OWN creation timestamp —
+            # no first-seen tracking, no pending entry. A candidate still
+            # under the floor simply re-qualifies from the feed next tick.
+            if not TEST_POST_ID and FRESH_HOLD_SECONDS > 0:
+                _post_age = now - float(published_ts or now)
+                if _post_age < FRESH_HOLD_SECONDS:
+                    logging.info(f"[{unique_key}] age {_post_age:.1f}s < "
+                                 f"FRESH_HOLD_SECONDS ({FRESH_HOLD_SECONDS}s) — "
+                                 f"skipped this tick (stateless, not cached), "
+                                 f"re-evaluated next tick.")
+                    continue
+
+            # ---- round 64: pristine listing confirmation (section B) ----
+            # Delivers only when a cache-busted, pristine read of the
+            # subreddit's /new listing proves the post is live right now.
+            # Absent -> skip this tick (never cached); appears -> posts on
+            # the very next tick. A candidate older than the listing's own
+            # span (scrolled past limit=100) cannot be proven OR disproven,
+            # so confirmation is inapplicable and it falls through normally.
+            # An unreadable listing is an OUTAGE, never read as absence —
+            # every new candidate for that subreddit is skipped and retried.
+            if not TEST_POST_ID and LISTING_CONFIRM:
+                _r64_listing = await _fetch_new_listing(session, subreddit)
+                if _r64_listing is None:
+                    logging.info(f"[{unique_key}] pristine /new listing unavailable "
+                                 f"for r/{subreddit} this tick (outage, not absence) "
+                                 f"— skipped (not cached), retried next tick.")
+                    continue
+                _r64_ids, _r64_oldest_age = _r64_listing
+                _r64_candidate_id = (extract_post_id(path) or "").lower()
+                _r64_post_age = now - float(published_ts or now)
+                if _r64_oldest_age is not None and _r64_post_age > _r64_oldest_age:
+                    logging.info(f"[{unique_key}] older than the pristine listing's own "
+                                 f"span — confirmation inapplicable, falling through to "
+                                 f"normal delivery.")
+                elif _r64_candidate_id not in _r64_ids:
+                    logging.info(f"[{unique_key}] not in pristine listing — skipped "
+                                 f"this tick (not cached), re-checked next tick.")
+                    continue
 
             # ---- round 42/45: fail-closed NSFW content gate -------------
             # Runs before any Discord payload, thumbnail or attachment is
@@ -4314,62 +4094,6 @@ async def main():
                 else:
                     logging.info(f"NSFW SCAN: {unique_key} {marker_log} (PASS)")
 
-            # ---- round 42: evidence-based settle + duplicate gates -------
-            _post_id = (extract_post_id(path) or "").lower()
-            _listing = None
-            _confirmed_in_new = False
-            if (not TEST_POST_ID and not DRY_RUN
-                    and POST_SETTLE_SECONDS > 0
-                    and (now - published_ts) < POST_SETTLE_SECONDS):
-                _listing = await _fetch_new_listing(session, subreddit)
-                _confirmed_in_new = _listing_confirms_post(_listing, _post_id)
-            if not TEST_POST_ID and not DRY_RUN:
-                _settle_window = settle_window_seconds(_confirmed_in_new)
-                if settle_holds(published_ts, now, _confirmed_in_new):
-                    _evidence = "confirmed in /new" if _confirmed_in_new else "not confirmed in /new"
-                    logging.info(f"SETTLE: {unique_key} age {int(now - published_ts)}s "
-                                 f"< {_settle_window}s ({_evidence}) — holding; "
-                                 f"re-evaluated next run.")
-                    continue
-                if (now - published_ts) < POST_SETTLE_SECONDS:
-                    _evidence = "confirmed in /new fast path" if _confirmed_in_new else "unverified slow path"
-                    logging.info(f"SETTLE: {unique_key} age {int(now - published_ts)}s "
-                                 f">= {_settle_window}s ({_evidence}) — proceeding.")
-            if not TEST_POST_ID and not DRY_RUN and DUP_MEDIA_GATE:
-                _dup_identity = media_identity((nsfw_flags.get(_post_id) or {}).get("url") or "")
-                _dup_winner = dup_media_hit(_dup_posted.get(subreddit), _dup_identity)
-                if _dup_winner:
-                    mark_pending(pending, unique_key, "duplicate_media", now,
-                                 source=_entry_source36,
-                                 title=str(getattr(entry, "title", "") or "")[:200],
-                                 published_ts=published_ts)
-                    logging.warning(f"DUP GATE: {unique_key} SKIPPED (same media as "
-                                    f"{_dup_winner}, already on Discord) — held 48 h "
-                                    f"(duplicate_media), NOT posted to Discord.")
-                    continue
-                if _dup_identity:
-                    logging.info(f"DUP SCAN: {unique_key} media unique (PASS)")
-                else:
-                    logging.info(f"DUP SCAN: {unique_key} media identity unknown — "
-                                 f"proceeding (fail-open).")
-            if not TEST_POST_ID and not DRY_RUN and REPOST_GATE:
-                _fp_author = str(getattr(entry, "author", "") or (nsfw_flags.get(_post_id) or {}).get("author") or "")
-                _fp_title = str(getattr(entry, "title", "") or (nsfw_flags.get(_post_id) or {}).get("title") or "")
-                _fingerprint = content_fingerprint(subreddit, _fp_author, _fp_title)
-                _repost_winner = duplicate_repost_hit(_repost_posted.get(subreddit), _fingerprint)
-                if _repost_winner:
-                    mark_pending(pending, unique_key, "duplicate_repost", now,
-                                 source=_entry_source36,
-                                 title=_fp_title[:200], published_ts=published_ts)
-                    logging.warning(f"REPOST GATE: {unique_key} SKIPPED (same author/title as "
-                                    f"{_repost_winner}, already on Discord) — held 48 h "
-                                    f"(duplicate_repost), NOT posted to Discord.")
-                    continue
-                if _fingerprint:
-                    logging.info(f"REPOST SCAN: {unique_key} author/title unique (PASS)")
-                else:
-                    logging.info(f"REPOST SCAN: {unique_key} author/title identity unknown — "
-                                 f"proceeding (fail-open).")
             if (unique_key in pending
                     and str(pending[unique_key].get("reason") or "") in _NO_RECHECK_REASONS
                     and not isinstance(entry, _ArcticEntry)):
@@ -4492,22 +4216,6 @@ async def main():
                                  f"({_why}) — skipping, not cached (will "
                                  f"post once approved/restored).")
                     continue
-
-            if (not TEST_POST_ID and not DRY_RUN and entry is not None and MOD_QUEUE_GATE
-                    and (now - published_ts) < MOD_QUEUE_WINDOW_SECONDS):
-                if _confirmed_in_new:
-                    logging.info(f"MODQUEUE: {unique_key} — confirmed in /new; "
-                                 f"skipping mod-queue instance checks")
-                else:
-                    _mq = await mod_queue_reason(session, subreddit, path, unique_key, post_age_seconds=now - published_ts)
-                    if not _mq:
-                        logging.info(f"MODQUEUE: {unique_key} — no queue hold — proceeding")
-                    if _mq:
-                        _mq_pending = mark_pending
-                        _mq_pending(pending, unique_key, _mq, now, source=_entry_source36,
-                                     title=str(base.get("title") or "")[:200], published_ts=published_ts)
-                        logging.info(f"MODQUEUE: {unique_key} age {int(now - published_ts)}s — awaiting moderator approval — holding")
-                        continue
 
             try:
                 data = await resolve_post_media(session, base, post_json,
