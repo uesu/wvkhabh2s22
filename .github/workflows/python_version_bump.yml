@@ -294,7 +294,7 @@ jobs:
           LEFTOVERS=""
           if [ "$OLD_SERIES" != "$NEW_SERIES" ]; then
             LEFTOVERS="$(grep -rn --include='*.md' -E "(CPython|Python) ${OLD_SERIES}([^.0-9]|$)" . \
-                         | grep -v '^./docs/CHANGELOG' | head -20 || true)"
+                         | grep -v '^./docs/history/' | head -20 || true)"
           fi
           {
             echo 'leftovers<<EOF'

@@ -113,11 +113,15 @@ jobs:
           REDDIT_OP_COMMENT: ${{ vars.REDDIT_OP_COMMENT }}
           YOUTUBE_MEDIA_EMBED: ${{ vars.YOUTUBE_MEDIA_EMBED }}
           FEEDTOKEN_JSON_STAGGER: ${{ vars.FEEDTOKEN_JSON_STAGGER }}
-          # Media-waiting entries use PENDING_RECHECK_SECONDS (default 1800 s);
-          # approval-queued/transient entries use APPROVAL_RECHECK_SECONDS
-          # (default 300 s). Removed posts are never re-checked.
+          # Media-waiting entries are re-checked every PENDING_RECHECK_SECONDS
+          # (default 1800 s). Removed posts are never re-checked.
           PENDING_RECHECK_SECONDS: ${{ vars.PENDING_RECHECK_SECONDS }}
-          APPROVAL_RECHECK_SECONDS: ${{ vars.APPROVAL_RECHECK_SECONDS }}
+          # Round 64 (2026-10-04; wired to the workflow in round 66):
+          # stateless delivery pipeline — FRESH_HOLD_SECONDS floors a
+          # candidate's age (default 30 s), LISTING_CONFIRM (default on)
+          # requires a pristine /new listing read before posting.
+          FRESH_HOLD_SECONDS: ${{ vars.FRESH_HOLD_SECONDS }}
+          LISTING_CONFIRM: ${{ vars.LISTING_CONFIRM }}
           # Dedup retention and per-run flood cap (round 34; all optional).
           MAX_CACHE_SIZE_PER_SUB: ${{ vars.MAX_CACHE_SIZE_PER_SUB }}
           MAX_CACHE_SIZE_TOTAL: ${{ vars.MAX_CACHE_SIZE_TOTAL }}
@@ -127,23 +131,17 @@ jobs:
           # Round 35: optional comma-separated author names / post IDs that
           # bypass the NSFW content gate. Empty means no exceptions.
           NSFW_ALLOWLIST: ${{ vars.NSFW_ALLOWLIST }}
-          # Round 42-45: evidence-based settle, fail-closed NSFW, repost gate and optional retraction.
-          POST_SETTLE_VERIFIED_SECONDS: ${{ vars.POST_SETTLE_VERIFIED_SECONDS }}
-          POST_SETTLE_SECONDS: ${{ vars.POST_SETTLE_SECONDS }}
+          # Round 42-45 (env list cleaned up in round 66): fail-closed NSFW
+          # and the optional retraction seatbelt remain; the settle window,
+          # duplicate-media gate, repost gate, mod-queue gate and listing
+          # outage racing were removed by round 63 ("The Great
+          # Simplification") — their Variables no longer map to anything.
           NSFW_FAIL_OPEN: ${{ vars.NSFW_FAIL_OPEN }}
           NSFW_REQUIRE_SUBREDDIT: ${{ vars.NSFW_REQUIRE_SUBREDDIT }}
           NSFW_PAGE_FALLBACK: ${{ vars.NSFW_PAGE_FALLBACK }}
-          DUP_MEDIA_GATE: ${{ vars.DUP_MEDIA_GATE }}
-          REPOST_GATE: ${{ vars.REPOST_GATE }}
-          REPOST_WINDOW_SECONDS: ${{ vars.REPOST_WINDOW_SECONDS }}
           RETRACT_DEAD_POSTS: ${{ vars.RETRACT_DEAD_POSTS }}
           RETRACT_MODE: ${{ vars.RETRACT_MODE }}
           RETRACT_WINDOW_SECONDS: ${{ vars.RETRACT_WINDOW_SECONDS }}
-          MOD_QUEUE_GATE: ${{ vars.MOD_QUEUE_GATE }}
-          MOD_QUEUE_WINDOW_SECONDS: ${{ vars.MOD_QUEUE_WINDOW_SECONDS }}
-          MOD_QUEUE_WEAK_GRACE_SECONDS: ${{ vars.MOD_QUEUE_WEAK_GRACE_SECONDS }}
-          LISTING_HTML_GRACE_SECONDS: ${{ vars.LISTING_HTML_GRACE_SECONDS }}
-          LISTING_TIMEOUT_SECONDS: ${{ vars.LISTING_TIMEOUT_SECONDS }}
           # Round 49 (2026-10-01): the three media proxies are queried
           # CONCURRENTLY instead of one after another (~1.5s -> ~0.4-0.8s per
           # post). Defaults are tuned on the prod timings of 11:55 UTC and
