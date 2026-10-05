@@ -17,20 +17,32 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    # requirements.txt uses ranges (aiohttp>=3.14.3,<4) and every workflow run already installs
+    # the newest allowed release, so a PR for an ordinary minor would be pure noise. Only open
+    # one when a release falls OUTSIDE the range — i.e. a new major, the only kind that can
+    # break us.
+    versioning-strategy: increase-if-necessary
     open-pull-requests-limit: 5
     labels:
       - "dependencies"
       - "python"
     commit-message:
       prefix: "deps(python)"
+    groups:
+      python-deps:              # one PR for all Python bumps instead of one per package
+        patterns: ["*"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
+    open-pull-requests-limit: 5
     labels:
       - "dependencies"
       - "github-actions"
     commit-message:
       prefix: "deps(actions)"
+    groups:
+      actions:
+        patterns: ["*"]
