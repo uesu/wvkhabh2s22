@@ -2371,13 +2371,25 @@ for _r39_wf in (".github/workflows/reddit_monitor.yml", ".github/workflows/twitt
 
 with open(os.path.join(ROOT, ".github/workflows/dependabot_auto_merge.yml"), encoding="utf-8") as _fh:
     _r39_merge = _fh.read()
-check("r39 Dependabot auto-merge waits for completed CI rather than an early PR event",
-      "workflow_run:" in _r39_merge
-      and 'workflows: ["CI — syntax + offline smoke test"]' in _r39_merge
-      and "types: [completed]" in _r39_merge
-      and "pull_request_target:" not in _r39_merge)
-check("r39 Dependabot auto-merge identifies the completed run's PR and never checks out PR code",
-      "run.pull_requests" in _r39_merge and "No checkout by design" in _r39_merge)
+# 2026-10-05 update — Dependabot auto-merge workflow repair: workflow_run
+# sometimes did not fire after CI, so this trusted pull_request_target flow
+# polls its immutable event SHA instead.
+check("Dependabot auto-merge uses trusted PR events and never checks out PR code",
+      "pull_request_target:" in _r39_merge
+      and "types: [opened, synchronize, reopened]" in _r39_merge
+      and "workflow_run:" not in _r39_merge
+      and "actions/checkout" not in _r39_merge
+      and "pull_request_target runs this trusted file" in _r39_merge)
+check("Dependabot auto-merge fails closed on the exact head SHA before squash merging",
+      "AUTO_MERGE_DEPENDABOT" in _r39_merge
+      and "pr.user?.login !== 'dependabot[bot]'" in _r39_merge
+      and "expectedHeadSha = eventPr.head.sha" in _r39_merge
+      and "data.check_runs" in _r39_merge
+      and "filter: 'latest'" in _r39_merge
+      and "maxAttempts = 32" in _r39_merge
+      and "sha: expectedHeadSha" in _r39_merge
+      and "merge_method: 'squash'" in _r39_merge
+      and "GitHub API error; failing closed" in _r39_merge)
 
 # ---- R42/R45 smoke guards: NSFW signal core wiring and defaults -----------
 signals = load_module("smoke_reddit_signals", "testing area/reddit_signals.py")
