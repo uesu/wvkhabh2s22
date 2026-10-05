@@ -473,11 +473,34 @@ for _r52_name in (
     "PROXY_MEDIA", "PROXY_WARMUP_POST", "EMBEDDIT_INSTANCE",
     "YOUTUBE_LINK_MESSAGE", "DISCOHOOK_PREVIEW", "REDDIT_OP_COMMENT",
     "YOUTUBE_MEDIA_EMBED", "FEEDTOKEN_JSON_STAGGER",
-    "PENDING_RECHECK_SECONDS", "APPROVAL_RECHECK_SECONDS",
+    "PENDING_RECHECK_SECONDS",
     "MAX_CACHE_SIZE_PER_SUB", "MAX_CACHE_SIZE_TOTAL", "MAX_POSTS_PER_RUN",
 ):
     check(f"r52 workflow maps {_r52_name} as a Variable",
           f"{_r52_name}: ${{{{ vars.{_r52_name} }}}}" in _wf)
+# Round 66 (2026-10-05) guard update, annotated: APPROVAL_RECHECK_SECONDS
+# was removed from this list on purpose — round 63 removed the
+# approval-recheck pipeline, so round 66 dropped its (and 10 other stale
+# gate Variables') env mappings from reddit_monitor.yml. The r52 guard
+# above still pins every mapping that SURVIVED round 66.
+check("r66 workflow drops the stale APPROVAL_RECHECK_SECONDS mapping",
+      "APPROVAL_RECHECK_SECONDS" not in _wf)
+for _r66_name in ("FRESH_HOLD_SECONDS", "LISTING_CONFIRM"):
+    check(f"r66 workflow maps {_r66_name} as a Variable (round-64 pipeline)",
+          f"{_r66_name}: ${{{{ vars.{_r66_name} }}}}" in _wf)
+check("r66 continuation tombstone — greyed V2 notice for follow-up parts",
+      (lambda p: p["flags"] == 1 << 15
+       and p["components"][0]["type"] == 17
+       and p["components"][0]["accent_color"] == 0x808080
+       and "no longer live" in p["components"][0]["components"][0]["content"]
+       and "-# The original card is kept for context" in p["components"][0]["components"][0]["content"])
+      (signals.tombstone_continuation_payload("removed by moderator")))
+check("r66 continuation tombstone — no reason, no parens suffix",
+      "(" not in signals.tombstone_continuation_payload()["components"][0]["components"][0]["content"]
+      .split("\n")[0])
+check("r66 engine delegates the continuation tombstone to signals",
+      hasattr(v3, "tombstone_continuation_payload")
+      and v3.tombstone_continuation_payload("gone")["components"][0]["accent_color"] == 0x808080)
 check("r52 X workflow maps MAX_CACHE_SIZE_PER_ACCOUNT as a Variable",
       "MAX_CACHE_SIZE_PER_ACCOUNT: ${{ vars.MAX_CACHE_SIZE_PER_ACCOUNT }}" in _twitter_wf)
 check("ci runs this suite", "python tests/test_reddit_signals.py" in _ci)

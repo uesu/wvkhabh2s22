@@ -4174,6 +4174,619 @@ check("r62: 1wx9c77 card — no raw-URL text component",
 check("r62: 1wx9c77 card — gallery intact, header+stats only",
       12 in _r62_kinds and _r62_kinds.count(10) == 2, str(_r62_kinds))
 
+
+# ---- round 65 (2026-10-05): body entity hygiene -------------------------
+# Live 1wxvl13 (r/HonkaiStarRail_leaks): a card built from the Arctic Shift
+# backup path showed literal "&gt;" — Arctic (like Reddit's JSON API) serves
+# selftext HTML-escaped, and only the JSON path (strip_html) unescaped it.
+# Every body path now unescapes EXACTLY ONCE, and a line that is only ">"
+# (an empty markdown blockquote separator) is dropped from the card body.
+_r65_live = ("All top-level comments must be showcases, like so:\n\n&gt;\n"
+             "&gt; link to showcase here\n&gt; names of the characters used")
+_r65_body = v3._clean_plain_body(_r65_live)
+check("r65: live 1wxvl13 Arctic body — the real quote line is kept",
+      "> link to showcase here" in _r65_body, repr(_r65_body))
+check("r65: live 1wxvl13 Arctic body — no literal '&gt;' anywhere",
+      "&gt;" not in _r65_body, repr(_r65_body))
+check("r65: live 1wxvl13 Arctic body — no lone '>' artifact line",
+      all(ln.strip() != ">" for ln in _r65_body.splitlines()), repr(_r65_body))
+check("r65: live 1wxvl13 Arctic body — full expected shape",
+      _r65_body == "All top-level comments must be showcases, like so:\n\n"
+                   "> link to showcase here\n> names of the characters used",
+      repr(_r65_body))
+check("r65: double-escape safety — Arctic '&amp;gt;' renders '&gt;', not '>'",
+      v3._clean_plain_body("&amp;gt;") == "&gt;",
+      repr(v3._clean_plain_body("&amp;gt;")))
+check("r65: JSON-path parity — strip_html still unescapes exactly once",
+      v3.strip_html("&gt;") == ">" and v3.strip_html("&amp;gt;") == "&gt;",
+      f"{v3.strip_html('&gt;')!r} / {v3.strip_html('&amp;gt;')!r}")
+check("r65: quoted content lines survive byte-identical",
+      v3._clean_plain_body("> quoted text") == "> quoted text"
+      and v3._clean_plain_body(">> nested quoted text") == ">> nested quoted text"
+      and v3._line_stage(["> quoted text"]) == ["> quoted text"])
+check("r65: '>'-only / '> '-only / '>>' lines are dropped",
+      v3._clean_plain_body(">") == "" and v3._clean_plain_body("> ") == ""
+      and v3._clean_plain_body(">>") == "")
+check("r65: a body of ONLY '>' lines yields an empty body",
+      v3._clean_plain_body(">\n> \n>>\n>  ") == "")
+check("r65: mixed body keeps prose + quotes, drops only the separator",
+      v3._clean_plain_body("before\n\n>\n\n> quoted\n\nafter")
+      == "before\n\n> quoted\n\nafter",
+      repr(v3._clean_plain_body("before\n\n>\n\n> quoted\n\nafter")))
+check("r65: exactly ONE unescape on the Arctic path (source guard)",
+      inspect.getsource(v3._clean_plain_body).count("html_lib.unescape(") == 1)
+check("r65: strip_html keeps its single unescape (source guard)",
+      inspect.getsource(v3.strip_html).count("html_lib.unescape(") == 1)
+_r65_card = v3.build_v3_payload(
+    "HonkaiStarRail_leaks",
+    {"title": "Daily Discussion Thread", "author": "leaker",
+     "body": v3._clean_plain_body(_r65_live), "media": [], "crosspost": None,
+     "stats": {"comments": 4, "ups": 12}, "youtube_url": None, "op_comment": None},
+    "https://www.reddit.com/r/HonkaiStarRail_leaks/comments/1wxvl13/x/", 1791139200)
+_r65_texts = [c["content"] for c in _r65_card["components"][0]["components"]
+              if c.get("type") == 10]
+check("r65: 1wxvl13 card — body component carries the real quote",
+      any("> link to showcase here" in t for t in _r65_texts), str(_r65_texts))
+check("r65: 1wxvl13 card — no '&gt;' and no lone '>' line on the card",
+      all("&gt;" not in t and all(ln.strip() != ">" for ln in t.splitlines())
+          for t in _r65_texts), str(_r65_texts))
+_r65_empty_card = v3.build_v3_payload(
+    "HonkaiStarRail_leaks",
+    {"title": "Daily Discussion Thread", "author": "leaker",
+     "body": v3._clean_plain_body(">\n> \n>>"), "media": [], "crosspost": None,
+     "stats": {"comments": 4, "ups": 12}, "youtube_url": None, "op_comment": None},
+    "https://www.reddit.com/r/HonkaiStarRail_leaks/comments/1wxvl13/x/", 1791139200)
+_r65_empty_kinds = [c["type"] for c in _r65_empty_card["components"][0]["components"]]
+check("r65: an all-'>' body omits the text component (header+stats only)",
+      _r65_empty_kinds.count(10) == 2, str(_r65_empty_kinds))
+
+print()
+
+# ===========================================================================
+# ROUND 66 (2026-10-05) — long-post continuations, markdown table rendering,
+# safe splits, stale env cleanup.
+# A body beyond the card's text budget is continued in follow-up messages
+# (main card layout unchanged), every split lands on a safe boundary —
+# never inside a link/URL/spoiler/marker pair (live 1wxfuj5) — markdown
+# tables render as per-row bullets (live 1wxfuj5), retraction covers every
+# part, and reddit_monitor.yml drops 11 env mappings for gates removed in
+# round 63 while wiring the round-64 FRESH_HOLD_SECONDS/LISTING_CONFIRM.
+# ===========================================================================
+
+_r66_sub = "TestSub"
+_r66_url = "https://www.reddit.com/r/TestSub/comments/abc123/x/"
+_r66_ts = 1791139200
+
+
+def _r66_data(body):
+    return {"title": "Long post continuation test", "author": "leaker",
+            "body": body, "media": [], "crosspost": None,
+            "stats": {"comments": 123, "ups": 45}, "youtube_url": None,
+            "op_comment": None}
+
+
+def _r66_para(tag, n):
+    # exactly n chars, no markdown markers inside
+    return (f"{tag} " + "x" * (n - len(tag) - 1))[:n]
+
+
+def _r66_texts(payload):
+    return [c["content"] for cont in payload["components"] for c in cont["components"]
+            if c.get("type") == 10]
+
+
+def _r66_chunks(conts):
+    out = []
+    for p in conts:
+        chunk = p["components"][0]["components"][0]["content"]
+        assert chunk.startswith(v3.CONTINUATION_HEADER + "\n"), chunk[:30]
+        out.append(chunk[len(v3.CONTINUATION_HEADER) + 1:])
+    return out
+
+
+# --- short body: parity — the card is byte-identical, zero continuations --
+_r66_short = "Short body — fits the card in one piece."
+_r66_p_plain = v3.build_v3_payload(_r66_sub, _r66_data(_r66_short), _r66_url, _r66_ts)
+_r66_p_split, _r66_rest = v3.build_v3_payload(_r66_sub, _r66_data(_r66_short),
+                                              _r66_url, _r66_ts, return_remainder=True)
+check("r66: short body — return_remainder=True returns the byte-identical card",
+      _r66_p_plain == _r66_p_split and _r66_rest == "",
+      f"equal={_r66_p_plain == _r66_p_split} rest={_r66_rest!r}")
+check("r66: short body — zero continuation messages",
+      v3.build_continuation_payloads(_r66_rest) == [])
+check("r66: short body — the whole body stays on the card, no ellipsis",
+      _r66_short in _r66_texts(_r66_p_plain), str(_r66_texts(_r66_p_plain)))
+
+# --- 5000-char body: main card + exactly ONE continuation ---------------
+_r66_paras5 = [_r66_para(f"P{i}", 1000) for i in range(5)]
+_r66_body5 = "\n\n".join(_r66_paras5)            # 5008 chars
+_r66_p5, _r66_rest5 = v3.build_v3_payload(_r66_sub, _r66_data(_r66_body5),
+                                          _r66_url, _r66_ts, return_remainder=True)
+_r66_t5 = _r66_texts(_r66_p5)
+_r66_budget5 = max(300, 3800 - len(_r66_t5[0]) - len(_r66_t5[-1]))   # op line empty here
+_r66_fill = ""
+for _p in _r66_paras5:                            # greedy paragraph fill
+    _cand = _r66_fill + ("\n\n" if _r66_fill else "") + _p
+    if len(_cand) <= _r66_budget5:
+        _r66_fill = _cand
+    else:
+        break
+check("r66: 5k body — the main card keeps the largest paragraph-safe prefix",
+      _r66_t5[1] == _r66_fill and len(_r66_fill) <= _r66_budget5,
+      f"body={_r66_t5[1][:40]!r}… len={len(_r66_t5[1])} expected={len(_r66_fill)} budget={_r66_budget5}")
+check("r66: 5k body — main + remainder reconstruct the body exactly",
+      _r66_t5[1] + "\n\n" + _r66_rest5 == _r66_body5,
+      f"lens {len(_r66_t5[1])}+{len(_r66_rest5)} vs {len(_r66_body5)}")
+_r66_conts5 = v3.build_continuation_payloads(_r66_rest5)
+check("r66: 5k body — exactly one continuation message",
+      len(_r66_conts5) == 1, str(len(_r66_conts5)))
+check("r66: 5k body — the continuation carries the whole remainder",
+      _r66_chunks(_r66_conts5) == [_r66_rest5],
+      str([len(c) for c in _r66_chunks(_r66_conts5)]))
+check("r66: continuation payload shape — V2 container, card accent, '-# (continued)' heading",
+      all(p["flags"] == v3.IS_COMPONENTS_V2
+          and p["components"][0]["type"] == 17
+          and p["components"][0]["accent_color"] == 16729344
+          and p["components"][0]["components"][0]["type"] == 10
+          and p["components"][0]["components"][0]["content"].startswith("-# (continued)\n")
+          and len(p["components"][0]["components"][0]["content"]) <= v3.CONTINUATION_CHAR_LIMIT
+          for p in _r66_conts5), str(_r66_conts5)[:300])
+
+# --- ~12000-char body: main + THREE continuations + 'full post on Reddit' -
+# 13 paragraphs x 1000 chars: the main card holds 3 and each continuation
+# holds 3, so the 13th paragraph spills past the 12k-char deliverable cap.
+_r66_paras12 = [_r66_para(f"P{i}", 1000) for i in range(13)]
+_r66_body12 = "\n\n".join(_r66_paras12)           # 13024 chars
+_r66_p12, _r66_rest12 = v3.build_v3_payload(_r66_sub, _r66_data(_r66_body12),
+                                            _r66_url, _r66_ts, return_remainder=True)
+_r66_t12 = _r66_texts(_r66_p12)
+_r66_conts12 = v3.build_continuation_payloads(_r66_rest12)
+_r66_chunks12 = _r66_chunks(_r66_conts12)
+check("r66: 12k-class body — capped at exactly three continuations",
+      len(_r66_conts12) == 3, str(len(_r66_conts12)))
+check("r66: 12k-class body — the last continuation ends with the 'full post on Reddit' pointer",
+      _r66_chunks12[-1].endswith("\n\n… full post on Reddit"),
+      repr(_r66_chunks12[-1][-60:]))
+_r66_c3_base = _r66_chunks12[-1][: -len("\n\n… full post on Reddit")]
+_r66_delivered = "\n\n".join([_r66_t12[1]] + _r66_chunks12[:2] + [_r66_c3_base])
+check("r66: 12k-class body — every delivered chunk is a paragraph-safe prefix of the body",
+      _r66_body12.startswith(_r66_delivered) and len(_r66_delivered) < len(_r66_body12),
+      f"delivered={len(_r66_delivered)} body={len(_r66_body12)}")
+check("r66: 12k-class body — beyond the cap only the spill is dropped (the last para)",
+      _r66_body12[len(_r66_delivered):].strip() == _r66_paras12[-1],
+      repr(_r66_body12[len(_r66_delivered):][:60]))
+check("r66: 12k-class body — no continuation slice ever cuts a paragraph",
+      all(chunk in _r66_body12 for chunk in _r66_chunks12[:2]),
+      str([len(c) for c in _r66_chunks12[:2]]))
+
+# --- safe splits: NEVER inside a link / URL / spoiler / marker pair -------
+_r66_link = "[Set](https://example.com/honkai-set)"
+_r66_h, _r66_t = v3.split_card_body("A" * 280 + " " + _r66_link + " trailing words here", 300)
+check("r66: a markdown link straddling the budget splits BEFORE it (live 1wxfuj5)",
+      _r66_h == "A" * 280 and _r66_t.startswith(_r66_link),
+      f"{_r66_h[-25:]!r} / {_r66_t[:45]!r}")
+_r66_h, _r66_t = v3.split_card_body("B" * 290 + " ||spoiler text|| more words follow", 300)
+check("r66: a spoiler straddling the budget is never sliced open",
+      _r66_t.startswith("||spoiler text||") and "||spoiler" not in _r66_h,
+      f"{_r66_h[-25:]!r} / {_r66_t[:35]!r}")
+_r66_h, _r66_t = v3.split_card_body(
+    "C" * 285 + " https://example.com/very/long/path/that/keeps/going/and/going plus words", 300)
+check("r66: a bare URL straddling the budget splits before the scheme",
+      _r66_t.startswith("https://example.com/very/long"), f"{_r66_h[-20:]!r} / {_r66_t[:45]!r}")
+_r66_nospace = "x" * 250 + _r66_link + "y" * 50   # no boundary chars at all
+_r66_h, _r66_t = v3.split_card_body(_r66_nospace, 300)
+check("r66: pathological no-boundary text still splits (progress) without slicing the link",
+      len(_r66_h) == 300 and _r66_link in _r66_h and _r66_h + _r66_t == _r66_nospace,
+      f"head_len={len(_r66_h)} link_intact={_r66_link in _r66_h}")
+# adversarial: the same straddle at a CONTINUATION boundary (~3784, not 3800,
+# because the '-# (continued)' heading claims the first 17 chars)
+_r66_adv = _r66_para("Adv", 3760) + "\n\n" + _r66_link + "\n\n" + _r66_para("Tail", 50)
+_r66_h, _r66_t = v3.split_card_body(_r66_adv, v3.CONTINUATION_CHAR_LIMIT
+                                    - len(v3.CONTINUATION_HEADER) - 1)
+check("r66: adversarial link straddling the continuation boundary splits before it",
+      _r66_t.startswith(_r66_link) and _r66_link in _r66_h + _r66_t
+      and not (_r66_link[:-1] in _r66_h and _r66_link not in _r66_h),
+      f"{_r66_h[-25:]!r} / {_r66_t[:45]!r}")
+
+# --- markdown tables → Discord-safe bullets -------------------------------
+# the REAL 1wxfuj5 table (verbatim from Arctic Shift, t3_1wxfuj5): the
+# first data cell is "3.8" under header "Patch" — the bold row label
+# COMPOSES them into "**Patch 3.8**", matching the hand-checked example
+_r66_tbl = ("|Patch|Drip Market|Beta Start|Livestream|First Half|Second Half|New Characters|\n"
+            "|:-|:-|:-|:-|:-|:-|:-|\n"
+            "|3.7|August 25/26, 2026|September 5, 2026|September 19, 2026|October 2, 2026|"
+            "October 23, 2026|Hsin (5\\* Electro) & Suoming (5\\* Electro)|\n"
+            "|3.8|October 9/10, 2026|October 16, 2026|October 30, 2026|November 13, 2026|"
+            "December 2, 2026|Lily (5\\* Spectro)|")
+check("r66: the real 1wxfuj5 table renders as the hand-checked example (live 1wxfuj5)",
+      v3._markdown_tables_to_bullets(_r66_tbl) ==
+      "**Patch 3.7**\n"
+      "- **Drip Market:** August 25/26, 2026\n"
+      "- **Beta Start:** September 5, 2026\n"
+      "- **Livestream:** September 19, 2026\n"
+      "- **First Half:** October 2, 2026\n"
+      "- **Second Half:** October 23, 2026\n"
+      "- **New Characters:** Hsin (5\\* Electro) & Suoming (5\\* Electro)\n\n"
+      "**Patch 3.8**\n"
+      "- **Drip Market:** October 9/10, 2026\n"
+      "- **Beta Start:** October 16, 2026\n"
+      "- **Livestream:** October 30, 2026\n"
+      "- **First Half:** November 13, 2026\n"
+      "- **Second Half:** December 2, 2026\n"
+      "- **New Characters:** Lily (5\\* Spectro)",
+      repr(v3._markdown_tables_to_bullets(_r66_tbl)))
+check("r66: a first cell already carrying the header word is never doubled",
+      v3._markdown_tables_to_bullets(
+          "| Patch | Drip Market |\n|---|---|\n| Patch 3.8 | October 9/10, 2026 |")
+      == "**Patch 3.8**\n- **Drip Market:** October 9/10, 2026",
+      repr(v3._markdown_tables_to_bullets(
+          "| Patch | Drip Market |\n|---|---|\n| Patch 3.8 | October 9/10, 2026 |")))
+check("r66: an empty first header falls back to the verbatim cell",
+      v3._markdown_tables_to_bullets(
+          "| | Drip Market |\n|---|---|\n| 3.8 | October 9/10, 2026 |")
+      == "**3.8**\n- **Drip Market:** October 9/10, 2026")
+check("r66: dates stay literal — NO Discord-timestamp guessing of body text",
+      "<t:" not in v3._markdown_tables_to_bullets(_r66_tbl))
+check("r66: table mid-body keeps the surrounding prose",
+      v3._markdown_tables_to_bullets("before\n\n" + _r66_tbl + "\nafter") ==
+      "before\n\n" + v3._markdown_tables_to_bullets(_r66_tbl) + "\nafter",
+      repr(v3._markdown_tables_to_bullets("before\n\n" + _r66_tbl + "\nafter")))
+check("r66: empty cells are skipped, not blank bullets",
+      v3._markdown_tables_to_bullets("| Patch | Drip Market | Notes |\n|---|---|---|\n| 3.8 | | z |")
+      == "**Patch 3.8**\n- **Notes:** z",
+      repr(v3._markdown_tables_to_bullets("| Patch | Drip Market | Notes |\n|---|---|---|\n| 3.8 | | z |")))
+check("r66: escaped pipes survive as literal pipes",
+      v3._markdown_tables_to_bullets("| Patch | a \\| b |\n|---|---|\n| 3.8 | x \\| y |")
+      == "**Patch 3.8**\n- **a | b:** x | y",
+      repr(v3._markdown_tables_to_bullets("| Patch | a \\| b |\n|---|---|\n| 3.8 | x \\| y |")))
+_r66_bad_tbls = [
+    "| a | b |\n| c | d |",                                  # no separator row
+    "| a | b | c |\n|---|---|---|\n| x | y |",               # unequal data cells
+    "| a | b |\n|---|---|\n| x | y |\n| c | d |\n|---|---|\n| e | f |",  # glued tables
+    "| a | b |\n|---|---|",                                  # zero data rows
+    "plain prose, no pipes at all",
+]
+check("r66: malformed/ambiguous tables stay byte-identical — never guess",
+      all(v3._markdown_tables_to_bullets(_b) == _b for _b in _r66_bad_tbls),
+      str([b for b in _r66_bad_tbls if v3._markdown_tables_to_bullets(b) != b]))
+check("r66: a pipe-free body short-circuits untouched",
+      v3._markdown_tables_to_bullets("") == "" and v3._markdown_tables_to_bullets(None) is None)
+
+# --- live 1wxfuj5 end-to-end shape: table + entities + link across the cut
+_r66_live_raw = (
+    "Version 3.8 drip market schedule below.\n\n"
+    "| Patch | Drip Market | Notes |\n"
+    "|---|---|---|\n"
+    "| 3.8 | October 9/10, 2026 | Version 3.8 livestream codes |\n\n"
+    "All top-level comments must be showcases, like so:\n\n"
+    "&gt; link to showcase here\n&gt; names of the characters used\n\n"
+    + _r66_para("Details", 3300) + "\n\n"
+    + "Full kit details in " + _r66_link + " — see the official notes.\n\n"
+    + _r66_para("Trailer", 1200)
+)
+_r66_live_body = v3._clean_plain_body(_r66_live_raw)
+_r66_live_p, _r66_live_rest = v3.build_v3_payload(
+    _r66_sub, _r66_data(_r66_live_body), _r66_url, _r66_ts, return_remainder=True)
+_r66_live_conts = v3.build_continuation_payloads(_r66_live_rest)
+# body parts only — the header's title link and the stats line's posted-time
+# 🕐 are not body text (the timestamp check below must not trip on them)
+_r66_live_parts = _r66_texts(_r66_live_p)[1:-1] + _r66_chunks(_r66_live_conts)
+check("r66: 1wxfuj5 shape — the table converts on the card itself",
+      any("**Patch 3.8**" in p and "- **Drip Market:** October 9/10, 2026" in p
+          for p in _r66_live_parts), str(_r66_live_parts[1][:120]))
+check("r66: 1wxfuj5 shape — r65 entity hygiene holds on every part",
+      all("&gt;" not in p and all(ln.strip() != ">" for ln in p.splitlines())
+          for p in _r66_live_parts), str(_r66_live_parts[:2]))
+check("r66: 1wxfuj5 shape — the quote block survives",
+      any("> link to showcase here" in p for p in _r66_live_parts))
+check("r66: 1wxfuj5 shape — the [Set](…) link is delivered intact, exactly once",
+      sum(p.count(_r66_link) for p in _r66_live_parts) == 1,
+      str([p.count(_r66_link) for p in _r66_live_parts]))
+check("r66: 1wxfuj5 shape — no partial-link fragment anywhere (the live bug)",
+      all(not re.search(r"\[Set\]\(https://example\.com/honkai-se", p)
+          or _r66_link in p for p in _r66_live_parts),
+      str([p[-80:] for p in _r66_live_parts]))
+check("r66: 1wxfuj5 shape — long body continues in follow-up messages",
+      len(_r66_live_conts) >= 1, str(len(_r66_live_conts)))
+check("r66: 1wxfuj5 shape — no body-level Discord timestamps (only the card 🕐)",
+      all("<t:" not in p for p in _r66_live_parts[1:]), str(_r66_live_parts[1][-80:]))
+
+# --- the FULL live 1wxfuj5 selftext (verbatim from Arctic Shift) -----------
+_r66_mega_raw = r"""Please use this thread for discussion, questions, or other topics related to the game. Off-topic discussions are welcome. **STORY LEAKS MUST BE PROPERLY SPOILER TAGGED**
+
+Thank you to u/justachilldude6347 for the megathread title. Remember to be respectful to others and follow the rules.
+
+---
+
+##### Guides & Wikis:
+
+* [encore.moe](http://encore.moe) (Character wiki + Voicelines in all languages + Leaked OSTs)
+* [Interactive Map 1](https://wuthering.gg/map)
+* [Interactive Map 2](https://www.ghzs666.com/wutheringwaves-map#/?map=default)
+* [nanoka.cc](http://ww.nanoka.cc) (Hakush-adjacent site)
+* [Prydwen](https://www.prydwen.gg/wuthering-waves/) (Guides and Builds)
+* [Tethys.gg](https://tethys.gg/) (Community-run guide by theorycrafters and speedrunners)
+* [Wuwa Wiki](https://wuwa.wiki/en)
+
+RIP Hakush
+
+---
+
+##### Resources:
+
+* [Banner Countdown](https://wuthering-countdown.gengamer.in/)
+* [BlackClears' 3.x Wuwa Calcs](https://docs.google.com/spreadsheets/d/1VGNYxq9nmxxRcA719RzfhXFHg8dtCWJmZ9WP-iq5AcQ/edit?gid=262258431#gid=262258431) (Calcs and more calcs)
+* [DPR Calc Results](https://docs.google.com/spreadsheets/d/1eoCTrwYIsRpacvL3KrcQpR5rwY3pbJ6gEljZdBj_DHs/edit?gid=1550476759#gid=1550476759) (Pre-Release/Beta Calc, **reminder that everything is stc and NOT indicative of a character's actual performance in game**)
+* [Maygi's Wuwa DPS Calculator spreadsheet](https://docs.google.com/spreadsheets/d/1vTbG2HfkVxyqvNXF2taikStK-vJJf40QrWa06Fgj17c/edit?usp=sharing) (Can be modified to work with leaked character info, note that **leak info are stc**)
+* [Riley's Calcs](https://riley31415.github.io/wuwa_calc/) (Another damage calculator)
+* [Wudamage](https://wudamage.com/) (Damage Simulator)
+* [wutheringtools.com](https://www.wutheringtools.com/) (Build optimizer)
+* [Wuwa Bookkeeping](https://docs.google.com/spreadsheets/d/1msSsnWBcXKniykf4rWQCEdk2IQuB9JHy/edit?gid=792709623#gid=792709623)
+* [Wuwalab](https://wuwalab.com/) (Another Damage Simulator)
+* [Wuwa Tracker](https://wuwatracker.com) (Achievement Tracker, Pull Tracker, Event Timeline, Ascension Planner)
+
+*If you're the owner of any of these resources and would like them removed from this list, please inform me via Chat*
+
+---
+
+##### Frequently Asked Questions (FAQ):
+
+**Q1: Banners?**
+
+3.7 2nd Phase: Suoming, Lynae, Lucilla with Lumi, Danjin, Chixia
+
+---
+
+**Q2: Future characters? (STC)**
+
+Suoming | 5\* Electro Sword
+
+[Drip](https://www.youtube.com/shorts/5mJgJC7GgkQ) | [Splash](https://www.youtube.com/shorts/0mwDm3U7m-w) | [Microwave](https://www.reddit.com/r/WutheringWavesLeaks/comments/1vqo0y0) | [Nanoka](https://ww.nanoka.cc/character/1312) | [Sig](https://ww.nanoka.cc/weapon/21020107) | [Set](https://ww.nanoka.cc/echo/6000224) MAJOR SPOILERS FOR 4C
+
+Tags: Main Damage Dealer, Basic Attack Damage, Electro Damage Amplification, Resonance Skill Damage Amplification, Tune Break: Unison
+
+---
+
+Lily | 5\* Spectro Gun
+
+[Appearance](https://www.reddit.com/r/WutheringWavesLeaks/comments/1wcpp9g) | [Set](https://www.reddit.com/r/WutheringWavesLeaks/comments/1w37g42)
+
+---
+
+* 4.x: Anna
+* 4.x: Luxier
+* 4.x: Aimoxishen/Amethyst
+
+**Reminder: All team comps with leaked characters are speculative!**
+
+**If anything is missing, check the Chinese version of nanoka**
+
+---
+
+**Q3: Skins?**
+
+Hiyuki skin in 3.8 (Seele)
+
+Scar, go back to jail. Do not pass GO, do not collect 200 dollars.
+
+---
+
+**Q4: When is beta?**
+
+Usually 2 weeks after the start of current patch.
+
+If it's not 2 weeks after the start of current patch, it's time to panic.
+
+---
+
+**Q4: Speculated future drip/beta/patch release dates?**
+
+### **TAKE WITH A GRAIN OF SALT**
+
+* Assuming every patch is 42 days long & every banner is 21 days long
+* Drip Market is one week after the start of patch in most cases
+* **Beta and Livestream dates are calculated off the average of previous patches, rounded to the nearest Friday**
+* Date timezone is EST/EDT
+
+|Patch|Drip Market|Beta Start|Livestream|First Half|Second Half|New Characters|
+|:-|:-|:-|:-|:-|:-|:-|
+|3.7|August 25/26, 2026|September 5, 2026|September 19, 2026|October 2, 2026|October 23, 2026|Hsin (5\* Electro) & Suoming (5\* Electro)|
+|3.8|October 9/10, 2026|October 16, 2026|October 30, 2026|November 13, 2026|December 2, 2026|Lily (5\* Spectro)|
+
+[Click here to see past megathreads](https://www.reddit.com/r/WutheringWavesLeaks/search/?q=Weekly+Questions+%2B+Discussions+Megathread&cId=7275eabe-0c38-45cf-a64b-730b18eb5943&iId=1ff6a97b-29f4-4dfc-b0a5-6fdb38038832&sort=new)"""
+_r66_mega_body = v3._clean_plain_body(_r66_mega_raw)
+_r66_mega_p, _r66_mega_rest = v3.build_v3_payload(
+    "WutheringWavesLeaks",
+    {"title": "Omae wa mou Hsindeiru - Weekly Questions & Discussions Megathread",
+     "author": "BriefVisit729", "body": _r66_mega_body, "media": [], "crosspost": None,
+     "stats": {"comments": 0, "ups": 1}, "youtube_url": None, "op_comment": None},
+    "https://www.reddit.com/r/WutheringWavesLeaks/comments/1wxfuj5/omae_wa_mou_hsindeiru_weekly_questions/",
+    1791120901, return_remainder=True)
+_r66_mega_conts = v3.build_continuation_payloads(_r66_mega_rest)
+_r66_mega_parts = _r66_texts(_r66_mega_p)[1:-1] + _r66_chunks(_r66_mega_conts)
+_r66_mega_joined = "\n".join(_r66_mega_parts)
+check("r66: live 1wxfuj5 megathread — the body is continued, not truncated (no '…' cut)",
+      len(_r66_mega_conts) >= 1
+      and all(not p.rstrip().endswith("…") or p.rstrip().endswith("… full post on Reddit")
+              for p in _r66_mega_parts),
+      f"conts={len(_r66_mega_conts)} lens={[len(p) for p in _r66_mega_parts]}")
+check("r66: live 1wxfuj5 megathread — the release-date table is the hand-checked example",
+      "**Patch 3.7**" in _r66_mega_joined and "**Patch 3.8**" in _r66_mega_joined
+      and "- **Drip Market:** October 9/10, 2026" in _r66_mega_joined
+      and "- **New Characters:** Lily (5\\* Spectro)" in _r66_mega_joined,
+      str([p[:60] for p in _r66_mega_parts]))
+check("r66: live 1wxfuj5 megathread — pipe-list lines ('Suoming | 5\\* …') are NOT tables",
+      "Suoming | 5\\* Electro Sword" in _r66_mega_joined
+      and "Lily | 5\\* Spectro Gun" in _r66_mega_joined)
+_r66_mega_links = re.findall(r"\[[^\]\n]+\]\(https?://[^)\s]+\)", _r66_mega_body)
+check("r66: live 1wxfuj5 megathread — EVERY markdown link delivered intact, none cut",
+      all(sum(p.count(_lnk) for p in _r66_mega_parts) == _r66_mega_body.count(_lnk) >= 1
+          for _lnk in _r66_mega_links)
+      and "[Set](https://www.reddit.com/r/WutheringWavesLeaks/comments/1w37g42)" in _r66_mega_joined,
+      f"{len(_r66_mega_links)} links; "
+      f"cut={[l for l in _r66_mega_links if sum(p.count(l) for p in _r66_mega_parts) < _r66_mega_body.count(l)]}")
+check("r66: live 1wxfuj5 megathread — no broken partial-link fragment (the live bug)",
+      all(not re.search(r"\[[^\]\n]{0,80}\]\(https?://[^\s\)]*$", p) for p in _r66_mega_parts),
+      str([p[-90:] for p in _r66_mega_parts]))
+check("r66: live 1wxfuj5 megathread — entity hygiene + no body timestamps",
+      all("&gt;" not in p and "<t:" not in p for p in _r66_mega_parts))
+
+# --- galleries are NOT affected by continuations ---------------------------
+def _r66_photos(n):
+    return [{"kind": "photo", "url": f"https://preview.redd.it/g{i}.jpg"} for i in range(n)]
+
+
+_r66_gdata = dict(_r66_data("\n\n".join(_r66_paras12)))
+_r66_gdata["media"] = _r66_photos(15)
+_r66_g15, _r66_g15_rest = v3.build_v3_payload(_r66_sub, _r66_gdata, _r66_url, _r66_ts,
+                                              return_remainder=True)
+_r66_g15_conts = v3.build_continuation_payloads(_r66_g15_rest)
+check("r66: 15-photo long-body card keeps the round-38c two-container split (10 + 5)",
+      len(_r66_g15["components"]) == 2
+      and [len(c["items"]) for c in _r66_g15["components"][0]["components"]
+           + _r66_g15["components"][1]["components"] if c.get("type") == 12] == [10, 5]
+      and [c["type"] for c in _r66_g15["components"][0]["components"]] == [10, 10, 14, 12]
+      and [c["type"] for c in _r66_g15["components"][1]["components"]] == [14, 12, 10, 14, 1],
+      str([[c["type"] for c in cont["components"]] for cont in _r66_g15["components"]]))
+check("r66: gallery card body split feeds the SAME continuation pipeline",
+      len(_r66_g15_conts) == 3
+      and all(c["components"][0]["components"][0]["type"] == 10
+              and len(c["components"][0]["components"]) == 1 for c in _r66_g15_conts),
+      f"conts={len(_r66_g15_conts)}")
+_r66_gdata_short = dict(_r66_data(_r66_short))
+_r66_gdata_short["media"] = _r66_photos(15)
+_r66_g15_short = v3.build_v3_payload(_r66_sub, _r66_gdata_short, _r66_url, _r66_ts)
+_r66_g15_short_r, _r66_g15_short_rest = v3.build_v3_payload(
+    _r66_sub, _r66_gdata_short, _r66_url, _r66_ts, return_remainder=True)
+check("r66: short-body 15-photo card — return_remainder changes nothing, zero continuations",
+      _r66_g15_short == _r66_g15_short_r and _r66_g15_short_rest == ""
+      and v3.build_continuation_payloads(_r66_g15_short_rest) == []
+      and len(_r66_g15_short["components"]) == 2,
+      f"equal={_r66_g15_short == _r66_g15_short_r} rest={_r66_g15_short_rest!r}")
+
+# --- retraction covers EVERY part (mocked session, r63 harness pattern) ---
+class _R66Session:
+    """Records every HTTP verb; optionally fails the Nth PATCH/DELETE
+    (0-based among that verb) to prove partial failures block 'retracted'."""
+
+    def __init__(self, fail_part=None):
+        self.calls = []
+        self.fail_part = fail_part
+
+    def _n(self, verb):
+        return len([c for c in self.calls if c[0] == verb])
+
+    def patch(self, url, json=None, **k):
+        n = self._n("PATCH")
+        self.calls.append(("PATCH", url, json))
+        return _R63Req(404 if self.fail_part == n else 200)
+
+    def delete(self, url, **k):
+        n = self._n("DELETE")
+        self.calls.append(("DELETE", url, None))
+        return _R63Req(404 if self.fail_part == n else 204)
+
+
+async def _r66_run(mode, fail_part=None):
+    saved = (v3.RETRACT_DEAD_POSTS, v3.RETRACT_MODE, v3.RETRACT_WINDOW_SECONDS,
+             v3._fetch_new_listing, v3.live_removal_reason, v3.get_webhook_for_subreddit)
+    try:
+        v3.RETRACT_DEAD_POSTS = True
+        v3.RETRACT_MODE = mode
+        v3.RETRACT_WINDOW_SECONDS = 21600
+
+        async def _fake_listing(session, subreddit):
+            return ({"zzz_other"}, 7200)
+
+        async def _fake_live(session, path, label=""):
+            return "removed by moderator"
+
+        v3._fetch_new_listing = _fake_listing
+        v3.live_removal_reason = _fake_live
+        v3.get_webhook_for_subreddit = lambda sub: "https://discord.test/api/webhooks/1/tok"
+        session = _R66Session(fail_part)
+        records = _r63_record(_r63_now)
+        records["RetractSub_abc111"]["message_ids"] = ["999", "1000", "1001"]
+        await v3.retract_dead_posts(session, records, _r63_now)
+        return session, records
+    finally:
+        (v3.RETRACT_DEAD_POSTS, v3.RETRACT_MODE, v3.RETRACT_WINDOW_SECONDS,
+         v3._fetch_new_listing, v3.live_removal_reason,
+         v3.get_webhook_for_subreddit) = saved
+
+
+_r66_sess, _r66_recs = asyncio.run(_r66_run("edit"))
+check("r66: edit-mode retraction PATCHes ALL parts (main + continuations)",
+      len(_r66_sess.calls) == 3 and all(c[0] == "PATCH" for c in _r66_sess.calls)
+      and all(f"/messages/{mid}" in c[1] for c, mid in zip(_r66_sess.calls, ("999", "1000", "1001"))),
+      str(_r66_sess.calls))
+check("r66: the MAIN card keeps its full tombstone payload",
+      "hi" in _r66_sess.calls[0][2]["components"][0]["components"][1]["content"]
+      and "no longer live" in _r66_sess.calls[0][2]["components"][0]["components"][0]["content"],
+      str(_r66_sess.calls[0][2])[:200])
+check("r66: continuation parts get the greyed continuation tombstone",
+      all("no longer live" in c[2]["components"][0]["components"][0]["content"]
+          and c[2]["components"][0]["accent_color"] == 0x808080
+          and c[2]["flags"] == v3.IS_COMPONENTS_V2
+          for c in _r66_sess.calls[1:]),
+      str(_r66_sess.calls[1][2])[:200])
+check("r66: retracted only marks when EVERY part was tombstoned",
+      _r66_recs["RetractSub_abc111"].get("retracted") is True)
+
+_r66_sess, _r66_recs = asyncio.run(_r66_run("edit", fail_part=1))
+check("r66: a failed part blocks 'retracted' but the other parts still get patched",
+      len(_r66_sess.calls) == 3 and _r66_recs["RetractSub_abc111"].get("retracted") is not True,
+      f"calls={len(_r66_sess.calls)} retracted={_r66_recs['RetractSub_abc111'].get('retracted')}")
+
+_r66_sess, _r66_recs = asyncio.run(_r66_run("delete"))
+check("r66: delete-mode retraction DELETEs ALL parts",
+      len(_r66_sess.calls) == 3 and all(c[0] == "DELETE" for c in _r66_sess.calls)
+      and all(f"/messages/{mid}" in c[1] for c, mid in zip(_r66_sess.calls, ("999", "1000", "1001")))
+      and _r66_recs["RetractSub_abc111"].get("retracted") is True,
+      str(_r66_sess.calls))
+
+# --- workflow guards (round-61 steps sacred; env list = mappings only) ----
+with open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8") as _r66_f:
+    _r66_wf = _r66_f.read()
+_r66_stale = ["APPROVAL_RECHECK_SECONDS", "POST_SETTLE_SECONDS", "POST_SETTLE_VERIFIED_SECONDS",
+              "DUP_MEDIA_GATE", "REPOST_GATE", "REPOST_WINDOW_SECONDS", "MOD_QUEUE_GATE",
+              "MOD_QUEUE_WINDOW_SECONDS", "MOD_QUEUE_WEAK_GRACE_SECONDS",
+              "LISTING_HTML_GRACE_SECONDS", "LISTING_TIMEOUT_SECONDS"]
+check("r66: reddit_monitor.yml — all 11 stale env mappings fully gone (lines AND comments)",
+      all(_n not in _r66_wf for _n in _r66_stale),
+      str([n for n in _r66_stale if n in _r66_wf]))
+check("r66: reddit_monitor.yml — round-64 FRESH_HOLD_SECONDS/LISTING_CONFIRM are wired",
+      "FRESH_HOLD_SECONDS: ${{ vars.FRESH_HOLD_SECONDS }}" in _r66_wf
+      and "LISTING_CONFIRM: ${{ vars.LISTING_CONFIRM }}" in _r66_wf)
+check("r66: reddit_monitor.yml — kept mappings intact (pending recheck, NSFW, retraction)",
+      all(f"{_n}: ${{{{ vars.{_n} }}}}" in _r66_wf for _n in
+          ["PENDING_RECHECK_SECONDS", "NSFW_ALLOWLIST", "NSFW_FAIL_OPEN",
+           "NSFW_REQUIRE_SUBREDDIT", "NSFW_PAGE_FALLBACK", "RETRACT_DEAD_POSTS",
+           "RETRACT_MODE", "RETRACT_WINDOW_SECONDS"]))
+check("r66: reddit_monitor.yml — round-61 deploy steps untouched",
+      "Sync to the live branch tip" in _r66_wf
+      and "git reset --hard FETCH_HEAD" in _r66_wf
+      and "merge_monitor_caches.py" in _r66_wf
+      and "git pull --rebase" not in _r66_wf)
+
+# --- engine source guards ---------------------------------------------------
+check("r66: budgets — main card cap raised for continuations, 3 × 3800 more",
+      v3.MAX_BODY_CHARS == 16000 and v3.MAX_CONTINUATIONS == 3
+      and v3.CONTINUATION_CHAR_LIMIT == 3800,
+      f"{v3.MAX_BODY_CHARS}/{v3.MAX_CONTINUATIONS}/{v3.CONTINUATION_CHAR_LIMIT}")
+_r66_bv3_src = inspect.getsource(v3.build_v3_payload)
+check("r66: the card build converts tables + splits safely — no ellipsis truncation left",
+      "_markdown_tables_to_bullets(" in _r66_bv3_src and "split_card_body(" in _r66_bv3_src
+      and 'rstrip() + "…"' not in _r66_bv3_src)
+check("r66: the table renderer never emits Discord timestamps",
+      "<t:" not in inspect.getsource(v3._markdown_tables_to_bullets))
+check("r66: the posting loop delivers continuations and records every message id",
+      "build_continuation_payloads(" in inspect.getsource(v3.main)
+      and "message_ids" in inspect.getsource(v3.main))
+check("r66: retraction reads message_ids and tombstones continuation parts",
+      "message_ids" in inspect.getsource(v3.retract_dead_posts)
+      and "tombstone_continuation_payload" in inspect.getsource(v3.retract_dead_posts))
+
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
     sys.exit(1)
