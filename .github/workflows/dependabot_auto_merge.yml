@@ -1,26 +1,28 @@
 # ---------------------------------------------------------------------------
-# OPTIONAL: automatically MERGE Dependabot PRs once CI is green.
+# OPTIONAL: automatically squash-merge eligible Dependabot PRs.
 #
-# This is DISABLED by default. To enable it:
-#   Repo -> Settings -> Secrets and variables -> Actions -> Variables
-#   -> New repository variable:  AUTO_MERGE_DEPENDABOT  =  yes
+# Enable it with the repository variable:
+#   AUTO_MERGE_DEPENDABOT = yes
 #
 # Security model:
-#   • workflow_run executes this trusted, default-branch file only after the
-#     named CI workflow completes; it never checks out or executes PR code.
-#   • the PR author must be dependabot[bot] (human PRs are never touched).
-#   • CI must succeed and all checks on the exact PR SHA must be green.
-#   • the PR must be cleanly mergeable.
+#   * pull_request_target always reads this workflow from the trusted base
+#     branch. This job never checks out or runs PR-supplied code.
+#   * The GitHub API is the sole source of truth for the PR and its exact head.
+#   * Only open, non-draft PRs authored by dependabot[bot] can be considered.
+#   * A bounded poll waits for completed checks on the event's exact head SHA;
+#     unknown state, API errors, conflicts, or a timeout all fail closed.
 #
-# Nothing here touches main unless every gate passes. See docs/DEPENDABOT.md.
+# Nothing here touches the default branch unless every gate passes. See
+# docs/DEPENDABOT.md for the trigger and race-handling details.
 # ---------------------------------------------------------------------------
 name: Dependabot auto-merge (opt-in)
 
 on:
-  workflow_run:
-    workflows: ["CI — syntax + offline smoke test"]
-    types: [completed]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
 
+# Do not broaden these permissions. The workflow needs only to inspect checks
+# and to squash-merge an already-validated pull request.
 permissions:
   checks: read
   contents: write
@@ -29,73 +31,207 @@ permissions:
 jobs:
   auto-merge:
     runs-on: ubuntu-latest
-    # Round 57: hard cap — single API script; seconds normally.
-    timeout-minutes: 5
-    # Gate 0: only runs when the variable is set to "yes" (empty = off).
-    if: vars.AUTO_MERGE_DEPENDABOT == 'yes'
+    # The bounded poll below lasts at most eight minutes; leave room for API
+    # latency and the final merge request.
+    timeout-minutes: 10
     steps:
-      # No checkout by design: workflow_run uses the trusted default-branch
-      # workflow definition, and this job never executes PR-supplied code.
-      - name: Evaluate + merge eligible Dependabot PR
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9 — SHA-pinned (round 57)
+      # Deliberately no checkout: pull_request_target runs this trusted file
+      # from the default branch, and no PR code is ever executed.
+      - name: Evaluate + squash-merge eligible Dependabot PR
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9 — SHA-pinned
+        env:
+          AUTO_MERGE_DEPENDABOT: ${{ vars.AUTO_MERGE_DEPENDABOT }}
         with:
           script: |
-            const run = context.payload.workflow_run;
-            if (run.conclusion !== 'success') {
-              console.log(`CI conclusion=${run.conclusion}; not merging.`);
-              return;
-            }
-
-            // Push runs have no PR. A CI run normally maps to exactly one PR;
-            // skip any unusual association rather than guessing.
-            const prs = run.pull_requests || [];
-            if (prs.length !== 1) {
-              console.log(`Expected one PR for the completed CI run; found ${prs.length}. Skipping.`);
-              return;
-            }
-
+            const allowedConclusions = new Set(['success', 'skipped', 'neutral']);
+            const maxAttempts = 32;
+            const pollIntervalMs = 15_000;
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const number = prs[0].number;
-            let pr;
-            for (let attempt = 1; attempt <= 3; attempt += 1) {
-              ({ data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number }));
-              if (pr.mergeable_state !== 'unknown') break;
-              console.log(`mergeable_state=unknown (attempt ${attempt}/3); waiting for GitHub.`);
-              await new Promise(resolve => setTimeout(resolve, 3000));
+            const eventPr = context.payload.pull_request;
+            const defaultBranch = context.payload.repository?.default_branch;
+
+            const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+            const stopForPrState = (pr, expectedHeadSha, number) => {
+              if (pr.number !== number || pr.base.repo?.full_name !== `${owner}/${repo}` ||
+                  pr.base.ref !== defaultBranch) {
+                console.log('Unexpected PR association or target branch; skipping safely.');
+                return true;
+              }
+              if (pr.user?.login !== 'dependabot[bot]') {
+                console.log(`Non-Dependabot author (${pr.user?.login ?? 'unknown'}); skipping.`);
+                return true;
+              }
+              if (pr.draft) {
+                console.log('Draft PR; skipping.');
+                return true;
+              }
+              if (pr.state !== 'open') {
+                console.log(`Closed PR (state=${pr.state}); skipping.`);
+                return true;
+              }
+              if (pr.head.sha !== expectedHeadSha) {
+                console.log('Unexpected PR head SHA; skipping safely rather than using a newer head.');
+                return true;
+              }
+              return false;
+            };
+
+            const listChecks = async headSha => {
+              const allChecks = [];
+              for (let page = 1; ; page += 1) {
+                const { data } = await github.rest.checks.listForRef({
+                  owner,
+                  repo,
+                  ref: headSha,
+                  filter: 'latest',
+                  per_page: 100,
+                  page,
+                });
+                if (!Array.isArray(data.check_runs)) {
+                  throw new Error('Checks API returned an unexpected response shape.');
+                }
+                allChecks.push(...data.check_runs);
+                if (allChecks.length >= data.total_count || data.check_runs.length < 100) {
+                  return allChecks;
+                }
+              }
+            };
+
+            const classifyChecks = checks => {
+              if (checks.length === 0) return { state: 'none' };
+
+              const pending = checks.filter(check => check.status !== 'completed');
+              if (pending.length > 0) {
+                return {
+                  state: 'pending',
+                  names: pending.map(check => check.name).join(', '),
+                };
+              }
+
+              const failed = checks.filter(check => !allowedConclusions.has(check.conclusion));
+              if (failed.length > 0) {
+                return {
+                  state: 'failed',
+                  names: failed.map(check => `${check.name} (${check.conclusion ?? 'no conclusion'})`).join(', '),
+                };
+              }
+
+              return { state: 'ready' };
+            };
+
+            const logWaitingForChecks = result => {
+              if (result.state === 'none') {
+                console.log('No checks on the exact head SHA yet; waiting without merging.');
+              } else {
+                console.log(`Checks still pending (${result.names}); waiting without merging.`);
+              }
+            };
+
+            async function main() {
+              if (process.env.AUTO_MERGE_DEPENDABOT !== 'yes') {
+                console.log('Variable disabled: AUTO_MERGE_DEPENDABOT must equal "yes"; skipping.');
+                return;
+              }
+
+              if (!eventPr || !Number.isInteger(eventPr.number) || typeof eventPr.head?.sha !== 'string' ||
+                  !defaultBranch) {
+                console.log('Unexpected PR association in the event payload; skipping safely.');
+                return;
+              }
+
+              const number = eventPr.number;
+              const expectedHeadSha = eventPr.head.sha;
+              let waitingFor = 'checks';
+
+              for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                const { data: pr } = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: number,
+                });
+                if (stopForPrState(pr, expectedHeadSha, number)) return;
+
+                // Query only the event's SHA, never a mutable branch reference.
+                const firstCheckResult = classifyChecks(await listChecks(expectedHeadSha));
+                if (firstCheckResult.state === 'failed') {
+                  console.log(`Failed check: ${firstCheckResult.names}; not merging.`);
+                  return;
+                }
+                if (firstCheckResult.state !== 'ready') {
+                  waitingFor = firstCheckResult.state;
+                  logWaitingForChecks(firstCheckResult);
+                  if (attempt < maxAttempts) await sleep(pollIntervalMs);
+                  continue;
+                }
+
+                // Refresh immediately before merging: GitHub computes mergeability
+                // asynchronously and the PR can change while its checks finish.
+                const { data: finalPr } = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: number,
+                });
+                if (stopForPrState(finalPr, expectedHeadSha, number)) return;
+
+                if (finalPr.mergeable === null || finalPr.mergeable_state === 'unknown') {
+                  waitingFor = 'mergeability';
+                  console.log('Mergeability is still unknown; waiting without merging.');
+                  if (attempt < maxAttempts) await sleep(pollIntervalMs);
+                  continue;
+                }
+                if (finalPr.mergeable === false || finalPr.mergeable_state === 'dirty') {
+                  console.log(`Merge conflict (mergeable_state=${finalPr.mergeable_state}); not merging.`);
+                  return;
+                }
+                if (finalPr.mergeable !== true || finalPr.mergeable_state !== 'clean') {
+                  console.log(`PR is not cleanly mergeable (mergeable_state=${finalPr.mergeable_state}); not merging.`);
+                  return;
+                }
+
+                // Re-read checks after the mergeability refresh. This catches a
+                // check that appeared or became pending during the first read.
+                const finalCheckResult = classifyChecks(await listChecks(expectedHeadSha));
+                if (finalCheckResult.state === 'failed') {
+                  console.log(`Failed check: ${finalCheckResult.names}; not merging.`);
+                  return;
+                }
+                if (finalCheckResult.state !== 'ready') {
+                  waitingFor = finalCheckResult.state;
+                  logWaitingForChecks(finalCheckResult);
+                  if (attempt < maxAttempts) await sleep(pollIntervalMs);
+                  continue;
+                }
+
+                // sha makes the merge API reject a head change after validation.
+                const { data: merge } = await github.rest.pulls.merge({
+                  owner,
+                  repo,
+                  pull_number: number,
+                  sha: expectedHeadSha,
+                  merge_method: 'squash',
+                });
+                if (!merge.merged) {
+                  core.setFailed(`Merge API declined the validated PR; failing closed: ${merge.message}`);
+                  return;
+                }
+
+                console.log(`Successful merge: squash-merged Dependabot PR #${number} at ${expectedHeadSha}.`);
+                return;
+              }
+
+              if (waitingFor === 'none') {
+                console.log('Timeout: no checks appeared on the exact head SHA; not merging.');
+              } else if (waitingFor === 'pending') {
+                console.log('Timeout: checks still pending on the exact head SHA; not merging.');
+              } else {
+                console.log('Timeout: mergeability remained unknown; not merging.');
+              }
             }
 
-            if (pr.user.login !== 'dependabot[bot]') {
-              console.log(`PR author is ${pr.user.login}; only dependabot[bot] is eligible.`);
-              return;
+            try {
+              await main();
+            } catch (error) {
+              core.setFailed(`GitHub API error; failing closed without merging: ${error.message}`);
             }
-            if (pr.draft) { console.log('Draft PR — skipping.'); return; }
-            if (pr.state !== 'open') { console.log('PR not open — skipping.'); return; }
-            if (pr.mergeable_state !== 'clean') {
-              console.log(`mergeable_state=${pr.mergeable_state} — skipping.`);
-              return;
-            }
-
-            const { data: checks } = await github.rest.checks.listForRef({
-              owner, repo, ref: pr.head.sha, per_page: 100,
-            });
-            if (!checks.check_runs || checks.check_runs.length === 0) {
-              console.log('No checks have run yet — skipping (safety).');
-              return;
-            }
-            const pending = checks.check_runs.filter(c => c.status !== 'completed');
-            const bad = checks.check_runs.filter(
-              c => c.status === 'completed' && !['success', 'skipped', 'neutral'].includes(c.conclusion));
-            if (pending.length) {
-              console.log(`${pending.length} check(s) still running — skipping.`);
-              return;
-            }
-            if (bad.length) {
-              console.log(`Failed check(s): ${bad.map(c => c.name).join(', ')} — NOT merging.`);
-              return;
-            }
-
-            console.log('All checks green on an eligible Dependabot PR — merging.');
-            await github.rest.pulls.merge({
-              owner, repo, pull_number: number, merge_method: 'squash',
-            });
