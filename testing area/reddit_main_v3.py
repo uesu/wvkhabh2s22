@@ -372,6 +372,29 @@ if not _LISTING_CONFIRM_RAW or _LISTING_CONFIRM_RAW.strip().lower() in ("1", "tr
 else:
     LISTING_CONFIRM = _LISTING_CONFIRM_RAW.strip().lower() not in ("0", "false", "no", "off")
 
+# ---------------------------------------------------------------------------
+# ■ ROUND 66 (2026-10-05): LONG-POST CONTINUATIONS + TABLE RENDERING
+# A body that no longer fits the card's text budget is no longer truncated
+# and dropped: the main card keeps the first chunk (same layout, gallery,
+# stats, buttons), and the remainder is delivered as up to
+# MAX_CONTINUATIONS follow-up messages to the same webhook — text-only
+# Components V2 containers, same accent color, each opening with a small
+# "-# (continued)" line. Beyond the cap the last message ends with
+# "… full post on Reddit" (the Read Post button already links the post).
+# Retraction covers every part: continuation message IDs are recorded
+# alongside the main card's, so the tombstone/delete pass hits them all.
+# Every split (main budget AND continuation boundaries) lands on a safe
+# point — paragraph break, then line break, then space — and NEVER inside
+# a markdown link, a bare URL, ||spoiler||, or a bold/italic marker pair
+# (live 1wxfuj5: the old budget cut sliced a link mid-URL, rendering a
+# broken "[Set](https://…" fragment). Markdown tables (Discord renders no
+# table markdown) are converted to per-row bold-label bullets at card
+# build — one choke point, every body path; malformed or ambiguous tables
+# are left byte-identical, and nothing is date-converted (ranges like
+# "October 9/10" cannot become Discord timestamps without guessing — the
+# card's posted-time 🕐 stays the only timestamp).
+# ---------------------------------------------------------------------------
+
 # Round 63 ("The Great Simplification"): the settle window, the mod-queue
 # gate, the duplicate-media gate, the repost gate and the page-identity
 # check are gone. A native Reddit post is delivered as-is — the only things
@@ -772,7 +795,17 @@ def feedtoken_probe_enabled() -> bool:
 
 # Text display budget (Discord: 4000 chars total per message across all
 # text components; we keep header+body+stats comfortably under it).
-MAX_BODY_CHARS = 3000
+# Round 66: this is now the MAIN CARD's body budget — a longer body is
+# continued in follow-up messages (MAX_CONTINUATIONS × ~3800 chars more;
+# see build_v3_payload/build_continuation_payloads) instead of truncated.
+MAX_BODY_CHARS = 16000
+# Round 66: follow-up messages carrying the body remainder (see the
+# ROUND 66 block above). 3800 leaves room under Discord's 4000-char
+# message limit for the "-# (continued)" heading line.
+MAX_CONTINUATIONS = 3
+CONTINUATION_CHAR_LIMIT = 3800
+CONTINUATION_HEADER = "-# (continued)"
+CONTINUATION_TAIL = "… full post on Reddit"
 
 # Buttons (style 5 = Link). YouTube button uses the animated starwardspark3.
 READ_POST_EMOJI = {"id": "1472388018689282261", "name": "starwardhmm", "animated": True}
@@ -1607,9 +1640,19 @@ def _arctic_media_count(post) -> int:
 
 
 def _clean_plain_body(text) -> str:
+    """Plain (non-HTML) selftext -> card body — the Arctic archive path.
+
+    Round 65 (2026-10-05, live 1wxvl13): Arctic Shift — like Reddit's own
+    JSON API — serves selftext with HTML entities escaped (&gt; &lt; &amp;),
+    so the Arctic path unescapes EXACTLY ONCE here, before the cleaning
+    (mirroring the JSON path's single unescape inside strip_html). Never a
+    second pass: a post that genuinely writes "&amp;gt;" must render
+    "&gt;", not ">".
+    """
     if text in ("[removed]", "[deleted]"):
         return ""
-    return _collapse_blanks(_line_stage([line.strip() for line in str(text or "").splitlines()]))
+    text = html_lib.unescape(str(text or ""))
+    return _collapse_blanks(_line_stage([line.strip() for line in text.splitlines()]))
 
 
 def _drop_youtube_line(body: str, youtube_url: str | None) -> str:
@@ -1674,8 +1717,229 @@ def _drop_gallery_media_lines(body: str, media: list) -> str:
     return _collapse_blanks(kept)
 
 
+# ---------------------------------------------------------------------------
+# ■ ROUND 66 (2026-10-05): SAFE BODY SPLITTING + MARKDOWN TABLE RENDERING
+# (see the ROUND 66 notes block near the top for the full design)
+# ---------------------------------------------------------------------------
+# Spans a body split must NEVER slice through — a sliced link renders
+# broken markdown (live 1wxfuj5: "[Set](https://…").
+_PROTECTED_SPAN_RES = (
+    # markdown link [text](url) — the whole thing is one span
+    re.compile(r"\[[^\[\]\n]*\]\(https?://[^)\s]*\)"),
+    # bare URL (never extends past a ')' — that is punctuation in prose,
+    # and a span bleeding past a link's closing paren would START inside
+    # the link span and defeat the straddle rule below)
+    re.compile(r"https?://[^\s<>\[\)]+"),
+    # Discord spoiler
+    re.compile(r"\|\|[^|\n]*\|\|"),
+    # bold / italic marker pairs
+    re.compile(r"\*\*[^*\n]*\*\*"),
+    re.compile(r"(?<!\*)\*[^*\n]+\*(?!\*)"),
+    re.compile(r"_[^_\n]+_"),
+)
+
+
+def _protected_spans(text: str) -> list:
+    """Round 66: the (start, end) character ranges of a body that a split
+    must never land inside — links, bare URLs, spoilers, marker pairs.
+    Overlapping matches (a bare URL found inside a markdown link) are
+    merged into one span so no span boundary can start inside another."""
+    spans = []
+    for rx in _PROTECTED_SPAN_RES:
+        spans.extend(m.span() for m in rx.finditer(text))
+    spans.sort()
+    merged = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _safe_split_point(text: str, limit: int) -> int:
+    """Round 66: the index at which to split `text` so text[:point] stays
+    within `limit` characters and lands on a safe boundary — the largest
+    paragraph break, else line break, else space — and never inside a
+    markdown link, bare URL, spoiler, or bold/italic marker pair. A span
+    straddling the limit pushes the split to BEFORE it (the live 1wxfuj5
+    fix). Pathological no-boundary text (one giant token) falls back to
+    the hard limit so delivery always makes progress."""
+    spans = _protected_spans(text)
+
+    def _inside(p: int) -> bool:
+        return any(s < p < e for s, e in spans)
+
+    for pattern in (r"\n\n", r"\n", r"[ \t]"):
+        best = 0
+        for m in re.finditer(pattern, text[:limit + 1]):
+            p = m.end()
+            if p <= limit and p > best and not _inside(p):
+                best = p
+        if best:
+            return best
+    # no paragraph/line/space boundary at all: never slice a protected
+    # span that straddles the limit — split just before it starts
+    for s, e in spans:
+        if 0 < s <= limit < e:
+            return s
+    # a protected span starting at 0 whose end fits the small slack above
+    # the limit: keep it whole instead of slicing it
+    for s, e in spans:
+        if s == 0 and e > limit and e <= limit + 200:
+            return e
+    return max(1, limit)
+
+
+def split_card_body(text: str, limit: int) -> tuple:
+    """Round 66: (head, tail) split of a card body at a safe boundary —
+    paragraph break preferred, then line break, then space, never inside
+    a link/URL/spoiler/marker pair (see _safe_split_point). A body within
+    the limit is returned untouched ("", remainder)."""
+    text = text or ""
+    if len(text) <= limit:
+        return text, ""
+    point = _safe_split_point(text, limit)
+    return text[:point].rstrip(), text[point:].lstrip()
+
+
+_MD_TABLE_SEP_CELL_RE = re.compile(r"^:?-+:?$")
+
+
+def _md_table_cells(line: str) -> "list | None":
+    """Round 66: the pipe-separated cells of one markdown table row, or
+    None when the line is not a table row (no pipe / fewer than 2 cells).
+    Reddit escapes literal pipes as \\| — unescaped after splitting."""
+    raw = (line or "").strip()
+    if not raw or "|" not in raw:
+        return None
+    if raw.startswith("|"):
+        raw = raw[1:]
+    if raw.endswith("|"):
+        raw = raw[:-1]
+    cells = [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", raw)]
+    return cells if len(cells) >= 2 else None
+
+
+def _markdown_tables_to_bullets(body: str) -> str:
+    """Round 66 (live 1wxfuj5): Discord renders no table markdown, so a
+    markdown table in the card body (header row + |---| separator + data
+    rows) is converted to per-row bullets:
+
+        **<Header1> <cell1>**
+        - **<Header2>:** <cell2>     (one bullet per remaining column,
+                                      empty cells skipped; rows joined
+                                      by a blank line)
+
+    The bold row label COMPOSES the first header with the first cell —
+    the live 1wxfuj5 table (header "Patch", cells "3.7"/"3.8") renders
+    "**Patch 3.8**", matching the hand-checked example from the PR
+    conversation. A cell that already carries the header word ("Patch
+    3.8" under header "Patch") is used verbatim — never doubled.
+
+    Conservative by design: a block only converts when every row agrees
+    on the cell count, the separator row is well-formed, and no second
+    separator-shaped row glues tables together — malformed or ambiguous
+    shapes stay byte-identical, and nothing is date-converted (ranges
+    like "October 9/10" cannot become Discord timestamps without
+    guessing; the card's posted-time 🕐 stays the only timestamp)."""
+    if not body or "|" not in body:
+        return body
+    lines = body.split("\n")
+    out = []
+    i, n = 0, len(lines)
+    while i < n:
+        header = _md_table_cells(lines[i])
+        sep = _md_table_cells(lines[i + 1]) if i + 1 < n else None
+        if not (header and sep and len(sep) == len(header)
+                and all(_MD_TABLE_SEP_CELL_RE.match(c) for c in sep)):
+            out.append(lines[i])
+            i += 1
+            continue
+        # the data rows: consecutive rows sharing the header's cell count
+        j = i + 2
+        rows = []
+        while j < n:
+            cells = _md_table_cells(lines[j])
+            if cells is None or len(cells) != len(header):
+                break
+            rows.append(cells)
+            j += 1
+        # full pipe-run end (for leaving malformed blocks byte-identical)
+        j_end = j
+        while j_end < n and _md_table_cells(lines[j_end]) is not None:
+            j_end += 1
+        # a separator-shaped row inside the data rows means two tables
+        # were glued together (or worse); a pipe-run that ends on a row
+        # with a DIFFERENT cell count is a malformed table — never guess
+        glued = any(all(_MD_TABLE_SEP_CELL_RE.match(c) for c in r) for r in rows)
+        malformed = (j < n and _md_table_cells(lines[j]) is not None
+                     and len(_md_table_cells(lines[j])) != len(header))
+        if rows and not glued and not malformed:
+            blocks = []
+            for cells in rows:
+                block = []
+                if cells[0]:
+                    label = cells[0]
+                    head1 = (header[0] or "").strip()
+                    # compose "Header1 cell1" ("Patch" + "3.8" ->
+                    # "Patch 3.8"); a cell already carrying the header
+                    # word stays verbatim ("Patch 3.8" -> "Patch 3.8")
+                    if head1 and head1.lower() not in label.lower():
+                        label = f"{head1} {label}"
+                    block.append(f"**{label}**")
+                for head, cell in zip(header[1:], cells[1:]):
+                    if cell:
+                        block.append(f"- **{head}:** {cell}")
+                if block:
+                    blocks.append("\n".join(block))
+            out.append("\n\n".join(blocks))
+            i = j
+        else:
+            out.extend(lines[i:max(j, j_end)])
+            i = max(j, j_end)
+    return "\n".join(out)
+
+
+def build_continuation_payloads(rest: str) -> list:
+    """Round 66: the follow-up message payloads that carry a card body's
+    remainder (see the ROUND 66 block above). Text-only Components V2
+    containers, same accent color as the card, each opening with a small
+    "-# (continued)" line; capped at MAX_CONTINUATIONS messages — any
+    further remainder ends the last message with '… full post on Reddit'
+    (the Read Post button already links the post)."""
+    text = (rest or "").strip()
+    if not text:
+        return []
+    budget = CONTINUATION_CHAR_LIMIT - len(CONTINUATION_HEADER) - 1
+    chunks = []
+    while text and len(chunks) < MAX_CONTINUATIONS:
+        if len(text) <= budget:
+            chunks.append(text)
+            text = ""
+            break
+        point = _safe_split_point(text, budget)
+        chunks.append(text[:point].rstrip())
+        text = text[point:].lstrip()
+    chunks = [c for c in chunks if c.strip()]
+    if text and chunks:
+        chunks[-1] = chunks[-1].rstrip() + f"\n\n{CONTINUATION_TAIL}"
+    return [
+        {"flags": IS_COMPONENTS_V2,
+         "components": [{"type": 17, "accent_color": 16729344,
+                         "components": [{"type": 10,
+                                         "content": f"{CONTINUATION_HEADER}\n{chunk}"}]}]}
+        for chunk in chunks
+    ]
+
+
 def strip_html(value: str | None) -> str:
-    """Removes tags from HTML-ish strings (used for JSON selftext etc.)."""
+    """Removes tags from HTML-ish strings (used for JSON selftext etc.).
+
+    Round 65 audit: the html_lib.unescape below is the JSON body path's
+    ONE unescape (JSON selftext, crosspost originals, OP comment all flow
+    through here) — never add a second pass anywhere upstream.
+    """
     if not value:
         return ""
     value = re.sub(r"(?is)<span\s+[^>]*\bclass=[\"\x27][^\"\x27]*\b(?:md-)?spoiler(?:-text)?\b[^\"\x27]*[\"\x27][^>]*>(.*?)</span>", r"||\1||", value)
@@ -2068,6 +2332,13 @@ def _line_stage(lines: list) -> list:
     """Drop recognizable feed navigation/footer artifacts, not prose."""
     kept = []
     for line in repair_mangled_link_lines(_repair_label_url_mangle(lines)):
+        # Round 65 (2026-10-05, live 1wxvl13): a line that is ONLY '>'
+        # characters (+ whitespace) — ">", "> ", ">>" — is an empty markdown
+        # blockquote separator with no content; it renders as a stray
+        # literal '>' on the card. Lines with actual quoted content
+        # ("> text") stay byte-identical.
+        if re.fullmatch(r">[\s>]*", line.strip()):
+            continue
         if line.lower() in ("link", "comments", "[link]", "[comments]", "permalink"):
             continue
         if re.match(r"^submitted\)?\s+by\s+\[?\s*/?u/", line, re.I):
@@ -2664,6 +2935,8 @@ def extract_op_comment(post_json: dict) -> dict | None:
         return None
 
     def _finish(d: dict) -> dict | None:
+        # Round 65 audit: the OP comment body unescapes exactly once —
+        # inside strip_html (never again downstream).
         body = strip_html(d.get("body"))
         if not body:
             return None
@@ -2790,6 +3063,9 @@ def base_from_redlib_page(page_html: str | None, path: str) -> dict | None:
         "author": _clean_author_name(author),
         "content_html": area,
         "thumb": og.group(1) if og else None,
+        # Round 65 audit: this body's HTML entities are unescaped exactly
+        # once — inside clean_rss_body (the round-16 fixpoint the feed's
+        # double-escaping requires).
         "body": clean_rss_body(area),
         "crosspost_orig_path": find_crosspost_original_path(area, path),
         "vred_id": extract_vreddit_id(area),
@@ -3016,6 +3292,9 @@ def entry_to_base_data(entry) -> dict:
         "author": _clean_author_name(author),
         "content_html": content_html,
         "thumb": thumb,
+        # Round 65 audit: this body's HTML entities are unescaped exactly
+        # once — inside clean_rss_body (the round-16 fixpoint the feed's
+        # double-escaping requires).
         "body": clean_rss_body(content_html),
         "crosspost_orig_path": find_crosspost_original_path(
             content_html, normalize_reddit_path(str(getattr(entry, "link", "")))),
@@ -3104,7 +3383,7 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
     stats = None
     crosspost = None
     op_comment = None
-    body = base["body"]
+    body = base["body"]  # round 65 audit: RSS/redlib/mirror base bodies are unescaped exactly once at build time (clean_rss_body / reddit_proxy.clean_proxy_body)
     title = base["title"]
     author = base["author"]
     yt_url = base["youtube_url"]
@@ -3117,6 +3396,8 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
         title = str(post_json.get("title") or title)[:400]
         author = str(post_json.get("author") or author)
         if post_json.get("selftext"):
+            # Round 65 audit: the JSON selftext unescapes exactly once —
+            # inside strip_html (no second pass anywhere downstream).
             body = strip_html(post_json["selftext"]) or body
         stats = {"comments": post_json.get("num_comments", 0),
                  "ups": post_json.get("ups", 0)}
@@ -3160,6 +3441,9 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                         if g:
                             media.append({"kind": "gif", "url": g})
                         if orig.get("selftext"):
+                            # Round 65 audit: the crosspost original's
+                            # selftext unescapes exactly once — inside
+                            # strip_html (never again downstream).
                             orig_body = strip_html(orig["selftext"])
                             if orig_body and len(orig_body) > len(body or ""):
                                 body = orig_body
@@ -3250,6 +3534,13 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
     # Structured text wins over flattened og descriptions. Archive text is
     # used only when the RSS/redlib body is empty.
     if arctic and not (body or "").strip():
+        # Round 65 (2026-10-05, live 1wxvl13): the Arctic body path now
+        # unescapes HTML entities EXACTLY ONCE, inside _clean_plain_body —
+        # completing the round-65 body-entity audit: JSON selftext / crosspost
+        # originals / OP comment unescape inside strip_html, RSS + redlib
+        # content inside clean_rss_body (round-16 fixpoint), proxy bodies
+        # inside reddit_proxy.clean_proxy_body, and Arctic selftext HERE.
+        # No path unescapes twice ("&amp;gt;" must render "&gt;", not ">").
         body = _clean_plain_body(arctic.get("selftext"))
 
     # ---- round 13: PROXY media services (native mode only) ---------------
@@ -3300,6 +3591,9 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                 nonlocal stats, body
                 stats = proxy.get("stats") or stats
                 if proxy.get("body") and not (body or "").strip():
+                    # Round 65 audit: proxy bodies arrive pre-unescaped
+                    # (exactly once) from reddit_proxy.py's parsers
+                    # (clean_proxy_body & friends) — no second unescape here.
                     body = proxy["body"][:MAX_BODY_CHARS]
 
             video_dead = bool(proxy_video) and not video_ok
@@ -3518,7 +3812,8 @@ def build_action_row(reddit_url: str, youtube_url: str | None) -> dict:
     return {"type": 1, "components": buttons[:5]}
 
 
-def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int) -> dict:
+def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int,
+                     *, return_remainder: bool = False):
     """
     <=10 media items -> single container (V2 look):
         header / body / divider / gallery / stats / divider / buttons
@@ -3526,6 +3821,12 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
         container 1: header / body / divider / gallery(10)
         container 2: divider / gallery(rest) / stats / divider / buttons
     (Discord: 10 items per gallery, 10 components per container, 40 total.)
+
+    Round 66: a body longer than the card's text budget is SPLIT at a safe
+    boundary instead of truncated — the main card keeps the first chunk
+    (layout identical), and return_remainder=True also hands back the rest
+    as (payload, rest) so the posting loop can deliver it as follow-up
+    continuation messages (build_continuation_payloads).
     """
     header = f"### [{_clean_post_title(data['title'])}]({reddit_url})\n*by {_clean_author_name(data['author'])} in r/{subreddit}*"
     if data["crosspost"]:
@@ -3587,10 +3888,13 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
     body_budget = max(300, 3800 - len(header) - len(op_line) - len(stats_line))
     # Round 62: an inline-image link that is ALSO a gallery item never
     # renders twice — the raw-URL body line is scrubbed (live 1wx9c77)
-    body_src = _drop_gallery_media_lines(data["body"], media)
-    body_out = body_src[:body_budget]
-    if len(body_src) > body_budget:
-        body_out = body_out.rsplit(" ", 1)[0].rstrip() + "…"
+    # Round 66: markdown tables become per-row bold-label bullets (Discord
+    # renders no table markdown — live 1wxfuj5), and the budget split lands
+    # on a safe boundary — never inside a link/URL/spoiler/marker pair. The
+    # remainder is carried by follow-up continuation messages; no ellipsis.
+    body_src = _markdown_tables_to_bullets(
+        _drop_gallery_media_lines(data["body"], media))
+    body_out, body_rest = split_card_body(body_src, body_budget)
 
     def gallery(items: list) -> dict:
         return {"type": 12, "items": [{"media": {"url": m["url"]}} for m in items]}
@@ -3620,8 +3924,11 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
         container2["components"].append({"type": 10, "content": stats_line})
         container2["components"].append({"type": 14, "divider": True, "spacing": 1})
         container2["components"].append(row)
-        return {"flags": IS_COMPONENTS_V2,
-                "components": [container1, container2]}
+        payload = {"flags": IS_COMPONENTS_V2,
+                   "components": [container1, container2]}
+        if return_remainder:
+            return payload, body_rest
+        return payload
 
     inner = [{"type": 10, "content": header}]
     if body_out:
@@ -3640,12 +3947,21 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
     inner.append({"type": 10, "content": stats_line})
     inner.append({"type": 14, "divider": True, "spacing": 1})
     inner.append(row)
-    return {"flags": IS_COMPONENTS_V2,
-            "components": [{"type": 17, "accent_color": 16729344, "components": inner}]}
+    payload = {"flags": IS_COMPONENTS_V2,
+               "components": [{"type": 17, "accent_color": 16729344, "components": inner}]}
+    if return_remainder:
+        return payload, body_rest
+    return payload
 
 
 def tombstone_payload(payload: dict, reason: str | None = None) -> dict:
     return reddit_signals.tombstone_payload(payload, reason)
+
+
+def tombstone_continuation_payload(reason: str | None = None) -> dict:
+    """Round 66: the tombstone replacement for a body-continuation message
+    (the main card keeps its full tombstone via tombstone_payload)."""
+    return reddit_signals.tombstone_continuation_payload(reason)
 
 
 async def live_removal_reason(session, path: str, label: str = "") -> str | None:
@@ -3699,30 +4015,53 @@ async def retract_dead_posts(session, posted_messages: dict, now: float) -> None
         if not decision:
             continue
         webhook_url = get_webhook_for_subreddit(subreddit)
-        message_id = str(record.get("message_id") or "")
-        if not webhook_url or not message_id:
+        # Round 66: retraction covers EVERY part of a delivered post — the
+        # main card plus its body-continuation messages (message_ids);
+        # older records fall back to the single message_id.
+        main_id = str(record.get("message_id") or "")
+        part_ids = [str(m) for m in (record.get("message_ids") or []) if str(m)]
+        ids = part_ids or ([main_id] if main_id else [])
+        if not webhook_url or not ids:
             continue
         try:
             if decision == "delete":
-                async with session.delete(
-                    f"{webhook_url}/messages/{message_id}",
+                deleted = True
+                for mid in ids:
+                    async with session.delete(
+                        f"{webhook_url}/messages/{mid}",
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as resp:
+                        if resp.status in (200, 204):
+                            logging.warning(f"RETRACT: {unique_key} deleted dead Discord message "
+                                            f"{mid} ({reason}).")
+                        else:
+                            deleted = False
+                            logging.error(f"RETRACT: Discord delete HTTP {resp.status} for "
+                                          f"{unique_key} (message {mid}): {(await resp.text())[:200]}")
+                if deleted:
+                    record["retracted"] = True
+                continue
+            payload = tombstone_payload(record.get("payload") or {}, reason)
+            edited = True
+            for idx, mid in enumerate(ids):
+                part = payload if idx == 0 else tombstone_continuation_payload(reason)
+                async with session.patch(
+                    f"{webhook_url}/messages/{mid}?with_components=true",
+                    json=part,
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.status in (200, 204):
-                        record["retracted"] = True
-                        logging.warning(f"RETRACT: {unique_key} deleted dead Discord card ({reason}).")
-                continue
-            payload = tombstone_payload(record.get("payload") or {}, reason)
-            async with session.patch(
-                f"{webhook_url}/messages/{message_id}?with_components=true",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status in (200, 204):
-                    record["retracted"] = True
-                    logging.warning(f"RETRACT: {unique_key} tombstoned dead Discord card ({reason}).")
-                else:
-                    logging.error(f"RETRACT: Discord edit HTTP {resp.status} for {unique_key}: {(await resp.text())[:200]}")
+                        if idx:
+                            logging.warning(f"RETRACT: {unique_key} tombstoned continuation "
+                                            f"message {mid} ({reason}).")
+                    else:
+                        edited = False
+                        logging.error(f"RETRACT: Discord edit HTTP {resp.status} for "
+                                      f"{unique_key} (message {mid}): {(await resp.text())[:200]}")
+            if edited:
+                record["retracted"] = True
+                logging.warning(f"RETRACT: {unique_key} tombstoned dead Discord card "
+                                f"({len(ids)} message(s), {reason}).")
         except Exception as exc:
             logging.error(f"RETRACT: failed for {unique_key}: {exc}")
 
@@ -4257,7 +4596,11 @@ async def main():
                                      f"skipping, not cached (retries next run).")
                         continue
                 posted_ts = int(max(published_ts, activity_ts))
-                payload = build_v3_payload(subreddit, data, reddit_url, posted_ts)
+                # Round 66: the body beyond the card budget is continued in
+                # follow-up messages (see build_continuation_payloads).
+                payload, body_rest = build_v3_payload(subreddit, data, reddit_url,
+                                                      posted_ts, return_remainder=True)
+                continuations = build_continuation_payloads(body_rest)
 
                 if DRY_RUN:
                     kinds = ",".join(sorted({m["kind"] for m in data["media"]})) or "text"
@@ -4266,6 +4609,12 @@ async def main():
                                  f"(media={kinds} | {mode} | {len(data['media'])} item(s))")
                     logging.info(f"DRY RUN payload for {unique_key}:\n"
                                  f"{json.dumps(payload, indent=2, ensure_ascii=False)}")
+                    if continuations:
+                        logging.info(f"DRY RUN: {unique_key} body continues in "
+                                     f"{len(continuations)} follow-up message(s).")
+                        for _ci, _cont in enumerate(continuations, 1):
+                            logging.info(f"DRY RUN continuation {_ci} for {unique_key}:\n"
+                                         f"{json.dumps(_cont, indent=2, ensure_ascii=False)}")
                     if data.get("youtube_url") and YOUTUBE_LINK_MESSAGE:
                         logging.info(f"DRY RUN 2nd message for {unique_key} "
                                      f"(YouTube link only): {data['youtube_url']}")
@@ -4312,6 +4661,40 @@ async def main():
                         logging.info(f"Reddit V3 Posted: {unique_key} (media={kinds} | {mode} | "
                                      f"{len(data['media'])} item(s)) | LATENCY "
                                      f"{_latency / 60:.1f}min after creation{_held_note}")
+                        # Round 66: a body that exceeded the card budget
+                        # continues in follow-up messages — same webhook,
+                        # same mechanism/ordering as the YouTube link
+                        # message below. Message IDs are recorded so the
+                        # retraction seatbelt covers EVERY part.
+                        for _ci, _cont in enumerate(continuations, 1):
+                            try:
+                                _cont_url = f"{webhook_url}?with_components=true"
+                                if RETRACT_DEAD_POSTS:
+                                    _cont_url += "&wait=true"
+                                async with session.post(_cont_url, json=_cont,
+                                                        timeout=aiohttp.ClientTimeout(total=15)) as c_resp:
+                                    if c_resp.status in (200, 204):
+                                        if RETRACT_DEAD_POSTS and c_resp.status == 200:
+                                            try:
+                                                _c_json = await c_resp.json(content_type=None)
+                                            except Exception:
+                                                _c_json = None
+                                            if isinstance(_c_json, dict) and _c_json.get("id"):
+                                                _record = posted_messages.get(unique_key)
+                                                if isinstance(_record, dict) and _record.get("message_id"):
+                                                    _ids = _record.setdefault(
+                                                        "message_ids", [_record["message_id"]])
+                                                    if str(_c_json["id"]) not in _ids:
+                                                        _ids.append(str(_c_json["id"]))
+                                        logging.info(f"Body continuation posted for {unique_key} "
+                                                     f"(part { _ci + 1 } of "
+                                                     f"{len(continuations) + 1}).")
+                                    else:
+                                        logging.error(f"Body continuation HTTP {c_resp.status} for "
+                                                      f"{unique_key}: {(await c_resp.text())[:200]}")
+                            except Exception as c_e:
+                                logging.error(f"Body continuation failed for {unique_key}: {c_e}")
+                            await asyncio.sleep(1.0)
                         await create_discohook_share(session, payload, unique_key)
                         # round 13: YouTube posts get a SECOND, plain message
                         # containing ONLY the YouTube link (Discord shows the

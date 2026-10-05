@@ -268,3 +268,21 @@ def tombstone_payload(payload: dict, reason: str | None = None) -> dict:
         else:
             components.insert(0, {"type": 10, "content": notice})
     return out
+
+
+def tombstone_continuation_payload(reason: str | None = None) -> dict:
+    """Round 66 (2026-10-05): the tombstone replacement for a body-
+    continuation message — the follow-up that carried a long post's body
+    remainder after its main card. The main card keeps its full tombstone
+    via tombstone_payload; these text-only parts get the same notice,
+    greyed, so a retracted long post reads consistently across every
+    message that delivered it."""
+    notice = "⚠️ **This Reddit post is no longer live.**"
+    if reason:
+        notice += f" ({reason})"
+    notice += "\n-# The original card is kept for context; Reddit removed or deleted the source post after delivery."
+    return {
+        "flags": 1 << 15,  # IS_COMPONENTS_V2
+        "components": [{"type": 17, "accent_color": 0x808080,
+                        "components": [{"type": 10, "content": notice}]}],
+    }
