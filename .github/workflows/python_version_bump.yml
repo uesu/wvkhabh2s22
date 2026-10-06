@@ -101,6 +101,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7 — SHA-pinned (round 57, immutable supply chain)
+        with:
+          token: ${{ secrets.BUMP_PAT }}
 
       - name: Work out the current pin and the next version to try
         id: resolve
@@ -321,8 +323,7 @@ jobs:
         if: steps.resolve.outputs.bump == 'yes' && steps.wheels.outputs.ok == 'yes'
         id: pr
         env:
-          # Swap to ${{ secrets.BUMP_PAT }} if you want ci.yml to run on the PR.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.BUMP_PAT }}
           CURRENT: ${{ steps.resolve.outputs.current }}
           LATEST: ${{ steps.resolve.outputs.latest }}
           KIND: ${{ steps.resolve.outputs.kind }}
@@ -406,7 +407,7 @@ jobs:
           (vars.AUTO_MERGE_PYTHON_BUMP == 'all' ||
            (vars.AUTO_MERGE_PYTHON_BUMP == 'yes' && steps.resolve.outputs.kind != 'minor'))
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.BUMP_PAT }}
           URL: ${{ steps.pr.outputs.url }}
         run: |
           set -euo pipefail
