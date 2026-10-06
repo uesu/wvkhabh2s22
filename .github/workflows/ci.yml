@@ -25,7 +25,7 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7 — SHA-pinned (round 57)
         with:
           # Exact stable CPython pin; update deliberately after CI validates it.
-          python-version: '3.14.7'
+          python-version: '3.14.8'
           cache: 'pip'
 
       - name: Install dependencies (a broken requirements.txt fails HERE, not in production)

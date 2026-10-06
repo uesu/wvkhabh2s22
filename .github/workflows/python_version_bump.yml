@@ -110,7 +110,7 @@ jobs:
           FORCE_VERSION: ${{ inputs.force_version }}
           IGNORE_SOAK: ${{ inputs.ignore_soak }}
           SOAK_DAYS: ${{ vars.PYTHON_BUMP_SOAK_DAYS }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.BUMP_PAT }}
         run: |
           set -euo pipefail
 
@@ -284,8 +284,15 @@ jobs:
           # python.org release links look like .../release/python-3147/
           OLD_SLUG="python-$(echo "$CURRENT" | tr -d '.')"
           NEW_SLUG="python-$(echo "$LATEST"  | tr -d '.')"
-          grep -rl --fixed-strings "$OLD_SLUG" --include='*.md' . \
-            | xargs -r sed -i "s/${OLD_SLUG}/${NEW_SLUG}/g"
+          # A production checkout may contain no Markdown files. Keep the
+          # no-match case successful under pipefail and invoke sed only when
+          # there are files to rewrite.
+          mapfile -t SLUG_FILES < <(
+            grep -rl --fixed-strings "$OLD_SLUG" --include='*.md' . || true
+          )
+          if [ "${#SLUG_FILES[@]}" -gt 0 ]; then
+            sed -i "s/${OLD_SLUG}/${NEW_SLUG}/g" "${SLUG_FILES[@]}"
+          fi
 
           # Prose that names the OLD SERIES ("the 3.14 line", "CPython 3.14")
           # is deliberately NOT rewritten: a blind series-wide sed would also
@@ -424,6 +431,7 @@ jobs:
           (vars.AUTO_MERGE_PYTHON_BUMP == 'all' ||
            (vars.AUTO_MERGE_PYTHON_BUMP == 'yes' && steps.resolve.outputs.kind != 'minor'))
         env:
+          GH_TOKEN: ${{ secrets.BUMP_PAT }}
           CURRENT: ${{ steps.resolve.outputs.current }}
           LATEST: ${{ steps.resolve.outputs.latest }}
         run: |
