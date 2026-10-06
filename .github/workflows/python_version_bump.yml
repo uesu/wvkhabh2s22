@@ -50,13 +50,9 @@
 #    Settings -> Actions -> General -> Workflow permissions ->
 #    "Allow GitHub Actions to create and approve pull requests"
 #  to be ticked. It is OFF by default on GitHub. If it is off, this workflow
-#  does NOT fail and does NOT silently do nothing: it falls back to pushing
-#  the verified branch and, when AUTO_MERGE_PYTHON_BUMP allows this kind of
-#  bump, fast-forwards main to it directly (contents: write needs no extra
-#  setting). The bump was already proven green twice before that point, so
-#  the PR is a review surface, not a safety mechanism.
-#  Using a fine-grained PAT in secrets.BUMP_PAT also sidesteps the setting
-#  entirely, because the PR is then opened by you, not by Actions.
+#  pushes the verified branch and reports that the PR is waiting; it never
+#  writes directly to main. A fine-grained PAT in secrets.BUMP_PAT allows the
+#  workflow to open the PR without changing that repository setting.
 #
 #  NOTE ON PR CHECKS
 #  A PR opened with the built-in GITHUB_TOKEN does NOT trigger other
@@ -110,7 +106,7 @@ jobs:
           FORCE_VERSION: ${{ inputs.force_version }}
           IGNORE_SOAK: ${{ inputs.ignore_soak }}
           SOAK_DAYS: ${{ vars.PYTHON_BUMP_SOAK_DAYS }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.BUMP_PAT }}
         run: |
           set -euo pipefail
 
@@ -254,7 +250,7 @@ jobs:
           python tests/test_smoke.py
           python tests/test_reddit_signals.py
 
-      - name: Rewrite the pin everywhere it appears
+      - name: Rewrite the active production workflow pins
         if: steps.resolve.outputs.bump == 'yes' && steps.wheels.outputs.ok == 'yes'
         id: rewrite
         env:
@@ -262,42 +258,27 @@ jobs:
           LATEST: ${{ steps.resolve.outputs.latest }}
         run: |
           set -euo pipefail
-          # Every tracked text file that mentions the old version, excluding
-          # this workflow's own documentation of the mechanism.
-          # *.py is included on purpose: tests/test_smoke.py (round 39)
-          # asserts the exact pinned version, so a bump that skipped it would
-          # merge a red CI. Verified afterwards by re-running the suites.
-          mapfile -t FILES < <(grep -rl --fixed-strings "$CURRENT" \
-            --include='*.yml' --include='*.yaml' --include='*.md' \
-            --include='*.txt' --include='*.cfg' --include='*.toml' \
-            --include='*.py' . \
-            | grep -v '^./.github/workflows/python_version_bump.yml$' || true)
+          # Deliberately allowlist only the active production workflows. Do
+          # not scan or rewrite Markdown, tests, source files, audit records,
+          # or unrelated configuration files.
+          FILES=(
+            .github/workflows/ci.yml
+            .github/workflows/reddit_monitor.yml
+            .github/workflows/twitter_monitor.yml
+          )
 
-          if [ ${#FILES[@]} -eq 0 ]; then
-            echo "::error::The pin $CURRENT was not found in any file — aborting."
-            exit 1
-          fi
+          for file in "${FILES[@]}"; do
+            if ! grep -qF "$CURRENT" "$file"; then
+              echo "::error::$file does not contain the current pin $CURRENT"
+              exit 1
+            fi
+            printf 'Updating: %s\n' "$file"
+            sed -i "s/${CURRENT}/${LATEST}/g" "$file"
+          done
 
-          printf 'Updating: %s\n' "${FILES[@]}"
-          sed -i "s/${CURRENT}/${LATEST}/g" "${FILES[@]}"
-
-          # python.org release links look like .../release/python-3147/
-          OLD_SLUG="python-$(echo "$CURRENT" | tr -d '.')"
-          NEW_SLUG="python-$(echo "$LATEST"  | tr -d '.')"
-          grep -rl --fixed-strings "$OLD_SLUG" --include='*.md' . \
-            | xargs -r sed -i "s/${OLD_SLUG}/${NEW_SLUG}/g"
-
-          # Prose that names the OLD SERIES ("the 3.14 line", "CPython 3.14")
-          # is deliberately NOT rewritten: a blind series-wide sed would also
-          # hit unrelated numbers such as `aiohttp>=3.14.3`. Instead the
-          # leftovers are listed in the PR so a human can edit them.
-          OLD_SERIES="${CURRENT%.*}"
-          NEW_SERIES="${LATEST%.*}"
+          # No documentation or historical leftovers are searched: this
+          # production repository's automated rewrite scope is workflows only.
           LEFTOVERS=""
-          if [ "$OLD_SERIES" != "$NEW_SERIES" ]; then
-            LEFTOVERS="$(grep -rn --include='*.md' -E "(CPython|Python) ${OLD_SERIES}([^.0-9]|$)" . \
-                         | grep -v '^./docs/history/' | head -20 || true)"
-          fi
           {
             echo 'leftovers<<EOF'
             echo "${LEFTOVERS:-}"
@@ -307,10 +288,10 @@ jobs:
           echo "---- diff ----"
           git --no-pager diff --stat
 
-      # The rewrite touches the test suite itself (the round-39 pin guard),
-      # so the tree is verified AGAIN afterwards. This is the gate that
-      # decides whether a PR is opened at all: if the bumped tree is not
-      # green, the job fails here and nothing is proposed.
+      # The allowlisted rewrite changes only active production workflows, but
+      # the tree is verified AGAIN afterwards. This is the gate that decides
+      # whether a PR is opened at all: if the bumped tree is not green, the
+      # job fails here and nothing is proposed.
       - name: Re-verify the REWRITTEN tree
         if: steps.resolve.outputs.bump == 'yes' && steps.wheels.outputs.ok == 'yes'
         run: |
@@ -413,24 +394,6 @@ jobs:
           set -euo pipefail
           gh pr merge "$URL" --squash --delete-branch
           echo "Merged $URL"
-
-      # Fallback when the repository forbids Actions from opening PRs. The
-      # tree being pushed is the one that just passed compileall + both test
-      # suites TWICE under the new interpreter, so this is the same content
-      # the PR would have carried — only the review surface is missing.
-      - name: Update main directly (only when a PR was blocked by settings)
-        if: >-
-          steps.pr.outputs.blocked == 'settings' &&
-          (vars.AUTO_MERGE_PYTHON_BUMP == 'all' ||
-           (vars.AUTO_MERGE_PYTHON_BUMP == 'yes' && steps.resolve.outputs.kind != 'minor'))
-        env:
-          CURRENT: ${{ steps.resolve.outputs.current }}
-          LATEST: ${{ steps.resolve.outputs.latest }}
-        run: |
-          set -euo pipefail
-          git push origin "HEAD:main"
-          git push origin --delete "${{ steps.pr.outputs.branch }}" || true
-          echo "Pushed the verified bump ${CURRENT} -> ${LATEST} straight to main."
 
       - name: Tell me a branch is waiting (PR blocked, auto-merge off)
         if: >-
