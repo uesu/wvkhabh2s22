@@ -50,13 +50,9 @@
 #    Settings -> Actions -> General -> Workflow permissions ->
 #    "Allow GitHub Actions to create and approve pull requests"
 #  to be ticked. It is OFF by default on GitHub. If it is off, this workflow
-#  does NOT fail and does NOT silently do nothing: it falls back to pushing
-#  the verified branch and, when AUTO_MERGE_PYTHON_BUMP allows this kind of
-#  bump, fast-forwards main to it directly (contents: write needs no extra
-#  setting). The bump was already proven green twice before that point, so
-#  the PR is a review surface, not a safety mechanism.
-#  Using a fine-grained PAT in secrets.BUMP_PAT also sidesteps the setting
-#  entirely, because the PR is then opened by you, not by Actions.
+#  pushes the verified branch and reports that the PR is waiting; it never
+#  writes directly to main. A fine-grained PAT in secrets.BUMP_PAT allows the
+#  workflow to open the PR without changing that repository setting.
 #
 #  NOTE ON PR CHECKS
 #  A PR opened with the built-in GITHUB_TOKEN does NOT trigger other
@@ -398,25 +394,6 @@ jobs:
           set -euo pipefail
           gh pr merge "$URL" --squash --delete-branch
           echo "Merged $URL"
-
-      # Fallback when the repository forbids Actions from opening PRs. The
-      # tree being pushed is the one that just passed compileall + both test
-      # suites TWICE under the new interpreter, so this is the same content
-      # the PR would have carried — only the review surface is missing.
-      - name: Update main directly (only when a PR was blocked by settings)
-        if: >-
-          steps.pr.outputs.blocked == 'settings' &&
-          (vars.AUTO_MERGE_PYTHON_BUMP == 'all' ||
-           (vars.AUTO_MERGE_PYTHON_BUMP == 'yes' && steps.resolve.outputs.kind != 'minor'))
-        env:
-          GH_TOKEN: ${{ secrets.BUMP_PAT }}
-          CURRENT: ${{ steps.resolve.outputs.current }}
-          LATEST: ${{ steps.resolve.outputs.latest }}
-        run: |
-          set -euo pipefail
-          git push origin "HEAD:main"
-          git push origin --delete "${{ steps.pr.outputs.branch }}" || true
-          echo "Pushed the verified bump ${CURRENT} -> ${LATEST} straight to main."
 
       - name: Tell me a branch is waiting (PR blocked, auto-merge off)
         if: >-
