@@ -254,7 +254,7 @@ jobs:
           python tests/test_smoke.py
           python tests/test_reddit_signals.py
 
-      - name: Rewrite the pin everywhere it appears
+      - name: Rewrite the active production workflow pins
         if: steps.resolve.outputs.bump == 'yes' && steps.wheels.outputs.ok == 'yes'
         id: rewrite
         env:
@@ -262,49 +262,27 @@ jobs:
           LATEST: ${{ steps.resolve.outputs.latest }}
         run: |
           set -euo pipefail
-          # Every tracked text file that mentions the old version, excluding
-          # this workflow's own documentation of the mechanism.
-          # *.py is included on purpose: tests/test_smoke.py (round 39)
-          # asserts the exact pinned version, so a bump that skipped it would
-          # merge a red CI. Verified afterwards by re-running the suites.
-          mapfile -t FILES < <(grep -rl --fixed-strings "$CURRENT" \
-            --include='*.yml' --include='*.yaml' --include='*.md' \
-            --include='*.txt' --include='*.cfg' --include='*.toml' \
-            --include='*.py' . \
-            | grep -v '^./.github/workflows/python_version_bump.yml$' || true)
-
-          if [ ${#FILES[@]} -eq 0 ]; then
-            echo "::error::The pin $CURRENT was not found in any file — aborting."
-            exit 1
-          fi
-
-          printf 'Updating: %s\n' "${FILES[@]}"
-          sed -i "s/${CURRENT}/${LATEST}/g" "${FILES[@]}"
-
-          # python.org release links look like .../release/python-3147/
-          OLD_SLUG="python-$(echo "$CURRENT" | tr -d '.')"
-          NEW_SLUG="python-$(echo "$LATEST"  | tr -d '.')"
-          # A production checkout may contain no Markdown files. Keep the
-          # no-match case successful under pipefail and invoke sed only when
-          # there are files to rewrite.
-          mapfile -t SLUG_FILES < <(
-            grep -rl --fixed-strings "$OLD_SLUG" --include='*.md' . || true
+          # Deliberately allowlist only the active production workflows. Do
+          # not scan or rewrite Markdown, tests, source files, audit records,
+          # or unrelated configuration files.
+          FILES=(
+            .github/workflows/ci.yml
+            .github/workflows/reddit_monitor.yml
+            .github/workflows/twitter_monitor.yml
           )
-          if [ "${#SLUG_FILES[@]}" -gt 0 ]; then
-            sed -i "s/${OLD_SLUG}/${NEW_SLUG}/g" "${SLUG_FILES[@]}"
-          fi
 
-          # Prose that names the OLD SERIES ("the 3.14 line", "CPython 3.14")
-          # is deliberately NOT rewritten: a blind series-wide sed would also
-          # hit unrelated numbers such as `aiohttp>=3.14.3`. Instead the
-          # leftovers are listed in the PR so a human can edit them.
-          OLD_SERIES="${CURRENT%.*}"
-          NEW_SERIES="${LATEST%.*}"
+          for file in "${FILES[@]}"; do
+            if ! grep -qF "$CURRENT" "$file"; then
+              echo "::error::$file does not contain the current pin $CURRENT"
+              exit 1
+            fi
+            printf 'Updating: %s\n' "$file"
+            sed -i "s/${CURRENT}/${LATEST}/g" "$file"
+          done
+
+          # No documentation or historical leftovers are searched: this
+          # production repository's automated rewrite scope is workflows only.
           LEFTOVERS=""
-          if [ "$OLD_SERIES" != "$NEW_SERIES" ]; then
-            LEFTOVERS="$(grep -rn --include='*.md' -E "(CPython|Python) ${OLD_SERIES}([^.0-9]|$)" . \
-                         | grep -v '^./docs/history/' | head -20 || true)"
-          fi
           {
             echo 'leftovers<<EOF'
             echo "${LEFTOVERS:-}"
@@ -314,10 +292,10 @@ jobs:
           echo "---- diff ----"
           git --no-pager diff --stat
 
-      # The rewrite touches the test suite itself (the round-39 pin guard),
-      # so the tree is verified AGAIN afterwards. This is the gate that
-      # decides whether a PR is opened at all: if the bumped tree is not
-      # green, the job fails here and nothing is proposed.
+      # The allowlisted rewrite changes only active production workflows, but
+      # the tree is verified AGAIN afterwards. This is the gate that decides
+      # whether a PR is opened at all: if the bumped tree is not green, the
+      # job fails here and nothing is proposed.
       - name: Re-verify the REWRITTEN tree
         if: steps.resolve.outputs.bump == 'yes' && steps.wheels.outputs.ok == 'yes'
         run: |

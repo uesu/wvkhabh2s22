@@ -2347,8 +2347,8 @@ for _r39_wf in (".github/workflows/ci.yml", ".github/workflows/reddit_monitor.ym
                 ".github/workflows/twitter_monitor.yml"):
     with open(os.path.join(ROOT, _r39_wf), encoding="utf-8") as _fh:
         _r39_source = _fh.read()
-    check(f"r39 runtime: {_r39_wf} pins CPython 3.14.8 exactly once",
-          _r39_source.count("python-version: '3.14.8'") == 1
+    check(f"r39 runtime: {_r39_wf} pins CPython 3.14.7 exactly once",
+          _r39_source.count("python-version: '3.14.7'") == 1
           and "python-version: '3.11'" not in _r39_source)
 
 for _r39_wf in (".github/workflows/reddit_monitor.yml", ".github/workflows/twitter_monitor.yml"):
