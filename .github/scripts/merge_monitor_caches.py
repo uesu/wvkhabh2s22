@@ -16,8 +16,9 @@ commit 2de1491). Two facts collided:
     whole run exited 1 with the dedup cache unpersisted ("the next run may
     re-post" — and it did).
 
-Git merges lines; these files carry MEANING. This script merges them
-semantically, so a cache-push conflict is structurally impossible:
+Git merges lines; these files carry MEANING. This script merges the supported
+JSON cache shapes semantically so workflow recovery does not depend on a line
+merge of deduplication state:
 
 *   JSON **list** files (e.g. posted_reddit.json, posted_tweets.json):
     the union, keeping the live tip's order first and appending our new
