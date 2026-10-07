@@ -107,6 +107,11 @@ jobs:
           PROXY_MEDIA: ${{ vars.PROXY_MEDIA }}
           PROXY_WARMUP_POST: ${{ vars.PROXY_WARMUP_POST }}
           EMBEDDIT_INSTANCE: ${{ vars.EMBEDDIT_INSTANCE }}
+          # Round 67: video-quality selection mode for the Reddit video
+          # resolver — balanced (default) | compatibility | highest.
+          # Empty = balanced; 'compatibility' restores the pre-round-67
+          # ladder exactly (instant rollback, no code change).
+          REDDIT_VIDEO_QUALITY: ${{ vars.REDDIT_VIDEO_QUALITY }}
           # YOUTUBE_LINK_MESSAGE='0' disables the second bare YouTube message.
           YOUTUBE_LINK_MESSAGE: ${{ vars.YOUTUBE_LINK_MESSAGE }}
           DISCOHOOK_PREVIEW: ${{ vars.DISCOHOOK_PREVIEW }}
@@ -128,17 +133,12 @@ jobs:
           MAX_POSTS_PER_RUN: ${{ vars.MAX_POSTS_PER_RUN }}
           # REDDIT_JSON_PROBE: auto (default), force, or off.
           REDDIT_JSON_PROBE: ${{ vars.REDDIT_JSON_PROBE }}
-          # Round 35: optional comma-separated author names / post IDs that
-          # bypass the NSFW content gate. Empty means no exceptions.
-          NSFW_ALLOWLIST: ${{ vars.NSFW_ALLOWLIST }}
-          # Round 42-45 (env list cleaned up in round 66): fail-closed NSFW
-          # and the optional retraction seatbelt remain; the settle window,
-          # duplicate-media gate, repost gate, mod-queue gate and listing
-          # outage racing were removed by round 63 ("The Great
-          # Simplification") — their Variables no longer map to anything.
-          NSFW_FAIL_OPEN: ${{ vars.NSFW_FAIL_OPEN }}
-          NSFW_REQUIRE_SUBREDDIT: ${{ vars.NSFW_REQUIRE_SUBREDDIT }}
-          NSFW_PAGE_FALLBACK: ${{ vars.NSFW_PAGE_FALLBACK }}
+          # Round 67 (2026-10-07): the content-advisory gate and its four
+          # Variables were REMOVED from the engine, so they no longer map
+          # here (the engine makes no content-based posting decision on any
+          # path). The optional retraction seatbelt (round 44) remains.
+          # Any Variable whose round-63-removed gate no longer exists is
+          # likewise unmapped — see the round-63 note in .env.example.
           RETRACT_DEAD_POSTS: ${{ vars.RETRACT_DEAD_POSTS }}
           RETRACT_MODE: ${{ vars.RETRACT_MODE }}
           RETRACT_WINDOW_SECONDS: ${{ vars.RETRACT_WINDOW_SECONDS }}
