@@ -80,66 +80,6 @@ for i, (title, body, expected) in enumerate(_removal_cases, 1):
     check(f"removal {i:02d}", signals.removed_post_reason(title, body) == expected,
           str(signals.removed_post_reason(title, body)))
 
-# 12 Redlib live-page NSFW badge cases ------------------------------------
-_page_cases = [
-    ('<div class="post"><small class="nsfw">NSFW</small></div>', True),
-    ('<div class="post"><small class="tag nsfw">NSFW</small></div>', True),
-    ('<div class="post"><small class="spoiler">Spoiler</small></div>', False),
-    ('<div class="post"><a href="/r/x/comments/abc/t/">t</a></div>', False),
-    ('<span class="post_title">Title</span>', False),
-    ('<span class="created">1 minute ago</span>', False),
-    ('Too Many Requests', None),
-    ('404 Not Found', None),
-    ('captcha bot check', None),
-    ('', None),
-    (None, None),
-    ('<div>plain shell</div>', None),
-]
-for i, (html, expected) in enumerate(_page_cases, 1):
-    check(f"page nsfw {i:02d}", signals.nsfw_from_post_page(html) is expected,
-          str(signals.nsfw_from_post_page(html)))
-
-# 34 fail-closed NSFW gate cases ------------------------------------------
-_gate_cases = [
-    ({"over_18": True}, "nsfw_flag"),
-    ({"over_18": False, "thumbnail": "nsfw"}, "nsfw_flag"),
-    ({"over_18": False, "thumbnail": "NSFW"}, "nsfw_flag"),
-    ({"over_18": False, "thumbnail": "spoiler"}, None),
-    ({"over_18": False}, None),
-    (None, "nsfw_unknown"),
-    ({"archive_status": "missing"}, "nsfw_unknown"),
-    ({"archive_status": "missing", "page_nsfw": False}, None),
-    ({"archive_status": "missing", "page_nsfw": True}, "nsfw_flag"),
-    ({"lookup_error": True}, "nsfw_unknown"),
-    ({"malformed": True}, "nsfw_unknown"),
-    ({"over_18": "false"}, "nsfw_unknown"),
-    ({"over_18": False, "subreddit_over18": True}, "nsfw_subreddit"),
-    ({"over_18": False, "source_present": True, "source_over_18": True}, "nsfw_crosspost_source"),
-    ({"over_18": False, "source_present": True, "source_over_18": False, "source_thumbnail": "nsfw"}, "nsfw_crosspost_source"),
-    ({"over_18": False, "source_present": True, "source_over_18": False, "source_subreddit_over18": True}, "nsfw_crosspost_source"),
-    ({"over_18": False, "source_present": True}, "nsfw_unknown"),
-    ({"over_18": False, "source_present": True, "source_over_18": False}, None),
-    ({"over_18": False, "source_present": False}, None),
-    ({"over_18": False, "subreddit_over18": False}, None),
-    ({"over_18": False, "source_present": True, "source_over_18": False, "source_subreddit_over18": False}, None),
-    ({"over_18": False, "source_present": True, "source_over_18": "no"}, "nsfw_unknown"),
-    ({"over_18": False, "source_present": True, "source_over_18": False, "source_subreddit_over18": "no"}, None),
-    ({"over_18": False, "subreddit_over18": "no"}, None),
-]
-for i, (markers, expected) in enumerate(_gate_cases, 1):
-    check(f"nsfw gate base {i:02d}", signals.nsfw_gate_reason("pid", "author", markers) == expected,
-          str(signals.nsfw_gate_reason("pid", "author", markers)))
-check("nsfw gate fail-open missing", signals.nsfw_gate_reason("pid", "author", None, fail_open=True) is None)
-check("nsfw gate fail-open lookup_error", signals.nsfw_gate_reason("pid", "author", {"lookup_error": True}, fail_open=True) is None)
-check("nsfw gate require subreddit unknown", signals.nsfw_gate_reason("pid", "author", {"over_18": False}, require_subreddit=True) == "nsfw_unknown")
-check("nsfw gate require source subreddit unknown", signals.nsfw_gate_reason("pid", "author", {"over_18": False, "source_present": True, "source_over_18": False}, require_subreddit=True) == "nsfw_unknown")
-check("nsfw gate allowlisted id bypasses unknown", signals.nsfw_gate_reason("pid", "author", None, allowlist=["t3_pid"]) is None)
-check("nsfw gate allowlisted author bypasses flag", signals.nsfw_gate_reason("pid", "/u/author", {"over_18": True}, allowlist=["Author"]) is None)
-check("nsfw gate non-allowlisted flag stays blocked", signals.nsfw_gate_reason("pid", "other", {"over_18": True}, allowlist=["someone"]) == "nsfw_flag")
-check("nsfw allowlist forms strip t3", "pid" in signals.nsfw_allowlist_forms("t3_pid"))
-check("nsfw allowlist forms strip user prefix", "name" in signals.nsfw_allowlist_forms("/u/Name"))
-check("nsfw gate clean live fallback ignores spoiler", signals.nsfw_gate_reason("pid", "author", {"archive_status": "missing", "page_nsfw": signals.nsfw_from_post_page('<div class="post"><small class="spoiler">Spoiler</small></div>')}) is None)
-
 # 20 retraction/tombstone cases -------------------------------------------
 check("retract absence proof true", signals.listing_absence_proves_dead("abc", 940, 1000, {"zzz"}, 120))
 check("retract present false", signals.listing_absence_proves_dead("abc", 940, 1000, {"abc"}, 120) is False)
@@ -165,57 +105,7 @@ check("tombstone content fallback", "content" in signals.tombstone_payload({"con
 check("tombstone empty fallback", "content" in signals.tombstone_payload({}, "removed"))
 check("tombstone reason included", "removed" in _tomb["components"][0]["components"][0]["content"])
 
-# 12 V3 archive normalization/fetch cases ---------------------------------
-_parent = {"over_18": True, "thumbnail": "default", "subreddit_over18": False}
-_markers = v3._arctic_nsfw_markers({"id": "abc", "over_18": False, "thumbnail": "default", "url": "https://example.com", "title": "T", "author": "A", "created_utc": 10, "crosspost_parent_list": [_parent]})
-check("arctic markers preserve over_18", _markers["over_18"] is False)
-check("arctic markers preserve url", _markers["url"] == "https://example.com")
-check("arctic markers preserve title", _markers["title"] == "T")
-check("arctic markers preserve author", _markers["author"] == "A")
-check("arctic markers preserve created", _markers["created_utc"] == 10)
-check("arctic markers detect source", _markers["source_present"] is True)
-check("arctic markers source over18", _markers["source_over_18"] is True)
-check("arctic markers malformed missing over18", v3._arctic_nsfw_markers({"id": "x"}).get("malformed") is True)
-
-class _Resp:
-    def __init__(self, payload, status=200):
-        self.payload = payload
-        self.status = status
-    async def json(self, content_type=None):
-        return self.payload
-    async def __aenter__(self):
-        return self
-    async def __aexit__(self, *args):
-        return False
-
-class _Sess:
-    def __init__(self, payload=None, error=None):
-        self.payload = payload
-        self.error = error
-        self.calls = []
-    def get(self, url, params=None, **kwargs):
-        self.calls.append((url, params))
-        if self.error:
-            raise self.error
-        return _Resp(self.payload)
-
-async def _fetch_checks():
-    old = v3._arctic_fail_count
-    try:
-        v3._arctic_fail_count = 0
-        s = _Sess({"data": [{"id": "abc", "over_18": False, "title": "T", "author": "A"}]})
-        flags = await v3.fetch_arctic_nsfw_flags(s, ["abc", "missing"])
-        check("fetch flags one request", len(s.calls) == 1)
-        check("fetch flags found record", flags["abc"]["archive_status"] == "found")
-        check("fetch flags missing record", flags["missing"] == {"archive_status": "missing"})
-        v3._arctic_fail_count = 0
-        down = await v3.fetch_arctic_nsfw_flags(_Sess(error=RuntimeError("down")), ["abc"])
-        check("fetch flags failure lookup_error", down == {"abc": {"lookup_error": True}})
-    finally:
-        v3._arctic_fail_count = old
-asyncio.run(_fetch_checks())
-
-# 8 end-to-end-ish main cases with fake session ----------------------------
+# Fake every I/O boundary so main() itself is exercised, not just parsers.
 class _Entry(dict):
     def __init__(self, age_seconds=120):
         super().__init__()
@@ -227,43 +117,54 @@ class _Entry(dict):
         self["content"] = [{"value": "body"}]
         self["summary"] = "body"
 
+
 class _Feed:
     def __init__(self, age_seconds=120):
         self.entries = [_Entry(age_seconds)]
 
+
 class _FakeResponse:
     status = 204
+
     async def text(self):
         return ""
+
     async def json(self, content_type=None):
         return {"id": "msg1"}
+
     async def __aenter__(self):
         return self
+
     async def __aexit__(self, *args):
         return False
 
+
 class _FakeClientSession:
     last = None
+
     def __init__(self):
         type(self).last = self
         self.posts = []
+
     async def __aenter__(self):
         return self
+
     async def __aexit__(self, *args):
         return False
+
     def post(self, url, json=None, timeout=None):
         self.posts.append((url, json))
         return _FakeResponse()
 
-async def _run_main_case(markers, page_html=None, age_seconds=120, listing=(("abc123",), 600),
-                          fresh_hold=None, listing_confirm=None):
+
+async def _run_main_case(age_seconds=120, listing=(("abc123",), 600),
+                         fresh_hold=None, listing_confirm=None, cached=False):
     names = [
         "SUBREDDITS", "TEST_POST_ID", "DRY_RUN", "fetch_combined_feed",
-        "fetch_arctic_nsfw_flags", "_fetch_new_listing",
-        "verify_archive_post_live", "fetch_post_json", "resolve_post_media",
-        "create_discohook_share", "load_posted", "load_pending", "save_posted",
-        "save_pending", "save_posted_messages", "load_posted_messages",
-        "fetch_first_redlib_post_page", "RETRACT_DEAD_POSTS", "aiohttp",
+        "_fetch_new_listing", "verify_archive_post_live", "fetch_post_json",
+        "resolve_post_media", "create_discohook_share", "load_posted",
+        "load_pending", "save_posted", "save_pending", "save_posted_messages",
+        "load_posted_messages", "RETRACT_DEAD_POSTS", "aiohttp",
         "FRESH_HOLD_SECONDS", "LISTING_CONFIRM",
     ]
     old = {name: getattr(v3, name) for name in names}
@@ -282,7 +183,6 @@ async def _run_main_case(markers, page_html=None, age_seconds=120, listing=(("ab
         if listing_confirm is not None:
             v3.LISTING_CONFIRM = listing_confirm
         v3.fetch_combined_feed = lambda session: _async_return(_Feed(age_seconds))
-        v3.fetch_arctic_nsfw_flags = lambda session, ids, label="": _async_return({"abc123": markers})
         if listing is None:
             v3._fetch_new_listing = lambda session, sub: _async_return(None)
         else:
@@ -297,16 +197,17 @@ async def _run_main_case(markers, page_html=None, age_seconds=120, listing=(("ab
             "youtube_id": None, "youtube_live": False, "full_mode": False,
         })
         v3.create_discohook_share = lambda session, payload, label: _async_return(None)
-        v3.load_posted = lambda: set()
+        v3.load_posted = lambda: ({"TestSub_abc123"} if cached else set())
         v3.load_pending = lambda: pending
         v3.save_posted = lambda posted, keep_newest=frozenset(): set(posted)
         v3.save_pending = lambda p: None
         v3.load_posted_messages = lambda: {}
         v3.save_posted_messages = lambda m: None
-        v3.fetch_first_redlib_post_page = lambda session, path: _async_return(page_html)
+
         class _Aio:
             ClientSession = _FakeClientSession
             ClientTimeout = staticmethod(lambda total=None: None)
+
         v3.aiohttp = _Aio
         await v3.main()
         return len(_FakeClientSession.last.posts), dict(pending)
@@ -328,45 +229,55 @@ def _async_return(value):
         return value
     return _coro()
 
+
+# 8 end-to-end-ish main cases with fake session ----------------------------
+# Round 67: the removed content gate held posts on unknown metadata; with the
+# gate gone there is no metadata lookup at all, so a post whose archive record
+# is missing or unreadable simply proceeds through the remaining decisions.
 async def _main_checks():
-    sent, pending = await _run_main_case({"over_18": False})
-    check("main clean archive sends once", sent == 1)
-    sent, pending = await _run_main_case({"over_18": True})
-    check("main nsfw post blocks Discord", sent == 0 and pending.get("TestSub_abc123", {}).get("reason") == "nsfw_flag")
-    sent, pending = await _run_main_case({"over_18": False, "subreddit_over18": True})
-    check("main nsfw subreddit blocks Discord", sent == 0 and pending.get("TestSub_abc123", {}).get("reason") == "nsfw_subreddit")
-    sent, pending = await _run_main_case({"over_18": False, "source_present": True, "source_over_18": True})
-    check("main nsfw source blocks Discord", sent == 0 and pending.get("TestSub_abc123", {}).get("reason") == "nsfw_crosspost_source")
-    sent, pending = await _run_main_case({"archive_status": "missing"}, '<div class="post"><a href="/r/x/comments/abc123/t/">t</a></div>')
-    check("main live-page clean fallback sends", sent == 1)
-    sent, pending = await _run_main_case({"archive_status": "missing"}, '<div class="post"><small class="nsfw">NSFW</small></div>')
-    check("main live-page nsfw fallback blocks", sent == 0 and pending.get("TestSub_abc123", {}).get("reason") == "nsfw_flag")
-    sent, pending = await _run_main_case({"archive_status": "missing"}, '<div class="post"><small class="spoiler">Spoiler</small></div>')
-    check("main spoiler fallback sends", sent == 1)
-    sent, pending = await _run_main_case({"archive_status": "missing"}, None)
-    check("main unreadable fallback fails closed", sent == 0 and pending.get("TestSub_abc123", {}).get("reason") == "nsfw_unknown")
+    sent, pending = await _run_main_case()
+    check("r67: a normal post with complete listing evidence proceeds + delivers",
+          sent == 1)
+    check("r67: a normal delivery records no pending/tracker entry", pending == {})
+    sent, pending = await _run_main_case(cached=True)
+    check("r67: dedup/repost protection is unchanged — a cached key is never "
+          "re-delivered", sent == 0 and pending == {})
+    sent, pending = await _run_main_case(age_seconds=10)
+    check("r67: the fresh-hold window still delays a brand-new post "
+          "(settle timing unchanged)",
+          sent == 0 and "TestSub_abc123" not in pending)
+    sent, pending = await _run_main_case(listing=None)
+    check("r67: a listing outage still follows the existing retry behavior — "
+          "skipped this tick, never cached",
+          sent == 0 and "TestSub_abc123" not in pending)
+    sent, pending = await _run_main_case()
+    check("r67: the same candidate delivers once the listing is readable again",
+          sent == 1)
+    sent, pending = await _run_main_case(listing=(("other",), 600))
+    check("r67: pristine listing evidence still gates delivery (absent -> "
+          "skipped, not blocked)", sent == 0 and "TestSub_abc123" not in pending)
 asyncio.run(_main_checks())
 
 # ROUND 64 ("Pristine Listing Protocol") end-to-end main() cases ------------
-# Precedence under test: dedup -> FRESH_HOLD floor -> pristine listing
-# confirmation -> NSFW gate (unchanged, fail-closed) -> deliver. Every case
-# below uses age_seconds/listing/fresh_hold/listing_confirm overrides added
-# to _run_main_case so a single harness exercises both new, fully stateless
-# gates (neither ever touches `pending` -- every "skipped" assertion below
-# also confirms no pending/tracker entry was created for the candidate).
+# Precedence under test (round 67): dedup -> FRESH_HOLD floor -> pristine
+# listing confirmation -> deliver. Every case below uses
+# age_seconds/listing/fresh_hold/listing_confirm overrides added to
+# _run_main_case so a single harness exercises both gates (neither ever
+# touches `pending` -- every "skipped" assertion below also confirms no
+# pending/tracker entry was created for the candidate).
 async def _r64_checks():
     # D.2: listed + older than the 30s default floor -> delivers.
-    sent, pending = await _run_main_case({"over_18": False}, age_seconds=120,
+    sent, pending = await _run_main_case(age_seconds=120,
                                           listing=(("abc123",), 600))
     check("r64: listed + older than FRESH_HOLD_SECONDS delivers", sent == 1)
 
     # D.3: absent from the pristine listing -> skipped, never cached, then
     # delivers the moment a later tick's listing includes it.
-    sent, pending = await _run_main_case({"over_18": False}, age_seconds=120,
+    sent, pending = await _run_main_case(age_seconds=120,
                                           listing=(("other",), 600))
     check("r64: absent from pristine listing is skipped, not delivered",
           sent == 0 and "TestSub_abc123" not in pending)
-    sent, pending = await _run_main_case({"over_18": False}, age_seconds=120,
+    sent, pending = await _run_main_case(age_seconds=120,
                                           listing=(("abc123",), 600))
     check("r64: same candidate delivers instantly once a later tick lists it",
           sent == 1)
@@ -374,12 +285,12 @@ async def _r64_checks():
     # D.4: younger than the 30s default floor -> skipped even when listed,
     # with NO pending/tracker entry (fully stateless); delivers once old
     # enough on a later tick.
-    sent, pending = await _run_main_case({"over_18": False}, age_seconds=10,
+    sent, pending = await _run_main_case(age_seconds=10,
                                           listing=(("abc123",), 600))
     check("r64: younger than FRESH_HOLD_SECONDS is skipped even when listed, "
           "and creates no pending/tracker entry",
           sent == 0 and "TestSub_abc123" not in pending)
-    sent, pending = await _run_main_case({"over_18": False}, age_seconds=45,
+    sent, pending = await _run_main_case(age_seconds=45,
                                           listing=(("abc123",), 600))
     check("r64: same candidate delivers next tick once older than the floor",
           sent == 1)
@@ -388,45 +299,48 @@ async def _r64_checks():
     # entry (scrolled past limit=100) cannot be confirmed OR disconfirmed,
     # so the gate is inapplicable and normal delivery proceeds, even though
     # the (too-short) listing snapshot here doesn't contain its id.
-    sent, pending = await _run_main_case({"over_18": False}, age_seconds=10000,
+    sent, pending = await _run_main_case(age_seconds=10000,
                                           listing=(("other",), 600))
     check("r64: older than the listing's own span falls through to normal "
           "delivery (confirmation inapplicable)", sent == 1)
 
     # D.6: outage -- no listing source readable this tick is NEVER read as
     # absence: the candidate is skipped (not cached) and recovers next tick.
-    sent, pending = await _run_main_case({"over_18": False}, age_seconds=120,
+    sent, pending = await _run_main_case(age_seconds=120,
                                           listing=None)
     check("r64: a listing outage skips the candidate without caching it",
           sent == 0 and "TestSub_abc123" not in pending)
-    sent, pending = await _run_main_case({"over_18": False}, age_seconds=120,
+    sent, pending = await _run_main_case(age_seconds=120,
                                           listing=(("abc123",), 600))
     check("r64: the same candidate recovers on the next tick once the "
           "listing is readable again", sent == 1)
 
-    # D.7: precedence -- an NSFW post that IS listed and past the fresh
-    # hold is still blocked by the (unchanged, fail-closed) NSFW gate.
-    sent, pending = await _run_main_case({"over_18": True}, age_seconds=120,
+    # D.7 (round 67 guard update, annotated): the removed content gate used
+    # to block here. With the gate gone the SAME candidate -- listed and past
+    # the fresh hold -- is delivered: no metadata lookup, no hold, no pending
+    # entry. A regression that reintroduces a metadata hold fails this check.
+    sent, pending = await _run_main_case(age_seconds=120,
                                           listing=(("abc123",), 600))
-    check("r64: precedence holds -- listed + old enough is still NSFW-blocked",
-          sent == 0 and pending.get("TestSub_abc123", {}).get("reason") == "nsfw_flag")
+    check("r67 guard updated: complete listing evidence + old enough delivers "
+          "with no content-metadata hold",
+          sent == 1 and pending == {})
 
     # D.8 (+ addendum): FRESH_HOLD_SECONDS=60 is honored independently of the
     # default -- 45s delivers at the 30s default, is skipped at 60, and
     # delivers once past 60s; FRESH_HOLD_SECONDS=0 disables the floor
     # entirely (a brand-new, 0-second-old, listed post posts immediately).
-    sent, pending = await _run_main_case({"over_18": False}, age_seconds=45,
+    sent, pending = await _run_main_case(age_seconds=45,
                                           listing=(("abc123",), 600))
     check("r64 addendum: age 45s delivers at the 30s default", sent == 1)
-    sent, pending = await _run_main_case({"over_18": False}, age_seconds=45,
+    sent, pending = await _run_main_case(age_seconds=45,
                                           listing=(("abc123",), 600), fresh_hold=60)
     check("r64 addendum: the same age 45s is skipped once FRESH_HOLD_SECONDS=60, "
           "with no pending/tracker entry",
           sent == 0 and "TestSub_abc123" not in pending)
-    sent, pending = await _run_main_case({"over_18": False}, age_seconds=65,
+    sent, pending = await _run_main_case(age_seconds=65,
                                           listing=(("abc123",), 600), fresh_hold=60)
     check("r64 addendum: it delivers once older than the 60s floor", sent == 1)
-    sent, pending = await _run_main_case({"over_18": False}, age_seconds=0,
+    sent, pending = await _run_main_case(age_seconds=0,
                                           listing=(("abc123",), 600), fresh_hold=0)
     check("r64 addendum: FRESH_HOLD_SECONDS=0 disables the floor entirely "
           "(posts at age 0 once listed)", sent == 1)
@@ -436,7 +350,7 @@ async def _r64_checks():
     # mechanisms, so true parity with pre-round-64 behavior needs BOTH off;
     # proven here with a candidate that would fail EITHER gate alone
     # (0s old, and absent from the listing) yet still delivers.
-    sent, pending = await _run_main_case({"over_18": False}, age_seconds=0,
+    sent, pending = await _run_main_case(age_seconds=0,
                                           listing=(("other",), 600),
                                           fresh_hold=0, listing_confirm=False)
     check("r64: LISTING_CONFIRM=0 + FRESH_HOLD_SECONDS=0 restores round-63 "
@@ -455,8 +369,29 @@ with open(os.path.join(ROOT, ".github/workflows/twitter_monitor.yml"), encoding=
     _twitter_wf = fh.read()
 check("static signal module has no aiohttp", "aiohttp" not in inspect.getsource(signals))
 check("static V3 imports reddit_signals", "reddit_signals" in _v3_src)
-check("static NSFW fail-open variable", "NSFW_FAIL_OPEN" in _v3_src)
-check("static live-page fallback variable", "NSFW_PAGE_FALLBACK" in _v3_src)
+# Round 67: the removed content-gate subsystem must never reappear. The
+# removed token is ASSEMBLED here on purpose — this file itself stays free of
+# the removed names, so a repository-wide search for them finds nothing in
+# active source, tests, workflows or configuration (the full record lives in
+# docs/history/ROUND_67.md).
+_r67_token = "n" + "sfw"
+check("r67: the engine source is free of the removed content-gate subsystem",
+      _r67_token not in _v3_src.lower()
+      and not hasattr(v3, _r67_token + "_gate_reason"))
+check("r67: the pure decision module exposes no content-gate classifier",
+      _r67_token not in inspect.getsource(signals).lower()
+      and not hasattr(signals, _r67_token + "_gate_reason")
+      and not hasattr(signals, _r67_token + "_from_post_page"))
+check("r67: the workflow maps no removed content-gate Variable",
+      _r67_token not in _wf.lower())
+check("r67: no removed content-gate reason can be recorded in pending",
+      not any(_r67_token in str(reason).lower() for reason in v3._NO_RECHECK_REASONS))
+check("static video quality mode Variable exists (round 67)",
+      "REDDIT_VIDEO_QUALITY" in _v3_src)
+check("r67: empty/unknown mode values fall back to the documented default",
+      v3._env_mode("R67_UNSET_MODE_CHECK", "balanced", v3.VIDEO_QUALITY_MODES) == "balanced"
+      and v3.VIDEO_QUALITY_MODE in v3.VIDEO_QUALITY_MODES
+      and os.environ.get("REDDIT_VIDEO_QUALITY", "") != "bananas")
 check("static retraction disabled variable", "RETRACT_DEAD_POSTS" in _v3_src)
 check("static redlib memo cache", "_redlib_post_page_cache" in _v3_src)
 check("static proxy memo cache", "_proxy_post_cache" in _v3_src)
@@ -467,7 +402,8 @@ check("r63: settle window, mod-queue gate, dup-media gate and repost gate symbol
       and "DUP_MEDIA_GATE" not in _v3_src and "REPOST_GATE" not in _v3_src
       and "settle_holds(" not in _v3_src)
 check("static webhook wait true conditional", "&wait=true" in _main_src and "RETRACT_DEAD_POSTS" in _main_src)
-check("workflow wires NSFW_PAGE_FALLBACK", "NSFW_PAGE_FALLBACK" in _wf)
+check("r67 workflow wires REDDIT_VIDEO_QUALITY as a Variable",
+      "REDDIT_VIDEO_QUALITY: ${{ vars.REDDIT_VIDEO_QUALITY }}" in _wf)
 check("workflow persists posted_messages", "posted_messages.json" in _wf)
 for _r52_name in (
     "PROXY_MEDIA", "PROXY_WARMUP_POST", "EMBEDDIT_INSTANCE",

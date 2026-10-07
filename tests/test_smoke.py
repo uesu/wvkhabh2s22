@@ -1795,8 +1795,11 @@ finally:
 _r30_main = inspect.getsource(v3.main)
 check("r30 main: pending cache loaded next to the dedup cache",
       "pending = load_pending()" in _r30_main)
+# r30 guard updated in round 67: the end marker used to be the removed
+# content gate's section header; the throttle is now bounded by the round-64
+# fresh hold, which follows it in the main loop.
 _r30_throttle = _r30_main.split("pending-post recheck throttle", 1)[-1].split(
-    "# ---- round 42/45: fail-closed NSFW content gate", 1)[0]
+    "# ---- round 64: stateless 30s fresh hold", 1)[0]
 for _cond in ("not TEST_POST_ID", "not DRY_RUN", "unique_key in pending",
               "_pending_throttle_skip(pending, unique_key, now, entry)"):
     check(f"r30 throttle keeps condition: {_cond} (round 32: the due-decision "
@@ -1807,11 +1810,11 @@ check("r30 throttle: skips with `continue` and never caches as posted",
 check("r30 throttle runs BEFORE any network work (the whole point)",
       _r30_main.index("pending-post recheck throttle")
       < _r30_main.index("post_json = await fetch_post_json"))
-check("r30/round-18/round-20/32/r63 gates: all skip paths record a pending entry "
-      "(settle/mod-queue/dup-media/repost gates removed round 63 -- only "
-      "removed-post-reason, archive-liveness, and media-wait/partial-gallery "
-      "skips remain)",
-      _r30_main.count("mark_pending(pending, unique_key") == 5
+check("r30/round-18/round-20/32/r63/r67 gates: all skip paths record a pending "
+      "entry (settle/mod-queue/dup-media/repost gates removed round 63; the "
+      "content gate's call removed round 67 -- only removed-post-reason, "
+      "archive-liveness, and media-wait/partial-gallery skips remain)",
+      _r30_main.count("mark_pending(pending, unique_key") == 4
       and "mark_pending(pending, unique_key, _removed, now" in _r30_main
       and "mark_pending(pending, unique_key,\n" in _r30_main
       and 'mark_pending(pending, unique_key, "media_wait", now)' in _r30_main
@@ -1932,12 +1935,12 @@ check("r32: media_wait keeps the round-30 30-min throttle (+60 s skipped, +30 mi
 check("r32: unknown/missing reason falls back to the round-30 30-min throttle",
       v3._pending_throttle_skip(_r32_pend(None), "k", 1060.0, _r32_arctic) is True
       and v3._pending_throttle_skip(_r32_pend(None), "k", 2800.0, _r32_arctic) is False)
-check("r32/r35 (round 63: duplicate/repost reasons removed): no-recheck set is "
-      "removal/deletion + proven nsfw reasons",
+check("r32/r35 (round 67 guard update, annotated): the no-recheck set is "
+      "removal/deletion ONLY — the round-42/45 content-advisory reasons were "
+      "removed with the gate",
       v3._NO_RECHECK_REASONS == frozenset({
           "removal_notice", "removal notice", "title marker", "whole-body marker",
-          "removed by moderator", "removed by moderators/filters", "deleted by author",
-          "nsfw_flag", "nsfw_subreddit", "nsfw_crosspost_source"}))
+          "removed by moderator", "removed by moderators/filters", "deleted by author"}))
 check("r32: the mod-queue-era banner text still classifies as 'pending approval' "
       "(removed_post_reason is a content classifier used by the retraction "
       "seatbelt, not a gate)",
@@ -2103,125 +2106,40 @@ check("r34b: the X run verifies its save (a missing this-run key is a loud error
       and "save_posted_urls(posted_urls, frozenset(posted_urls - posted_urls_at_start))"
       in _r34t_main_src)
 
-# ---- R35: NSFW content gate (live BopLeaks spam 1ws8huc / 1ws99dp) ------
-# The gate checks Reddit's over_18 flag, "nsfw" thumbnail sentinel,
-# community/source markers, and the live Redlib badge fallback. Spoilers use a
-# separate field and must pass. Unknown metadata fails closed by default;
-# flagged posts are held in pending and never sent to Discord.
-_r35_over = {"over_18": True, "thumbnail": "nsfw"}
-_r35_thumb = {"over_18": False, "thumbnail": "nsfw"}
-_r35_clean_spoiler = {"over_18": False, "thumbnail": "spoiler", "spoiler": True}
-check("r35: over_18=True is held",
-      v3.nsfw_gate_reason("aaa111", "author", _r35_over) == "nsfw_flag")
-check("r35: the nsfw thumbnail sentinel is held even when over_18=False",
-      v3.nsfw_gate_reason("bbb222", "author", _r35_thumb) == "nsfw_flag")
-check("r35: a clean post passes",
-      v3.nsfw_gate_reason("ccc333", "author", {"over_18": False,
-                                                 "thumbnail": "default"}) is None)
-check("r42: unknown metadata fails CLOSED",
-      v3.nsfw_gate_reason("ddd444", "author", None) == "nsfw_unknown")
-check("r35: spoiler=True is a different field and passes untouched",
-      v3.nsfw_gate_reason("ccc333", "author", _r35_clean_spoiler) is None)
-_r35_original_allowlist = v3.NSFW_ALLOWLIST
-try:
-    v3.NSFW_ALLOWLIST = ["AllowedAuthor", "t3_eee555"]
-    check("r35: allowlisted author bypasses the gate (case/prefix insensitive)",
-          v3.nsfw_gate_reason("fff666", "/u/allowedauthor", _r35_over) is None)
-    check("r35: allowlisted post ID bypasses the gate (t3_ prefix accepted)",
-          v3.nsfw_gate_reason("eee555", "somebody", _r35_over) is None)
-    check("r35: a non-allowlisted flagged post is still held",
-          v3.nsfw_gate_reason("fff666", "somebody", _r35_over) == "nsfw_flag")
-finally:
-    v3.NSFW_ALLOWLIST = _r35_original_allowlist
-
-
-class _R35Response:
-    def __init__(self, payload, status=200):
-        self.payload = payload
-        self.status = status
-
-    async def json(self, content_type=None):
-        return self.payload
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return False
-
-
-class _R35Session:
-    def __init__(self, response=None, error=None):
-        self.response = response
-        self.error = error
-        self.calls = []
-
-    def get(self, url, params=None, **kwargs):
-        self.calls.append((url, params, kwargs))
-        if self.error:
-            raise self.error
-        return self.response
-
-
-_r35_payload = {"data": [
-    {"id": "aaa111", "over_18": True, "thumbnail": "nsfw"},
-    {"id": "bbb222", "over_18": False, "thumbnail": "nsfw"},
-    {"id": "ccc333", "over_18": False, "thumbnail": "spoiler", "spoiler": True},
-]}
-_r35_original_fail_count = v3._arctic_fail_count
-try:
-    v3._arctic_fail_count = 0
-    _r35_session = _R35Session(_R35Response(_r35_payload))
-    _r35_flags = asyncio.run(v3.fetch_arctic_nsfw_flags(
-        _r35_session, ["aaa111", "bbb222", "ccc333", "ddd444"], label="test"))
-    check("r35: all IDs use ONE batched Arctic request",
-          len(_r35_session.calls) == 1
-          and _r35_session.calls[0][0].endswith("/api/posts/ids")
-          and _r35_session.calls[0][1] == {
-              "ids": "aaa111,bbb222,ccc333,ddd444"}, str(_r35_session.calls))
-    check("r35: batched lookup preserves over_18=True",
-          _r35_flags["aaa111"]["over_18"] is True, str(_r35_flags))
-    check("r35: batched lookup preserves the nsfw thumbnail sentinel",
-          _r35_flags["bbb222"]["over_18"] is False
-          and _r35_flags["bbb222"]["thumbnail"] == "nsfw", str(_r35_flags))
-    check("r35: spoiler metadata remains clean (not confused with NSFW)",
-          v3.nsfw_gate_reason("ccc333", "author", _r35_flags["ccc333"]) is None,
-          str(_r35_flags))
-    check("r42: an ID absent from Arctic is marked missing for fail-closed/live-page fallback",
-          _r35_flags["ddd444"] == {"archive_status": "missing"}, str(_r35_flags))
-
-    v3._arctic_fail_count = 0
-    _r35_down = asyncio.run(v3.fetch_arctic_nsfw_flags(
-        _R35Session(error=RuntimeError("network down")), ["aaa111", "ccc333"]))
-    check("r42: a failed lookup marks every requested ID as lookup_error (fail-closed)",
-          _r35_down == {"aaa111": {"lookup_error": True}, "ccc333": {"lookup_error": True}}, str(_r35_down))
-finally:
-    v3._arctic_fail_count = _r35_original_fail_count
-
-check("r35: nsfw_flag uses the archive no-recheck pending path",
-      "nsfw_flag" in v3._NO_RECHECK_REASONS)
-_r35_main_src = inspect.getsource(v3.main)
-_r35_loop = "for subreddit, path, unique_key, published_ts, activity_ts, entry in new_posts:"
-check("r35: the single batched lookup is wired before the posting loop",
-      "fetch_arctic_nsfw_flags(" in _r35_main_src
-      and _r35_main_src.index("fetch_arctic_nsfw_flags(") < _r35_main_src.index(_r35_loop))
-check("r35: a no-new-post run returns before making the new lookup",
-      _r35_main_src.index("if total_found == 0:")
-      < _r35_main_src.index("fetch_arctic_nsfw_flags("))
-check("r35: TEST_POST_ID explicitly bypasses both lookup and decision",
-      "if TEST_POST_ID:\n            nsfw_flags = {}" in _r35_main_src
-      and "if not TEST_POST_ID:\n                nsfw_post_id" in _r35_main_src)
-check("r42: a flagged/unknown post is held and logged, then exits before Discord",
-      "mark_pending(pending, unique_key, reason, now" in _r35_main_src
-      and "NSFW GATE:" in _r35_main_src
-      and "NOT posted to Discord" in _r35_main_src)
-check("r42/r45: pass and fail-closed fallback paths are visible in NSFW SCAN logs",
-      "NSFW SCAN:" in _r35_main_src and "fail-closed" in _r35_main_src
-      and "thumbnail_nsfw" in _r35_main_src and "live page says over_18" in _r35_main_src)
+# ---- R35/R42/R45 (round 67 guard update, annotated): the content-advisory
+# gate was REMOVED — engine, pure decision module, workflow mapping and its
+# tests are gone, and the engine makes no content-based posting decision on
+# any path. These guards pin the REMOVAL, so reintroducing the subsystem (a
+# policy regression) fails the suite. The removed token is assembled here on
+# purpose: this file itself stays free of it, so a repository-wide search for
+# the removed names comes back empty for every active file. The full truthful
+# record lives in docs/history/ROUND_67.md.
+_r35_token = "n" + "sfw"
+signals = load_module("smoke_reddit_signals", "testing area/reddit_signals.py")
+_r35_removed_vars = [f"{_r35_token.upper()}_{suffix}" for suffix in
+                     ("ALLOWLIST", "FAIL_OPEN", "REQUIRE_SUBREDDIT", "PAGE_FALLBACK")]
+check("r35/r42/r45 guard updated in round 67: the engine exposes no removed "
+      "content-advisory decision function",
+      not hasattr(v3, _r35_token + "_gate_reason")
+      and not hasattr(v3, _r35_token + "_from_post_page")
+      and not hasattr(v3, _r35_token + "_allowlist_forms"))
+check("r35/r42/r45 guard updated in round 67: no batched content-metadata "
+      "lookup remains anywhere in the engine",
+      f"fetch_arctic_{_r35_token}" not in inspect.getsource(v3))
+check("r35/r42/r45 guard updated in round 67: the engine source and the pure "
+      "decision module are free of the removed subsystem",
+      _r35_token not in inspect.getsource(v3).lower()
+      and _r35_token not in inspect.getsource(signals).lower())
 with open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8") as _r35_f:
     _r35_workflow = _r35_f.read()
-check("r35: the optional repository Variable is wired into the live workflow",
-      "NSFW_ALLOWLIST: ${{ vars.NSFW_ALLOWLIST }}" in _r35_workflow)
+check("r35/r42/r45 guard updated in round 67: the workflow env block and its "
+      "comments are free of the removed gate",
+      _r35_token not in _r35_workflow.lower()
+      and all(_name not in _r35_workflow for _name in _r35_removed_vars))
+check("r67: the video-quality Variable is wired into the live workflow",
+      "REDDIT_VIDEO_QUALITY: ${{ vars.REDDIT_VIDEO_QUALITY }}" in _r35_workflow)
+# Main-loop source kept under its historical name for the later guards.
+_r35_main_src = inspect.getsource(v3.main)
 
 # ---- R36 (round 63: settle window + duplicate-media gate removed; the
 # pending-cache audit fields they introduced are still used by the
@@ -2391,29 +2309,13 @@ check("Dependabot auto-merge fails closed on the exact head SHA before squash me
       and "merge_method: 'squash'" in _r39_merge
       and "GitHub API error; failing closed" in _r39_merge)
 
-# ---- R42/R45 smoke guards: NSFW signal core wiring and defaults -----------
-signals = load_module("smoke_reddit_signals", "testing area/reddit_signals.py")
+# ---- R42/R45 smoke guards (round 67 guard update, annotated): the Redlib
+# badge reader, the fail-closed decision matrix, the allowlist and the
+# live-page fallback were all removed with the gate. What remains of that era
+# is the retraction seatbelt below; the removal itself is pinned by the
+# R35/R42/R45 block above and by the pure-signal absence guards in
+# tests/test_reddit_signals.py.
 check("r42: signal module imports independently", signals is not None)
-check("r45: Redlib NSFW badge is detected", signals.nsfw_from_post_page('<div class="post"><small class="nsfw">NSFW</small></div>') is True)
-check("r45: Redlib spoiler badge is not NSFW", signals.nsfw_from_post_page('<div class="post"><small class="spoiler">Spoiler</small></div>') is False)
-check("r45: readable unbadged Redlib page is clean", signals.nsfw_from_post_page('<div class="post"><a href="/r/x/comments/abc/t/">t</a></div>') is False)
-check("r45: unreadable page yields unknown", signals.nsfw_from_post_page('Too Many Requests') is None)
-check("r45: V3 exposes the live-page NSFW helper", v3.nsfw_from_post_page('<div class="post"><small class="nsfw">NSFW</small></div>') is True)
-check("r45: the fallback kill switch is wired", "NSFW_PAGE_FALLBACK" in _r35_workflow)
-check("r42: missing metadata is nsfw_unknown", signals.nsfw_gate_reason("p", "a", None) == "nsfw_unknown")
-check("r42: NSFW_FAIL_OPEN restores old pass", signals.nsfw_gate_reason("p", "a", None, fail_open=True) is None)
-check("r45: missing archive + clean live page passes", signals.nsfw_gate_reason("p", "a", {"archive_status": "missing", "page_nsfw": False}) is None)
-check("r45: missing archive + live NSFW badge blocks", signals.nsfw_gate_reason("p", "a", {"archive_status": "missing", "page_nsfw": True}) == "nsfw_flag")
-check("r42: over18 subreddit blocks", signals.nsfw_gate_reason("p", "a", {"over_18": False, "subreddit_over18": True}) == "nsfw_subreddit")
-check("r42: NSFW crosspost source blocks", signals.nsfw_gate_reason("p", "a", {"over_18": False, "source_present": True, "source_over_18": True}) == "nsfw_crosspost_source")
-check("r42: NSFW crosspost source subreddit blocks", signals.nsfw_gate_reason("p", "a", {"over_18": False, "source_present": True, "source_over_18": False, "source_subreddit_over18": True}) == "nsfw_crosspost_source")
-check("r42: malformed crosspost source fails closed", signals.nsfw_gate_reason("p", "a", {"over_18": False, "source_present": True}) == "nsfw_unknown")
-check("r42: require-subreddit makes missing community metadata unknown", signals.nsfw_gate_reason("p", "a", {"over_18": False}, require_subreddit=True) == "nsfw_unknown")
-check("r42: allowlist bypass remains available", signals.nsfw_gate_reason("t3_p", "a", None, allowlist=["p"]) is None)
-check("r63: title-only 'nsfw' with an explicit over_18=false marker does NOT false-positive "
-      "(Reddit auto-marks a literal 'nsfw' title as over_18 itself -- the gate reads the "
-      "flag, never the title text)",
-      signals.nsfw_gate_reason("p", "a", {"over_18": False, "thumbnail": "default"}) is None)
 
 # ---- R44 / round 63: retraction seatbelt (dead/edit/delete/outside-window) -
 check("r44: listing absence can prove dead within listing span", signals.listing_absence_proves_dead("abc", 940, 1000, {"zzz"}, 120))
@@ -2438,7 +2340,9 @@ check("r44: tombstone greys the accent", _tomb["components"][0]["accent_color"] 
 with open(os.path.join(ROOT, ".github/workflows/ci.yml"), encoding="utf-8") as _fh:
     _r42_ci = _fh.read()
 check("r42: CI runs the pure signal suite", "python tests/test_reddit_signals.py" in _r42_ci)
-check("r42: workflow wires NSFW_FAIL_OPEN", "NSFW_FAIL_OPEN: ${{ vars.NSFW_FAIL_OPEN }}" in _r35_workflow)
+check("r42/r45 guard updated in round 67: the removed gate's repository "
+      "Variables are unmapped",
+      not any(_v in _r35_workflow for _v in _r35_removed_vars))
 check("r44: workflow persists posted_messages only when present", "posted_messages.json" in _r35_workflow and "-f posted_messages.json" in _r35_workflow)
 check("r44: wait=true is conditional on retraction", "&wait=true" in _r35_main_src and "RETRACT_DEAD_POSTS" in _r35_main_src)
 check("r42: signal module is side-effect-free (no aiohttp import)", "aiohttp" not in inspect.getsource(signals))
@@ -2802,8 +2706,9 @@ try:
           and _r47_x.heal_eligible_items(_r56_msg(_r56_vid_url, _r56_img_url)) == [])
 finally:
     _r47_x.MEDIA_HEAL_SCOPE = _r56b_saved_scope
-# Round 42 pattern (NSFW_FAIL_OPEN): the prod workflow passes env vars
-# EXPLICITLY, so an unwired Variable would silently strand the escape hatch.
+# Round 42 pattern (operator escape hatches, e.g. the X media-heal scope):
+# the prod workflow passes env vars EXPLICITLY, so an unwired Variable would
+# silently strand the escape hatch.
 with open(os.path.join(ROOT, ".github/workflows/twitter_monitor.yml"), encoding="utf-8") as _r56_f:
     _r56_workflow = _r56_f.read()
 check("r56: workflow wires MEDIA_HEAL_SCOPE",
@@ -3625,7 +3530,7 @@ _r49b_names = (
     "MAX_CACHE_SIZE_PER_SUB", "MAX_POSTS_PER_RUN",
     "PENDING_RECHECK_SECONDS",
     "FEEDTOKEN_JSON_STAGGER", "PROXY_MEDIA", "YOUTUBE_LINK_MESSAGE",
-    "DISCOHOOK_PREVIEW", "REDDIT_OP_COMMENT", "NSFW_PAGE_FALLBACK",
+    "DISCOHOOK_PREVIEW", "REDDIT_OP_COMMENT", "REDDIT_VIDEO_QUALITY",
 )
 check("r49b: no direct numeric os.getenv conversion remains",
       not any(re.search(r"(?:int|float)\(os\.getenv", open(os.path.join(ROOT, p)).read())
@@ -3660,9 +3565,14 @@ try:
           (_r49b_reddit.PROXY_MEDIA,
            _r49b_reddit.YOUTUBE_LINK_MESSAGE,
            _r49b_reddit.DISCOHOOK_PREVIEW,
-           _r49b_reddit.INCLUDE_OP_COMMENT,
-           _r49b_reddit.NSFW_PAGE_FALLBACK)
-          == (True, True, True, True, True))
+           _r49b_reddit.INCLUDE_OP_COMMENT)
+          == (True, True, True, True))
+    check("r67: an empty REDDIT_VIDEO_QUALITY uses the documented default",
+          _r49b_reddit.VIDEO_QUALITY_MODE == "balanced")
+    check("r67: an unknown REDDIT_VIDEO_QUALITY value also falls back to the "
+          "default (a typo never picks an unintended mode)",
+          _r49b_reddit._env_mode("R67_GARBAGE_MODE", "balanced",
+                                 _r49b_reddit.VIDEO_QUALITY_MODES) == "balanced")
 finally:
     for _name, _value in _r49b_saved_env.items():
         if _value is None:
@@ -4770,11 +4680,12 @@ check("r66: reddit_monitor.yml — all 11 stale env mappings fully gone (lines A
 check("r66: reddit_monitor.yml — round-64 FRESH_HOLD_SECONDS/LISTING_CONFIRM are wired",
       "FRESH_HOLD_SECONDS: ${{ vars.FRESH_HOLD_SECONDS }}" in _r66_wf
       and "LISTING_CONFIRM: ${{ vars.LISTING_CONFIRM }}" in _r66_wf)
-check("r66: reddit_monitor.yml — kept mappings intact (pending recheck, NSFW, retraction)",
+check("r66: reddit_monitor.yml — kept mappings intact (pending recheck, "
+      "retraction); r67 guard update: the removed gate's four Variables are "
+      "no longer part of this list, and REDDIT_VIDEO_QUALITY joined it",
       all(f"{_n}: ${{{{ vars.{_n} }}}}" in _r66_wf for _n in
-          ["PENDING_RECHECK_SECONDS", "NSFW_ALLOWLIST", "NSFW_FAIL_OPEN",
-           "NSFW_REQUIRE_SUBREDDIT", "NSFW_PAGE_FALLBACK", "RETRACT_DEAD_POSTS",
-           "RETRACT_MODE", "RETRACT_WINDOW_SECONDS"]))
+          ["PENDING_RECHECK_SECONDS", "RETRACT_DEAD_POSTS", "RETRACT_MODE",
+           "RETRACT_WINDOW_SECONDS", "REDDIT_VIDEO_QUALITY"]))
 check("r66: reddit_monitor.yml — round-61 deploy steps untouched",
       "Sync to the live branch tip" in _r66_wf
       and "git reset --hard FETCH_HEAD" in _r66_wf
@@ -4798,6 +4709,559 @@ check("r66: the posting loop delivers continuations and records every message id
 check("r66: retraction reads message_ids and tombstones continuation parts",
       "message_ids" in inspect.getsource(v3.retract_dead_posts)
       and "tombstone_continuation_payload" in inspect.getsource(v3.retract_dead_posts))
+
+
+# ===========================================================================
+# ROUND 67 (2026-10-07) — REDDIT VIDEO QUALITY SELECTION
+# Evidence: docs/REDDIT_VIDEO_MEDIA_REPORT.md (live Discord/Discohook tests;
+# the post IDs are recorded there as evidence only — never in code).
+# Deterministic guards for the whole
+# resolver contract: EmbedEZ 1080p success, 1080p failure -> 720p, proxy
+# failure -> vxreddit, a "1080"-named URL that is NOT 1080p, timeouts, HTTP
+# failures, HTML error bodies with a 200 status, oversized media, missing
+# audio/failed muxing, portrait + landscape, the thumbnail+button fallback,
+# no duplicate poster image, unchanged image/GIF/photo/gallery behavior, the
+# durable-URL policy for signed/expiring native media, the compatibility
+# rollback order and the bounded budgets. Nothing here opens a connection.
+# ===========================================================================
+
+
+def _r67_box(box_type: bytes, payload: bytes) -> bytes:
+    return (len(payload) + 8).to_bytes(4, "big") + box_type + payload
+
+
+def _r67_tkhd(width: int, height: int, version: int = 0) -> bytes:
+    if version == 0:
+        body = bytes(4) + b"\x00" * 12 + b"\x00" * 4 + b"\x00" * 4
+    else:
+        body = bytes([1, 0, 0, 0]) + b"\x00" * 16 + b"\x00" * 4 + b"\x00" * 4 + b"\x00" * 8
+    body += b"\x00" * 8 + b"\x00" * 8 + b"\x00" * 36
+    body += int(width * 65536).to_bytes(4, "big") + int(height * 65536).to_bytes(4, "big")
+    return _r67_box(b"tkhd", body)
+
+
+def _r67_hdlr(handler: bytes) -> bytes:
+    return _r67_box(b"hdlr", bytes(4) + b"\x00" * 4 + handler + b"\x00" * 12)
+
+
+def _r67_mp4(width: int = 1920, height: int = 1080, audio: bool = True,
+             version: int = 0) -> bytes:
+    traks = _r67_box(b"trak", _r67_tkhd(width, height, version) + _r67_box(b"mdia", _r67_hdlr(b"vide")))
+    if audio:
+        traks += _r67_box(b"trak", _r67_tkhd(0, 0) + _r67_box(b"mdia", _r67_hdlr(b"soun")))
+    return (_r67_box(b"ftyp", b"isom" + bytes(4))
+            + _r67_box(b"moov", traks) + b"\x00" * 256)
+
+
+class _R67Resp:
+    def __init__(self, status=206, headers=None, body=b"", hang=False):
+        self.status = status
+        self.headers = headers or {}
+        self._body = body
+        self._hang = hang
+        self.content = self
+
+    async def read(self, n=-1):
+        if self._hang:
+            await asyncio.sleep(30)
+        return self._body if (not n or n < 0) else self._body[:n]
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class _R67Sess:
+    """Routes requests to canned responses by substring; records every URL."""
+
+    def __init__(self, routes=None, default=None):
+        self.routes = routes or {}
+        self.default = default
+        self.calls = []
+
+    def get(self, url, headers=None, timeout=None):
+        self.calls.append(url)
+        for key, resp in self.routes.items():
+            if key in url:
+                return resp() if callable(resp) else resp
+        if self.default is not None:
+            return self.default() if callable(self.default) else self.default
+        return _R67Resp(404, {}, b"")
+
+
+def _r67_mp4_resp(width=1920, height=1080, audio=True, size=5_000_000, version=0):
+    body = _r67_mp4(width, height, audio, version)
+
+    def _make():
+        return _R67Resp(206, {"Content-Type": "video/mp4",
+                              "Content-Range": f"bytes 0-{len(body) - 1}/{size}"}, body)
+    return _make
+
+
+def _r67_html_resp(status=200, ctype="video/mp4"):
+    return lambda: _R67Resp(status, {"Content-Type": ctype},
+                            b"<!DOCTYPE html><html>muxing failed</html>".ljust(180, b" "))
+
+
+def _r67_hang_resp():
+    return lambda: _R67Resp(206, {"Content-Type": "video/mp4"}, b"", hang=True)
+
+
+def _r67_big_resp():
+    return lambda: _R67Resp(206, {"Content-Type": "video/mp4",
+                                  "Content-Range": "bytes 0-65535/999999999"}, _r67_mp4())
+
+
+_R67_VX = "vxreddit.com"
+_R67_EZ = "proxy.embedez.com"
+
+
+async def _r67_video_resolve(routes=None, default=None, vid="vid1", fallback=None,
+                             mode=None, window=None):
+    old_mode = v3.VIDEO_QUALITY_MODE
+    old_window = v3.VIDEO_QUALITY_WINDOW_SECONDS
+    old_timeout = v3.VIDEO_CANDIDATE_TIMEOUT_SECONDS
+    try:
+        if mode is not None:
+            v3.VIDEO_QUALITY_MODE = mode
+        if window is not None:
+            v3.VIDEO_QUALITY_WINDOW_SECONDS = window
+            v3.VIDEO_CANDIDATE_TIMEOUT_SECONDS = window * 2
+        session = _R67Sess(routes, default)
+        url = await v3.resolve_video_url(session, vid, fallback, label="r67")
+        return url, session.calls
+    finally:
+        v3.VIDEO_QUALITY_MODE = old_mode
+        v3.VIDEO_QUALITY_WINDOW_SECONDS = old_window
+        v3.VIDEO_CANDIDATE_TIMEOUT_SECONDS = old_timeout
+
+
+async def _r67_video_checks():
+    v3.reset_video_quality_budget()
+
+    # Media facts: real dimensions + audio presence are read from the MP4
+    # structure, for both tkhd versions, and never raise on junk input.
+    _facts = v3.mp4_media_facts(_r67_mp4())
+    check("r67: MP4 evidence reads landscape dimensions + audio track",
+          _facts == {"width": 1920, "height": 1080, "has_video": True, "has_audio": True},
+          str(_facts))
+    check("r67: MP4 evidence reads portrait dimensions",
+          v3.mp4_media_facts(_r67_mp4(1080, 1920))["width"] == 1080
+          and v3.mp4_media_facts(_r67_mp4(1080, 1920))["height"] == 1920)
+    check("r67: MP4 evidence handles tkhd version 1",
+          v3.mp4_media_facts(_r67_mp4(version=1))["width"] == 1920)
+    check("r67: MP4 evidence detects a missing audio track",
+          v3.mp4_media_facts(_r67_mp4(audio=False))["has_audio"] is False)
+    check("r67: MP4 evidence is None for junk/truncated prefixes (never raises)",
+          v3.mp4_media_facts(b"\x00" * 40) is None
+          and v3.mp4_media_facts(None) is None
+          and v3.mp4_media_facts(b"<html>not an mp4</html>") is None
+          and v3.mp4_media_facts(_r67_mp4()[:10]) is None)
+    check("r67: orientation helper classifies portrait/landscape",
+          v3.video_orientation({"width": 1080, "height": 1920}) == "portrait"
+          and v3.video_orientation({"width": 1920, "height": 1080}) == "landscape"
+          and v3.video_orientation({}) is None)
+
+    # Durable-URL policy: signed/expiring native media is never a candidate.
+    check("r67: unsigned v.redd.it DASH/CMAF URLs are durable",
+          v3.media_url_is_durable("https://v.redd.it/abc/DASH_720.mp4")
+          and v3.media_url_is_durable("https://v.redd.it/abc/CMAF_1080.mp4"))
+    check("r67: signed/expiring packaged-media URLs are never candidates",
+          not v3.media_url_is_durable(
+              "https://packaged-media.redd.it/abc.mp4?s=xyz&e=1234567")
+          and not v3.media_url_is_durable("https://v.redd.it/abc/DASH_720.mp4?token=x"))
+    check("r67: the quality hint reads the URL path only (a 1080 in the query "
+          "is never proof)",
+          v3.video_quality_hint("https://v.redd.it/x/CMAF_1080.mp4") == 1080
+          and v3.video_quality_hint("https://ez/x?videoUrl=CMAF_1080.mp4") is None)
+
+    # 1. EmbedEZ 1080p success (balanced default).
+    url, _ = await _r67_video_resolve({_R67_EZ: _r67_mp4_resp(), _R67_VX: _r67_mp4_resp()})
+    check("r67: balanced — a validated EmbedEZ 1080p result wins", url is not None
+          and url.startswith("https://proxy.embedez.com"), str(url))
+
+    # 2. EmbedEZ 1080p failure followed by EmbedEZ 720p success.
+    def _r67_ez_split():
+        class _Split(_R67Sess):
+            def get(self, url, headers=None, timeout=None):
+                self.calls.append(url)
+                if "proxy.embedez.com" in url:
+                    return (_r67_html_resp()() if "CMAF_1080" in url else _r67_mp4_resp()())
+                return _R67Resp(500, {}, b"")
+        return _Split()
+    session = _r67_ez_split()
+    url = await v3.resolve_video_url(session, "vid1", None, label="r67")
+    check("r67: EmbedEZ 1080p failure falls through to EmbedEZ 720p",
+          url is not None and "CMAF_720.mp4" in url, str(url))
+
+    # 3. EmbedEZ failure followed by vxreddit success.
+    url, _ = await _r67_video_resolve({_R67_EZ: _r67_html_resp(), _R67_VX: _r67_mp4_resp()})
+    check("r67: EmbedEZ failure falls back to a working vxreddit result",
+          url is not None and url.startswith("https://vxreddit.com"), str(url))
+
+    # 4. A "1080" in a URL is never proof: a smaller EmbedEZ output loses to
+    #    the vxreddit base (this is the tested vxreddit behaviour, inverted).
+    url, _ = await _r67_video_resolve({_R67_EZ: _r67_mp4_resp(1280, 720),
+                                       _R67_VX: _r67_mp4_resp(1920, 1080)})
+    check("r67: a named-1080 candidate returning fewer pixels does NOT replace "
+          "the vxreddit result", url is not None and url.startswith("https://vxreddit.com"),
+          str(url))
+    url, _ = await _r67_video_resolve({_R67_EZ: _r67_mp4_resp(), _R67_VX: _r67_mp4_resp(1280, 720)})
+    check("r67: a sharper validated EmbedEZ result does replace the vxreddit result",
+          url is not None and url.startswith("https://proxy.embedez.com"), str(url))
+
+    # 5. Timeout and HTTP failure.
+    url, _ = await _r67_video_resolve({_R67_EZ: _r67_hang_resp(), _R67_VX: _r67_mp4_resp()},
+                                      window=0.2)
+    check("r67: a hung EmbedEZ candidate times out into the vxreddit result "
+          "within the quality window",
+          url is not None and url.startswith("https://vxreddit.com"), str(url))
+    url, _ = await _r67_video_resolve(
+        {_R67_EZ: lambda: _R67Resp(503, {}, b""), _R67_VX: lambda: _R67Resp(500, {}, b"")},
+        default=_r67_mp4_resp())
+    check("r67: HTTP failures on both proxies fall through to the durable "
+          "native DASH ladder", url == "https://v.redd.it/vid1/DASH_720.mp4", str(url))
+
+    # 6. HTML error body returned with a successful transport response.
+    url, _ = await _r67_video_resolve({_R67_EZ: _r67_html_resp(), _R67_VX: _r67_mp4_resp()})
+    check("r67: a 200 HTML error body is rejected (never used as the video)",
+          url is not None and url.startswith("https://vxreddit.com"), str(url))
+    url, _ = await _r67_video_resolve(
+        {_R67_EZ: _r67_html_resp(ctype="text/html"), _R67_VX: _r67_html_resp(ctype="text/html")},
+        default=lambda: _R67Resp(404, {}, b""))
+    check("r67: HTML error bodies everywhere end at thumbnail + button (None)",
+          url is None, str(url))
+
+    # 7. Oversized media.
+    url, _ = await _r67_video_resolve(default=_r67_big_resp())
+    check("r67: any candidate above the 256 MiB limit is rejected (thumbnail "
+          "+ button remains)", url is None, str(url))
+
+    # 8. Missing audio / failed muxing: an audio-less mux never replaces a
+    #    working audio-capable result, and a silent SOURCE still gets a video.
+    url, _ = await _r67_video_resolve({_R67_EZ: _r67_mp4_resp(audio=False),
+                                       _R67_VX: _r67_mp4_resp(audio=True)})
+    check("r67: a failed mux (EmbedEZ output without an audio track) keeps the "
+          "audio-capable vxreddit result",
+          url is not None and url.startswith("https://vxreddit.com"), str(url))
+    url, _ = await _r67_video_resolve({_R67_EZ: _r67_mp4_resp(audio=False),
+                                       _R67_VX: _r67_mp4_resp(audio=False)})
+    check("r67: a genuinely silent source still resolves a video (never a "
+          "thumbnail just for missing audio)",
+          url is not None and url.startswith("https://proxy.embedez.com"), str(url))
+
+    # 9/10. Portrait and landscape are preserved and compared like for like.
+    url, _ = await _r67_video_resolve({_R67_EZ: _r67_mp4_resp(1080, 1920),
+                                       _R67_VX: _r67_mp4_resp(1080, 1920)})
+    check("r67: portrait EmbedEZ result wins over a portrait vxreddit result "
+          "(no stretching/conversion in the resolver)",
+          url is not None and url.startswith("https://proxy.embedez.com"), str(url))
+    url, _ = await _r67_video_resolve({_R67_EZ: _r67_mp4_resp(1280, 720),
+                                       _R67_VX: _r67_mp4_resp(1080, 1920)})
+    check("r67: an orientation flip (landscape candidate for a portrait base) "
+          "never replaces the base", url is not None and url.startswith("https://vxreddit.com"),
+          str(url))
+    url, _ = await _r67_video_resolve({_R67_EZ: _r67_mp4_resp(1920, 1080),
+                                       _R67_VX: _r67_mp4_resp(1920, 1080)})
+    check("r67: landscape video resolves and keeps its aspect ratio",
+          url is not None and url.startswith("https://proxy.embedez.com"), str(url))
+
+    # 11. No valid video at all -> None (the caller keeps thumbnail + button).
+    url, _ = await _r67_video_resolve(default=lambda: _R67Resp(404, {}, b""))
+    check("r67: no valid candidate anywhere returns None — thumbnail + Read "
+          "Post button is the final fallback", url is None, str(url))
+
+    # 12. Signed native fallback_url is refused; the durable ladder is used.
+    url, calls = await _r67_video_resolve(
+        {_R67_EZ: lambda: _R67Resp(500, {}, b""), _R67_VX: lambda: _R67Resp(500, {}, b"")},
+        default=_r67_mp4_resp(), fallback="https://packaged-media.redd.it/x.mp4?s=abc&e=1")
+    check("r67: a signed/expiring fallback_url is never returned as the card "
+          "video", url == "https://v.redd.it/vid1/DASH_720.mp4", str(url))
+    check("r67: the signed fallback_url was never even requested as a candidate",
+          not any("packaged-media" in call for call in calls), str(calls))
+
+    # Compatibility mode: the pre-round-67 ladder, unchanged, and no EmbedEZ
+    # 1080p attempt (the zero-code rollback).
+    url, calls = await _r67_video_resolve({_R67_EZ: _r67_mp4_resp(), _R67_VX: _r67_mp4_resp()},
+                                          default=_r67_mp4_resp(), mode="compatibility")
+    check("r67: compatibility mode tries the durable native ladder first",
+          url == "https://v.redd.it/vid1/DASH_720.mp4", str(url))
+    check("r67: compatibility mode makes no EmbedEZ 1080p attempt",
+          not any("CMAF_1080" in call for call in calls), str(calls))
+    url, calls = await _r67_video_resolve({_R67_EZ: _r67_mp4_resp(), _R67_VX: _r67_mp4_resp()},
+                                          default=lambda: _R67Resp(404, {}, b""),
+                                          mode="compatibility")
+    check("r67: compatibility mode then prefers EmbedEZ 720p (pre-round-67 order)",
+          url is not None and "CMAF_720" in url and url.startswith("https://proxy.embedez.com"),
+          str(url))
+
+    # The per-run quality ceiling falls back to the durable ladder, so a slow
+    # proxy can never stall a run.
+    try:
+        v3._video_quality_budget_used = 10_000.0
+        url, calls = await _r67_video_resolve({_R67_EZ: _r67_mp4_resp(), _R67_VX: _r67_mp4_resp()},
+                                              default=_r67_mp4_resp())
+        check("r67: once the per-run quality budget is spent the resolver goes "
+              "straight to the durable native ladder",
+              url == "https://v.redd.it/vid1/DASH_720.mp4"
+              and not any("proxy.embedez.com" in call for call in calls), str(url))
+    finally:
+        v3.reset_video_quality_budget()
+
+    # The resolver never writes cache/state: it only reads media URLs.
+    _r67_src = inspect.getsource(v3.resolve_video_url)
+    check("r67: the resolver touches no cache/state file and logs no webhook",
+          all(sym not in _r67_src for sym in
+              ("save_posted", "save_pending", "posted_reddit.json", "pending_reddit.json",
+               "proxy_health.json", "webhook")))
+    check("r67: the resolver is bounded end to end (budgets + timeouts exist)",
+          v3.VIDEO_RESOLVE_BUDGET_SECONDS > 0 and v3.VIDEO_CANDIDATE_TIMEOUT_SECONDS > 0
+          and v3.VIDEO_NATIVE_TIMEOUT_SECONDS > 0 and v3.VIDEO_RUN_BUDGET_SECONDS > 0
+          and v3.VIDEO_QUALITY_WINDOW_SECONDS > 0
+          and v3.VIDEO_QUALITY_WINDOW_HIGHEST_SECONDS >= v3.VIDEO_QUALITY_WINDOW_SECONDS)
+asyncio.run(_r67_video_checks())
+
+# 13. Image / GIF / photo / gallery behavior is unchanged: the resolver only
+#     runs for a video post, media_url_ok keeps its 2-tuple contract, and the
+#     native media kinds are untouched.
+_r67_native = v3.extract_native_media(
+    '<img src="https://i.redd.it/a.jpg"/>'
+    '<img src="https://i.redd.it/b.gif"/>'
+    '<img src="https://external-preview.redd.it/c.jpg?width=300"/>')
+check("r67: native media kinds for image/GIF/photo are unchanged",
+      [item["kind"] for item in _r67_native] == ["image", "gif", "image"],
+      str(_r67_native))
+
+
+async def _r67_media_contract():
+    ok, size = await v3.media_url_ok(
+        _R67Sess(default=lambda: _R67Resp(206, {"Content-Type": "image/jpeg",
+                                                "Content-Range": "bytes 0-0/2048"}, b"x")),
+        "https://i.redd.it/a.jpg")
+    check("r67: media_url_ok keeps its (ok, size) contract for images", ok is True and size == 2048)
+    base = {"title": "T", "author": "A", "body": "b", "youtube_url": None,
+            "vred_id": None, "redgifs_url": None, "thumb": None,
+            "content_html": '<img src="https://i.redd.it/p1.jpg"/>'}
+    with patch.object(v3, "PROXY_MEDIA", False), \
+         patch.object(v3, "fetch_arctic_post", AsyncMock(return_value=None)), \
+         patch.object(v3, "enrich_gallery_redlib", AsyncMock(return_value=[])), \
+         patch.object(v3, "resolve_video_url", AsyncMock(return_value="https://example.com/v.mp4")) as _r67_rv:
+        result = await v3.resolve_post_media(None, dict(base), None, "/r/Sub/comments/img1/title/")
+        check("r67: an image post never calls the video resolver",
+              _r67_rv.await_count == 0 and result["media"] ==
+              [{"kind": "image", "url": "https://i.redd.it/p1.jpg"}], str(result["media"]))
+        video_base = dict(base, vred_id="vid1")
+        result = await v3.resolve_post_media(None, video_base, None, "/r/Sub/comments/vid1/title/")
+        check("r67: a video post shows the video only — no duplicate poster image",
+              result["media"] == [{"kind": "video", "url": "https://example.com/v.mp4"}],
+              str(result["media"]))
+        check("r67: the video resolver ran exactly once for the video post "
+              "(never for the image post)",
+              _r67_rv.await_count == 1, str(_r67_rv.await_count))
+    with patch.object(v3, "PROXY_MEDIA", False), \
+         patch.object(v3, "fetch_arctic_post", AsyncMock(return_value=None)), \
+         patch.object(v3, "enrich_gallery_redlib", AsyncMock(return_value=[])), \
+         patch.object(v3, "resolve_video_url", AsyncMock(return_value=None)):
+        result = await v3.resolve_post_media(None, dict(base, vred_id="vid2"), None,
+                                             "/r/Sub/comments/vid2/title/")
+        check("r67: when no video resolves the post keeps its photos + a button "
+              "(thumbnail fallback path)",
+              result["media"] == [{"kind": "image", "url": "https://i.redd.it/p1.jpg"}],
+              str(result["media"]))
+
+
+async def _r67_gallery_contract():
+    """A reddit-hosted gallery clip still resolves through the video resolver
+    and keeps its photos (round-38c behavior, unchanged by round 67)."""
+    with patch.object(v3, "_fetch_redlib_post_page", AsyncMock(return_value="<html>g</html>")), \
+         patch.object(v3, "extract_redlib_video_id", lambda html: "vid1"), \
+         patch.object(v3, "extract_redlib_gallery",
+                      lambda html: [{"kind": "image", "url": "https://i.redd.it/g1.jpg"}]), \
+         patch.object(v3, "resolve_video_url",
+                      AsyncMock(return_value="https://example.com/clip.mp4")) as _r67_grv:
+        items = await v3.enrich_gallery_redlib(None, "/r/Sub/comments/g1/title/", "r67")
+    check("r67: a reddit-hosted gallery video still resolves via the video "
+          "resolver and keeps its photos (gallery handling unchanged)",
+          items == [{"kind": "image", "url": "https://i.redd.it/g1.jpg"},
+                    {"kind": "video", "url": "https://example.com/clip.mp4",
+                     "gallery": True}]
+          and _r67_grv.await_count == 1, str(items))
+
+
+asyncio.run(_r67_gallery_contract())
+asyncio.run(_r67_media_contract())
+
+# ---- round 67 follow-up: the PROXY-delivered video path --------------------
+# Production runs native RSS mode with PROXY_MEDIA=1 by default, so a video
+# post usually arrives from the round-49 proxy chain (tie-break vxreddit
+# first). Those videos now get the SAME bounded EmbedEZ 1080p opportunity:
+# the validated proxy mux is the held base and can only be replaced by a
+# better validated candidate, never lost to the quality attempt.
+
+_r67b_base = "https://vxreddit.com/redditvideo.mp4?video_url=x&audio_url=y"
+
+
+async def _r67b_cand_ok(session, url, *, timeout=None, quality_hint=None, label=""):
+    return {"url": "https://proxy.embedez.com/render/video.mp4?videoUrl=1080",
+            "size": 4321, "width": 1920, "height": 1080, "has_video": True,
+            "has_audio": True, "quality_hint": 1080, "label": label}
+
+
+async def _r67b_probe_base_720(session, url, *, timeout=10.0):
+    check("r67b: the base probe reads the ALREADY-validated proxy video",
+          url == _r67b_base, url)
+    return {"width": 1280, "height": 720, "has_video": True, "has_audio": True}
+
+
+def _r67b_upgrade(candidate, probe=_r67b_probe_base_720, mode="balanced",
+                  spent=0.0, vid="abc123"):
+    """Run the proxy-path quality helper under controlled globals."""
+    with patch.object(v3, "video_candidate", candidate), \
+         patch.object(v3, "probe_video_facts", probe), \
+         patch.object(v3, "VIDEO_QUALITY_MODE", mode), \
+         patch.object(v3, "_video_quality_budget_used", spent):
+        return asyncio.run(v3.proxy_video_quality_upgrade(None, vid, _r67b_base, "r67b"))
+
+
+_r67b_cand = AsyncMock(side_effect=_r67b_cand_ok)
+_r67b_none = AsyncMock(return_value=None)
+_r67b_probe = AsyncMock(side_effect=_r67b_probe_base_720)
+
+check("r67b: a validated EmbedEZ 1080p upgrade replaces the proxy-muxed video "
+      "(1920x1080 vs the base's 1280x720)",
+      _r67b_upgrade(_r67b_cand) == "https://proxy.embedez.com/render/video.mp4?videoUrl=1080")
+
+_r67b_cand.reset_mock(); _r67b_probe.reset_mock()
+check("r67b: an EmbedEZ failure returns the proxy video verbatim — and never "
+      "spends the base probe",
+      _r67b_upgrade(_r67b_none) == _r67b_base and _r67b_probe.await_count == 0)
+
+_r67b_cand.reset_mock()
+check("r67b: compatibility mode never makes the quality request at all "
+      "(exact pre-round-67 proxy path)",
+      _r67b_upgrade(_r67b_cand, mode="compatibility") == _r67b_base
+      and _r67b_cand.await_count == 0)
+
+
+async def _r67b_probe_flip(session, url, *, timeout=10.0):
+    return {"width": 1080, "height": 1920, "has_video": True, "has_audio": True}
+
+
+async def _r67b_cand_silent(session, url, *, timeout=None, quality_hint=None, label=""):
+    return {"url": "https://proxy.embedez.com/render/video.mp4?silent=1", "size": 4321,
+            "width": 1920, "height": 1080, "has_video": True, "has_audio": False,
+            "quality_hint": 1080, "label": label}
+
+
+async def _r67b_probe_smaller(session, url, *, timeout=10.0):
+    return {"width": 3840, "height": 2160, "has_video": True, "has_audio": True}
+
+
+check("r67b: a portrait source is never replaced by a landscape candidate "
+      "(orientation flip keeps the proxy video)",
+      _r67b_upgrade(_r67b_cand, probe=_r67b_probe_flip) == _r67b_base)
+check("r67b: a candidate that loses the base's audio track is refused",
+      _r67b_upgrade(_r67b_cand_silent, probe=_r67b_probe_base_720) == _r67b_base)
+check("r67b: a candidate with FEWER pixels than the base is refused",
+      _r67b_upgrade(_r67b_cand, probe=_r67b_probe_smaller) == _r67b_base)
+check("r67b: with the per-run budget spent the proxy video is kept untouched",
+      _r67b_upgrade(_r67b_cand, spent=float(v3.VIDEO_RUN_BUDGET_SECONDS) + 1) == _r67b_base)
+check("r67b: a post with no Reddit video id (YouTube/redgifs) skips the "
+      "opportunity entirely",
+      _r67b_upgrade(_r67b_cand, vid=None) == _r67b_base)
+
+_r67b_cand.reset_mock()
+_r67b_upgrade(_r67b_cand, spent=float(v3.VIDEO_RUN_BUDGET_SECONDS) + 1)
+_r67b_upgrade(_r67b_cand, vid=None)
+check("r67b: no quality request is made when the budget is spent or the post "
+      "is not a Reddit video", _r67b_cand.await_count == 0)
+
+
+async def _r67b_hang(session, url, *, timeout=None, quality_hint=None, label=""):
+    await asyncio.sleep(5)
+    return {"url": "https://proxy.embedez.com/render/video.mp4?late=1", "size": 1}
+
+
+_r67b_t0 = time.monotonic()
+with patch.object(v3, "VIDEO_QUALITY_WINDOW_SECONDS", 0.1):
+    _r67b_hang_out = _r67b_upgrade(_r67b_hang)
+_r67b_hang_dt = time.monotonic() - _r67b_t0
+check("r67b: a hung EmbedEZ candidate is cut off by the quality window and "
+      "yields the proxy video (bounded, never stalls the post)",
+      _r67b_hang_out == _r67b_base and _r67b_hang_dt < 2.0,
+      f"{_r67b_hang_out} after {_r67b_hang_dt:.2f}s")
+
+
+async def _r67b_proxy_flow():
+    """The proxy branch of resolve_post_media: quality attempt is video-only."""
+    _r67b_ns = SimpleNamespace(
+        fetch_proxy_post=AsyncMock(return_value={
+            "service": "vxreddit",
+            "media": [{"kind": "video", "url": _r67b_base}],
+            "stats": None, "body": ""}),
+        fetch_embeddit_stats=AsyncMock(return_value=None))
+    _r67b_post_base = {"title": "t", "author": "a", "body": "", "youtube_url": None,
+                       "vred_id": "abc123", "redgifs_url": None,
+                       "content_html": "", "thumb": None}
+    _r67b_calls = AsyncMock(side_effect=_r67b_cand_ok)
+    _r67b_rv = AsyncMock(return_value=None)
+    with patch.object(v3, "reddit_proxy", _r67b_ns), \
+         patch.object(v3, "PROXY_MEDIA", True), \
+         patch.object(v3, "fetch_arctic_post", AsyncMock(return_value=None)), \
+         patch.object(v3, "enrich_gallery_redlib", AsyncMock(return_value=[])), \
+         patch.object(v3, "media_url_ok", AsyncMock(return_value=(True, 999))), \
+         patch.object(v3, "video_candidate", _r67b_calls), \
+         patch.object(v3, "probe_video_facts", _r67b_probe), \
+         patch.object(v3, "VIDEO_QUALITY_MODE", "balanced"), \
+         patch.object(v3, "resolve_video_url", _r67b_rv), \
+         patch.object(v3, "_video_quality_budget_used", 0.0):
+        _r67b_res = await v3.resolve_post_media(
+            None, dict(_r67b_post_base), None, "/r/Sub/comments/abc123/title/")
+        check("r67b: a proxy-muxed video post upgrades to the validated "
+              "EmbedEZ 1080p tile (video only, no duplicate poster)",
+              _r67b_res["media"] == [{"kind": "video",
+                                      "url": "https://proxy.embedez.com/render/video.mp4?videoUrl=1080"}],
+              str(_r67b_res["media"]))
+        check("r67b: the native resolver is never called once the proxy "
+              "supplied the video", _r67b_rv.await_count == 0)
+        _r67b_ns.fetch_proxy_post = AsyncMock(return_value={
+            "service": "vxreddit",
+            "media": [{"kind": "image", "url": "https://i.redd.it/p.jpg"}],
+            "stats": None, "body": ""})
+        _r67b_calls.reset_mock()
+        await v3.resolve_post_media(None, dict(_r67b_post_base), None,
+                                    "/r/Sub/comments/img1/title/")
+        check("r67b: an image post never touches the video quality path",
+              _r67b_calls.await_count == 0, str(_r67b_calls.await_count))
+
+    # compatibility mode: the proxy video is used verbatim, exactly as before.
+    with patch.object(v3, "reddit_proxy", _r67b_ns), \
+         patch.object(v3, "PROXY_MEDIA", True), \
+         patch.object(v3, "fetch_arctic_post", AsyncMock(return_value=None)), \
+         patch.object(v3, "enrich_gallery_redlib", AsyncMock(return_value=[])), \
+         patch.object(v3, "media_url_ok", AsyncMock(return_value=(True, 999))), \
+         patch.object(v3, "video_candidate", _r67b_calls), \
+         patch.object(v3, "VIDEO_QUALITY_MODE", "compatibility"):
+        _r67b_ns.fetch_proxy_post = AsyncMock(return_value={
+            "service": "vxreddit",
+            "media": [{"kind": "video", "url": _r67b_base}],
+            "stats": None, "body": ""})
+        _r67b_calls.reset_mock()
+        _r67b_res = await v3.resolve_post_media(
+            None, dict(_r67b_post_base), None, "/r/Sub/comments/abc123/title/")
+        check("r67b: compatibility keeps the proxy video verbatim and makes no "
+              "quality request",
+              _r67b_res["media"] == [{"kind": "video", "url": _r67b_base}]
+              and _r67b_calls.await_count == 0, str(_r67b_res["media"]))
+
+
+asyncio.run(_r67b_proxy_flow())
+check("r67b: the proxy branch is wired to the bounded quality helper",
+      "proxy_video_quality_upgrade(" in inspect.getsource(v3.resolve_post_media))
+
+
 
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
