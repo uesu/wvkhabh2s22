@@ -124,12 +124,23 @@ jobs:
         #       run: python "testing area/twitter_v2_button_outside.py" <- V2 (card, buttons outside)
         #       run: python "testing area/twitter_v3.py"                <- V3 (card, buttons nested)
         # ───────────────────────────────────────────────────────────────────
-        run: python "testing area/twitter_v3.py"   # ← switch to testing area/twitter_v1.py / twitter_v2_button_outside.py here
+        run: |
+          echo "TWITTER_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+          set -o pipefail
+          set +e
+          python "testing area/twitter_v3.py" 2>&1 | tee twitter_monitor.log   # ← V3
+          statuses=("${PIPESTATUS[@]}")
+          echo "TWITTER_END_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+          if [ "${statuses[0]}" -ne 0 ] || [ "${statuses[1]}" -ne 0 ]; then
+            exit 1
+          fi
 
       - name: Persist updated posted_tweets.json cache (retry safely on a concurrent main update)
         env:
           CACHE_BRANCH: ${{ github.ref_name }}
         run: |
+          cache_result=failed
+          echo "TWITTER_CACHE_RESULT=failed" >> "$GITHUB_ENV"
           set -o pipefail
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
@@ -137,6 +148,8 @@ jobs:
 
           if git diff --cached --quiet; then
             echo "No cache changes to push."
+            cache_result=no-changes
+            echo "TWITTER_CACHE_RESULT=no-changes" >> "$GITHUB_ENV"
           else
             if ! git commit -m "auto: update posted_tweets.json cache"; then
               echo "::error::CACHE COMMIT FAILED — dedup cache was not persisted; rerun this monitor after resolving the repository state."
@@ -192,3 +205,41 @@ jobs:
               exit 1
             fi
           fi
+          if [ "$cache_result" != "no-changes" ]; then echo "TWITTER_CACHE_RESULT=success" >> "$GITHUB_ENV"; fi
+
+      - name: Write Twitter monitor run summary
+        if: always()
+        run: |
+          [ -f twitter_monitor.log ] || : > twitter_monitor.log
+          count_matches() { local pattern="$1"; grep -Ec "$pattern" twitter_monitor.log 2>/dev/null || true; }
+          total_feed_entries() { local total; total=$(grep 'feed OK via' twitter_monitor.log 2>/dev/null | grep -Eo '[0-9]+ entries' | grep -Eo '[0-9]+' | awk '{ total += $1 } END { print total + 0 }' || true); printf '%s\n' "${total:-0}"; }
+          feed_failures() { awk '/^\[[^]]+\] NO working nitter instance this run/ { n++ } END { print n + 0 }' twitter_monitor.log 2>/dev/null || true; }
+          runtime=$(( ${TWITTER_END_EPOCH:-$(date +%s)} - ${TWITTER_START_EPOCH:-$(date +%s)} ))
+          feeds_ok=$(count_matches 'feed OK via')
+          feeds_failed=$(feed_failures)
+          feeds_empty=$(count_matches 'skipping — no feed / 0 entries')
+          entries_read=$(total_feed_entries)
+          {
+            echo "## Twitter Feed Monitor — run summary"
+            echo
+            if [ "${{ job.status }}" = "success" ]; then echo "**Result:** success"; else echo "**Result:** failure"; fi
+            echo "**Runtime:** ${runtime}s"
+            echo
+            echo "### Feeds"
+            accounts_checked=$(awk '/^\[[^]]+\] feed OK via/ || /^\[[^]]+\] NO working nitter instance this run/ || /^\[[^]]+\] skipping — no feed \/ 0 entries/ { account=$0; sub(/^\[/, "", account); sub(/\].*$/, "", account); print account }' twitter_monitor.log 2>/dev/null | sort -u | wc -l | tr -d ' ' || true)
+            echo "- accounts checked: ${accounts_checked}"
+            echo "- entries read: ${entries_read}"
+            echo "- successful feeds: ${feeds_ok}"
+            echo "- failed feeds: ${feeds_failed}"
+            echo "- empty feeds: ${feeds_empty}"
+            echo
+            echo "### Posts"
+            echo "- new posts found: $(count_matches 'new posts|new tweet')"
+            echo "- posts delivered: $(count_matches 'V3 Posted:')"
+            echo "- skip log lines: $(count_matches 'skipping')"
+            echo "- retry/fallback log lines: $(count_matches 'trying next|retry')"
+            echo
+            echo "### State"
+            echo "- cache: ${TWITTER_CACHE_RESULT:-failed}"
+            echo "- summary source: local twitter_monitor.log only; no additional requests"
+          } >> "$GITHUB_STEP_SUMMARY"

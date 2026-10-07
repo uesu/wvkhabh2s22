@@ -178,12 +178,22 @@ jobs:
         #       run: python "testing area/reddit_main_v2_embedez.py"  <- rich card (EmbedEZ key)
         #       run: python "testing area/reddit_main_v3.py"          <- rich card (native media, no key)
         # ───────────────────────────────────────────────────────────────────
-        run: python "testing area/reddit_main_v3.py"   # ← V3 (proxy media + native fallback)
+        run: |
+          echo "MONITOR_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+          set -o pipefail
+          set +e
+          python "testing area/reddit_main_v3.py" 2>&1 | tee monitor.log
+          statuses=("${PIPESTATUS[@]}")
+          echo "MONITOR_END_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+          if [ "${statuses[0]}" -ne 0 ] || [ "${statuses[1]}" -ne 0 ]; then
+            exit 1
+          fi
 
       - name: Persist updated caches (retry safely on a concurrent main update)
         env:
           CACHE_BRANCH: ${{ github.ref_name }}
         run: |
+          echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"
           set -o pipefail
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
@@ -194,6 +204,7 @@ jobs:
 
           if git diff --cached --quiet; then
             echo "No cache changes to push."
+            echo "CACHE_RESULT=success" >> "$GITHUB_ENV"
           else
             if ! git commit -m "auto: update reddit monitor caches"; then
               echo "::error::CACHE COMMIT FAILED — dedup cache was not persisted; rerun this monitor after resolving the repository state."
@@ -256,3 +267,38 @@ jobs:
               exit 1
             fi
           fi
+          echo "CACHE_RESULT=success" >> "$GITHUB_ENV"
+
+      # Reporting only: reads the local monitor log and performs no network or cache work.
+      - name: Write monitor run summary
+        if: always()
+        run: |
+          [ -f monitor.log ] || : > monitor.log
+          count_matches() { local pattern="$1"; grep -Ec "$pattern" monitor.log 2>/dev/null || true; }
+          extract_number() { local value; value=$(grep -Eo "$1" monitor.log 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || true); printf '%s\n' "${value:-0}"; }
+          runtime=$(( ${MONITOR_END_EPOCH:-$(date +%s)} - ${MONITOR_START_EPOCH:-$(date +%s)} ))
+          ok=$(count_matches 'proxy warm-up.*OK')
+          failed=$(count_matches 'proxy warm-up.*(DOWN|FAILED|unavailable|error)')
+          new_candidates=$(extract_number 'Found [0-9]+ new Reddit posts')
+          {
+            echo "## Reddit Feed Monitor — run summary"
+            echo
+            if [ "${{ job.status }}" = "success" ]; then echo "**Result:** success"; else echo "**Result:** failure"; fi
+            echo "**Runtime:** ${runtime}s"
+            echo
+            echo "### Feed"
+            echo "- entries read: $(extract_number 'Combined feed OK: [0-9]+ entries')"
+            echo "- new candidates: ${new_candidates}"
+            echo "- posts delivered: $(count_matches 'Reddit V3 Posted:')"
+            echo "- listing/retry-related log lines: $(count_matches 'skipped.*next tick|retried next tick')"
+            echo
+            echo "### Providers and videos"
+            echo "- proxy warmups: ${ok} OK, ${failed} failed"
+            echo "- accepted 1080p upgrades: $(count_matches 'EmbedEZ 1080p candidate accepted')"
+            echo "- quality fallback notices: $(count_matches 'retaining validated base')"
+            echo "- final video provider labels: $(grep -Eo 'card media via [^ ]+' monitor.log 2>/dev/null | sort -u | tr '\n' ' ' || true)"
+            echo
+            echo "### State"
+            echo "- cache commit/push: ${CACHE_RESULT:-failed}"
+            echo "- summary source: local monitor.log only; no additional requests"
+          } >> "$GITHUB_STEP_SUMMARY"
