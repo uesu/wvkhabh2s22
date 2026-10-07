@@ -218,6 +218,7 @@ import os
 import re
 import json
 import time
+import urllib.parse
 import base64
 import asyncio
 import logging
@@ -2954,21 +2955,37 @@ async def video_candidate(session: aiohttp.ClientSession, url: str, *,
 
 
 def _video_evidence(candidate: dict | None) -> str:
-    """Compact log evidence for a validated candidate."""
+    """Conservative evidence: URL quality hints are never probe evidence."""
     if not isinstance(candidate, dict):
         return "none"
-    bits = [f"{candidate['size']} bytes" if candidate.get("size") else "size unknown"]
+    bits = [f"bytes={candidate['size']}" if candidate.get("size") else "bytes=unknown"]
     if candidate.get("width") and candidate.get("height"):
-        bits.append(f"{candidate['width']}x{candidate['height']}")
+        bits.append(f"dimensions={candidate['width']}x{candidate['height']} (verified)")
     else:
-        bits.append("dims unverified")
+        bits.append("dimensions=unverified; URL quality hint was not used as proof")
     if candidate.get("has_audio") is True:
-        bits.append("audio track")
+        bits.append("audio=present")
     elif candidate.get("has_audio") is False:
-        bits.append("no audio track")
+        bits.append("audio=absent")
+    else:
+        bits.append("audio=unknown")
     if candidate.get("quality_hint"):
-        bits.append(f"url hint {candidate['quality_hint']}p")
+        bits.append(f"url_quality_hint={candidate['quality_hint']}p (not evidence)")
     return ", ".join(bits)
+
+
+def _provider_for_url(url: str) -> str:
+    """Return a safe, stable provider label (never expose the full URL)."""
+    host = urllib.parse.urlparse(str(url or "")).netloc.lower()
+    if "embedez" in host or "redditez" in host:
+        return "embedez"
+    if "vxreddit" in host:
+        return "vxreddit"
+    if "embeddit" in host:
+        return "embeddit"
+    if "v.redd.it" in host:
+        return "native-dash"
+    return "thumbnail"
 
 
 def prefer_quality_candidate(quality: dict | None, base: dict | None) -> dict | None:
@@ -3077,6 +3094,8 @@ async def proxy_video_quality_upgrade(session: aiohttp.ClientSession, vid: str |
         quality = None
     _video_quality_budget_used += max(0.0, time.monotonic() - started)
     if not quality:
+        logging.info(f"[{label or 'proxy'}] EmbedEZ 1080p unavailable; retaining "
+                     f"validated base provider={_provider_for_url(base_url)}.")
         return base_url
     facts = await probe_video_facts(session, base_url,
                                    timeout=float(VIDEO_NATIVE_TIMEOUT_SECONDS))
@@ -3086,8 +3105,11 @@ async def proxy_video_quality_upgrade(session: aiohttp.ClientSession, vid: str |
             "has_audio": (facts or {}).get("has_audio")}
     winner = prefer_quality_candidate(quality, base)
     if isinstance(winner, dict) and str(winner.get("url") or "") == str(quality.get("url")):
-        logging.info(f"[{label or 'proxy'}] video upgraded to embedez-1080p "
-                     f"({_video_evidence(quality)}).")
+        content_type = (quality.get("content_type") or quality.get("mime_type")
+                       or "validated")
+        logging.info(f"[{label or 'proxy'}] EmbedEZ 1080p candidate accepted: "
+                     f"provider=embedez, content_type={content_type}, "
+                     f"{_video_evidence(quality)}, reason=validated quality improvement.")
         return quality["url"]
     return base_url
 
@@ -4118,8 +4140,8 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                 media = [proxy_video]
                 _use_proxy_text()
                 proxy_media_used = True
-                logging.info(f"[{label or 'proxy'}] card media via {proxy['service']} "
-                             f"— 1 video tile.")
+                logging.info(f"[{label or 'proxy'}] card media via "
+                             f"{_provider_for_url(proxy_video['url'])} — 1 video tile.")
             elif (not video_dead and not arctic_is_video and redlib_items
                   and any(x["kind"] == "video" for x in redlib_items)):
                 # round 38c: a redlib gallery WITH a video item is the most
@@ -5111,7 +5133,13 @@ async def main():
                                 "payload": payload,
                             }
                         kinds = ",".join(sorted({m["kind"] for m in data["media"]})) or "text"
-                        mode = "full" if data["full_mode"] else "native"
+                        mode = ("full" if data["full_mode"] else
+                                ("proxy: " + _provider_for_url(data["media"][0].get("url", ""))
+                                 if data["media"] and data["media"][0].get("kind") == "video"
+                                 and _provider_for_url(data["media"][0].get("url", "")) != "thumbnail"
+                                 else "native-dash" if data["media"] and
+                                 _provider_for_url(data["media"][0].get("url", "")) == "native-dash"
+                                 else "native"))
                         _latency = max(0.0, now - float(published_ts or now))
                         _held_note = ""
                         if isinstance(_pend_entry, dict):
