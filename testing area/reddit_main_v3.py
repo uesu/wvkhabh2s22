@@ -34,13 +34,23 @@
 #       file id; PNGs 404 there → largest signed preview URL as-is)
 #     • GIF: i.redd.it .gif (unsigned) / signed preview .gif as-is
 #     • video (video posts show the video ONLY, never a dup thumb):
+#           ROUND 67 (REDDIT_VIDEO_QUALITY, default balanced): EmbedEZ 1080p
+#           and vxreddit are attempted together — a validated EmbedEZ 1080p
+#           result may replace the vxreddit result, else EmbedEZ 720p, else
+#           the durable v.redd.it DASH ladder below. The whole resolver is
+#           bounded (candidate timeouts + per-post and per-run budgets) and
+#           decides on validated facts, never on a quality string in a URL.
 #           1. v.redd.it/<id>/DASH_<q>.mp4 (720→1080→480→360) — self-
 #              contained mp4 WITH audio, straight from Reddit, open, no sig
-#              (round 12 — replaces the old proxy-first chain)
+#              (round 12; the durable reliability floor in every mode)
 #           2. proxy.embedez.com/render/video.mp4?videoUrl=…&audioUrl=…
-#              (CMAF video + CMAF audio -> muxed mp4; keyless, verified
-#              h264 720p + AAC out)
+#              (CMAF video + CMAF audio -> muxed mp4; keyless)
 #           3. vxreddit.com/redditvideo.mp4?video_url=…&audio_url=…
+#           REDDIT_VIDEO_QUALITY=compatibility restores the pre-round-67
+#           order exactly (native ladder → EmbedEZ 720 → vxreddit →
+#           EmbedEZ 1080).
+#           Signed packaged-media.redd.it render URLs EXPIRE: they are never
+#           card URLs and are never persisted (round 67: refused outright).
 #     • NEVER a silent video: if the chain fails → first-frame thumbnail +
 #       Read Post button.
 #   • signed preview.redd.it URLs MUST be used verbatim — changing ANY query
@@ -216,7 +226,7 @@ import importlib.util
 import aiohttp
 import feedparser
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlparse
 from dotenv import load_dotenv
 
 try:
@@ -322,25 +332,6 @@ PENDING_FILE = "pending_reddit.json"
 PENDING_RECHECK_SECONDS = _env_int("PENDING_RECHECK_SECONDS", 1800)  # 30 min
 PENDING_MAX_AGE_SECONDS = 48 * 3600  # matches the 48h posting window
 
-# Round 35 (2026-09-28): optional escape list for the NSFW content gate.
-# This is a repository Variable, not a secret: comma-separated author names
-# or post IDs that bypass the gate. Empty (the default) means no exceptions.
-NSFW_ALLOWLIST = [
-    value.strip() for value in os.getenv("NSFW_ALLOWLIST", "").split(",") if value.strip()
-]
-# Round 42/45: NSFW now fails closed by default. NSFW_FAIL_OPEN=1 restores
-# the pre-round-42 behavior; NSFW_PAGE_FALLBACK=0 disables the Redlib badge
-# fallback used only when Arctic has not indexed the post yet.
-NSFW_FAIL_OPEN = os.getenv("NSFW_FAIL_OPEN", "0").strip().lower() in ("1", "true", "yes", "on")
-NSFW_REQUIRE_SUBREDDIT = os.getenv("NSFW_REQUIRE_SUBREDDIT", "0").strip().lower() in ("1", "true", "yes", "on")
-# GitHub exposes an unset repository Variable as an empty environment value.
-# Keep the documented default (enabled) in that case.
-NSFW_PAGE_FALLBACK = os.getenv("NSFW_PAGE_FALLBACK")
-if not NSFW_PAGE_FALLBACK or NSFW_PAGE_FALLBACK.strip().lower() in ("1", "true", "yes", "on"):
-    NSFW_PAGE_FALLBACK = True
-else:
-    NSFW_PAGE_FALLBACK = NSFW_PAGE_FALLBACK.strip().lower() not in ("0", "false", "no", "off")
-
 # Round 44: delivered-post retraction/tombstone. Disabled by default; when on
 # the webhook is called with wait=true so Discord returns a message ID.
 RETRACT_DEAD_POSTS = os.getenv("RETRACT_DEAD_POSTS", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -398,9 +389,11 @@ else:
 # Round 63 ("The Great Simplification"): the settle window, the mod-queue
 # gate, the duplicate-media gate, the repost gate and the page-identity
 # check are gone. A native Reddit post is delivered as-is — the only things
-# that can still stop a card are the dedup cache (below), the fail-closed
-# NSFW gate, and the opt-in retraction seatbelt above. Delivery latency is
-# now simply cron interval + runtime overhead.
+# that can still stop a card are the dedup cache (below) and the opt-in
+# retraction seatbelt above. Delivery latency is now simply cron interval +
+# runtime overhead. (Round 67 removed the content-advisory gate as well —
+# see docs/history/ROUND_67.md: the engine makes no content-based posting
+# decision, on any path.)
 #
 # The /new listing fetch below is kept ONLY for the retraction seatbelt
 # (it needs to know whether a delivered post has dropped out of the
@@ -677,6 +670,76 @@ def _env_flag(name: str, default: str) -> bool:
     if not value:
         value = default.strip().lower()
     return value not in ("0", "false", "no", "off")
+
+
+def _env_mode(name: str, default: str, allowed: tuple) -> str:
+    """Read a string-mode option; unset/empty/garbage means the default.
+
+    GitHub passes an unset repository Variable as an empty string, and a
+    typo must never silently pick an unintended mode — both fall back to the
+    documented default (same contract as round 53's empty-string handling).
+    """
+    value = (os.getenv(name) or "").strip().lower()
+    if not value:
+        return default
+    if value in allowed:
+        return value
+    logging.warning(f"{name}={value!r} is not one of {allowed} — using {default!r}.")
+    return default
+
+
+# ---------------------------------------------------------------------------
+# ■ ROUND 67 (2026-10-07): REDDIT VIDEO QUALITY SELECTION
+# Live Discord/Discohook tests on multiple Reddit videos (evidence:
+# docs/REDDIT_VIDEO_MEDIA_REPORT.md) established three facts that shape this
+# resolver:
+#   • EmbedEZ 1080p — playable with audio and visibly sharper than 720p.
+#   • vxreddit      — playable with audio, but its own output stayed at its
+#                     own quality even when handed a CMAF_1080 input. A URL
+#                     containing "1080" is therefore NEVER proof of quality;
+#                     the resolver decides on validated response facts.
+#   • signed native packaged-media.redd.it URLs play at original quality but
+#     EXPIRE — they are never card URLs and never persisted (see
+#     media_url_is_durable).
+# Reliability order is unchanged: vxreddit is the winner path and the
+# immediate fallback, and EmbedEZ 1080p is a bounded quality opportunity —
+# never a single point of failure. A timeout, an HTTP error, an HTML error
+# page, an oversized file or a failed mux simply keeps vxreddit.
+#   REDDIT_VIDEO_QUALITY (empty-safe; wired in reddit_monitor.yml):
+#     balanced (default) — EmbedEZ 1080p may replace a validated vxreddit
+#                          result; EmbedEZ 720p is only tried when vxreddit
+#                          itself is unusable.
+#     compatibility      — the pre-round-67 ladder, byte-order identical
+#                          (native DASH first, no 1080p EmbedEZ attempt):
+#                          the instant rollback, no code change needed.
+#     highest            — balanced with a wider quality window; still bound
+#                          by the same size and latency limits.
+# The resolver is also bounded end to end: every candidate has a timeout, the
+# 1080p opportunity holds the decision for at most
+# VIDEO_QUALITY_WINDOW_SECONDS, one post may not exceed
+# VIDEO_RESOLVE_BUDGET_SECONDS, and a run may not exceed
+# VIDEO_RUN_BUDGET_SECONDS of quality attempts (after that the durable native
+# ladder is used directly — a slow proxy can never stall the monitor). The
+# image, GIF, photo and gallery paths do not use any of this.
+# ---------------------------------------------------------------------------
+VIDEO_QUALITY_MODES = ("balanced", "compatibility", "highest")
+VIDEO_QUALITY_MODE = _env_mode("REDDIT_VIDEO_QUALITY", "balanced", VIDEO_QUALITY_MODES)
+# One muxing-proxy candidate (pre-round-67 code allowed 120 s per attempt).
+VIDEO_CANDIDATE_TIMEOUT_SECONDS = 20.0
+# One durable v.redd.it candidate (Reddit answers 404 / 206 quickly).
+VIDEO_NATIVE_TIMEOUT_SECONDS = 10.0
+# How long a validated EmbedEZ 1080p result may hold the decision open.
+VIDEO_QUALITY_WINDOW_SECONDS = 8.0
+# The same window in "highest" mode (still bounded — this is not "wait
+# indefinitely"; a canary run may widen it deliberately).
+VIDEO_QUALITY_WINDOW_HIGHEST_SECONDS = 15.0
+# The whole resolver, wall clock, for one post.
+VIDEO_RESOLVE_BUDGET_SECONDS = 40.0
+# Per-run ceiling for quality attempts; afterwards the resolver goes straight
+# to the durable native ladder.
+VIDEO_RUN_BUDGET_SECONDS = 180.0
+# Body prefix pulled for the MP4 evidence probe (dimensions + audio track).
+VIDEO_PROBE_BYTES = 64 * 1024
 
 
 # YouTube: default = thumbnail + animated starwardspark3 button (deterministic,
@@ -1043,7 +1106,7 @@ def pending_due(pending: dict, key: str, now: float) -> bool:
 # cannot change state while removed; if a mod RESTORES it, it re-enters via
 # RSS with a fresh "updated" stamp, which bypasses the skip and the full
 # pipeline posts it. Everything else (approval-pending, transient source
-# outages, media-wait, NSFW-unknown, ...) shares the single round-30
+# outages, media-wait, source trouble, ...) shares the single round-30
 # PENDING_RECHECK_SECONDS throttle — round 63 removed the mod-queue gate
 # that justified a separate short interval.
 # ---------------------------------------------------------------------------
@@ -1055,12 +1118,6 @@ _NO_RECHECK_REASONS = frozenset({
     "removed by moderator",
     "removed by moderators/filters",
     "deleted by author",
-    # Round 35: an archive-sourced NSFW post stays held for the 48 h window.
-    # An RSS reappearance still runs the gate again, just like the restore
-    # path for removal notices.
-    "nsfw_flag",
-    "nsfw_subreddit",
-    "nsfw_crosspost_source",
 })
 
 
@@ -1292,122 +1349,6 @@ async def fetch_arctic_post(session, post_id: str, label: str = "") -> dict | No
         _arctic_fail_count += 1
         logging.info(f"[{label or post_id}] Arctic Shift unavailable: {exc}")
         return None
-
-
-def _arctic_bool(*values):
-    for value in values:
-        if isinstance(value, bool):
-            return value
-    return None
-
-
-def _arctic_nsfw_markers(post: dict) -> dict:
-    markers = {
-        "archive_status": "found",
-        "over_18": post.get("over_18"),
-        "thumbnail": str(post.get("thumbnail") or "").strip().lower(),
-        # round 36/43: destination URL + title/author feed the duplicate gates.
-        "url": str(post.get("url_overridden_by_dest") or post.get("url") or ""),
-        "title": str(post.get("title") or ""),
-        "author": str(post.get("author") or ""),
-        "created_utc": post.get("created_utc"),
-    }
-    # Some archive/community shapes expose subreddit NSFW under different
-    # keys. Missing community records are tolerated unless
-    # NSFW_REQUIRE_SUBREDDIT=1; any positive marker still blocks.
-    markers["subreddit_over18"] = _arctic_bool(
-        post.get("subreddit_over18"),
-        post.get("subreddit_over_18"),
-        post.get("over18"),
-        (post.get("subreddit") or {}).get("over18") if isinstance(post.get("subreddit"), dict) else None,
-        (post.get("subreddit") or {}).get("over_18") if isinstance(post.get("subreddit"), dict) else None,
-    )
-    parent = arctic_crosspost_orig(post)
-    if isinstance(parent, dict):
-        markers["source_present"] = True
-        markers["source_over_18"] = parent.get("over_18")
-        markers["source_thumbnail"] = str(parent.get("thumbnail") or "").strip().lower()
-        markers["source_subreddit_over18"] = _arctic_bool(
-            parent.get("subreddit_over18"),
-            parent.get("subreddit_over_18"),
-            parent.get("over18"),
-            (parent.get("subreddit") or {}).get("over18") if isinstance(parent.get("subreddit"), dict) else None,
-            (parent.get("subreddit") or {}).get("over_18") if isinstance(parent.get("subreddit"), dict) else None,
-        )
-    else:
-        markers["source_present"] = False
-    if not isinstance(markers.get("over_18"), bool):
-        markers["malformed"] = True
-    if markers.get("source_present") and not isinstance(markers.get("source_over_18"), bool):
-        markers["malformed"] = True
-    return markers
-
-
-async def fetch_arctic_nsfw_flags(session, post_ids: list, label: str = "") -> dict:
-    """Return normalized NSFW metadata for up to 500 post IDs in one call.
-
-    Values are dictionaries consumed by ``nsfw_gate_reason``. A missing Arctic
-    record is ``{"archive_status": "missing"}``; an API/malformed lookup
-    failure is ``{"lookup_error": True}`` and therefore fails closed unless
-    NSFW_FAIL_OPEN=1.
-    """
-    global _arctic_fail_count
-    requested = list(dict.fromkeys(str(post_id or "").lower() for post_id in post_ids))
-    flags = {post_id: {"archive_status": "missing"} for post_id in requested if post_id}
-    ids = [post_id for post_id in requested
-           if re.fullmatch(r"[a-z0-9]+", post_id or "")][:500]
-    if not ids:
-        return flags
-    if _arctic_fail_count >= 3:
-        return {post_id: {"lookup_error": True} for post_id in flags}
-    try:
-        async with session.get(
-            ARCTIC_POSTS_URL,
-            params={"ids": ",".join(ids)},
-            headers=dict(BROWSER_HEADERS),
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            if resp.status != 200:
-                raise ValueError(f"HTTP {resp.status}")
-            data = await resp.json(content_type=None)
-        posts = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(posts, list):
-            raise ValueError("invalid archive response")
-        _arctic_fail_count = 0
-        for post in posts:
-            if not isinstance(post, dict):
-                continue
-            post_id = str(post.get("id") or "").lower()
-            if post_id not in flags:
-                continue
-            flags[post_id] = _arctic_nsfw_markers(post)
-        return flags
-    except Exception as exc:
-        _arctic_fail_count += 1
-        logging.info(f"[{label or 'nsfw-gate'}] Arctic Shift NSFW flag lookup "
-                     f"unavailable: {exc} — failing closed for this run.")
-        return {post_id: {"lookup_error": True} for post_id in flags}
-
-
-def _nsfw_allowlist_forms(value) -> set:
-    """Case-insensitive allowlist forms for a post ID or Reddit author."""
-    return reddit_signals.nsfw_allowlist_forms(value)
-
-
-def nsfw_from_post_page(page_html: str | None) -> bool | None:
-    return reddit_signals.nsfw_from_post_page(page_html)
-
-
-def nsfw_gate_reason(post_id: str, author: str, markers: dict | None) -> str | None:
-    """Return the fail-closed NSFW hold reason, else None."""
-    return reddit_signals.nsfw_gate_reason(
-        post_id,
-        author,
-        markers,
-        allowlist=NSFW_ALLOWLIST,
-        fail_open=NSFW_FAIL_OPEN,
-        require_subreddit=NSFW_REQUIRE_SUBREDDIT,
-    )
 
 
 def arctic_crosspost_orig(post) -> dict | None:
@@ -2748,46 +2689,619 @@ def cmaf_urls(vid: str, quality: int = CMAF_QUALITY) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# ■ ROUND 67: video candidate validation (no URL is trusted by its name)
+# ---------------------------------------------------------------------------
+# Native Reddit media that is signed or timestamped expires within hours and
+# must never become the card's video URL or be persisted in cache/state.
+_EXPIRING_MEDIA_HOSTS = ("packaged-media.redd.it",)
+_SIGNATURE_QUERY_KEYS = frozenset({
+    "s", "sig", "signature", "hmac", "token", "jwt", "policy",
+    "expires", "expire", "e", "se", "sp", "sv",
+    "x-amz-signature", "x-amz-credential", "x-amz-expires", "x-amz-date",
+})
+_VIDEO_QUALITY_HINT_RE = re.compile(r"(?:^|[^0-9])(1080|720|480|360|240|144)(?:p)?(?:[^0-9]|$)")
+# Round 67: per-run seconds spent on quality attempts. Once the ceiling is
+# reached the resolver uses the durable native ladder directly, so a slow or
+# transcode-queued proxy can never stall a whole monitor run.
+_video_quality_budget_used = 0.0
+
+
+def reset_video_quality_budget() -> None:
+    """Called once per run (main()); keeps the quality ceiling per-run."""
+    global _video_quality_budget_used
+    _video_quality_budget_used = 0.0
+
+
+def media_url_is_durable(url: str) -> bool:
+    """True only for a media URL with no signature and no expiry parameter.
+
+    Round 67 policy: signed/expiring native Reddit media (today:
+    ``packaged-media.redd.it``, whose render URLs carry ``s=``/``e=``
+    parameters) may be used as a short-lived *input* to a proxy during the
+    run, but never as the card's own media URL and never persisted.
+    Unsigned v.redd.it CMAF/DASH files do not expire and remain usable.
+    """
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    if any(host == bad or host.endswith("." + bad) for bad in _EXPIRING_MEDIA_HOSTS):
+        return False
+    try:
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    except Exception:
+        return False
+    for key, _value in pairs:
+        if str(key).strip().lower() in _SIGNATURE_QUERY_KEYS:
+            return False
+    return True
+
+
+def video_quality_hint(url: str) -> int | None:
+    """Ordering hint read from a URL *path* — never proof of quality.
+
+    ``.../CMAF_1080.mp4`` -> 1080. The query string is ignored on purpose: a
+    muxing URL carries its INPUT quality there, and the live tests showed a
+    CMAF_1080 input still producing the service's own output. The resolver
+    ranks candidates with this hint and decides with validated facts.
+    """
+    try:
+        path = urlparse(str(url or "")).path
+    except Exception:
+        return None
+    match = _VIDEO_QUALITY_HINT_RE.search(path or "")
+    return int(match.group(1)) if match else None
+
+
+def _mp4_boxes(buf: bytes, start: int, end: int):
+    """Yield (type, payload_start, payload_end) for boxes at one level."""
+    pos = start
+    while pos + 8 <= end:
+        size = int.from_bytes(buf[pos:pos + 4], "big")
+        box_type = buf[pos + 4:pos + 8]
+        header = 8
+        if size == 1:
+            if pos + 16 > end:
+                return
+            size = int.from_bytes(buf[pos + 8:pos + 16], "big")
+            header = 16
+        elif size == 0:
+            size = end - pos
+        if size < header or pos + size > end:
+            return
+        yield box_type, pos + header, min(pos + size, end)
+        pos += size
+
+
+def _mp4_tkhd_dims(buf: bytes, start: int, end: int):
+    """(width, height) from a tkhd payload, or None. Bounds-checked.
+
+    Layout (ISO/IEC 14496-12): version+flags, creation, modification, track
+    id, reserved, duration, then 8+2+2+2+2 reserved/layer/group/volume
+    bytes and the 36-byte matrix — so the 16.16 fixed-point width/height
+    start at byte 76 (v0) / 88 (v1) of the box payload.
+    """
+    version = buf[start] if end > start else 0
+    offset = start + (88 if version == 1 else 76)
+    if offset + 8 > end:
+        return None
+    width = int.from_bytes(buf[offset:offset + 4], "big") / 65536.0
+    height = int.from_bytes(buf[offset + 4:offset + 8], "big") / 65536.0
+    if width <= 0 or height <= 0:
+        return None
+    return int(round(width)), int(round(height))
+
+
+def _mp4_hdlr_type(buf: bytes, start: int, end: int) -> bytes | None:
+    if end - start < 12:
+        return None
+    return buf[start + 8:start + 12]
+
+
+def mp4_media_facts(prefix: bytes | None) -> dict | None:
+    """Best-effort facts from an MP4 byte prefix; None when there is no moov.
+
+    Returns ``{"width", "height", "has_video", "has_audio"}`` when a readable
+    ``moov`` box is inside the prefix (faststart files and Reddit's own
+    renditions). A fragmented/truncated prefix, a moov at the end of the file
+    or any malformed box simply yields None — never an exception, so this can
+    never fail a resolution.
+    """
+    if not isinstance(prefix, (bytes, bytearray)) or len(prefix) < 16:
+        return None
+    buf = bytes(prefix)
+    width = height = None
+    has_video = has_audio = False
+    found = False
+    for box_type, p_start, p_end in _mp4_boxes(buf, 0, len(buf)):
+        if box_type != b"moov":
+            continue
+        found = True
+        for sub_type, s_start, s_end in _mp4_boxes(buf, p_start, p_end):
+            if sub_type != b"trak":
+                continue
+            handler = None
+            dims = None
+            for leaf_type, l_start, l_end in _mp4_boxes(buf, s_start, s_end):
+                if leaf_type == b"tkhd":
+                    dims = _mp4_tkhd_dims(buf, l_start, l_end)
+                elif leaf_type == b"mdia":
+                    for mdia_type, m_start, m_end in _mp4_boxes(buf, l_start, l_end):
+                        if mdia_type == b"hdlr":
+                            handler = _mp4_hdlr_type(buf, m_start, m_end)
+            if handler == b"vide":
+                has_video = True
+                if dims and not (width and height):
+                    width, height = dims
+            elif handler == b"soun":
+                has_audio = True
+    if not found:
+        return None
+    return {"width": width, "height": height,
+            "has_video": has_video, "has_audio": has_audio}
+
+
+def video_orientation(facts: dict | None) -> str | None:
+    """'portrait' / 'landscape' / 'square' / None from validated dimensions."""
+    if not isinstance(facts, dict):
+        return None
+    width, height = facts.get("width"), facts.get("height")
+    if not width or not height:
+        return None
+    if height > width:
+        return "portrait"
+    if width > height:
+        return "landscape"
+    return "square"
+
+
+def _looks_like_error_body(prefix: bytes | None) -> bool:
+    """True for the HTML/JSON error pages a proxy returns on success codes."""
+    if not isinstance(prefix, (bytes, bytearray)) or not prefix:
+        return False
+    head = bytes(prefix[:512]).lstrip().lower()
+    return head[:1] in (b"<", b"{") or head.startswith(b"\xef\xbb\xbf<")
+
+
+async def video_candidate(session: aiohttp.ClientSession, url: str, *,
+                          timeout: float | None = None,
+                          quality_hint: int | None = None,
+                          label: str = "") -> dict | None:
+    """Range-probe ONE video URL; return validated facts, or None.
+
+    Usable only when: the request completes inside the candidate timeout, the
+    status is 200/206, the body prefix is not an HTML/JSON error page, the
+    content type is compatible (or the body carries real MP4 structure), and
+    the known size is under MAX_MEDIA_BYTES. Never raises, never blocks past
+    ``timeout``. Signed/expiring URLs are refused outright.
+    """
+    url = str(url or "").strip()
+    if not url:
+        return None
+    tag = label or "video"
+    if not media_url_is_durable(url):
+        logging.info(f"[{tag}] signed/expiring media URL refused as a card "
+                     f"candidate: {url[:90]}")
+        return None
+    limit = VIDEO_CANDIDATE_TIMEOUT_SECONDS if timeout is None else min(
+        float(timeout), float(VIDEO_CANDIDATE_TIMEOUT_SECONDS))
+    limit = max(1.0, limit)
+    facts = None
+    try:
+        async with session.get(
+                url,
+                headers={"User-Agent": "Discordbot/2.0",
+                         "Range": f"bytes=0-{max(1, int(VIDEO_PROBE_BYTES)) - 1}"},
+                timeout=aiohttp.ClientTimeout(total=limit)) as resp:
+            status = resp.status
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            size = 0
+            content_range = resp.headers.get("Content-Range") or ""
+            if "/" in content_range:
+                try:
+                    size = int(content_range.rsplit("/", 1)[1])
+                except (TypeError, ValueError, IndexError):
+                    size = 0
+            if not size and status == 200:
+                try:
+                    size = int(resp.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    size = 0
+            if status not in (200, 206):
+                logging.info(f"[{tag}] candidate rejected — HTTP {status}: {url[:90]}")
+                return None
+            if size and size > MAX_MEDIA_BYTES:
+                logging.info(f"[{tag}] candidate rejected — {size} bytes exceeds "
+                             f"the {MAX_MEDIA_BYTES}-byte media limit: {url[:90]}")
+                return None
+            try:
+                prefix = await resp.content.read(max(1, int(VIDEO_PROBE_BYTES)))
+            except Exception:
+                prefix = b""
+            if _looks_like_error_body(prefix):
+                logging.info(f"[{tag}] candidate rejected — HTML/JSON error body "
+                             f"despite HTTP {status}: {url[:90]}")
+                return None
+            ctype_ok = (not ctype) or any(token in ctype for token in
+                                          ("video", "octet-stream", "mp4"))
+            mp4_facts = mp4_media_facts(prefix)
+            if not ctype_ok:
+                logging.info(f"[{tag}] candidate rejected — content type "
+                             f"{ctype!r} is not a video type: {url[:90]}")
+                return None
+            facts = mp4_facts
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logging.info(f"[{tag}] candidate failed ({exc.__class__.__name__}: "
+                     f"{exc}) — {url[:90]}")
+        return None
+    return {
+        "url": url,
+        "size": size,
+        "width": (facts or {}).get("width"),
+        "height": (facts or {}).get("height"),
+        "has_video": (facts or {}).get("has_video"),
+        "has_audio": (facts or {}).get("has_audio"),
+        "quality_hint": quality_hint if quality_hint is not None
+                        else video_quality_hint(url),
+        "label": tag,
+    }
+
+
+def _video_evidence(candidate: dict | None) -> str:
+    """Compact log evidence for a validated candidate."""
+    if not isinstance(candidate, dict):
+        return "none"
+    bits = [f"{candidate['size']} bytes" if candidate.get("size") else "size unknown"]
+    if candidate.get("width") and candidate.get("height"):
+        bits.append(f"{candidate['width']}x{candidate['height']}")
+    else:
+        bits.append("dims unverified")
+    if candidate.get("has_audio") is True:
+        bits.append("audio track")
+    elif candidate.get("has_audio") is False:
+        bits.append("no audio track")
+    if candidate.get("quality_hint"):
+        bits.append(f"url hint {candidate['quality_hint']}p")
+    return ", ".join(bits)
+
+
+def prefer_quality_candidate(quality: dict | None, base: dict | None) -> dict | None:
+    """Pick between the EmbedEZ 1080p opportunity and the vxreddit base.
+
+    The quality candidate wins only when it passed validation AND the probe
+    evidence does not contradict the quality claim: no orientation flip
+    (portrait media is never replaced by a landscape output, or vice versa),
+    no resolution downgrade, and no loss of an audio track the base carries.
+    """
+    if quality is None:
+        return base
+    if base is None:
+        return quality
+    q_orient, b_orient = video_orientation(quality), video_orientation(base)
+    if q_orient and b_orient and q_orient != b_orient:
+        logging.info(f"[video] EmbedEZ 1080p candidate is {q_orient} while the "
+                     f"vxreddit result is {b_orient} — keeping vxreddit.")
+        return base
+    q_pixels = (quality.get("width") or 0) * (quality.get("height") or 0)
+    b_pixels = (base.get("width") or 0) * (base.get("height") or 0)
+    if q_pixels and b_pixels and q_pixels < b_pixels:
+        logging.info(f"[video] EmbedEZ 1080p candidate returns fewer pixels "
+                     f"({q_pixels}) than the vxreddit result ({b_pixels}) — "
+                     f"keeping vxreddit.")
+        return base
+    if quality.get("has_audio") is False and base.get("has_audio") is True:
+        logging.info("[video] EmbedEZ 1080p candidate has no audio track while "
+                     "the vxreddit result does — keeping vxreddit.")
+        return base
+    return quality
+
+
+async def probe_video_facts(session: aiohttp.ClientSession, url: str, *,
+                            timeout: float = 10.0) -> dict | None:
+    """Best-effort MP4 facts for a media URL that is ALREADY validated.
+
+    Round 67 proxy-path comparison helper. It never gates the URL itself —
+    the caller has already range-checked it as card media — it only gives
+    ``prefer_quality_candidate`` real dimension/audio evidence with which to
+    compare the established proxy video against the EmbedEZ 1080p
+    opportunity. Never raises; None when the prefix cannot be read.
+    """
+    url = str(url or "").strip()
+    if not url:
+        return None
+    try:
+        async with session.get(
+                url,
+                headers={"User-Agent": "Discordbot/2.0",
+                         "Range": f"bytes=0-{max(1, int(VIDEO_PROBE_BYTES)) - 1}"},
+                timeout=aiohttp.ClientTimeout(total=max(1.0, float(timeout)))) as resp:
+            if resp.status not in (200, 206):
+                return None
+            prefix = await resp.content.read(max(1, int(VIDEO_PROBE_BYTES)))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return None
+    if _looks_like_error_body(prefix):
+        return None
+    return mp4_media_facts(prefix)
+
+
+async def proxy_video_quality_upgrade(session: aiohttp.ClientSession, vid: str | None,
+                                      base_url: str, label: str = "") -> str:
+    """One bounded EmbedEZ 1080p opportunity for a PROXY-delivered video.
+
+    The proxy chain's already-validated muxed mp4 stays the HELD base: this
+    only replaces it when a validated EmbedEZ 1080p candidate survives
+    ``prefer_quality_candidate`` against the base's own probe facts (never an
+    orientation flip, never fewer pixels, never an audio-track loss). Any
+    failure — timeout, HTTP error, error body, oversize, unreadable probe, a
+    spent per-run budget, or compatibility mode — returns ``base_url``
+    unchanged, so a proxy video is never lost to the quality attempt and the
+    extra probe happens only on Reddit-video posts (never on image, GIF,
+    photo or gallery paths).
+    """
+    global _video_quality_budget_used
+    if not vid or not base_url:
+        return base_url
+    mode = VIDEO_QUALITY_MODE if VIDEO_QUALITY_MODE in VIDEO_QUALITY_MODES else "balanced"
+    if mode == "compatibility":
+        return base_url
+    if _video_quality_budget_used >= float(VIDEO_RUN_BUDGET_SECONDS):
+        logging.info(f"[{label or 'proxy'}] per-run quality budget spent — keeping "
+                     f"the validated proxy video.")
+        return base_url
+    started = time.monotonic()
+    cmaf1080 = cmaf_urls(vid, 1080)
+    embedez_1080 = VIDEO_PROXY_EMBEDEZ.format(
+        video_url=quote(cmaf1080["video_mp4"], safe=""),
+        audio_url=quote(cmaf1080["audio_mp4"], safe=""))
+    window = (float(VIDEO_QUALITY_WINDOW_HIGHEST_SECONDS) if mode == "highest"
+              else float(VIDEO_QUALITY_WINDOW_SECONDS))
+    try:
+        quality = await asyncio.wait_for(
+            video_candidate(session, embedez_1080,
+                            timeout=float(VIDEO_CANDIDATE_TIMEOUT_SECONDS),
+                            quality_hint=1080,
+                            label=f"{label or 'proxy'} embedez-1080p"),
+            timeout=max(0.05, window))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        quality = None
+    _video_quality_budget_used += max(0.0, time.monotonic() - started)
+    if not quality:
+        return base_url
+    facts = await probe_video_facts(session, base_url,
+                                   timeout=float(VIDEO_NATIVE_TIMEOUT_SECONDS))
+    base = {"url": base_url,
+            "width": (facts or {}).get("width"),
+            "height": (facts or {}).get("height"),
+            "has_audio": (facts or {}).get("has_audio")}
+    winner = prefer_quality_candidate(quality, base)
+    if isinstance(winner, dict) and str(winner.get("url") or "") == str(quality.get("url")):
+        logging.info(f"[{label or 'proxy'}] video upgraded to embedez-1080p "
+                     f"({_video_evidence(quality)}).")
+        return quality["url"]
+    return base_url
+
+
+def _task_video_facts(task) -> dict | None:
+    """Validated facts from a finished task, else None (never raises)."""
+    if task is None or not task.done() or task.cancelled():
+        return None
+    try:
+        result = task.result()
+    except Exception:
+        return None
+    if isinstance(result, dict) and result.get("url"):
+        return result
+    return None
+
+
+async def _race_quality_candidates(session, vx_url: str, ez_url: str, window: float,
+                                   budget: float, label: str):
+    """Run the vxreddit base and the EmbedEZ 1080p opportunity concurrently.
+
+    vxreddit is started FIRST and is never starved: the wait is bounded by
+    ``window`` (and by the caller's remaining budget), so a slow or hung
+    EmbedEZ request can only ever cost the window — never the video.
+    Returns ``(embedez_facts, vxreddit_facts)``, each None when that
+    candidate did not validate.
+    """
+    tag = label or "video"
+    vx_task = asyncio.ensure_future(video_candidate(
+        session, vx_url, timeout=budget, quality_hint=CMAF_QUALITY,
+        label=f"{tag} vxreddit"))
+    ez_task = asyncio.ensure_future(video_candidate(
+        session, ez_url, timeout=budget, quality_hint=1080,
+        label=f"{tag} embedez-1080p"))
+    tasks = (vx_task, ez_task)
+    hold_until = time.monotonic() + max(0.0, float(window))
+    try:
+        while True:
+            pending = [task for task in tasks if not task.done()]
+            if not pending:
+                break
+            if _task_video_facts(ez_task) is not None:
+                break  # the quality candidate is in — stop holding the post
+            if _task_video_facts(vx_task) is not None and ez_task.done():
+                break  # base validated and EmbedEZ already failed
+            remaining = hold_until - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.wait(pending, timeout=remaining,
+                               return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return _task_video_facts(ez_task), _task_video_facts(vx_task)
+
+
 async def resolve_video_url(session: aiohttp.ClientSession, vid: str,
-                            fallback_url: str | None = None) -> str | None:
+                            fallback_url: str | None = None, *,
+                            label: str = "") -> str | None:
+    """Resolve the card's video URL — quality-aware, never a silent video.
+
+    Round 67 order (REDDIT_VIDEO_QUALITY):
+
+      balanced (default) — EmbedEZ 1080p and vxreddit are attempted together;
+        a validated EmbedEZ 1080p result replaces vxreddit only when the probe
+        evidence supports it (see prefer_quality_candidate). If neither
+        validates, EmbedEZ 720p is tried, and the durable native v.redd.it
+        DASH ladder is the reliability floor. Nothing usable -> None, and the
+        caller shows thumbnail + Read Post.
+
+      compatibility — the pre-round-67 ladder, unchanged in order (native
+        DASH first, then EmbedEZ 720p, vxreddit, EmbedEZ 1080p): the
+        zero-code rollback.
+
+      highest — as balanced, with the wider quality window.
+
+    Every candidate is validated (HTTP status, content type, error-body
+    sniff, size limit, candidate timeout, and — when the byte prefix allows
+    it — real MP4 dimensions and audio-track evidence). A URL containing
+    "1080" is never accepted as proof of quality.
     """
-    Audio video chain (NO silent fallback):
-      1. fallback_url (from post JSON, if it serves an mp4)
-      2. proxy.embedez.com  (CMAF mp4 + audio -> muxed mp4)
-      3. vxreddit.com       (CMAF m3u8 pair -> muxed mp4, cached by them)
-    Qualities tried: CMAF_QUALITY, then 1080 (not every video has 720p).
-    -> None means the caller uses thumbnail + button.
-    """
-    if fallback_url and "v.redd.it" in fallback_url and fallback_url.lower().split("?")[0].endswith(".mp4"):
-        ok, size = await media_url_ok(session, fallback_url, timeout=60, video=True)
-        if ok:
-            logging.info(f"video url OK via fallback_url ({size} bytes).")
-            return fallback_url
-    # Native ladder FIRST: v.redd.it DASH_<q>.mp4 = self-contained mp4
-    # (h264 + AAC, WITH audio) straight from Reddit — no proxy, no sig, no
-    # expiry. (The signed packaged-media.redd.it masters expire in hours.)
-    for quality in DASH_QUALITIES:
-        dash = f"https://v.redd.it/{vid}/DASH_{quality}.mp4"
-        ok, size = await media_url_ok(session, dash, timeout=30, video=True)
-        if ok:
-            logging.info(f"video url OK via native v.redd.it DASH_{quality} ({size} bytes).")
-            return dash
-    for quality in (CMAF_QUALITY, 1080):
-        c = cmaf_urls(vid, quality)
-        em = VIDEO_PROXY_EMBEDEZ.format(video_url=quote(c["video_mp4"], safe=""),
-                                        audio_url=quote(c["audio_mp4"], safe=""))
-        ok, size = await media_url_ok(session, em, timeout=120, video=True)
-        if ok:
-            logging.info(f"video url OK via embedez-proxy q{quality} ({size} bytes).")
-            return em
-        if quality == CMAF_QUALITY:
-            vx = VIDEO_PROXY_VXREDDIT.format(video_url=quote(c["video_m3u8"], safe=""),
-                                             audio_url=quote(c["audio_m3u8"], safe=""))
-            ok, size = await media_url_ok(session, vx, timeout=120, video=True)
-            if ok:
-                logging.info(f"video url OK via vxreddit-proxy ({size} bytes).")
-                return vx
-    logging.info("video chain exhausted — using thumbnail + button (no silent video).")
+    global _video_quality_budget_used
+    started = time.monotonic()
+    deadline = started + max(1.0, float(VIDEO_RESOLVE_BUDGET_SECONDS))
+    mode = VIDEO_QUALITY_MODE if VIDEO_QUALITY_MODE in VIDEO_QUALITY_MODES else "balanced"
+    tag = label or "video"
+
+    def _budget() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    def _native_timeout() -> float:
+        return min(_budget(), float(VIDEO_NATIVE_TIMEOUT_SECONDS))
+
+    def _proxy_timeout() -> float:
+        return min(_budget(), float(VIDEO_CANDIDATE_TIMEOUT_SECONDS))
+
+    native_ladder = []
+    if fallback_url:
+        fallback_url = str(fallback_url)
+        if ("v.redd.it" in fallback_url
+                and fallback_url.lower().split("?")[0].endswith(".mp4")):
+            native_ladder.append((fallback_url, video_quality_hint(fallback_url)))
+        elif "packaged-media.redd.it" in fallback_url:
+            logging.info(f"[{tag}] signed packaged-media fallback_url is not a "
+                         f"durable candidate — using the CMAF ladder instead.")
+    if vid:
+        native_ladder.extend((f"https://v.redd.it/{vid}/DASH_{quality}.mp4", quality)
+                             for quality in DASH_QUALITIES)
+
+    async def _try_urls(candidates, timeout: float, kind: str) -> dict | None:
+        for url, hint in candidates:
+            if _budget() <= 0:
+                logging.info(f"[{tag}] resolution budget exhausted before {kind} "
+                             f"candidate {url[:70]}.")
+                return None
+            facts = await video_candidate(session, url, timeout=timeout,
+                                          quality_hint=hint, label=tag)
+            if facts:
+                logging.info(f"[{tag}] video url OK via {kind} "
+                             f"({_video_evidence(facts)}).")
+                return facts
+        return None
+
+    # ---- compatibility: the exact pre-round-67 ladder --------------------
+    if mode == "compatibility":
+        native = await _try_urls(native_ladder,
+                                 float(VIDEO_NATIVE_TIMEOUT_SECONDS), "native v.redd.it")
+        if native:
+            return native["url"]
+        if vid:
+            cmaf720 = cmaf_urls(vid, CMAF_QUALITY)
+            embedez_720 = VIDEO_PROXY_EMBEDEZ.format(
+                video_url=quote(cmaf720["video_mp4"], safe=""),
+                audio_url=quote(cmaf720["audio_mp4"], safe=""))
+            facts = await video_candidate(session, embedez_720,
+                                          timeout=_proxy_timeout(),
+                                          quality_hint=CMAF_QUALITY, label=tag)
+            if facts:
+                logging.info(f"[{tag}] video url OK via embedez-proxy "
+                             f"q{CMAF_QUALITY} ({_video_evidence(facts)}).")
+                return facts["url"]
+            vx_url = VIDEO_PROXY_VXREDDIT.format(
+                video_url=quote(cmaf720["video_m3u8"], safe=""),
+                audio_url=quote(cmaf720["audio_m3u8"], safe=""))
+            vx_facts = await video_candidate(session, vx_url,
+                                             timeout=_proxy_timeout(),
+                                             quality_hint=CMAF_QUALITY, label=tag)
+            if vx_facts:
+                logging.info(f"[{tag}] video url OK via vxreddit-proxy "
+                             f"({_video_evidence(vx_facts)}).")
+                return vx_facts["url"]
+            cmaf1080 = cmaf_urls(vid, 1080)
+            embedez_1080 = VIDEO_PROXY_EMBEDEZ.format(
+                video_url=quote(cmaf1080["video_mp4"], safe=""),
+                audio_url=quote(cmaf1080["audio_mp4"], safe=""))
+            facts = await video_candidate(session, embedez_1080,
+                                          timeout=_proxy_timeout(),
+                                          quality_hint=1080, label=tag)
+            if facts:
+                logging.info(f"[{tag}] video url OK via embedez-proxy q1080 "
+                             f"({_video_evidence(facts)}).")
+                return facts["url"]
+        logging.info(f"[{tag}] video chain exhausted — using thumbnail + button "
+                     f"(no silent video).")
+        return None
+
+    # ---- balanced / highest: bounded quality opportunity -----------------
+    quality_allowed = _video_quality_budget_used < float(VIDEO_RUN_BUDGET_SECONDS)
+    if not quality_allowed:
+        logging.info(f"[{tag}] per-run quality budget spent — using the durable "
+                     f"native ladder.")
+    elif vid and _budget() > 0:
+        cmaf1080 = cmaf_urls(vid, 1080)
+        embedez_1080 = VIDEO_PROXY_EMBEDEZ.format(
+            video_url=quote(cmaf1080["video_mp4"], safe=""),
+            audio_url=quote(cmaf1080["audio_mp4"], safe=""))
+        vx_1080 = VIDEO_PROXY_VXREDDIT.format(
+            video_url=quote(cmaf1080["video_m3u8"], safe=""),
+            audio_url=quote(cmaf1080["audio_m3u8"], safe=""))
+        window = (float(VIDEO_QUALITY_WINDOW_HIGHEST_SECONDS) if mode == "highest"
+                  else float(VIDEO_QUALITY_WINDOW_SECONDS))
+        window = min(window, _budget())
+        ez_facts, vx_facts = await _race_quality_candidates(
+            session, vx_1080, embedez_1080, window, _proxy_timeout(), tag)
+        _video_quality_budget_used += max(0.0, time.monotonic() - started)
+        winner = prefer_quality_candidate(ez_facts, vx_facts)
+        if winner is not None:
+            source = "embedez-1080p" if winner is ez_facts else "vxreddit"
+            logging.info(f"[{tag}] video url OK via {source} "
+                         f"({_video_evidence(winner)}).")
+            return winner["url"]
+        # 720p is a lower-quality fallback: it is only reached when neither
+        # the vxreddit base nor the EmbedEZ 1080p opportunity validated, so
+        # it can never displace a healthy vxreddit result.
+        cmaf720 = cmaf_urls(vid, CMAF_QUALITY)
+        embedez_720 = VIDEO_PROXY_EMBEDEZ.format(
+            video_url=quote(cmaf720["video_mp4"], safe=""),
+            audio_url=quote(cmaf720["audio_mp4"], safe=""))
+        facts = await video_candidate(session, embedez_720, timeout=_proxy_timeout(),
+                                      quality_hint=CMAF_QUALITY, label=tag)
+        if facts:
+            logging.info(f"[{tag}] video url OK via embedez-720p "
+                         f"({_video_evidence(facts)}).")
+            return facts["url"]
+
+    # ---- durable native ladder: the reliability floor --------------------
+    native = await _try_urls(native_ladder, _native_timeout(), "native v.redd.it")
+    if native:
+        return native["url"]
+
+    logging.info(f"[{tag}] video chain exhausted — using thumbnail + button "
+                 f"(no silent video).")
     return None
 
 
@@ -3143,7 +3657,7 @@ async def fetch_test_post_base(session: aiohttp.ClientSession, path: str,
 async def _fetch_redlib_post_page(session: aiohttp.ClientSession, instance: str,
                                   path: str, timeout: int = 10) -> str | None:
     # Round 42: per-run memo. Successful page fetches are reused by the
-    # NSFW fallback, liveness gate, mod-queue gate and media enrichment; misses
+    # liveness gate and media enrichment; misses
     # are deliberately not cached so a transient failure stays retryable.
     key = (str(instance or ""), str(path or ""))
     if key in _redlib_post_page_cache:
@@ -3162,14 +3676,6 @@ async def _fetch_redlib_post_page(session: aiohttp.ClientSession, instance: str,
                 return text
     except Exception:
         pass
-    return None
-
-
-async def fetch_first_redlib_post_page(session: aiohttp.ClientSession, path: str) -> str | None:
-    for instance in REDDIT_RSS_INSTANCES:
-        page = await _fetch_redlib_post_page(session, instance, path)
-        if page:
-            return page
     return None
 
 
@@ -3210,7 +3716,8 @@ async def enrich_gallery_redlib(session: aiohttp.ClientSession, path: str,
             # card); "gallery" marks it so the round-13 video-tile-only
             # rule keeps the post's photos.
             if video_vid and not any(i["kind"] == "video" for i in items):
-                _vurl = await resolve_video_url(session, video_vid, None)
+                _vurl = await resolve_video_url(session, video_vid, None,
+                                            label=f"{label} gallery video")
                 if _vurl:
                     items.append({"kind": "video", "url": _vurl, "gallery": True})
                     logging.info(f"[{label}] redlib gallery video {video_vid} "
@@ -3598,6 +4105,14 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
 
             video_dead = bool(proxy_video) and not video_ok
             if proxy_video and video_ok:
+                # Round 67: one bounded quality opportunity for a PROXY-muxed
+                # Reddit video — the validated proxy result is the held base,
+                # so this can only ever improve it (video-only; the helper
+                # returns the base unchanged on any failure).
+                _q_url = await proxy_video_quality_upgrade(
+                    session, vid, proxy_video["url"], label or "proxy")
+                if _q_url and _q_url != proxy_video["url"]:
+                    proxy_video = dict(proxy_video, url=_q_url)
                 # video post: the proxy's muxed mp4 tile ONLY (never a dup
                 # first-frame thumbnail)
                 media = [proxy_video]
@@ -3663,7 +4178,8 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
     video_url = None
     if (not proxy_media_used and vid
             and not any(x["kind"] in ("video", "gif") for x in media)):
-        video_url = await resolve_video_url(session, vid, fallback_url)
+        video_url = await resolve_video_url(session, vid, fallback_url,
+                                   label=label or "video")
 
     if video_url:
         media.append({"kind": "video", "url": video_url})
@@ -4153,6 +4669,10 @@ async def main():
                          "REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET for FULL MODE "
                          "(reddit.com/prefs/apps -> type 'script') — no code change.")
 
+    # Round 67: the video-quality ceiling is per RUN — every run starts with
+    # the full quality budget available.
+    reset_video_quality_budget()
+
     posted = load_posted()
     pending = load_pending()
     posted_messages = load_posted_messages()
@@ -4292,18 +4812,6 @@ async def main():
         # re-post storm.
         new_posts = cap_new_posts(new_posts, MAX_POSTS_PER_RUN)
 
-        # Round 35: fetch Reddit's two NSFW markers for every candidate in
-        # ONE keyless Arctic Shift request. Explicit test-post rebuilds bypass
-        # the gate; unavailable/not-yet-archived metadata fails open below.
-        if TEST_POST_ID:
-            nsfw_flags = {}
-        else:
-            nsfw_flags = await fetch_arctic_nsfw_flags(
-                session,
-                [extract_post_id(post[1]) or "" for post in new_posts],
-                label="nsfw-gate",
-            )
-
         for subreddit, path, unique_key, published_ts, activity_ts, entry in new_posts:
             # Round 34: double dedup (belt and braces) — collect() already
             # skips keys in the loaded cache, but a key can surface twice in
@@ -4335,14 +4843,9 @@ async def main():
                     and _pending_throttle_skip(pending, unique_key, now, entry)):
                 _pend = pending[unique_key]
                 if _pend.get("reason") in _NO_RECHECK_REASONS:
-                    if str(_pend.get("reason") or "").startswith("nsfw"):
-                        logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — held by "
-                                     f"the NSFW content gate (entry expires at the "
-                                     f"48 h window).")
-                    else:
-                        logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — "
-                                     f"not re-checking (removed posts re-enter via RSS "
-                                     f"when restored; entry expires at the 48 h window).")
+                    logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — "
+                                 f"not re-checking (removed posts re-enter via RSS "
+                                 f"when restored; entry expires at the 48 h window).")
                 else:
                     _due_in = int(PENDING_RECHECK_SECONDS
                                   - (now - float(_pend.get("last_checked") or 0)))
@@ -4390,48 +4893,6 @@ async def main():
                     logging.info(f"[{unique_key}] not in pristine listing — skipped "
                                  f"this tick (not cached), re-checked next tick.")
                     continue
-
-            # ---- round 42/45: fail-closed NSFW content gate -------------
-            # Runs before any Discord payload, thumbnail or attachment is
-            # built. Unknown metadata is held, except when NSFW_FAIL_OPEN=1.
-            if not TEST_POST_ID:
-                nsfw_post_id = (extract_post_id(path) or "").lower()
-                nsfw_markers = nsfw_flags.get(nsfw_post_id) or {"archive_status": "missing"}
-                if (NSFW_PAGE_FALLBACK and not NSFW_FAIL_OPEN
-                        and nsfw_markers.get("archive_status") == "missing"):
-                    page = await fetch_first_redlib_post_page(session, path)
-                    page_verdict = nsfw_from_post_page(page)
-                    nsfw_markers = dict(nsfw_markers)
-                    nsfw_markers["page_nsfw"] = page_verdict
-                    if page_verdict is None:
-                        logging.info(f"NSFW SCAN: {unique_key} not in the archive yet — "
-                                     f"live page unreadable (fail-closed).")
-                    else:
-                        logging.info(f"NSFW SCAN: {unique_key} not in the archive yet — "
-                                     f"live page says over_18={page_verdict}")
-                reason = nsfw_gate_reason(
-                    nsfw_post_id,
-                    str(getattr(entry, "author", "") or ""),
-                    nsfw_markers,
-                )
-                over_18 = nsfw_markers.get("over_18") is True or nsfw_markers.get("page_nsfw") is True
-                thumbnail_nsfw = nsfw_markers.get("thumbnail") == "nsfw"
-                marker_log = (f"over_18={over_18} thumbnail_nsfw={thumbnail_nsfw} "
-                              f"source_over_18={nsfw_markers.get('source_over_18') is True}")
-                if reason:
-                    mark_pending(pending, unique_key, reason, now,
-                                 source=_entry_source36,
-                                 title=str(getattr(entry, "title", "") or "")[:200],
-                                 published_ts=published_ts)
-                    logging.warning(f"NSFW GATE: {unique_key} SKIPPED "
-                                    f"({marker_log}) — held 48 h "
-                                    f"({reason}), NOT posted to Discord.")
-                    continue
-                if over_18 or thumbnail_nsfw or nsfw_markers.get("source_over_18") is True:
-                    logging.info(f"NSFW SCAN: {unique_key} {marker_log} — "
-                                 f"allowlisted (NSFW_ALLOWLIST), proceeding.")
-                else:
-                    logging.info(f"NSFW SCAN: {unique_key} {marker_log} (PASS)")
 
             if (unique_key in pending
                     and str(pending[unique_key].get("reason") or "") in _NO_RECHECK_REASONS

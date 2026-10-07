@@ -1,19 +1,39 @@
 # ---------------------------------------------------------------------------
-# ■ Reddit proxy media services (round 13) — redditez / vxreddit / embeddit
+# ■ Reddit proxy media services (round 13; dispatch reworked in round 49) ----
 # ---------------------------------------------------------------------------
-# Card media (photos / galleries / videos with audio / GIFs) is fetched from
-# one of three public proxy services, in PRIORITY ORDER:
+# Card media (photos / galleries / videos with audio / GIFs) comes from three
+# public proxy services. The PRIORITY / TIE-BREAK order is:
 #
-#   1. redditez.com (EmbedEZ) — primary. The keyless search API resolves a
-#      permalink to a stable key, then the bot embed page (Discordbot UA)
-#      exposes og: tags: photos (incl. galleries) as embedez media URLs,
-#      videos as a playable mp4 WITH audio, plus title/body/stats.
-#   2. vxreddit.com — OpenGraph bot pages (Discordbot UA): every gallery
+#   1. vxreddit.com — OpenGraph bot pages (Discordbot UA): every gallery
 #      photo as a full-res i.redd.it og:image, videos as a muxed mp4 WITH
-#      audio (redditvideo.mp4), stats in og:site_name.
-#   3. embeddit.deltandy.me — Mastodon-style JSON API (no bot UA needed):
-#      ALL gallery photos (up to 20), video with audio (under ~50 MB,
-#      merge=true), stats + body + author in the JSON.
+#      audio (redditvideo.mp4), stats in og:site_name. The round-49 field
+#      table ranks it first: most complete and most stable, and it resolves
+#      both /comments/ paths and /s/ share links.
+#   2. redditez.com (EmbedEZ) — the keyless search API resolves a permalink
+#      to a stable key, then the bot embed page (Discordbot UA) exposes
+#      og: tags: photos (incl. galleries) as embedez media URLs, videos as a
+#      playable mp4 WITH audio, plus title/body/stats. Field table:
+#      intermittent, and it rejects /s/ share links.
+#   3. embeddit.deltandy.me — Mastodon-style JSON API (no bot UA needed),
+#      plus the round-54 Components-V2 page used when the instance runs the
+#      rewrite: ALL gallery photos (up to 20; the rewrite caps at 10), stats
+#      + body + author in the JSON. Its video is the v.redd.it DASH fallback
+#      stream WITHOUT audio — the `merge=true` id requests a merged copy,
+#      but what is served (both eras, and the rewrite's PR #2 so far) is the
+#      audio-less fallback, and upstream does not list audio in the rewrite
+#      to-do — so embeddit stays the LAST resort for video (round 50 /
+#      incident 1wv12qb: a silent embeddit video must never cancel a
+#      vxreddit/redditez answer in flight).
+#
+# Round 49 replaced the serial chain with BOUNDED CONCURRENT WAVES; the order
+# above is the tie-break, NOT the request order. Wave 1 dispatches the first
+# two eligible services together at t=0; the rest are held back
+# PROXY_WAVE_DELAY seconds and are cancelled before opening a socket when
+# wave 1 already produced a decisive answer. A decisive result (a video on a
+# video post, or MEDIA_CAP_ITEMS items) cancels everything in flight; an
+# incomplete gallery may still wait PROXY_GALLERY_GRACE for a straggler that
+# could hold a more complete gallery (round 25). PROXY_MAX_CONCURRENCY caps
+# in-flight requests. See fetch_proxy_post for the full state machine.
 #
 # The winning service's own URLs are used VERBATIM in the card (mixing the
 # services' CDNs in one card is fine — Discord fetches each media URL
@@ -166,7 +186,9 @@ VXREDDIT_STATS_RE = re.compile(r"u/(\S+) on r/(\S+) - ⬆️ (\d+)(?: \| 💬 (\
 # --- embeddit -------------------------------------------------------------------
 # Mastodon-spoof API: GET /api/v1/statuses/<encoded-id> -> JSON. The encoded
 # id is Embeddit's idEncode of {"type": "post", "id": <post_id>, "merge":
-# true} (merge=true => the video comes back WITH audio, under ~50 MB).
+# true} (the id asks for the merged video, under ~50 MB). Field observation
+# (rounds 49/50/53/54): the video this service actually serves is the
+# v.redd.it DASH fallback stream WITHOUT audio — see the module header.
 EMBEDDIT_DEFAULT_BASE = "https://embeddit.deltandy.me"
 
 
