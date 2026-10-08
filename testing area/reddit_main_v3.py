@@ -2985,7 +2985,7 @@ def _provider_for_url(url: str) -> str:
         return "embeddit"
     if "v.redd.it" in host:
         return "native-dash"
-    return "thumbnail"
+    return "unknown"
 
 
 def prefer_quality_candidate(quality: dict | None, base: dict | None) -> dict | None:
@@ -3094,8 +3094,9 @@ async def proxy_video_quality_upgrade(session: aiohttp.ClientSession, vid: str |
         quality = None
     _video_quality_budget_used += max(0.0, time.monotonic() - started)
     if not quality:
-        logging.info(f"[{label or 'proxy'}] EmbedEZ 1080p unavailable; retaining "
-                     f"validated base provider={_provider_for_url(base_url)}.")
+        logging.info(f"[{label or 'proxy'}] quality fallback: candidate=embedez; "
+                     f"retaining validated base provider={_provider_for_url(base_url)}; "
+                     "reason=quality_candidate_unavailable")
         return base_url
     facts = await probe_video_facts(session, base_url,
                                    timeout=float(VIDEO_NATIVE_TIMEOUT_SECONDS))
@@ -3111,6 +3112,9 @@ async def proxy_video_quality_upgrade(session: aiohttp.ClientSession, vid: str |
                      f"provider=embedez, content_type={content_type}, "
                      f"{_video_evidence(quality)}, reason=validated quality improvement.")
         return quality["url"]
+    logging.info(f"[{label or 'proxy'}] quality fallback: candidate=embedez; "
+                 f"retaining validated base provider={_provider_for_url(base_url)}; "
+                 "reason=quality_candidate_not_superior_or_unvalidated")
     return base_url
 
 
