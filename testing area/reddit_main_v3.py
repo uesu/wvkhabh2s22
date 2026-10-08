@@ -1,10 +1,12 @@
 # ---------------------------------------------------------------------------
-# ■ Reddit RSS Feed Monitor — V3 (Components V2 rich card — NATIVE media, NO EmbedEZ)
+# ■ Reddit RSS Feed Monitor — V3 (Components V2 rich card — NATIVE media + proxy services)
 # ---------------------------------------------------------------------------
 # Same monitoring as V1/V2 (combined feed, feed token, 429 retries, mod-queue
 # safe 48h window, per-channel webhooks, dedup cache, auto-commit), but the
-# card media comes from REDDIT'S OWN URLs — no EmbedEZ API, no mirror links,
-# no credits. Round 12 (2026-09-15).
+# card media comes from REDDIT'S OWN URLs and keyless public proxy services
+# (vxreddit, redditez/EmbedEZ, Embeddit) — no EmbedEZ API key, no credits.
+# Round 12 (2026-09-15); proxy-service round 13; EmbedEZ video-quality
+# candidate round 67 (see PROXY MEDIA SERVICES below).
 #
 # ■ DATA PATHS (every fact below was live-verified 2026-09-15 from a
 #   datacenter IP with the Discordbot/2.0 UA):
@@ -108,8 +110,9 @@
 #       combined feed's 100-entry window. Native photo path now logs how
 #       many media URLs the RSS content carries (gallery diagnostics).
 #   12. (round 13) PROXY MEDIA: native-mode card media now comes FIRST from
-#       the public proxy services — redditez.com (EmbedEZ) -> vxreddit.com
-#       -> embeddit.deltandy.me, in that priority order (see testing
+#       the public proxy services (original round-13 order; round 49 replaced
+#       the serial chain with bounded waves, tie-break vxreddit -> redditez
+#       (EmbedEZ) -> embeddit — see PROXY MEDIA SERVICES below). See testing
 #       area/reddit_proxy.py). Each service's own URLs are used verbatim in
 #       the components-v2 card: full-res photos, EVERY gallery photo (up to
 #       20 = 2 containers), videos WITH audio, GIFs, plus stats. A per-run
@@ -165,8 +168,8 @@
 #       removed by moderators, deleted by the author, or still pending
 #       approval — often with the ORIGINAL body stored, which the
 #       removal-notice filter cannot see. An archive-sourced post is now
-#       only posted when a live source (redditez -> vxreddit -> embeddit,
-#       then redlib) can actually retrieve it; otherwise it is skipped
+#       only posted when a live source (vxreddit, redditez, embeddit in
+#       tie-break order, then redlib) can actually retrieve it; otherwise it is skipped
 #       and NOT cached, so it posts normally once approved or restored.
 #       RSS posts and TEST POST rebuilds are unaffected.
 #   18. (round 21, 2026-09-17) RAW PLAIN LINKS — the card body now matches
@@ -770,10 +773,15 @@ DISCOHOOK_USER_AGENT = "python:uesu.news-express:v3 (discohook share preview)"
 # ---------------------------------------------------------------------------
 # ■ PROXY MEDIA SERVICES (round 13) — see testing area/reddit_proxy.py
 # ---------------------------------------------------------------------------
-# Native-mode card media now comes from the public proxy services FIRST:
-# redditez.com (EmbedEZ) -> vxreddit.com -> embeddit.deltandy.me, in that
-# priority order. The winning service's own URLs are used verbatim in the
-# card (full-res photos, every gallery photo, videos WITH audio, GIFs).
+# Native-mode card media comes from the public proxy services FIRST. Their
+# tie-break priority is vxreddit.com -> redditez.com (EmbedEZ) ->
+# embeddit.deltandy.me, dispatched as bounded concurrent waves (round 49), not
+# as a serial chain: the first two eligible services start together and
+# Embeddit is held back. The winning service's own URLs are used verbatim in
+# the card (full-res photos, every gallery photo, videos WITH audio, GIFs).
+# EmbedEZ is also an optional, validated 1080p video-quality candidate (round
+# 67) that can only replace a validated proxy video — see
+# docs/REDDIT_VIDEO_QUALITY.md.
 PROXY_MEDIA = _env_flag("PROXY_MEDIA", "1")        # '0' disables the proxy path entirely
 YOUTUBE_LINK_MESSAGE = _env_flag("YOUTUBE_LINK_MESSAGE", "1")
 # '0' stops the SECOND plain YouTube-link message (the card's own YouTube
@@ -1451,7 +1459,12 @@ async def fetch_arctic_subreddit_posts(session, subreddit: str,
         return [p for p in posts if isinstance(p, dict) and p.get("id")]
     except Exception as exc:
         _arctic_fail_count += 1
-        logging.info(f"[{label or subreddit}] Arctic Shift search unavailable: {exc}")
+        # Keep HTTP messages ("HTTP 422") and descriptive exception text; fall
+        # back to the class name so a blank str(exc) never logs an empty reason.
+        reason = str(exc).strip() or type(exc).__name__
+        logging.info(
+            f"[{label or subreddit}] Arctic Shift search unavailable: {reason}"
+        )
         return []
 
 
@@ -2085,7 +2098,7 @@ def _repair_label_url_mangle(lines: list) -> list:
 # stores the ORIGINAL content from capture time, so the round-18/19
 # removal-notice filter cannot see the removal. Live sources can: a post
 # that is removed / deleted / not approved yet is invisible to the proxy
-# services (redditez -> vxreddit -> embeddit) and to redlib. So an
+# services (vxreddit, redditez, embeddit) and to redlib. So an
 # archive-sourced post is only posted when at least one live source can
 # actually retrieve it; otherwise it is skipped and NOT cached — once it
 # is approved or restored it becomes visible and posts normally on a
@@ -4077,8 +4090,9 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
         body = _clean_plain_body(arctic.get("selftext"))
 
     # ---- round 13: PROXY media services (native mode only) ---------------
-    # redditez.com -> vxreddit.com -> embeddit.deltandy.me, in that priority
-    # order (see testing area/reddit_proxy.py). The winning service's own
+    # Tie-break priority vxreddit.com -> redditez.com (EmbedEZ) ->
+    # embeddit.deltandy.me, dispatched as bounded concurrent waves (see
+    # testing area/reddit_proxy.py). The winning service's own
     # URLs are used verbatim: full-res photos, EVERY gallery photo (20 ->
     # 2 containers), videos WITH audio, GIFs. The per-run warm-up
     # (proxy_health.json) skips services already proven dead this run.
