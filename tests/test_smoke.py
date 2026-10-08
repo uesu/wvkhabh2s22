@@ -5481,6 +5481,48 @@ check("r68: workflow summary remains compatible with the retained-base log "
       and "summary source: local monitor.log only; no additional requests" in _r68_workflow)
 
 
+# ---- round 69: Arctic Shift search failure reasons (offline) ---------------
+# A blank-message exception must log its class name (never an empty reason);
+# HTTP status messages and descriptive exception text must be preserved.
+class _R69Session:
+    def __init__(self, exc=None, status=None):
+        self._exc = exc
+        self._status = status
+
+    def get(self, url, params=None, **k):
+        if self._exc is not None:
+            raise self._exc
+        return _ArcticResp(self._status, {})
+
+
+def _r69_arctic_log(session):
+    with patch.object(v3, "_arctic_fail_count", 0), \
+         patch.object(v3.logging, "info") as _log:
+        result = asyncio.run(v3.fetch_arctic_subreddit_posts(
+            session, "AnantaLeaks", label="t"))
+        messages = [c.args[0] for c in _log.call_args_list if c.args]
+    return result, messages
+
+
+_r69_blank, _r69_blank_msgs = _r69_arctic_log(_R69Session(exc=TimeoutError()))
+check("r69 arctic: blank exception returns []",
+      _r69_blank == [], str(_r69_blank))
+check("r69 arctic: blank exception logs class name",
+      _r69_blank_msgs == ["[t] Arctic Shift search unavailable: TimeoutError"],
+      str(_r69_blank_msgs))
+
+_r69_http, _r69_http_msgs = _r69_arctic_log(_R69Session(status=422))
+check("r69 arctic: HTTP 422 message preserved",
+      _r69_http == [] and _r69_http_msgs ==
+      ["[t] Arctic Shift search unavailable: HTTP 422"], str(_r69_http_msgs))
+
+_r69_desc, _r69_desc_msgs = _r69_arctic_log(
+    _R69Session(exc=ConnectionResetError("peer reset")))
+check("r69 arctic: descriptive exception text preserved",
+      _r69_desc == [] and _r69_desc_msgs ==
+      ["[t] Arctic Shift search unavailable: peer reset"], str(_r69_desc_msgs))
+
+
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
     sys.exit(1)
