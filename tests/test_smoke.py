@@ -5262,6 +5262,224 @@ check("r67b: the proxy branch is wired to the bounded quality helper",
       "proxy_video_quality_upgrade(" in inspect.getsource(v3.resolve_post_media))
 
 
+# ---- round 68: conservative, provider-generic quality fallback logs ------
+# This round changes only local diagnostics. The existing candidate selection,
+# request budget, and held-base behavior remain pinned by the round-67 guards.
+
+def _r68_run_real_quality_attempt(session, base_url=_r67b_base):
+    with patch.object(v3, "VIDEO_QUALITY_MODE", "balanced"), \
+         patch.object(v3, "_video_quality_budget_used", 0.0), \
+         patch.object(v3.logging, "info") as _r68_log:
+        result = asyncio.run(v3.proxy_video_quality_upgrade(
+            session, "vid1", base_url, "r68"))
+        messages = [str(call.args[0]) for call in _r68_log.call_args_list]
+    return result, session.calls, messages
+
+
+def _r68_run_mock_quality_attempt(candidate, probe, base_url):
+    with patch.object(v3, "video_candidate", candidate), \
+         patch.object(v3, "probe_video_facts", probe), \
+         patch.object(v3, "VIDEO_QUALITY_MODE", "balanced"), \
+         patch.object(v3, "_video_quality_budget_used", 0.0), \
+         patch.object(v3.logging, "info") as _r68_log:
+        result = asyncio.run(v3.proxy_video_quality_upgrade(
+            None, "vid1", base_url, "r68"))
+        messages = [str(call.args[0]) for call in _r68_log.call_args_list]
+    return result, messages
+
+
+# A valid candidate that is measurably better still uses the pre-existing,
+# explicit accepted-upgrade diagnostic. One request validates each candidate;
+# the base gets its already-established single comparison probe.
+_r68_accepted_session = _R67Sess(routes={
+    "proxy.embedez.com": _r67_mp4_resp(1920, 1080, audio=True),
+    "vxreddit.com": _r67_mp4_resp(1280, 720, audio=True),
+})
+_r68_accepted, _r68_accepted_calls, _r68_accepted_logs = _r68_run_real_quality_attempt(
+    _r68_accepted_session)
+_r68_accept_logs = [line for line in _r68_accepted_logs
+                    if "EmbedEZ 1080p candidate accepted:" in line]
+check("r68: a validated superior candidate keeps the existing evidence-based "
+      "accepted-upgrade log",
+      _r68_accepted.startswith("https://proxy.embedez.com")
+      and len(_r68_accepted_calls) == 2
+      and len(_r68_accept_logs) == 1
+      and "provider=embedez, content_type=validated" in _r68_accept_logs[0]
+      and "dimensions=1920x1080 (verified)" in _r68_accept_logs[0]
+      and "audio=present" in _r68_accept_logs[0]
+      and "reason=validated quality improvement" in _r68_accept_logs[0]
+      and not any("quality fallback:" in line for line in _r68_accepted_logs),
+      str((_r68_accepted, _r68_accepted_calls, _r68_accepted_logs)))
+
+# An HTTP failure and a success-status HTML error both count as unavailable;
+# neither probes the held base again or changes the validated vxreddit URL.
+_r68_http400 = _R67Sess(default=lambda: _R67Resp(400, {}, b""))
+_r68_http400_url, _r68_http400_calls, _r68_http400_logs = _r68_run_real_quality_attempt(
+    _r68_http400)
+_r68_http400_fallbacks = [line for line in _r68_http400_logs
+                          if "quality fallback:" in line]
+check("r68: HTTP 400 logs unavailable and retains the validated vxreddit base "
+      "with no extra request or unsupported quality claim",
+      _r68_http400_url == _r67b_base and len(_r68_http400_calls) == 1
+      and _r68_http400_fallbacks == [
+          "[r68] quality fallback: candidate=embedez; "
+          "retaining validated base provider=vxreddit; "
+          "reason=quality_candidate_unavailable"]
+      and not any(word in _r68_http400_fallbacks[0]
+                  for word in ("720p", "1080p", "dimensions=", "audio=")),
+      str((_r68_http400_url, _r68_http400_calls, _r68_http400_logs)))
+
+_r68_invalid = _R67Sess(default=_r67_html_resp())
+_r68_invalid_url, _r68_invalid_calls, _r68_invalid_logs = _r68_run_real_quality_attempt(
+    _r68_invalid)
+check("r68: an invalid HTML quality response uses the unavailable fallback "
+      "reason and retains the base",
+      _r68_invalid_url == _r67b_base and len(_r68_invalid_calls) == 1
+      and any("quality fallback: candidate=embedez; "
+              "retaining validated base provider=vxreddit; "
+              "reason=quality_candidate_unavailable" in line
+              for line in _r68_invalid_logs),
+      str((_r68_invalid_url, _r68_invalid_calls, _r68_invalid_logs)))
+
+class _R68OfflineSession(_R67Sess):
+    def get(self, url, headers=None, timeout=None):
+        self.calls.append(url)
+        raise OSError("offline quality endpoint")
+
+
+_r68_offline = _R68OfflineSession()
+_r68_offline_url, _r68_offline_calls, _r68_offline_logs = _r68_run_real_quality_attempt(
+    _r68_offline)
+check("r68: a failed quality request emits the unavailable fallback without "
+      "probing or losing vxreddit",
+      _r68_offline_url == _r67b_base and len(_r68_offline_calls) == 1
+      and any("quality fallback: candidate=embedez; "
+              "retaining validated base provider=vxreddit; "
+              "reason=quality_candidate_unavailable" in line
+              for line in _r68_offline_logs),
+      str((_r68_offline_url, _r68_offline_calls, _r68_offline_logs)))
+
+# A valid but lower-resolution candidate is rejected by the unchanged selector;
+# the new final log describes the decision without guessing source maximum.
+_r68_not_superior = _R67Sess(routes={
+    "proxy.embedez.com": _r67_mp4_resp(1920, 1080, audio=True),
+    "vxreddit.com": _r67_mp4_resp(3840, 2160, audio=True),
+})
+_r68_not_superior_url, _r68_not_superior_calls, _r68_not_superior_logs = \
+    _r68_run_real_quality_attempt(_r68_not_superior)
+_r68_not_superior_fallbacks = [line for line in _r68_not_superior_logs
+                               if "quality fallback:" in line]
+check("r68: a validated candidate that is not superior retains the base with "
+      "the conservative not-superior/unvalidated reason",
+      _r68_not_superior_url == _r67b_base
+      and len(_r68_not_superior_calls) == 2
+      and _r68_not_superior_fallbacks == [
+          "[r68] quality fallback: candidate=embedez; "
+          "retaining validated base provider=vxreddit; "
+          "reason=quality_candidate_not_superior_or_unvalidated"],
+      str((_r68_not_superior_url, _r68_not_superior_calls,
+           _r68_not_superior_logs)))
+
+# Provider naming is dynamic for current providers and conservative for a
+# future host; the fallback text itself is provider-agnostic.
+_r68_provider_cases = [
+    (_r67b_base, "vxreddit"),
+    ("https://proxy.embedez.com/render/video.mp4", "embedez"),
+    ("https://redditez.com/render/video.mp4", "embedez"),
+    ("https://embeddit.deltandy.me/video.mp4", "embeddit"),
+    ("https://v.redd.it/vid1/DASH_720.mp4", "native-dash"),
+    ("https://future-video.example/video.mp4", "unknown"),
+]
+_r68_provider_results = []
+for _r68_base_url, _r68_expected_provider in _r68_provider_cases:
+    _r68_no_candidate = AsyncMock(return_value=None)
+    _r68_no_probe = AsyncMock(return_value=None)
+    _r68_result, _r68_messages = _r68_run_mock_quality_attempt(
+        _r68_no_candidate, _r68_no_probe, _r68_base_url)
+    _r68_expected_log = (
+        "[r68] quality fallback: candidate=embedez; retaining validated base "
+        f"provider={_r68_expected_provider}; reason=quality_candidate_unavailable")
+    _r68_provider_results.append(
+        _r68_result == _r68_base_url
+        and _r68_messages == [_r68_expected_log]
+        and _r68_no_probe.await_count == 0
+        and "thumbnail" not in _r68_expected_log)
+check("r68: fallback labels cover vxreddit, EmbedEZ/redditez, embeddit, "
+      "native Reddit, and unknown future hosts",
+      all(_r68_provider_results), str(_r68_provider_results))
+
+# Conservative fact formatting: neither a URL hint nor missing facts may be
+# turned into verified dimensions or an audio-present claim.
+_r68_unknown_evidence = v3._video_evidence({
+    "url": "https://proxy.embedez.com/render/video.mp4?videoUrl=CMAF_1080.mp4",
+    "size": 123, "width": None, "height": None, "has_audio": None,
+    "quality_hint": 1080,
+})
+_r68_silent_evidence = v3._video_evidence({
+    "url": "https://proxy.embedez.com/render/video.mp4?videoUrl=CMAF_1080.mp4",
+    "size": 123, "width": None, "height": None, "has_audio": False,
+    "quality_hint": 1080,
+})
+check("r68: URL text containing 1080 is only a hint; missing dimensions/audio "
+      "stay unknown and a silent candidate is never logged as audio-present",
+      "url_quality_hint=1080p (not evidence)" in _r68_unknown_evidence
+      and "dimensions=unverified" in _r68_unknown_evidence
+      and "dimensions=1080" not in _r68_unknown_evidence
+      and "audio=unknown" in _r68_unknown_evidence
+      and "audio=present" not in _r68_unknown_evidence
+      and "audio=absent" in _r68_silent_evidence
+      and "audio=present" not in _r68_silent_evidence,
+      str((_r68_unknown_evidence, _r68_silent_evidence)))
+
+# Integration guard: a range-validated proxy video is still the only card tile
+# when the optional quality request fails; image/gallery code is not involved.
+async def _r68_proxy_fallback_flow():
+    _r68_proxy = SimpleNamespace(
+        fetch_proxy_post=AsyncMock(return_value={
+            "service": "vxreddit", "media": [{"kind": "video", "url": _r67b_base}],
+            "stats": None, "body": ""}),
+        fetch_embeddit_stats=AsyncMock(return_value=None))
+    _r68_base = {"title": "t", "author": "a", "body": "", "youtube_url": None,
+                 "vred_id": "abc123", "redgifs_url": None,
+                 "content_html": "", "thumb": None}
+    _r68_base_check = AsyncMock(return_value=(True, 4321))
+    _r68_quality = AsyncMock(return_value=None)
+    _r68_probe = AsyncMock(return_value=None)
+    with patch.object(v3, "reddit_proxy", _r68_proxy), \
+         patch.object(v3, "PROXY_MEDIA", True), \
+         patch.object(v3, "fetch_arctic_post", AsyncMock(return_value=None)), \
+         patch.object(v3, "enrich_gallery_redlib", AsyncMock(return_value=[])), \
+         patch.object(v3, "media_url_ok", _r68_base_check), \
+         patch.object(v3, "video_candidate", _r68_quality), \
+         patch.object(v3, "probe_video_facts", _r68_probe), \
+         patch.object(v3, "VIDEO_QUALITY_MODE", "balanced"), \
+         patch.object(v3, "_video_quality_budget_used", 0.0):
+        _r68_result = await v3.resolve_post_media(
+            None, _r68_base, None, "/r/Sub/comments/abc123/title/")
+    return _r68_result, _r68_base_check, _r68_quality, _r68_probe
+
+
+_r68_proxy_result, _r68_base_check, _r68_quality, _r68_probe = asyncio.run(
+    _r68_proxy_fallback_flow())
+check("r68: failed quality upgrade preserves the already-validated vxreddit "
+      "video tile and does not spend a base comparison probe",
+      _r68_proxy_result["media"] == [{"kind": "video", "url": _r67b_base}]
+      and _r68_base_check.await_count == 1
+      and _r68_quality.await_count == 1
+      and _r68_probe.await_count == 0,
+      str((_r68_proxy_result["media"], _r68_base_check.await_count,
+           _r68_quality.await_count, _r68_probe.await_count)))
+
+# The workflow's existing grep counter intentionally counts fallback NOTICES
+# by the stable retained-base phrase, not every possible quality decision.
+with open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"),
+          encoding="utf-8") as _r68_workflow_file:
+    _r68_workflow = _r68_workflow_file.read()
+check("r68: workflow summary remains compatible with the retained-base log "
+      "wording and uses only the local monitor log",
+      "count_matches 'retaining validated base'" in _r68_workflow
+      and "summary source: local monitor.log only; no additional requests" in _r68_workflow)
+
 
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
