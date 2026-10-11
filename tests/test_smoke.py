@@ -5637,6 +5637,284 @@ check("r69 arctic: descriptive exception text preserved",
       ["[t] Arctic Shift search unavailable: peer reset"], str(_r69_desc_msgs))
 
 
+# ---- round 72: inspect the created Discord message (offline) ------------
+_r72_url = "https://vxreddit.com/redditvideo.mp4?video_url=x"
+_r72_native = "https://v.redd.it/id/DASH_720.mp4"
+_r72_unknown = "https://new-provider.example/render/opaque-video"
+
+
+def _r72_message(*medias):
+    return {"id": "msg1", "components": [{"type": 17, "components": [
+        {"type": 12, "items": [{"media": m} for m in medias]}]}]}
+
+
+def _r72_media(url, width=0, height=0, content_type=""):
+    return {"url": url, "width": width, "height": height,
+            "content_type": content_type}
+
+
+_r72_bad = _r72_message(_r72_media(_r72_url))
+_r72_good = _r72_message(_r72_media(_r72_url, 1280, 720, "video/mp4"))
+_r72_native_bad = _r72_message(_r72_media(_r72_native))
+check("r72: Discord 0x0/missing type detects unresolved video",
+      v3.unresolved_reddit_video_items(_r72_bad) == [_r72_url])
+check("r72: either missing dimension OR missing content type detects unresolved video",
+      all(v3.unresolved_reddit_video_items(_r72_message(m)) == [_r72_url]
+          for m in (_r72_media(_r72_url, 0, 720, "video/mp4"),
+                    _r72_media(_r72_url, 1280, 0, "video/mp4"),
+                    _r72_media(_r72_url, 1280, 720, ""))))
+check("r72: a healthy video does not queue an edit",
+      v3.unresolved_reddit_video_items(_r72_good) == []
+      and v3._unresolved_healable_video_items(_r72_good, {
+          "media": [{"kind": "video", "url": _r72_url}]}) == [])
+check("r72: pure detection includes unresolved native video, but no repair",
+      v3.unresolved_reddit_video_items(_r72_native_bad) == [_r72_native]
+      and v3._unresolved_healable_video_items(_r72_native_bad, {
+          "media": [{"kind": "video", "url": _r72_native}]}) == [])
+check("r72: provider-agnostic detection covers known and future video endpoints",
+      all(v3._unresolved_healable_video_items(
+          _r72_message(_r72_media(url)),
+          {"media": [{"kind": "video", "url": url}]}) == [url]
+          for url in (
+              _r72_url,
+              "https://www.vxreddit.com/redditvideo.mp4?video_url=x",
+              "https://redditez.com/redditvideo.mp4?video_url=x",
+              "https://embeddit.deltandy.me/video/vid1/name.mp4",
+              "https://proxy.embedez.com/render/video.mp4?videoUrl=x",
+              _r72_unknown)))
+check("r72: unknown source with resolved Discord video type still detects",
+      v3.unresolved_reddit_video_items(
+          _r72_message(_r72_media(_r72_unknown, 0, 0, "video/mp4"))) == [_r72_unknown])
+check("r72: images and thumbnail accessories never trigger a video repair",
+      v3.unresolved_reddit_video_items(_r72_message(
+          _r72_media("https://i.redd.it/image.jpg"))) == []
+      and v3.unresolved_reddit_video_items({"components": [{
+          "type": 9, "accessory": {"type": 11, "media": _r72_media(_r72_url)}}]}) == [])
+check("r72: all containers scanned; unrelated images cannot trigger an edit",
+      v3._unresolved_healable_video_items({"components": [
+          {"type": 17, "components": [{"type": 12, "items": [
+              {"media": _r72_media("https://i.redd.it/image.jpg")}]}]},
+          {"type": 17, "components": [{"type": 12, "items": [
+              {"media": _r72_media(_r72_url)}]}]}]},
+          {"media": [{"kind": "video", "url": _r72_url}]}) == [_r72_url])
+check("r72: malformed or missing Discord response fails closed",
+      all(v3.unresolved_reddit_video_items(m) == [] for m in
+          (None, {}, {"components": None}, {"components": [{"items": [None, {}]}]})))
+check("r72: a returned video not present in the outgoing card cannot trigger a repair",
+      v3._unresolved_healable_video_items(_r72_bad, {
+          "media": [{"kind": "video", "url": _r72_unknown}]}) == [])
+with patch.object(v3, "PROXY_VIDEO_HEAL", False):
+    check("r72: opt-out disables response inspection/repair",
+          not v3._has_video_media({"media": [{"kind": "video", "url": _r72_url}]})
+          and v3._unresolved_healable_video_items(_r72_bad, {
+              "media": [{"kind": "video", "url": _r72_url}]}) == [])
+
+
+class _R72Session:
+    def __init__(self, status=200, fail=False):
+        self.calls = []
+        self.status = status
+        self.fail = fail
+
+    def patch(self, url, json=None, **kw):
+        if self.fail:
+            raise ConnectionError("transient outage")
+        self.calls.append((url, json, kw))
+        return _R63Req(self.status)
+
+
+_r72_payload = {"flags": 32768, "components": [{"type": 17, "components": []}]}
+_r72_sleep = AsyncMock()
+with patch.object(v3, "PROXY_VIDEO_HEAL", True), \
+     patch.object(v3, "PROXY_VIDEO_HEAL_DELAY", 6), \
+     patch.object(v3.asyncio, "sleep", _r72_sleep):
+    _r72_session = _R72Session()
+    _r72_result = asyncio.run(v3.heal_proxy_video_message(
+        _r72_session, "https://discord.test/api/webhooks/1/tok", "999",
+        _r72_payload, "sub_post"))
+    check("r72: waits once then PATCHes same card with identical payload and components",
+          _r72_result is True and _r72_sleep.await_args_list == [((6,), {})]
+          and len(_r72_session.calls) == 1
+          and _r72_session.calls[0][0] ==
+          "https://discord.test/api/webhooks/1/tok/messages/999?with_components=true"
+          and _r72_session.calls[0][1] is _r72_payload)
+    _r72_failed = _R72Session(status=429)
+    check("r72: failed edit does not retry or fail the posted card",
+          asyncio.run(v3.heal_proxy_video_message(
+              _r72_failed, "https://discord.test/api/webhooks/1/tok", "999",
+              _r72_payload, "sub_post")) is False and len(_r72_failed.calls) == 1)
+    _r72_error = _R72Session(fail=True)
+    check("r72: network exception does not fail the posted card",
+          asyncio.run(v3.heal_proxy_video_message(
+              _r72_error, "https://discord.test/api/webhooks/1/tok", "999",
+              _r72_payload, "sub_post")) is False)
+    _r72_no_id = _R72Session()
+    _r72_sleep.reset_mock()
+    check("r72: missing message ID makes no request or wait",
+          asyncio.run(v3.heal_proxy_video_message(
+              _r72_no_id, "https://discord.test/api/webhooks/1/tok", "",
+              _r72_payload, "sub_post")) is False
+          and not _r72_no_id.calls and _r72_sleep.await_count == 0)
+
+with patch.dict(os.environ, {"PROXY_VIDEO_HEAL": "", "PROXY_VIDEO_HEAL_DELAY": ""}):
+    _r72_defaults = load_module("r72_defaults", "testing area/reddit_main_v3.py")
+check("r72: blank workflow Variables restore on / six seconds",
+      _r72_defaults.PROXY_VIDEO_HEAL and _r72_defaults.PROXY_VIDEO_HEAL_DELAY == 6)
+with patch.dict(os.environ, {"PROXY_VIDEO_HEAL": "off", "PROXY_VIDEO_HEAL_DELAY": "999"}):
+    _r72_disabled = load_module("r72_disabled", "testing area/reddit_main_v3.py")
+check("r72: opt-out and delay cap are parsed safely",
+      not _r72_disabled.PROXY_VIDEO_HEAL and _r72_disabled.PROXY_VIDEO_HEAL_DELAY == 60)
+
+with open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8") as _f:
+    _r72_workflow = _f.read()
+_r72_main = inspect.getsource(v3.main)
+check("r72: both repository Variables are workflow-wired",
+      all(f"{name}: ${{{{ vars.{name} }}}}" in _r72_workflow
+          for name in ("PROXY_VIDEO_HEAL", "PROXY_VIDEO_HEAL_DELAY")))
+check("r72: video/retract cards request wait=true and read the created message",
+      "if RETRACT_DEAD_POSTS or inspect_video_response:" in _r72_main
+      and "if (RETRACT_DEAD_POSTS or inspect_video_response) and resp.status == 200:" in _r72_main)
+check("r72: only an unresolved item with message ID queues an edit after posting loop",
+      "unresolved = _unresolved_healable_video_items(message_json, data)" in _r72_main
+      and "if (unresolved and isinstance(message_json, dict)" in _r72_main
+      and "message_json.get(\"id\")" in _r72_main
+      and _r72_main.index("await asyncio.gather(*(\n                heal_proxy_video_message")
+      > _r72_main.index("for subreddit, path, unique_key, published_ts, activity_ts, entry in new_posts:"))
+
+# Exercise main()'s webhook POST/response/PATCH wiring, not only the helper.
+class _R72PostResponse(_R63Req):
+    def __init__(self, message, status=200):
+        super().__init__(status)
+        self.message = message
+
+    async def __aenter__(self):
+        response = await super().__aenter__()
+        response.json = AsyncMock(return_value=self.message)
+        return response
+
+
+class _R72MainSession:
+    last = None
+    response_message = None
+    response_status = 200
+
+    def __init__(self):
+        type(self).last = self
+        self.posts = []
+        self.patches = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def post(self, url, json=None, **kw):
+        self.posts.append((url, json))
+        return _R72PostResponse(self.response_message, self.response_status)
+
+    def patch(self, url, json=None, **kw):
+        self.patches.append((url, json))
+        return _R63Req(204)
+
+
+async def _r72_main_case(media, response, enabled=True, retract=False, status=200):
+    base = {"title": "Title", "author": "Author", "body": "hi", "content_html": "",
+            "thumb": None, "crosspost_orig_path": None, "vred_id": None,
+            "redgifs_url": None, "youtube_url": None}
+    data = {"title": "Title", "author": "Author", "body": "hi", "media": media,
+            "stats": None, "crosspost": None, "op_comment": None,
+            "youtube_url": None, "full_mode": False}
+    posted = set()
+    records = {}
+    class _Aio:
+        ClientSession = _R72MainSession
+        ClientTimeout = staticmethod(lambda total=None: None)
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        for target, name, value in (
+                (_R72MainSession, "response_message", response),
+                (_R72MainSession, "response_status", status),
+                (v3, "SUBREDDITS", ["TestSub"]),
+                (v3, "TEST_POST_ID", "TestSub/abc123"),
+                (v3, "DRY_RUN", False),
+                (v3, "PROXY_MEDIA", False),
+                (v3, "PROXY_VIDEO_HEAL", enabled),
+                (v3, "PROXY_VIDEO_HEAL_DELAY", 6),
+                (v3, "RETRACT_DEAD_POSTS", retract),
+                (v3, "aiohttp", _Aio),
+                (v3, "fetch_post_json", AsyncMock(return_value=base)),
+                (v3, "resolve_post_media", AsyncMock(return_value=data)),
+                (v3, "create_discohook_share", AsyncMock()),
+                (v3, "retract_dead_posts", AsyncMock()),
+                (v3.asyncio, "sleep", AsyncMock())):
+            stack.enter_context(patch.object(target, name, value))
+        for name, kwargs in (
+                ("load_posted", {"return_value": posted}),
+                ("load_pending", {"return_value": {}}),
+                ("load_posted_messages", {"return_value": records}),
+                ("save_posted", {"side_effect": lambda keys, fresh: set(keys)}),
+                ("save_pending", {}), ("save_posted_messages", {}),
+                ("get_webhook_for_subreddit", {"return_value": "https://discord.test/webhook"})):
+            stack.enter_context(patch.object(v3, name, **kwargs))
+        await v3.main()
+    return _R72MainSession.last, posted, records
+
+
+_r72_main_proxy, _r72_posted, _ = asyncio.run(_r72_main_case(
+    [{"kind": "video", "url": _r72_url}], _r72_bad))
+check("r72 main: broken proxy video POST asks for response and PATCHes original card",
+      len(_r72_main_proxy.posts) == 1
+      and _r72_main_proxy.posts[0][0] == "https://discord.test/webhook?with_components=true&wait=true"
+      and _r72_main_proxy.patches == [
+          ("https://discord.test/webhook/messages/msg1?with_components=true",
+           _r72_main_proxy.posts[0][1])]
+      and "TestSub_abc123" in _r72_posted)
+_r72_main_good, _, _ = asyncio.run(_r72_main_case(
+    [{"kind": "video", "url": _r72_url}], _r72_good))
+check("r72 main: healthy proxy video gets a response but no edit",
+      len(_r72_main_good.posts) == 1
+      and _r72_main_good.posts[0][0].endswith("&wait=true")
+      and not _r72_main_good.patches)
+_r72_main_new, _, _ = asyncio.run(_r72_main_case(
+    [{"kind": "video", "url": _r72_unknown}],
+    _r72_message(_r72_media(_r72_unknown))))
+check("r72 main: future extensionless video provider heals without code changes",
+      len(_r72_main_new.patches) == 1)
+_r72_main_native, _, _ = asyncio.run(_r72_main_case(
+    [{"kind": "video", "url": _r72_native}], _r72_native_bad))
+check("r72 main: native video can be inspected but is not edited",
+      len(_r72_main_native.posts) == 1
+      and _r72_main_native.posts[0][0].endswith("&wait=true")
+      and not _r72_main_native.patches)
+_r72_main_img, _, _ = asyncio.run(_r72_main_case(
+    [{"kind": "image", "url": "https://i.redd.it/pic.jpg"}],
+    _r72_message(_r72_media("https://i.redd.it/pic.jpg"))))
+check("r72 main: image-only cards keep no-wait/no-edit delivery",
+      len(_r72_main_img.posts) == 1
+      and _r72_main_img.posts[0][0] == "https://discord.test/webhook?with_components=true"
+      and not _r72_main_img.patches)
+_r72_main_off, _, _ = asyncio.run(_r72_main_case(
+    [{"kind": "video", "url": _r72_url}], _r72_bad, enabled=False))
+check("r72 main: opt-out keeps existing no-wait/no-PATCH delivery",
+      len(_r72_main_off.posts) == 1
+      and _r72_main_off.posts[0][0] == "https://discord.test/webhook?with_components=true"
+      and not _r72_main_off.patches)
+_r72_main_no_id, _, _ = asyncio.run(_r72_main_case(
+    [{"kind": "video", "url": _r72_url}], {"components": _r72_bad["components"]}))
+check("r72 main: missing returned message ID fails closed (delivery cached)",
+      len(_r72_main_no_id.posts) == 1 and not _r72_main_no_id.patches)
+_r72_main_204, _r72_posted_204, _ = asyncio.run(_r72_main_case(
+    [{"kind": "video", "url": _r72_url}], _r72_bad, status=204))
+check("r72 main: Discord 204 without JSON skips repair but caches delivery",
+      not _r72_main_204.patches and "TestSub_abc123" in _r72_posted_204)
+_r72_main_retract, _, _r72_records = asyncio.run(_r72_main_case(
+    [{"kind": "video", "url": _r72_url}], _r72_good, retract=True))
+check("r72 main: retraction seatbelt still records original ID with no heal for healthy video",
+      not _r72_main_retract.patches
+      and _r72_records["TestSub_abc123"]["message_id"] == "msg1"
+      and _r72_records["TestSub_abc123"]["payload"] == _r72_main_retract.posts[0][1])
+
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
     sys.exit(1)
