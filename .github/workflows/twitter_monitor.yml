@@ -100,7 +100,8 @@ jobs:
           # loop, so posting speed is unchanged. Optional Variables:
           #   MEDIA_HEAL=off              disable it
           #   MEDIA_HEAL_DELAY_SECONDS=45 wait before each re-edit
-          #   MEDIA_HEAL_ATTEMPTS=2       max re-edits per message
+          #   MEDIA_HEAL_ATTEMPTS=4       max re-edits per message (default 4,
+          #                               hard-capped at 4)
           #   MEDIA_HEAL_SCOPE=video      round 56 default: only video
           #                               renditions are re-edited — the one
           #                               media type whose tile actually
