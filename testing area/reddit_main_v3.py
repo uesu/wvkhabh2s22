@@ -383,11 +383,37 @@ else:
 # a markdown link, a bare URL, ||spoiler||, or a bold/italic marker pair
 # (live 1wxfuj5: the old budget cut sliced a link mid-URL, rendering a
 # broken "[Set](https://…" fragment). Markdown tables (Discord renders no
-# table markdown) are converted to per-row bold-label bullets at card
-# build — one choke point, every body path; malformed or ambiguous tables
-# are left byte-identical, and nothing is date-converted (ranges like
-# "October 9/10" cannot become Discord timestamps without guessing — the
-# card's posted-time 🕐 stays the only timestamp).
+# table markdown) are converted at card build — one choke point, every
+# body path; malformed or ambiguous tables are left byte-identical, and
+# nothing is date-converted (ranges like "October 9/10" cannot become
+# Discord timestamps without guessing — the card's posted-time 🕐 stays
+# the only timestamp). Round 71 changed the RENDERING (round 66 emitted
+# per-row bold-label bullets; round 71 groups each row under a plain
+# "Patch 3.7" label with "- Column: value" bullets — see below).
+# ---------------------------------------------------------------------------
+#
+# ■ ROUND 71 (2026-10-11): TABLE READABILITY — GROUPED ROW BLOCKS
+# A table is a schedule, and a schedule is read row by row. Round 66's
+# "**Patch 3.8**" + "- **Drip Market:** …" blocks were complete but read as
+# a wall of bold on a phone: every row re-pitched its column headings and
+# nothing separated one row from the next. `_format_markdown_tables` keeps
+# the exact round-66 detection (a header row + a well-formed separator of
+# the same width + a full run of data rows; malformed, glued or ambiguous
+# shapes stay byte-identical) and renders compact grouped blocks:
+#
+#     Patch 3.7
+#     - Drip Market: August 25/26, 2026
+#     - Beta Start: September 5, 2026
+#
+# — a plain label line (the first cell composed with its heading when the
+# cell does not already carry it), one bullet per populated column, HTML
+# entities decoded (&amp; -> &), a blank line between rows, and a blank line
+# before a "Q1:"-style FAQ question that follows text. The transform is
+# local and linear in the body length, makes NO request (no provider,
+# proxy, media, cache, retry or Discord call), runs only at the single
+# card-build choke point, and leaves every non-table line byte-identical;
+# the existing body/total Components V2 text budgets still bound the
+# result before delivery.
 # ---------------------------------------------------------------------------
 
 # Round 63 ("The Great Simplification"): the settle window, the mod-queue
@@ -1758,102 +1784,138 @@ def split_card_body(text: str, limit: int) -> tuple:
     return text[:point].rstrip(), text[point:].lstrip()
 
 
-_MD_TABLE_SEP_CELL_RE = re.compile(r"^:?-+:?$")
+_TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-+:?$")
 
 
-def _md_table_cells(line: str) -> "list | None":
-    """Round 66: the pipe-separated cells of one markdown table row, or
+def _split_markdown_table_row(line: str) -> "list | None":
+    """Round 71: the pipe-separated cells of one Markdown table row, or
     None when the line is not a table row (no pipe / fewer than 2 cells).
-    Reddit escapes literal pipes as \\| — unescaped after splitting."""
+
+    Reddit escapes a literal pipe as ``\\|`` — the escape is undone after
+    splitting, so a rendered bullet shows the literal character, exactly
+    as round 66 did. A row ending in an ESCAPED pipe keeps that pipe as
+    part of the last cell instead of losing it to the delimiter strip."""
     raw = (line or "").strip()
     if not raw or "|" not in raw:
         return None
     if raw.startswith("|"):
         raw = raw[1:]
-    if raw.endswith("|"):
+    if raw.endswith("|") and not raw.endswith("\\|"):
         raw = raw[:-1]
     cells = [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", raw)]
     return cells if len(cells) >= 2 else None
 
 
-def _markdown_tables_to_bullets(body: str) -> str:
-    """Round 66 (live 1wxfuj5): Discord renders no table markdown, so a
-    markdown table in the card body (header row + |---| separator + data
-    rows) is converted to per-row bullets:
+def _format_markdown_tables(body: str | None) -> str:
+    """Round 71 (2026-10-11, live 1wxfuj5): make a Reddit Markdown table
+    readable in a Discord text component.
 
-        **<Header1> <cell1>**
-        - **<Header2>:** <cell2>     (one bullet per remaining column,
-                                      empty cells skipped; rows joined
-                                      by a blank line)
+    Discord renders no table markdown. Round 66 turned a table into
+    per-row ``**bold-label**`` bullet blocks — complete, but a wall of
+    bold that re-reads the column headings on every row. Round 71 renders
+    the same detected table as compact, grouped row blocks:
 
-    The bold row label COMPOSES the first header with the first cell —
-    the live 1wxfuj5 table (header "Patch", cells "3.7"/"3.8") renders
-    "**Patch 3.8**", matching the hand-checked example from the PR
-    conversation. A cell that already carries the header word ("Patch
-    3.8" under header "Patch") is used verbatim — never doubled.
+        Patch 3.7
+        - Drip Market: August 25/26, 2026
+        - Beta Start: September 5, 2026
 
-    Conservative by design: a block only converts when every row agrees
-    on the cell count, the separator row is well-formed, and no second
-    separator-shaped row glues tables together — malformed or ambiguous
-    shapes stay byte-identical, and nothing is date-converted (ranges
-    like "October 9/10" cannot become Discord timestamps without
-    guessing; the card's posted-time 🕐 stays the only timestamp)."""
-    if not body or "|" not in body:
-        return body
-    lines = body.split("\n")
+    One block per data row: the first cell is the row's semantic key,
+    composed with its column heading when the cell does not already carry
+    the heading word ("Patch" + "3.7" -> "Patch 3.7"; "Patch 3.8" stays
+    verbatim — never doubled), followed by one "- <column>: <value>"
+    bullet per populated column, then a blank line. HTML entities are
+    decoded (&amp; -> &). A "Q1:"-style line gains a blank line before it
+    when it follows text, so an FAQ question never runs into its heading.
+
+    Conservative by design (unchanged from round 66): a block converts
+    only when the header row is followed by a well-formed separator row of
+    the same width and a full run of data rows of that width — malformed,
+    glued or ambiguous shapes are returned byte-identical, so ordinary
+    prose containing a pipe is never touched. Nothing is date-converted
+    (a range like "October 9/10" cannot become a Discord timestamp without
+    guessing — the card's 🕐 stays the only timestamp).
+
+    Local and linear in the body length, no request of any kind; the ONLY
+    call site is the card build, so RSS, FULL MODE, Arctic and proxy
+    bodies all render identically. The existing body/total Components V2
+    text budgets keep the result bounded before delivery.
+    """
+    if not body:
+        return ""
+    text = str(body)
+    lines = text.splitlines()
     out = []
     i, n = 0, len(lines)
     while i < n:
-        header = _md_table_cells(lines[i])
-        sep = _md_table_cells(lines[i + 1]) if i + 1 < n else None
-        if not (header and sep and len(sep) == len(header)
-                and all(_MD_TABLE_SEP_CELL_RE.match(c) for c in sep)):
+        headers = _split_markdown_table_row(lines[i])
+        separator = _split_markdown_table_row(lines[i + 1]) if i + 1 < n else None
+        valid_separator = (
+            headers and separator and len(headers) == len(separator)
+            and all(_TABLE_SEPARATOR_CELL_RE.fullmatch(cell.replace(" ", ""))
+                    for cell in separator))
+        if not valid_separator:
             out.append(lines[i])
             i += 1
             continue
-        # the data rows: consecutive rows sharing the header's cell count
-        j = i + 2
         rows = []
+        j = i + 2
         while j < n:
-            cells = _md_table_cells(lines[j])
-            if cells is None or len(cells) != len(header):
+            cells = _split_markdown_table_row(lines[j])
+            if not cells or len(cells) != len(headers):
                 break
             rows.append(cells)
             j += 1
-        # full pipe-run end (for leaving malformed blocks byte-identical)
-        j_end = j
-        while j_end < n and _md_table_cells(lines[j_end]) is not None:
-            j_end += 1
-        # a separator-shaped row inside the data rows means two tables
-        # were glued together (or worse); a pipe-run that ends on a row
-        # with a DIFFERENT cell count is a malformed table — never guess
-        glued = any(all(_MD_TABLE_SEP_CELL_RE.match(c) for c in r) for r in rows)
-        malformed = (j < n and _md_table_cells(lines[j]) is not None
-                     and len(_md_table_cells(lines[j])) != len(header))
-        if rows and not glued and not malformed:
-            blocks = []
-            for cells in rows:
-                block = []
-                if cells[0]:
-                    label = cells[0]
-                    head1 = (header[0] or "").strip()
-                    # compose "Header1 cell1" ("Patch" + "3.8" ->
-                    # "Patch 3.8"); a cell already carrying the header
-                    # word stays verbatim ("Patch 3.8" -> "Patch 3.8")
-                    if head1 and head1.lower() not in label.lower():
-                        label = f"{head1} {label}"
-                    block.append(f"**{label}**")
-                for head, cell in zip(header[1:], cells[1:]):
-                    if cell:
-                        block.append(f"- **{head}:** {cell}")
-                if block:
-                    blocks.append("\n".join(block))
-            out.append("\n\n".join(blocks))
-            i = j
-        else:
-            out.extend(lines[i:max(j, j_end)])
-            i = max(j, j_end)
-    return "\n".join(out)
+        if not rows:
+            # a header + separator with no data rows at all (or a first
+            # data row of the wrong width): not a table — never guess
+            out.append(lines[i])
+            i += 1
+            continue
+        # Round 66 robustness, kept: a separator-shaped row INSIDE the data
+        # rows means two tables were glued together, and a pipe run that
+        # ends on a row with a different cell count is malformed — leave
+        # the whole run byte-identical rather than guess at a repair.
+        glued = any(all(_TABLE_SEPARATOR_CELL_RE.fullmatch(cell.replace(" ", ""))
+                        for cell in row) for row in rows)
+        # Round 71 review fix (PR #58): only a following pipe line that
+        # actually looks like a table row — a leading or trailing boundary
+        # pipe — may mark the run malformed. A prose line that merely
+        # contains a pipe (the live "Suoming | 5\* Electro Sword" shape)
+        # must never disable a valid table above it.
+        next_line = lines[j].strip() if j < n else ""
+        malformed = (
+            _split_markdown_table_row(next_line) is not None
+            and (next_line.startswith("|") or next_line.endswith("|")))
+        if glued or malformed:
+            run_end = j
+            while run_end < n and _split_markdown_table_row(lines[run_end]) is not None:
+                run_end += 1
+            out.extend(lines[i:run_end])
+            i = run_end
+            continue
+        for row in rows:
+            label = html_lib.unescape(row[0]).strip() or "Entry"
+            # The first column is the row's semantic key — repeat the
+            # context instead of emitting a bare value like just "3.7".
+            heading0 = html_lib.unescape(headers[0]).strip()
+            if heading0 and heading0.lower() not in label.lower():
+                label = f"{heading0} {label}"
+            out.append(label)
+            for heading, value in zip(headers[1:], row[1:]):
+                value = html_lib.unescape(value).strip()
+                if value:
+                    out.append(f"- {html_lib.unescape(heading).strip()}: {value}")
+            out.append("")
+        i = j
+    # FAQ hygiene: a "Q1: …" line that follows text gains a blank line, so
+    # a heading and its first question do not visually run together.
+    spaced = []
+    for line in out:
+        if (line.strip() and re.match(r"^Q\d+\s*:", line, re.I)
+                and spaced and spaced[-1].strip()):
+            spaced.append("")
+        spaced.append(line)
+    return _collapse_blanks(spaced)
 
 
 def build_continuation_payloads(rest: str) -> list:
@@ -4444,11 +4506,15 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
     body_budget = max(300, 3800 - len(header) - len(op_line) - len(stats_line))
     # Round 62: an inline-image link that is ALSO a gallery item never
     # renders twice — the raw-URL body line is scrubbed (live 1wx9c77)
-    # Round 66: markdown tables become per-row bold-label bullets (Discord
-    # renders no table markdown — live 1wxfuj5), and the budget split lands
+    # Round 66: markdown tables get Discord-safe rendering (Discord renders
+    # no table markdown — live 1wxfuj5), and the budget split lands
     # on a safe boundary — never inside a link/URL/spoiler/marker pair. The
     # remainder is carried by follow-up continuation messages; no ellipsis.
-    body_src = _markdown_tables_to_bullets(
+    # Round 71: that rendering is the grouped row-block format ("Patch 3.7"
+    # + "- Column: value" bullets, entities decoded, FAQ spacing) — one
+    # choke point, so every body source (RSS, FULL MODE, Arctic, proxy)
+    # receives the identical readable form.
+    body_src = _format_markdown_tables(
         _drop_gallery_media_lines(data["body"], media))
     body_out, body_rest = split_card_body(body_src, body_budget)
 
