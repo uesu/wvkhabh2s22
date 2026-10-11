@@ -270,7 +270,12 @@ GALLERY_VIDEO_LIMIT = 0
 # ---------------------------------------------------------------------------
 MEDIA_HEAL = os.getenv("MEDIA_HEAL", "on").strip().lower() not in ("0", "off", "no", "false")
 MEDIA_HEAL_DELAY_SECONDS = _env_int("MEDIA_HEAL_DELAY_SECONDS", 45)
-MEDIA_HEAL_ATTEMPTS = _env_int("MEDIA_HEAL_ATTEMPTS", 2)
+# Bounded retry policy (2026-10-11): up to four same-payload re-edits at the
+# 45-second delay, so an unresolved video gets up to ~180 s for Discord's
+# external-media proxy to resolve. A successful edit exits immediately, so
+# this is a maximum, not a fixed wait. The hard cap keeps a mis-set Variable
+# from creating an unbounded workflow run.
+MEDIA_HEAL_ATTEMPTS = min(4, max(1, _env_int("MEDIA_HEAL_ATTEMPTS", 4)))
 # ---------------------------------------------------------------------------
 # ■ ROUND 56 (2026-10-02): MEDIA-HEAL SCOPE — VIDEOS ONLY BY DEFAULT
 # The only confirmed broken tile in production was a VIDEO (round 47,
