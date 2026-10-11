@@ -2822,6 +2822,15 @@ check("r47: the proven 256 MiB external-video cap is unchanged (no guessing)",
       _r47_x.VIDEO_SIZE_LIMIT == 256 * 1024 * 1024,
       f"limit={_r47_x.VIDEO_SIZE_LIMIT / (1024 * 1024):.0f} MiB")
 
+# ---- 2026-10-11: bounded Twitter video heal (default 4, hard cap 4) -------
+check("r63: twitter media-heal default is four bounded attempts at 45s",
+      (_r47_x.MEDIA_HEAL_DELAY_SECONDS, _r47_x.MEDIA_HEAL_ATTEMPTS) == (45, 4))
+check("r63: media-heal attempts are hard-capped at four in source",
+      "MEDIA_HEAL_ATTEMPTS = min(4, max(1, _env_int(\"MEDIA_HEAL_ATTEMPTS\", 4)))"
+      in open(os.path.join(ROOT, "testing area", "twitter_v3.py"), encoding="utf-8").read())
+check("r63: live media-heal attempt count sits inside the 1..4 bound",
+      1 <= _r47_x.MEDIA_HEAL_ATTEMPTS <= 4)
+
 # ---- ROUND 47: Reddit profile posts + crossposts of them ------------------
 # LIVE INCIDENT: r/AnantaLeaks 1wuv547 is a crosspost of the PROFILE post
 # /user/aphotide/comments/1wuv4j8/ — the card showed the external-preview
@@ -3550,7 +3559,7 @@ try:
            _r49b_twitter.MAX_CACHE_SIZE_TOTAL) == (250, 10000))
     check("r49b: twitter_v3 empty media-heal Variables use defaults",
           (_r49b_twitter.MEDIA_HEAL_DELAY_SECONDS,
-           _r49b_twitter.MEDIA_HEAL_ATTEMPTS) == (45, 2))
+           _r49b_twitter.MEDIA_HEAL_ATTEMPTS) == (45, 4))
     _r49b_reddit = load_module("smoke_reddit_v3_empty_env", _r49b_files[2])
     check("r49b: reddit_main_v3 imports with empty numeric Variables", True)
     check("r49b: reddit_main_v3 empty cache Variables use defaults",
