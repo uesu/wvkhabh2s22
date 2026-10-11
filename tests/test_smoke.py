@@ -4179,9 +4179,11 @@ print()
 # A body beyond the card's text budget is continued in follow-up messages
 # (main card layout unchanged), every split lands on a safe boundary —
 # never inside a link/URL/spoiler/marker pair (live 1wxfuj5) — markdown
-# tables render as per-row bullets (live 1wxfuj5), retraction covers every
-# part, and reddit_monitor.yml drops 11 env mappings for gates removed in
-# round 63 while wiring the round-64 FRESH_HOLD_SECONDS/LISTING_CONFIRM.
+# tables get a Discord-safe rendering (live 1wxfuj5; round 71 changed the
+# format to grouped row blocks — see the r71 guards below), retraction
+# covers every part, and reddit_monitor.yml drops 11 env mappings for gates
+# removed in round 63 while wiring the round-64
+# FRESH_HOLD_SECONDS/LISTING_CONFIRM.
 # ===========================================================================
 
 _r66_sub = "TestSub"
@@ -4319,57 +4321,143 @@ check("r66: adversarial link straddling the continuation boundary splits before 
       and not (_r66_link[:-1] in _r66_h and _r66_link not in _r66_h),
       f"{_r66_h[-25:]!r} / {_r66_t[:45]!r}")
 
-# --- markdown tables → Discord-safe bullets -------------------------------
-# the REAL 1wxfuj5 table (verbatim from Arctic Shift, t3_1wxfuj5): the
-# first data cell is "3.8" under header "Patch" — the bold row label
-# COMPOSES them into "**Patch 3.8**", matching the hand-checked example
+# --- markdown tables → grouped row blocks (round 71) -----------------------
+# Round 71 keeps round 66's DETECTION (header row + a well-formed separator
+# of equal width + a full run of data rows; malformed/glued shapes stay
+# byte-identical) and changes the RENDERING: round 66 emitted per-row
+# "**bold-label**" bullet blocks, round 71 emits compact grouped blocks —
+# a plain "Patch 3.7" label line, one "- Column: value" bullet per
+# populated column, a blank line between rows, entities decoded.
+# the REAL 1wxfuj5 table (verbatim from Arctic Shift, t3_1wxfuj5) — it uses
+# single-dash separator cells ("|:-|"); Reddit's own renderer accepts them,
+# so the round-66 tolerance (one or more dashes) is kept.
 _r66_tbl = ("|Patch|Drip Market|Beta Start|Livestream|First Half|Second Half|New Characters|\n"
             "|:-|:-|:-|:-|:-|:-|:-|\n"
             "|3.7|August 25/26, 2026|September 5, 2026|September 19, 2026|October 2, 2026|"
             "October 23, 2026|Hsin (5\\* Electro) & Suoming (5\\* Electro)|\n"
             "|3.8|October 9/10, 2026|October 16, 2026|October 30, 2026|November 13, 2026|"
             "December 2, 2026|Lily (5\\* Spectro)|")
-check("r66: the real 1wxfuj5 table renders as the hand-checked example (live 1wxfuj5)",
-      v3._markdown_tables_to_bullets(_r66_tbl) ==
-      "**Patch 3.7**\n"
-      "- **Drip Market:** August 25/26, 2026\n"
-      "- **Beta Start:** September 5, 2026\n"
-      "- **Livestream:** September 19, 2026\n"
-      "- **First Half:** October 2, 2026\n"
-      "- **Second Half:** October 23, 2026\n"
-      "- **New Characters:** Hsin (5\\* Electro) & Suoming (5\\* Electro)\n\n"
-      "**Patch 3.8**\n"
-      "- **Drip Market:** October 9/10, 2026\n"
-      "- **Beta Start:** October 16, 2026\n"
-      "- **Livestream:** October 30, 2026\n"
-      "- **First Half:** November 13, 2026\n"
-      "- **Second Half:** December 2, 2026\n"
-      "- **New Characters:** Lily (5\\* Spectro)",
-      repr(v3._markdown_tables_to_bullets(_r66_tbl)))
-check("r66: a first cell already carrying the header word is never doubled",
-      v3._markdown_tables_to_bullets(
+check("r71: the real 1wxfuj5 table renders as grouped patch blocks (live 1wxfuj5)",
+      v3._format_markdown_tables(_r66_tbl) ==
+      "Patch 3.7\n"
+      "- Drip Market: August 25/26, 2026\n"
+      "- Beta Start: September 5, 2026\n"
+      "- Livestream: September 19, 2026\n"
+      "- First Half: October 2, 2026\n"
+      "- Second Half: October 23, 2026\n"
+      "- New Characters: Hsin (5\\* Electro) & Suoming (5\\* Electro)\n\n"
+      "Patch 3.8\n"
+      "- Drip Market: October 9/10, 2026\n"
+      "- Beta Start: October 16, 2026\n"
+      "- Livestream: October 30, 2026\n"
+      "- First Half: November 13, 2026\n"
+      "- Second Half: December 2, 2026\n"
+      "- New Characters: Lily (5\\* Spectro)",
+      repr(v3._format_markdown_tables(_r66_tbl)))
+# --- the hand-checked example from the round-71 PR conversation ------------
+_r71_tbl = (
+    "Patch | Drip Market | Beta Start | Livestream | First Half | Second Half | New Characters\n"
+    "--- | --- | --- | --- | --- | --- | ---\n"
+    "3.7 | August 25/26, 2026 | September 5, 2026 | September 19, 2026 | October 2, 2026 | "
+    "October 23, 2026 | Hsin (5* Electro) &amp; Suoming (5* Electro)\n"
+    "3.8 | October 6, 2026 | October 16, 2026 | October 30, 2026 | November 13, 2026 | "
+    "December 2, 2026 | Lily (5* Spectro)")
+_r71_expected = (
+    "Patch 3.7\n"
+    "- Drip Market: August 25/26, 2026\n"
+    "- Beta Start: September 5, 2026\n"
+    "- Livestream: September 19, 2026\n"
+    "- First Half: October 2, 2026\n"
+    "- Second Half: October 23, 2026\n"
+    "- New Characters: Hsin (5* Electro) & Suoming (5* Electro)\n\n"
+    "Patch 3.8\n"
+    "- Drip Market: October 6, 2026\n"
+    "- Beta Start: October 16, 2026\n"
+    "- Livestream: October 30, 2026\n"
+    "- First Half: November 13, 2026\n"
+    "- Second Half: December 2, 2026\n"
+    "- New Characters: Lily (5* Spectro)")
+check("r71: the PR example matches byte for byte (grouped blocks, entities decoded)",
+      v3._format_markdown_tables(_r71_tbl) == _r71_expected,
+      repr(v3._format_markdown_tables(_r71_tbl)))
+check("r71: ordinary prose containing a pipe is left unchanged",
+      v3._format_markdown_tables("A | B\nplain prose") == "A | B\nplain prose"
+      and v3._format_markdown_tables(
+          "Suoming | 5\\* Electro Sword\nLily | 5\\* Spectro Gun")
+      == "Suoming | 5\\* Electro Sword\nLily | 5\\* Spectro Gun")
+# r71 review fix (PR #58): a following line that merely CONTAINS a pipe is
+# not a table continuation — only a line with real table-row boundaries
+# (leading or trailing pipe) can mark the run malformed. These three checks
+# pin the reviewer's regression test, the harder no-blank-line variant (a
+# different cell count is what tripped the original guard), and the
+# boundary-pipe case that must still stay byte-identical.
+check("r71: a valid table is still formatted before ordinary pipe prose",
+      v3._format_markdown_tables(
+          "| Patch | Drip Market |\n"
+          "|---|---|\n"
+          "| 3.7 | August 25/26, 2026 |\n\n"
+          "Suoming | 5\\* Electro Sword")
+      ==
+      "Patch 3.7\n"
+      "- Drip Market: August 25/26, 2026\n\n"
+      "Suoming | 5\\* Electro Sword",
+      repr(v3._format_markdown_tables(
+          "| Patch | Drip Market |\n|---|---|\n| 3.7 | August 25/26, 2026 |\n\n"
+          "Suoming | 5\\* Electro Sword")))
+check("r71: pipe prose with a DIFFERENT cell count straight after a table "
+      "(no blank line) still formats the table",
+      v3._format_markdown_tables(
+          "| Patch | Drip Market | Notes |\n"
+          "|---|---|---|\n"
+          "| 3.7 | August 25/26, 2026 | x |\n"
+          "Suoming | 5\\* Electro Sword")
+      ==
+      "Patch 3.7\n"
+      "- Drip Market: August 25/26, 2026\n"
+      "- Notes: x\n\n"
+      "Suoming | 5\\* Electro Sword",
+      repr(v3._format_markdown_tables(
+          "| Patch | Drip Market | Notes |\n|---|---|---|\n| 3.7 | August 25/26, 2026 | x |\n"
+          "Suoming | 5\\* Electro Sword")))
+_r71_boundary = "| a | b |\n|---|---|\n| x | y |\n| c | d | e |"
+check("r71: a mismatched row WITH table boundaries still leaves the run byte-identical",
+      v3._format_markdown_tables(_r71_boundary) == _r71_boundary
+      and v3._format_markdown_tables("| a | b |\n|---|---|\n| x | y |\nc | d | e |")
+      == "| a | b |\n|---|---|\n| x | y |\nc | d | e |",
+      repr(v3._format_markdown_tables(_r71_boundary)))
+check("r71: FAQ question gets a blank line after the heading",
+      v3._format_markdown_tables("Frequently Asked Questions (FAQ):\nQ1: Banners?")
+      == "Frequently Asked Questions (FAQ):\n\nQ1: Banners?")
+check("r71: a first cell already carrying the header word is never doubled",
+      v3._format_markdown_tables(
           "| Patch | Drip Market |\n|---|---|\n| Patch 3.8 | October 9/10, 2026 |")
-      == "**Patch 3.8**\n- **Drip Market:** October 9/10, 2026",
-      repr(v3._markdown_tables_to_bullets(
+      == "Patch 3.8\n- Drip Market: October 9/10, 2026",
+      repr(v3._format_markdown_tables(
           "| Patch | Drip Market |\n|---|---|\n| Patch 3.8 | October 9/10, 2026 |")))
-check("r66: an empty first header falls back to the verbatim cell",
-      v3._markdown_tables_to_bullets(
+check("r71: an empty first header falls back to the verbatim cell",
+      v3._format_markdown_tables(
           "| | Drip Market |\n|---|---|\n| 3.8 | October 9/10, 2026 |")
-      == "**3.8**\n- **Drip Market:** October 9/10, 2026")
-check("r66: dates stay literal — NO Discord-timestamp guessing of body text",
-      "<t:" not in v3._markdown_tables_to_bullets(_r66_tbl))
-check("r66: table mid-body keeps the surrounding prose",
-      v3._markdown_tables_to_bullets("before\n\n" + _r66_tbl + "\nafter") ==
-      "before\n\n" + v3._markdown_tables_to_bullets(_r66_tbl) + "\nafter",
-      repr(v3._markdown_tables_to_bullets("before\n\n" + _r66_tbl + "\nafter")))
-check("r66: empty cells are skipped, not blank bullets",
-      v3._markdown_tables_to_bullets("| Patch | Drip Market | Notes |\n|---|---|---|\n| 3.8 | | z |")
-      == "**Patch 3.8**\n- **Notes:** z",
-      repr(v3._markdown_tables_to_bullets("| Patch | Drip Market | Notes |\n|---|---|---|\n| 3.8 | | z |")))
-check("r66: escaped pipes survive as literal pipes",
-      v3._markdown_tables_to_bullets("| Patch | a \\| b |\n|---|---|\n| 3.8 | x \\| y |")
-      == "**Patch 3.8**\n- **a | b:** x | y",
-      repr(v3._markdown_tables_to_bullets("| Patch | a \\| b |\n|---|---|\n| 3.8 | x \\| y |")))
+      == "3.8\n- Drip Market: October 9/10, 2026")
+check("r71: an empty first cell falls back to the 'Entry' label",
+      v3._format_markdown_tables(
+          "| | Drip Market |\n|---|---|\n| | October 9/10, 2026 |")
+      == "Entry\n- Drip Market: October 9/10, 2026")
+check("r71: dates stay literal — NO Discord-timestamp guessing of body text",
+      "<t:" not in v3._format_markdown_tables(_r66_tbl))
+_r71_mid = v3._format_markdown_tables("before\n\n" + _r66_tbl + "\nafter")
+check("r71: table mid-body keeps the surrounding prose (a blank line closes the last block)",
+      _r71_mid.startswith("before\n\n") and _r71_mid.endswith("\n\nafter")
+      and "Patch 3.7" in _r71_mid and "Patch 3.8" in _r71_mid
+      and "|:-|" not in _r71_mid,
+      repr(_r71_mid))
+check("r71: empty cells are skipped, not blank bullets",
+      v3._format_markdown_tables("| Patch | Drip Market | Notes |\n|---|---|---|\n| 3.8 | | z |")
+      == "Patch 3.8\n- Notes: z",
+      repr(v3._format_markdown_tables("| Patch | Drip Market | Notes |\n|---|---|---|\n| 3.8 | | z |")))
+check("r71: escaped pipes survive as literal pipes",
+      v3._format_markdown_tables("| Patch | a \\| b |\n|---|---|\n| 3.8 | x \\| y |")
+      == "Patch 3.8\n- a | b: x | y",
+      repr(v3._format_markdown_tables("| Patch | a \\| b |\n|---|---|\n| 3.8 | x \\| y |")))
 _r66_bad_tbls = [
     "| a | b |\n| c | d |",                                  # no separator row
     "| a | b | c |\n|---|---|---|\n| x | y |",               # unequal data cells
@@ -4377,11 +4465,14 @@ _r66_bad_tbls = [
     "| a | b |\n|---|---|",                                  # zero data rows
     "plain prose, no pipes at all",
 ]
-check("r66: malformed/ambiguous tables stay byte-identical — never guess",
-      all(v3._markdown_tables_to_bullets(_b) == _b for _b in _r66_bad_tbls),
-      str([b for b in _r66_bad_tbls if v3._markdown_tables_to_bullets(b) != b]))
-check("r66: a pipe-free body short-circuits untouched",
-      v3._markdown_tables_to_bullets("") == "" and v3._markdown_tables_to_bullets(None) is None)
+check("r71: malformed/ambiguous tables stay byte-identical — never guess",
+      all(v3._format_markdown_tables(_b) == _b for _b in _r66_bad_tbls),
+      str([b for b in _r66_bad_tbls if v3._format_markdown_tables(b) != b]))
+check("r71: a pipe-free body is returned unchanged (None/empty are safe)",
+      v3._format_markdown_tables("") == ""
+      and v3._format_markdown_tables(None) == ""
+      and v3._format_markdown_tables("plain prose line\nanother")
+      == "plain prose line\nanother")
 
 # --- live 1wxfuj5 end-to-end shape: table + entities + link across the cut
 _r66_live_raw = (
@@ -4402,9 +4493,12 @@ _r66_live_conts = v3.build_continuation_payloads(_r66_live_rest)
 # body parts only — the header's title link and the stats line's posted-time
 # 🕐 are not body text (the timestamp check below must not trip on them)
 _r66_live_parts = _r66_texts(_r66_live_p)[1:-1] + _r66_chunks(_r66_live_conts)
-check("r66: 1wxfuj5 shape — the table converts on the card itself",
-      any("**Patch 3.8**" in p and "- **Drip Market:** October 9/10, 2026" in p
-          for p in _r66_live_parts), str(_r66_live_parts[1][:120]))
+# r66 guard updated in round 71: the end-to-end card assertion now pins the
+# grouped-block format instead of the old `**Patch 3.8**` bold labels.
+check("r71: 1wxfuj5 shape — the table converts to grouped blocks on the card itself",
+      any("Patch 3.8" in p and "- Drip Market: October 9/10, 2026" in p
+          and "**Patch" not in p for p in _r66_live_parts),
+      str(_r66_live_parts[1][:160]))
 check("r66: 1wxfuj5 shape — r65 entity hygiene holds on every part",
       all("&gt;" not in p and all(ln.strip() != ">" for ln in p.splitlines())
           for p in _r66_live_parts), str(_r66_live_parts[:2]))
@@ -4541,10 +4635,13 @@ check("r66: live 1wxfuj5 megathread — the body is continued, not truncated (no
       and all(not p.rstrip().endswith("…") or p.rstrip().endswith("… full post on Reddit")
               for p in _r66_mega_parts),
       f"conts={len(_r66_mega_conts)} lens={[len(p) for p in _r66_mega_parts]}")
-check("r66: live 1wxfuj5 megathread — the release-date table is the hand-checked example",
-      "**Patch 3.7**" in _r66_mega_joined and "**Patch 3.8**" in _r66_mega_joined
-      and "- **Drip Market:** October 9/10, 2026" in _r66_mega_joined
-      and "- **New Characters:** Lily (5\\* Spectro)" in _r66_mega_joined,
+# r66 guard updated in round 71: the full-megathread end-to-end check now
+# pins the grouped-block format (and the absence of the old bold labels).
+check("r71: live 1wxfuj5 megathread — the release-date table is the grouped row blocks",
+      "Patch 3.7" in _r66_mega_joined and "Patch 3.8" in _r66_mega_joined
+      and "- Drip Market: October 9/10, 2026" in _r66_mega_joined
+      and "- New Characters: Lily (5\\* Spectro)" in _r66_mega_joined
+      and "**Patch" not in _r66_mega_joined,
       str([p[:60] for p in _r66_mega_parts]))
 check("r66: live 1wxfuj5 megathread — pipe-list lines ('Suoming | 5\\* …') are NOT tables",
       "Suoming | 5\\* Electro Sword" in _r66_mega_joined
@@ -4707,11 +4804,19 @@ check("r66: budgets — main card cap raised for continuations, 3 × 3800 more",
       and v3.CONTINUATION_CHAR_LIMIT == 3800,
       f"{v3.MAX_BODY_CHARS}/{v3.MAX_CONTINUATIONS}/{v3.CONTINUATION_CHAR_LIMIT}")
 _r66_bv3_src = inspect.getsource(v3.build_v3_payload)
-check("r66: the card build converts tables + splits safely — no ellipsis truncation left",
-      "_markdown_tables_to_bullets(" in _r66_bv3_src and "split_card_body(" in _r66_bv3_src
+# r66 guards updated in round 71: the renderer was renamed
+# `_markdown_tables_to_bullets` -> `_format_markdown_tables` and its output
+# format changed (grouped row blocks). The guards are kept, never weakened:
+# the card build still converts tables before the safe split, and the
+# renderer still never emits a Discord timestamp.
+check("r71: the card build converts tables + splits safely — no ellipsis truncation left",
+      "_format_markdown_tables(" in _r66_bv3_src and "split_card_body(" in _r66_bv3_src
       and 'rstrip() + "…"' not in _r66_bv3_src)
-check("r66: the table renderer never emits Discord timestamps",
-      "<t:" not in inspect.getsource(v3._markdown_tables_to_bullets))
+check("r71: the table renderer never emits Discord timestamps",
+      "<t:" not in inspect.getsource(v3._format_markdown_tables))
+check("r71: the table renderer makes no request — local formatting only",
+      all(token not in inspect.getsource(v3._format_markdown_tables)
+          for token in ("aiohttp", "session", "await", "webhook", "urlopen")))
 check("r66: the posting loop delivers continuations and records every message id",
       "build_continuation_payloads(" in inspect.getsource(v3.main)
       and "message_ids" in inspect.getsource(v3.main))
