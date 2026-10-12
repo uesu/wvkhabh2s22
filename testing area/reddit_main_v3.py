@@ -343,9 +343,19 @@ RETRACT_MODE = os.getenv("RETRACT_MODE", "edit").strip().lower() or "edit"
 RETRACT_WINDOW_SECONDS = _env_int("RETRACT_WINDOW_SECONDS", 21600)
 POSTED_MESSAGES_FILE = "posted_messages.json"
 
-# Round 72: inspect Discord's response for video cards. Only a video tile
-# with unresolved metadata may get one same-message edit; ordinary cards
-# keep their existing POST path (no wait=true or extra request).
+# Round 72 (+ precision follow-up): inspect Discord's response for video
+# cards. A video endpoint can be reachable before Discord has finished
+# probing its metadata, producing a one-off 0x0 / "Image failed to load"
+# tile. The initial post is unchanged; video cards request wait=true so
+# Discord's returned width/height/content_type can decide whether one
+# identical webhook edit is needed, and a queued edit revalidates the
+# message first. Only EXPLICIT unresolved evidence (a returned non-positive
+# width or height) is heal-eligible — omitted metadata is unknown, not
+# failure. Healthy videos are never flagged, so they get no edit, delay or
+# revalidation; a flagged candidate gets one revalidation read and no edit
+# when it has rendered by then. Native Reddit media and ordinary posts never
+# enter the repair path; ordinary cards keep their existing POST path
+# (no wait=true and no extra request).
 PROXY_VIDEO_HEAL = (os.getenv("PROXY_VIDEO_HEAL") or "1").strip().lower() not in ("0", "false", "no", "off")
 PROXY_VIDEO_HEAL_DELAY = max(0, min(60, _env_int("PROXY_VIDEO_HEAL_DELAY", 6)))
 
@@ -4616,11 +4626,18 @@ async def live_removal_reason(session, path: str, label: str = "") -> str | None
 
 
 # Video classification is by media kind in the outgoing card and by Discord's
-# returned media record, not by a fixed proxy-provider hostname list. URL
-# extension is a fallback for the pure response inspector (Discord omits the
-# kind when content_type is empty); the main loop also passes its known video
-# URLs so extensionless providers remain covered.
-_REDDIT_VIDEO_EXTENSION_RE = re.compile(r"\.(?:mp4|m4v|mov|webm|m3u8)$", re.I)
+# returned media record, not by a fixed proxy-provider hostname list. The URL
+# extension is the provider-agnostic classification signal the pure response
+# inspector relies on (every supported video provider serves an .mp4/.m3u8
+# rendition); Discord's own `content_type` is used only as a second *classifier*
+# for extensionless endpoints — never as failure evidence (round 56 lesson:
+# an empty content_type is exactly what an unresolved tile looks like).
+_VIDEO_MEDIA_RE = re.compile(r"\.(?:mp4|m4v|mov|webm|m3u8)(?:[?#]|$)", re.I)
+
+
+def _is_video_media_url(url: str | None) -> bool:
+    """Recognize player media without assuming a particular provider."""
+    return bool(_VIDEO_MEDIA_RE.search(str(url or "")))
 
 
 def _has_video_media(data: dict) -> bool:
@@ -4639,26 +4656,36 @@ def _native_reddit_media_url(url: str) -> bool:
             or host.endswith((".reddit.com", ".redd.it")))
 
 
-def unresolved_reddit_video_items(message: dict | None,
-                                  video_urls=()) -> list[str]:
-    """Return video URLs Discord reported with unresolved media metadata.
+def unresolved_reddit_video_items(message: dict | None) -> list[str]:
+    """Find video tiles with EXPLICIT Discord unresolved-media evidence.
 
     Walk gallery items in all Components V2 containers, including split
-    galleries. Ignore unrelated images, thumbnails and absent/malformed
-    responses. A video with both dimensions > 0 and a content type is healthy.
-    This pure inspector deliberately detects native videos too; the caller
-    excludes native URLs before queuing a repair.
+    galleries, and ignore unrelated images, thumbnails and absent/malformed
+    responses.
+
+    Discord's create response can omit the optional width/height/content_type
+    fields even when a video is already rendering, so omitted metadata is
+    *unknown*, not proof of failure. The known cold-proxy failure shape
+    explicitly reports a non-positive dimension (normally 0 x 0): only a
+    returned width or height <= 0 is heal-eligible. An explicitly empty
+    content_type is diagnostic evidence only and can never trigger an edit by
+    itself, so a sparse-but-healthy response produces no unnecessary edit.
+
+    A tile counts as a video when its URL is a video rendition or Discord
+    itself typed it ``video/...`` — there is no proxy hostname list, so every
+    supported rendition is covered and a future provider is covered as soon
+    as Discord types its tile or its URL exposes a recognized video
+    rendition. This pure inspector deliberately detects native videos too;
+    the caller excludes native Reddit media before queuing a repair.
     """
     if not isinstance(message, dict):
         return []
-    known_urls = set(video_urls)
-    bad = []
+    unresolved = []
 
-    def positive(value):
-        try:
-            return not isinstance(value, bool) and float(value) > 0
-        except (ValueError, TypeError):
-            return False
+    def explicit_non_positive(value) -> bool:
+        """Only a returned number <= 0 is evidence; None/missing is unknown."""
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and value <= 0)
 
     def walk(node):
         if isinstance(node, list):
@@ -4667,34 +4694,34 @@ def unresolved_reddit_video_items(message: dict | None,
             return
         if not isinstance(node, dict):
             return
-        items = node.get("items")
-        if isinstance(items, list):
-            for item in items:
-                media = item.get("media") if isinstance(item, dict) else None
-                if not isinstance(media, dict):
-                    continue
-                url = media.get("url")
-                if not isinstance(url, str) or not url:
-                    continue
-                try:
-                    path = urllib.parse.urlparse(url).path
-                except ValueError:
-                    continue
-                kind = str(media.get("content_type") or "").strip().lower()
-                if not (url in known_urls or kind.startswith("video/")
-                        or _REDDIT_VIDEO_EXTENSION_RE.search(path)):
-                    continue
-                if (not positive(media.get("width"))
-                        or not positive(media.get("height")) or not kind):
-                    bad.append(url)
-        walk(node.get("components"))
+        for item in node.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            media = item.get("media")
+            if not isinstance(media, dict):
+                continue
+            url = media.get("url")
+            if not isinstance(url, str) or not url:
+                continue
+            kind = str(media.get("content_type") or "").strip().lower()
+            if not (_is_video_media_url(url) or kind.startswith("video/")):
+                continue
+            if (explicit_non_positive(media.get("width"))
+                    or explicit_non_positive(media.get("height"))):
+                unresolved.append(url)
+        walk(node.get("components") or [])
 
-    walk(message.get("components"))
-    return bad
+    walk(message.get("components") or [])
+    return unresolved
 
 
 def _unresolved_healable_video_items(message: dict | None, data: dict) -> list[str]:
-    """Response-based heal eligibility; native Reddit media is untouched."""
+    """Response-based heal eligibility; native Reddit media is untouched.
+
+    A URL can only queue a repair when the outgoing card really carried it as
+    a NON-native video (an unrelated gallery item, a thumbnail or a native
+    v.redd.it tile cannot trigger an edit).
+    """
     if not _has_video_media(data):
         return []
     video_urls = {str(m["url"]) for m in data["media"]
@@ -4702,30 +4729,76 @@ def _unresolved_healable_video_items(message: dict | None, data: dict) -> list[s
                   and not _native_reddit_media_url(m["url"])}
     if not video_urls:
         return []
-    return [url for url in unresolved_reddit_video_items(message, video_urls)
+    return [url for url in unresolved_reddit_video_items(message)
             if url in video_urls]
 
 
 async def heal_proxy_video_message(session, webhook_url: str, message_id: str,
-                                   payload: dict, label: str) -> bool:
-    """Make one identical same-message edit after a generated video's warm-up."""
+                                   payload: dict, label: str,
+                                   queued_urls=()) -> bool:
+    """Revalidate, then edit one still-explicitly-unresolved video once.
+
+    The create response is an early signal, not a promise that a client still
+    sees a cold tile after the delay — production showed cards whose returned
+    metadata was 0x0 while the same post was already playable. So re-read the
+    existing Discord message (Components V2 included) first: healthy or sparse
+    metadata means no PATCH is necessary.
+
+    `queued_urls` are the unresolved video URLs the CREATE response produced
+    (main's `_unresolved_healable_video_items` output — the card's own
+    non-native video media). Revalidation is URL-specific: only one of those
+    exact URLs may still trigger the edit, so an unrelated video component in
+    the same message can never cause a PATCH. No queued URLs ⇒ nothing to
+    revalidate, so no edit.
+
+    Only a still-explicitly-unresolved queued video receives one IDENTICAL
+    same-message edit (the Discohook "Edit without changing anything" cure).
+    A failed revalidation or edit fails closed and never turns a delivered
+    card into a failure.
+    """
     if not message_id or not webhook_url or not PROXY_VIDEO_HEAL:
+        return False
+    expected_urls = {str(u).strip() for u in queued_urls if u}
+    if not expected_urls:
         return False
     await asyncio.sleep(PROXY_VIDEO_HEAL_DELAY)
     try:
+        message_url = f"{webhook_url}/messages/{message_id}"
+        async with session.get(
+                message_url + "?with_components=true",
+                timeout=aiohttp.ClientTimeout(total=15)) as check_resp:
+            if check_resp.status != 200:
+                logging.info(f"[{label}] proxy-video media heal skipped: "
+                             f"revalidation HTTP {check_resp.status}")
+                return False
+            try:
+                current = await check_resp.json(content_type=None)
+            except Exception:
+                logging.info(f"[{label}] proxy-video media heal skipped: "
+                             "revalidation response was not JSON")
+                return False
+        still_unresolved = [url for url in unresolved_reddit_video_items(current)
+                            if url.strip() in expected_urls]
+        if not still_unresolved:
+            logging.info(f"[{label}] proxy-video media heal skipped after "
+                         f"{PROXY_VIDEO_HEAL_DELAY}s revalidation: the queued "
+                         "video is no longer explicitly unresolved")
+            return False
+
         async with session.patch(
-                f"{webhook_url}/messages/{message_id}?with_components=true",
+                message_url + "?with_components=true",
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status in (200, 204):
                 logging.info(f"[{label}] proxy-video media heal edit succeeded "
-                             f"after {PROXY_VIDEO_HEAL_DELAY}s")
+                             f"after {PROXY_VIDEO_HEAL_DELAY}s revalidation")
                 return True
             logging.warning(f"[{label}] proxy-video media heal edit HTTP {resp.status}: "
                             f"{(await resp.text())[:200]}")
+            return False
     except Exception as exc:
         # aiohttp exceptions can include the webhook URL (and its token).
-        logging.warning(f"[{label}] proxy-video media heal edit failed: "
+        logging.warning(f"[{label}] proxy-video media heal failed: "
                         f"{type(exc).__name__}")
     return False
 
@@ -5420,16 +5493,23 @@ async def main():
                                 logging.error(f"YouTube link message failed: {yt_e}")
                             await asyncio.sleep(1.0)
                         # A missing/invalid wait=true response cannot be edited.
-                        # Only Discord-reported unresolved *non-native* video
-                        # items queue a repair; healthy cards are left alone.
+                        # Round 72 + follow-up: only Discord-reported unresolved
+                        # *non-native* video items queue a repair, and only when
+                        # the returned metadata is EXPLICIT evidence (a
+                        # non-positive width/height). Omitted metadata is
+                        # unknown, not failure — healthy cards stay untouched.
+                        # The queued URLs travel with the entry: the edit below
+                        # revalidates them and may only act on one of them.
                         unresolved = _unresolved_healable_video_items(message_json, data)
                         if (unresolved and isinstance(message_json, dict)
                                 and message_json.get("id")):
                             proxy_video_heal_queue.append(
-                                (webhook_url, str(message_json["id"]), payload, unique_key))
-                            logging.info(f"[{unique_key}] proxy-video heal queued: "
-                                         f"Discord reported {len(unresolved)} unresolved "
-                                         "video item(s).")
+                                (webhook_url, str(message_json["id"]), payload,
+                                 unique_key, unresolved))
+                            logging.info(f"[{unique_key}] proxy-video heal queued: Discord "
+                                         f"returned {len(unresolved)} video item(s) with "
+                                         "explicit non-positive dimensions; the edit is "
+                                         "revalidated before it is sent.")
                         await asyncio.sleep(1.5)
                     else:
                         body = await resp.text()
@@ -5437,10 +5517,14 @@ async def main():
             except Exception as e:
                 logging.error(f"Failed building/posting {unique_key}: {e}")
 
-        if proxy_video_heal_queue:
+        if proxy_video_heal_queue and not DRY_RUN:
+            logging.info(f"MEDIA-HEAL: {len(proxy_video_heal_queue)} unresolved Reddit "
+                         "video card(s) queued; revalidating them concurrently after "
+                         "delivery and editing only the still-unresolved ones.")
             await asyncio.gather(*(
-                heal_proxy_video_message(session, url, mid, payload, label)
-                for url, mid, payload, label in proxy_video_heal_queue))
+                heal_proxy_video_message(session, url, mid, payload, label, urls)
+                for url, mid, payload, label, urls in proxy_video_heal_queue),
+                return_exceptions=True)
 
         if RETRACT_DEAD_POSTS and not DRY_RUN:
             await retract_dead_posts(session, posted_messages, now)
