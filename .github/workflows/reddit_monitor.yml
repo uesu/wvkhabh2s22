@@ -105,8 +105,8 @@ jobs:
           # PROXY_MEDIA='0' disables proxy media; PROXY_WARMUP_POST selects the
           # per-run public warm-up post; EMBEDDIT_INSTANCE overrides its host.
           PROXY_MEDIA: ${{ vars.PROXY_MEDIA }}
-          # Round 72: one revalidated edit of generated proxy-video cards, and
-          # only when Discord explicitly reports unresolved media metadata.
+          # Round 72/74: one revalidated edit of generated proxy-video cards;
+          # queue on invalid dimensions or an incomplete Discord proxy attempt.
           PROXY_VIDEO_HEAL: ${{ vars.PROXY_VIDEO_HEAL }}
           PROXY_VIDEO_HEAL_DELAY: ${{ vars.PROXY_VIDEO_HEAL_DELAY }}
           PROXY_WARMUP_POST: ${{ vars.PROXY_WARMUP_POST }}
