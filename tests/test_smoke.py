@@ -5637,18 +5637,18 @@ check("r69 arctic: descriptive exception text preserved",
       ["[t] Arctic Shift search unavailable: peer reset"], str(_r69_desc_msgs))
 
 
-# ---- round 72: response-based Reddit video heal (offline) ---------------
+# ---- round 72/74: response-based Reddit video heal (offline) -------------
 # Round 72 (merged in PR #59) gave video cards a wait=true create response and
 # one identical same-message edit when Discord returned an unresolved video
-# tile. The precision follow-up guarded here:
-#   (1) ONLY explicit evidence — a returned width/height <= 0 — is heal-
-#       eligible. Omitted width/height/content_type fields mean *unknown*,
-#       not failure, so a sparse-but-rendering response can never produce an
-#       unnecessary edit (the 2026-10-12 production regression);
+# tile. The precision follow-up and Round 74 cold-proxy coverage guard:
+#   (1) an explicit returned width/height <= 0 remains heal-eligible; a
+#       returned Discord proxy_url also qualifies when metadata lacks positive
+#       dimensions plus a video content type. Sparse metadata without a proxy
+#       attempt remains *unknown*, not failure (2026-10-12 regression);
 #   (2) a queued edit REVALIDATES the delivered message first and PATCHes only
-#       a still-explicitly-unresolved non-native video — and only one of the
-#       EXACT URLs the create response queued, so an unrelated video component
-#       in the same message can never trigger an edit.
+#       a still-unresolved non-native video — and only one of the EXACT URLs
+#       the create response queued, so an unrelated video component in the
+#       same message can never trigger an edit.
 # Guards updated in place (never weakened): round 72's "missing content_type
 # alone detects an unresolved video" check is superseded by the sparse-response
 # checks below, and every round-72 failure mode keeps its guard.
@@ -5709,6 +5709,53 @@ check("r72 follow-up: one explicit 0 with the other field omitted is still evide
       all(v3.unresolved_reddit_video_items(_r72_message(m)) == [_r72_url]
           for m in ({"url": _r72_url, "width": 0, "height": None},
                     {"url": _r72_url, "width": None, "height": 0})))
+
+# Round 74: Discord's proxy_url proves it has attempted a proxy even when its
+# first response is missing some of the media metadata. The provider URL and
+# outgoing card stay unchanged; eligibility is based solely on Discord's
+# returned proxy state, and the existing delayed revalidation bounds edits.
+_r74_discord_proxy = "https://images-ext-1.discordapp.net/external/token/video.mp4"
+_r74_cold_proxy_sparse = _r72_message({
+    "url": _r72_url, "proxy_url": _r74_discord_proxy,
+})
+_r74_cold_proxy_missing_type = _r72_message({
+    "url": _r72_url, "proxy_url": _r74_discord_proxy,
+    "width": 1662, "height": 1080,
+})
+_r74_cold_proxy_missing_height = _r72_message({
+    "url": _r72_url, "proxy_url": _r74_discord_proxy,
+    "width": 1662, "content_type": "video/mp4",
+})
+_r74_proxy_healthy = _r72_message({
+    "url": _r72_url, "proxy_url": _r74_discord_proxy,
+    "width": 1662, "height": 1080, "content_type": "video/mp4",
+})
+check("r74: Discord proxy plus incomplete video metadata is heal-eligible",
+      all(v3.unresolved_reddit_video_items(message) == [_r72_url]
+          for message in (_r74_cold_proxy_sparse,
+                          _r74_cold_proxy_missing_type,
+                          _r74_cold_proxy_missing_height)))
+check("r74: sparse video metadata without a Discord proxy remains unknown",
+      v3.unresolved_reddit_video_items(_r72_sparse_message) == [])
+check("r74: a complete video proxy with positive dimensions is healthy",
+      v3.unresolved_reddit_video_items(_r74_proxy_healthy) == [])
+_r74_embedz_sparse = _r72_message({
+    "url": _r72_embedz, "width": 1662, "height": 1080,
+})
+check("r74: selecting EmbedEZ alone does not queue a heal",
+      v3._unresolved_healable_video_items(
+          _r74_embedz_sparse, _r72_card(_r72_embedz)) == [])
+check("r74: a cold image proxy cannot be classified or queued as video",
+      v3.unresolved_reddit_video_items(_r72_message({
+          "url": "https://i.redd.it/image.jpg",
+          "proxy_url": _r74_discord_proxy,
+      })) == [])
+check("r74: cold-proxy eligibility still requires the card's non-native video URL",
+      v3._unresolved_healable_video_items(
+          _r74_cold_proxy_sparse, _r72_card(_r72_url)) == [_r72_url]
+      and v3._unresolved_healable_video_items(
+          _r74_cold_proxy_sparse, _r72_card(_r72_url, kind="image")) == [])
+
 check("r72: native unresolved video is also detected provider-agnostically",
       len(v3.unresolved_reddit_video_items(_r72_native_message)) == 1)
 check("r72: image media is never classified as an unresolved video",
@@ -6063,6 +6110,22 @@ check("r72 main: broken proxy video asks for the response, revalidates, then PAT
           ("https://discord.test/webhook/messages/msg1?with_components=true",
            _r72_main_proxy.posts[0][1])]
       and "TestSub_abc123" in _r72_posted)
+_r74_main_cold, _, _ = asyncio.run(_r72_main_case(
+    [{"kind": "video", "url": _r72_url}], _r74_cold_proxy_sparse,
+    current=_r74_cold_proxy_sparse))
+check("r74 main: an unresolved cold proxy gets one GET and at most one PATCH",
+      len(_r74_main_cold.posts) == 1
+      and _r74_main_cold.gets == [
+          "https://discord.test/webhook/messages/msg1?with_components=true"]
+      and _r74_main_cold.patches == [
+          ("https://discord.test/webhook/messages/msg1?with_components=true",
+           _r74_main_cold.posts[0][1])])
+_r74_main_resolved, _, _ = asyncio.run(_r72_main_case(
+    [{"kind": "video", "url": _r72_url}], _r74_cold_proxy_sparse,
+    current=_r74_proxy_healthy))
+check("r74 main: a cold proxy that resolves during revalidation is not edited",
+      len(_r74_main_resolved.gets) == 1
+      and not _r74_main_resolved.patches)
 _r72_main_good, _, _ = asyncio.run(_r72_main_case(
     [{"kind": "video", "url": _r72_url}], _r72_good_message))
 check("r72 main: healthy proxy video gets a response but no GET and no edit",
