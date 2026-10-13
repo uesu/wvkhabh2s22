@@ -41,3 +41,6 @@ jobs:
 
       - name: Reddit signal unit tests (pure, no network)
         run: python tests/test_reddit_signals.py
+
+      - name: Twitter media unit tests (pure, no network)
+        run: python tests/test_twitter_media.py
