@@ -72,7 +72,28 @@
 #   • ROUND 11: GIF chain restructured — gif.fxtwitter .webp ->
 #     gifconvert.vxtwitter.com .webp -> .gif (browser-Referer probe) ->
 #     fastgif (offline since 2026-09-17, last probe only). .avif is never
-#     used (Discord's gallery can't render it).
+#     preferred (see round 73).
+#   • ROUND 73 (2026-10-13): MIXED-MEDIA ORDER + GIF FALLBACK QUALITY.
+#     (a) The gallery now follows the tweet's CANONICAL media order: the
+#         API's media.all list (the tweet's own extended_entities order) is
+#         read instead of photos-after-videos, so a mixed post keeps the
+#         observed source order JPG -> GIF 1 -> GIF 2 -> GIF 3. Photo-only
+#         and video-only posts with valid media URLs preserve their previous
+#         order and output; malformed entries without a usable URL are
+#         omitted instead of becoming empty tiles. Providers that don't
+#         return media.all (vxtwitter/twitterez) keep the legacy
+#         videos-then-photos order.
+#     (b) GIF fallback selection now classes every converter answer by the
+#         ACTUAL response content type (never by the URL extension): an
+#         animated image/webp or image/gif wins, anything else is not
+#         preferred. When no animated image answers, the ORIGINAL MP4 is
+#         preferred over an .avif fallback — an avif tile can look static in
+#         Discord's gallery preview while still animating once opened, so it
+#         is used ONLY as a last resort (a GIF that has no playable mp4
+#         rendition at all). The chain is probed ONCE per GIF
+#         (probe_gif_candidates) and the remembered AVIF is reused, so the
+#         last-resort path adds at most the 2 AVIF-route HEADs. Healthy
+#         FxTwitter media costs no extra request and no delay.
 # ---------------------------------------------------------------------------
 import os
 import re
@@ -203,10 +224,17 @@ GIF_WEBP_BASE = "https://gif.fxtwitter.com/tweet_video/"
 GIF_RAILWAY_BASE = "https://fastgif-production.up.railway.app/tweet_video/"
 # ROUND 11 (2026-09-17): BetterTwitFix (vxtwitter) converter — the exact
 # URL shape vxtwitter's own embeds use (verified live). They serve .avif,
-# which Discord's gallery can't render, so we probe .webp, then .gif. The
-# endpoint is header-gated (500 to plain clients), so its probes carry a
+# which Discord's gallery preview MAY paint as a static first frame (round
+# 73), so we probe .webp, then .gif, and .avif only as a last resort.
+# The endpoint is header-gated (500 to plain clients), so its probes carry a
 # browser Referer (see resolve_gif_image below).
 GIFCONVERT_BASE = "https://gifconvert.vxtwitter.com/convert."
+# ROUND 73 (2026-10-13): GIF answers are classed by their RETURNED content
+# type, never by the URL's extension. Animated WebP/GIF is what Discord loops
+# inline; an AVIF is treated as a last resort because Discord's gallery
+# preview can show it as a static frame even though it animates when opened.
+ANIMATED_IMAGE_TYPES = ("image/webp", "image/gif")
+AVIF_IMAGE_TYPES = ("image/avif", "image/heic", "image/heif")
 IS_COMPONENTS_V2 = 1 << 15  # Flag for rich card layout
 
 # ---------------------------------------------------------------------------
@@ -560,6 +588,47 @@ def is_gif_video(video: dict) -> bool:
     return video.get("type") == "gif" or "tweet_video" in url
 
 
+def media_entry_is_video(entry: dict) -> bool:
+    """ROUND 73: True when a media entry is a video/GIF (vs a photo).
+
+    Used for the canonical `media.all` list, whose entries carry the API's
+    own `type` ("photo" | "video" | "gif"). A missing/unknown type falls back
+    to the video-only keys, so a stripped-down provider payload is still
+    classified correctly instead of being emitted as a photo tile.
+    """
+    entry = entry if isinstance(entry, dict) else {}
+    kind = str(entry.get("type") or "").strip().lower()
+    if kind in ("video", "gif", "animated_gif"):
+        return True
+    if kind == "photo":
+        return False
+    return bool(entry.get("formats") or entry.get("thumbnail_url")
+                or entry.get("duration"))
+
+
+def canonical_media_entries(media: dict | None) -> list:
+    """ROUND 73: one tweet's media in the tweet's OWN (canonical) order.
+
+    FxEmbed/FxTwitter returns `media.all` — every photo and video/GIF in the
+    tweet's extended_entities order — alongside the per-type `photos` and
+    `videos` subsets. Reading the subsets separately reordered mixed posts
+    (the observed live case: the source order JPG -> GIF 1 -> GIF 2 -> GIF 3
+    reached Discord as GIF, GIF, GIF, JPG).
+
+    `all` wins when the API returns it; otherwise the legacy videos-then-
+    photos order is preserved verbatim, so providers that do not return it
+    (vxtwitter, twitterez) and photo-only / video-only posts are unchanged.
+    Entries without a usable URL are dropped, and the input is never mutated.
+    """
+    media = media if isinstance(media, dict) else {}
+    entries = [e for e in (media.get("all") or []) if isinstance(e, dict) and e.get("url")]
+    if entries:
+        return entries
+    ordered = [v for v in (media.get("videos") or []) if isinstance(v, dict) and v.get("url")]
+    ordered += [p for p in (media.get("photos") or []) if isinstance(p, dict) and p.get("url")]
+    return ordered
+
+
 def gallery_video_url(video: dict, raw_url: str) -> str:
     """
     Gallery URL for a video. Portrait/vertical videos (h > w) were once
@@ -612,28 +681,65 @@ async def probe_video_size(session: aiohttp.ClientSession, url: str,
     return None
 
 
-async def _probe_image_url(session: aiohttp.ClientSession, url: str,
-                           referer: str | None = None) -> bool:
-    """HEAD-checks that a URL answers 200 with an image content type.
-    ROUND 11: optional referer for header-gated converters (gifconvert)."""
+async def _probe_media_content_type(session: aiohttp.ClientSession, url: str,
+                                    referer: str | None = None) -> str:
+    """ROUND 73: HEAD-checks a URL and returns its ACTUAL, lowercased
+    Content-Type when it answers 200 with an image type — "" otherwise.
+
+    The returned type is what the caller trusts, never the URL extension:
+    a converter may answer a `.webp` URL with an AVIF (or the other way
+    round), and the live round-11 chain assumed the extension was honest.
+    ROUND 11: optional referer for header-gated converters (gifconvert).
+    """
     try:
         headers = dict(BROWSER_HEADERS)
         if referer:
             headers["Referer"] = referer
         async with session.head(url, headers=headers, allow_redirects=True,
                                 timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            content_type = resp.headers.get("Content-Type") or ""
-            return resp.status == 200 and content_type.startswith("image/")
+            content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            return content_type if resp.status == 200 and content_type.startswith("image/") else ""
     except Exception:
-        return False
+        return ""
 
 
-async def resolve_gif_image(session: aiohttp.ClientSession,
-                            video_url: str) -> tuple[str | None, str]:
+def image_format_tier(content_type: str) -> str:
+    """ROUND 73: class a converter answer by its real content type.
+
+      "animated" — image/webp or image/gif: Discord loops these inline, the
+                   behaviour a re-rendered X "GIF" is supposed to have.
+      "avif"     — the AVIF family: possibly a static first frame in
+                   Discord's gallery preview, so usable only as a last
+                   resort (see resolve_gif_image).
+      "other"    — any other image type (png/jpeg/…): a static picture.
+      ""         — not an image answer at all (or no answer).
     """
-    X GIFs ship as tweet_video/*.mp4. Community converters re-encode them
-    into REAL animated images that Discord renders inline (better than an mp4
-    player for tiny loops). Probed in order — never forced (round 11):
+    ct = str(content_type or "").split(";")[0].strip().lower()
+    if not ct.startswith("image/"):
+        return ""
+    if ct in ANIMATED_IMAGE_TYPES:
+        return "animated"
+    if ct in AVIF_IMAGE_TYPES:
+        return "avif"
+    return "other"
+
+
+async def _probe_image_url(session: aiohttp.ClientSession, url: str,
+                           referer: str | None = None) -> bool:
+    """HEAD-checks that a URL answers 200 with an image content type.
+    ROUND 11: optional referer for header-gated converters (gifconvert).
+    ROUND 73: thin wrapper over _probe_media_content_type."""
+    return bool(await _probe_media_content_type(session, url, referer=referer))
+
+
+# ROUND 73: the GIF converter chain, as (url, source, referer) triples in
+# probe order (round 11 — unchanged URLs and order). Empty for anything that
+# is not a tweet_video mp4: no converter can re-encode it.
+_GIF_MP4_RE = re.compile(r"tweet_video/([^./]+)\.mp4")
+
+
+def gif_converter_candidates(video_url: str) -> tuple:
+    """ROUND 73: the animated-rendition candidates to probe, in order:
 
       1. gif.fxtwitter.com/tweet_video/<id>.webp — the official FxTwitter
          asset that V1 embeds use. Verified INTERMITTENTLY DOWN (Cloudflare
@@ -645,28 +751,134 @@ async def resolve_gif_image(session: aiohttp.ClientSession,
       4. fastgif-production.up.railway.app/tweet_video/<id>.gif — independent
          third-party converter (round 6; OFFLINE since 2026-09-17 — last
          probe only, auto-revives if it returns).
-
-    Returns (url, source) with source "gif.fxtwitter" | "gifconvert" |
-    "fastgif", or (None, "") when nothing answers — caller then keeps the
-    mp4 (it still plays, just as a video).
     """
-    match = re.search(r"tweet_video/([^./]+)\.mp4", video_url)
+    match = _GIF_MP4_RE.search(str(video_url or ""))
     if not match:
-        return None, ""
+        return ()
     key = match.group(1)
-    webp_url = GIF_WEBP_BASE + key + ".webp"
-    if await _probe_image_url(session, webp_url):
-        return webp_url, "gif.fxtwitter"
-    vc_webp = GIFCONVERT_BASE + "webp?url=" + url_quote(video_url, safe="")
-    if await _probe_image_url(session, vc_webp, referer="https://vxtwitter.com"):
-        return vc_webp, "gifconvert"
-    vc_gif = GIFCONVERT_BASE + "gif?url=" + url_quote(video_url, safe="")
-    if await _probe_image_url(session, vc_gif, referer="https://vxtwitter.com"):
-        return vc_gif, "gifconvert"
-    gif_url = GIF_RAILWAY_BASE + key + ".gif"
-    if await _probe_image_url(session, gif_url):
-        return gif_url, "fastgif"
-    return None, ""
+    vc_quoted = url_quote(video_url, safe="")
+    referer = "https://vxtwitter.com"
+    return (
+        (GIF_WEBP_BASE + key + ".webp", "gif.fxtwitter", None),
+        (GIFCONVERT_BASE + "webp?url=" + vc_quoted, "gifconvert", referer),
+        (GIFCONVERT_BASE + "gif?url=" + vc_quoted, "gifconvert", referer),
+        (GIF_RAILWAY_BASE + key + ".gif", "fastgif", None),
+    )
+
+
+def gif_avif_candidates(video_url: str) -> tuple:
+    """ROUND 73: the two known AVIF routes, as (url, source, referer) triples
+    — the same shape as gif_converter_candidates(), for the same reason.
+
+    Only the last-resort path probes these (see probe_gif_avif_routes): an
+    AVIF can preview as a static frame in Discord's gallery, so it must never
+    win over an animated WebP/GIF or over a playable mp4.
+
+    gifconvert is HEADER-GATED (500 to plain clients), so its AVIF route
+    carries the same browser Referer as its .webp/.gif probes — without it
+    the route would look dead in production even when it is serving.
+    """
+    match = _GIF_MP4_RE.search(str(video_url or ""))
+    if not match:
+        return ()
+    key = match.group(1)
+    vc_quoted = url_quote(video_url, safe="")
+    return (
+        (GIF_WEBP_BASE + key + ".avif", "gif.fxtwitter-avif", None),
+        (GIFCONVERT_BASE + "avif?url=" + vc_quoted, "gifconvert-avif",
+         "https://vxtwitter.com"),
+    )
+
+
+async def probe_gif_candidates(session: aiohttp.ClientSession,
+                               video_url: str) -> tuple:
+    """ROUND 73: ONE probe pass over the animated converter chain.
+
+    Returns (url, source, avif_url, avif_source) — empty strings for the
+    parts that did not answer:
+
+      • url / source            — the first candidate whose RETURNED content
+                                  type really is an animated image
+                                  (image/webp | image/gif). A static picture
+                                  or a video answer is ignored: the extension
+                                  is never trusted.
+      • avif_url / avif_source  — the first candidate that answered with an
+                                  AVIF (source suffixed "-avif"). Remembered,
+                                  never preferred.
+
+    The AVIF *routes* are deliberately NOT probed here: probe_gif_avif_routes()
+    asks them, and only when a caller has decided the mp4 is unusable. That
+    keeps this pass to at most 4 HEADs for a GIF — the caller reuses the
+    remembered AVIF instead of running the chain a second time.
+    """
+    url, source, avif_url, avif_source = "", "", "", ""
+    for candidate, candidate_source, referer in gif_converter_candidates(video_url):
+        content_type = await _probe_media_content_type(session, candidate,
+                                                      referer=referer)
+        tier = image_format_tier(content_type)
+        if tier == "animated":
+            return candidate, candidate_source, avif_url, avif_source
+        if tier == "avif" and not avif_url:
+            # Remember the URL that ANSWERED — an extension is not evidence.
+            avif_url, avif_source = candidate, candidate_source + "-avif"
+    return url, source, avif_url, avif_source
+
+
+async def probe_gif_avif_routes(session: aiohttp.ClientSession,
+                                video_url: str) -> tuple[str, str]:
+    """ROUND 73: the AVIF last resort — at most 2 HEADs, one per known route.
+
+    Called only when a GIF has no animated rendition AND no playable mp4, so
+    a healthy card (or one the mp4 can cover) never pays for these probes.
+    Each route is probed with the headers it needs: gifconvert is
+    header-gated, so its AVIF probe carries the browser Referer exactly like
+    its .webp/.gif probes (a Referer-less probe would 500 and make a working
+    route look dead).
+    """
+    for candidate, source, referer in gif_avif_candidates(video_url):
+        if image_format_tier(await _probe_media_content_type(
+                session, candidate, referer=referer)) == "avif":
+            return candidate, source
+    return "", ""
+
+
+async def resolve_gif_image(session: aiohttp.ClientSession,
+                            video_url: str,
+                            allow_avif: bool = False) -> tuple[str | None, str]:
+    """
+    X GIFs ship as tweet_video/*.mp4. Community converters re-encode them
+    into REAL animated images that Discord renders inline (better than an mp4
+    player for tiny loops). The chain is probed in the round-11 order — never
+    forced (gif_converter_candidates) — and this is the single-GIF API:
+
+      resolve_gif_image(...)                    -> the animated rendition, or
+                                                   (None, "") — the caller then
+                                                   keeps the mp4 (it still
+                                                   plays, just as a video)
+      resolve_gif_image(..., allow_avif=True)   -> the same, but when nothing
+                                                   animated answers the AVIF
+                                                   remembered from the SAME
+                                                   single pass is returned
+                                                   (source "<source>-avif"),
+                                                   else the AVIF routes are
+                                                   probed (2 extra HEADs).
+
+    ROUND 73: an answer only WINS when its returned content type really is an
+    animated image (image/webp | image/gif) — the extension is not trusted,
+    and a static picture is never preferred over the mp4. An AVIF is a LAST
+    RESORT only (Discord's gallery preview can paint one as a static first
+    frame while it still animates when opened), which is why
+    collect_media() keeps the mp4 — and reuses the remembered AVIF from
+    probe_gif_candidates() — instead of calling this twice.
+    """
+    url, source, avif_url, avif_source = await probe_gif_candidates(session, video_url)
+    if url:
+        return url, source
+    if not allow_avif:
+        return None, ""
+    if not avif_url:
+        avif_url, avif_source = await probe_gif_avif_routes(session, video_url)
+    return (avif_url, avif_source) if avif_url else (None, "")
 
 
 def unresolved_media_items(message: dict | None) -> list:
@@ -793,27 +1005,46 @@ async def collect_media(session: aiohttp.ClientSession, tweet_like: dict) -> tup
     Returns (gallery_items, notes) for any tweet-shaped object (works for
     quoted tweets too — they use the same media shape).
 
+    ROUND 73: the gallery is built in the tweet's CANONICAL media order —
+    photos and videos/GIFs interleaved exactly as the tweet posted them
+    (media.all), not photos-after-videos. Photo-only and video-only posts
+    with valid media URLs keep their previous order and output, and providers
+    without media.all keep the legacy videos-then-photos order (see
+    canonical_media_entries — an entry with no usable URL is omitted instead
+    of becoming an empty tile).
+
     Order of decisions per video:
       • GIF (type=gif / tweet_video)  -> animated image if a converter answers
-                                         (gif.fxtwitter .webp, else fastgif
-                                         .gif), otherwise mp4 handling
+                                         (gif.fxtwitter .webp -> gifconvert
+                                         .webp/.gif -> fastgif .gif, each
+                                         trusted only for a really animated
+                                         content type), otherwise mp4 handling
       • size <= VIDEO_SIZE_LIMIT      -> playable in gallery (portraits proxied)
       • size >  limit, variant fits   -> smaller mp4 + downgrade note
-      • size >  limit, nothing fits   -> thumbnail + "watch on X" note
+      • size >  limit, nothing fits   -> GIF: AVIF last resort, else thumbnail
+                                         + "watch on X" note
       • size unknown                  -> untouched unless clearly risky
     """
     gallery_items = []
     notes = []
     media = tweet_like.get("media", {}) or {}
 
-    for v in media.get("videos", []) or []:
+    for v in canonical_media_entries(media):
+        if not media_entry_is_video(v):
+            # a photo — emitted in place, exactly where the tweet put it
+            gallery_items.append({"media": {"url": v["url"]}})
+            continue
         video_url = v.get("url")
         if not video_url:
             continue
+        # ROUND 73: the AVIF remembered by this item's single converter pass
+        # (empty until a candidate really answered with one).
+        avif_url, avif_src = "", ""
 
         # --- GIFs: prefer an animated image rendition (image, not video) ---
         if is_gif_video(v):
-            gif_url, gif_src = await resolve_gif_image(session, video_url)
+            gif_url, gif_src, avif_url, avif_src = await probe_gif_candidates(
+                session, video_url)
             if gif_url:
                 if gif_src != "gif.fxtwitter":
                     logging.info(f"gif.fxtwitter.com down; using {gif_src} for {video_url}")
@@ -866,15 +1097,31 @@ async def collect_media(session: aiohttp.ClientSession, tweet_like: dict) -> tup
                 swapped = True
                 break
         if not swapped:
+            # ROUND 73: a GIF whose mp4 cannot play here gets ONE last look
+            # for an AVIF conversion before the static thumbnail — an AVIF
+            # may preview as a still frame in Discord's gallery, but it
+            # animates when opened, which beats a poster image for a loop.
+            # It is reached ONLY when no animated WebP/GIF answered AND no
+            # playable mp4 rendition exists, so the original video always
+            # outranks it. The converter chain is NEVER re-probed: an AVIF
+            # already remembered by this item's single pass is reused, and
+            # only when that pass found none are the AVIF routes asked
+            # (2 HEADs at most).
+            if is_gif_video(v):
+                if not avif_url:
+                    avif_url, avif_src = await probe_gif_avif_routes(session, video_url)
+                if avif_url:
+                    gallery_items.append({"media": {"url": avif_url}})
+                    logging.warning(f"GIF {video_url}: no animated WebP/GIF and no "
+                                    f"playable mp4 — using the {avif_src} AVIF "
+                                    f"(last resort; it may preview as a static "
+                                    f"frame and animate once opened).")
+                    continue
             thumbnail = v.get("thumbnail_url")
             if thumbnail:
                 gallery_items.append({"media": {"url": thumbnail}})
             notes.append(f"⚠️ Video is ~{mb:.0f} MB — too large for this card. "
                          f"[▶️ Watch it on X]({video_url})")
-
-    for p in media.get("photos", []) or []:
-        if p.get("url"):
-            gallery_items.append({"media": {"url": p["url"]}})
 
     return gallery_items, notes
 
