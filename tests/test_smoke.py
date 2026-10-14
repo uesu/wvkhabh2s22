@@ -398,7 +398,6 @@ check("proxy: ALL-dead health still retries every service",
 proxy._fetch_redditez, proxy._fetch_vxreddit, proxy._fetch_embeddit = orig_rr, orig_vx, orig_ed
 
 # 7.7 health file round-trip
-import tempfile
 orig_health_file = proxy.PROXY_HEALTH_FILE
 with tempfile.TemporaryDirectory() as _td:
     proxy.PROXY_HEALTH_FILE = os.path.join(_td, "health.json")
@@ -2225,13 +2224,28 @@ _r39_x_expected = [
 _r59_x_walled_tail = ["https://nitter.netbub.com", "https://nitter.jaydenha.uk"]
 _r59_fleet = _literal_list_constant("testing area/twitter_v3.py", "RSS_INSTANCES")
 check("r59: operator pair remains in slots 1-2", _r59_fleet[:2] == ["https://nitter.cf", "https://xitter.cf"])
-check("r75 v4: eir-nya keeps its retryable seat ahead of the token fallback",
-      _r59_fleet.index("https://tw.eir-nya.gay") < _r59_fleet.index("https://nitter.miningtcup.me"))
-check("r75 v4: token fallback precedes the complementary 3/5 mirrors",
+# r75 v4 guard "eir-nya keeps its retryable seat ahead of the token fallback"
+# updated in round 76: the operator directed the token-gated, runner-proven
+# miningtcup to seat 4 (ahead of eir-nya, which has 0 runner deliveries), so
+# the relative pin is now the round-76 ranking rule itself.
+check("r76: the runner-proven head (meowing, miningtcup) precedes every member without a runner delivery",
+      max(_r59_fleet.index("https://nitter.meowing.monster"),
+          _r59_fleet.index("https://nitter.miningtcup.me"))
+      < min(_r59_fleet.index(h) for h in (
+          "https://nitter.freedit.eu", "https://nitter.gravitywell.xyz",
+          "https://tw.eir-nya.gay", "https://shitter.thepixora.com",
+          "https://nitter.kareem.one", "https://xcopy.uk")))
+check("r76 rule: no member with a measured runner 403 (GitHub Actions / Azure datacenter IPs) "
+      "sits above one that has never refused the runners",
+      max(_r59_fleet.index(h) for h in (
+          "https://nitter.freedit.eu", "https://nitter.gravitywell.xyz", "https://tw.eir-nya.gay"))
+      < min(_r59_fleet.index(h) for h in (
+          "https://shitter.thepixora.com", "https://nitter.kareem.one", "https://xcopy.uk")))
+check("r76: token fallback precedes the complementary mirrors (gravitywell, then kareem)",
       _r59_fleet.index("https://nitter.miningtcup.me")
       < _r59_fleet.index("https://nitter.gravitywell.xyz")
       < _r59_fleet.index("https://nitter.kareem.one"))
-check("r75 v4: walled hosts remain the final two fallback probes",
+check("r76: walled hosts remain the final two fallback probes",
       _r59_fleet[-2:] == _r59_x_walled_tail)
 _r59_token_env = _literal_list_constant("testing area/twitter_v3.py", "RSS_TOKEN_ENV")
 check("r59: miningtcup token mapping unchanged", _r59_token_env == {"https://nitter.miningtcup.me": "NITTER_RSS_TOKEN"})
@@ -2246,61 +2260,69 @@ for _r39_rel, _r39_expected in (
     check(f"r39 source fleet: {_r39_rel} has the reviewed X RSS order",
           _literal_list_constant(_r39_rel, "RSS_INSTANCES") == _r39_expected)
 
-# Round 75 addendum v4 (2026-10-14): the operator-directed seat 3, probe-ranked
-# remaining hosts and two fill-in sweep additions are pinned as the final 12-member
-# order. V1/V2 retain their separately reviewed lists.
-_r75_x_expected = [
+# Round 76 (2026-10-15): the rotation-5 verdict (xcopy.uk 403 x24 from the
+# runners), the operator-directed runner-proven head and the no-datacenter-block
+# ranking rule are pinned as the exact 12-member order (r75 v4 pin updated in
+# place: same twelve members, re-ranked only). V1/V2 retain their separately
+# reviewed lists.
+_r76_x_expected = [
     "https://nitter.cf",
     "https://xitter.cf",
-    "https://xcopy.uk",
     "https://nitter.meowing.monster",
-    "https://tw.eir-nya.gay",
-    "https://nitter.freedit.eu",
-    "https://shitter.thepixora.com",
     "https://nitter.miningtcup.me",
+    "https://nitter.freedit.eu",
     "https://nitter.gravitywell.xyz",
+    "https://tw.eir-nya.gay",
+    "https://shitter.thepixora.com",
     "https://nitter.kareem.one",
+    "https://xcopy.uk",
     "https://nitter.netbub.com",
     "https://nitter.jaydenha.uk",
 ]
-check("r75 v4 source fleet: Twitter V3 has the reviewed exact 12-member order",
-      _literal_list_constant("testing area/twitter_v3.py", "RSS_INSTANCES") == _r75_x_expected)
-def test_r75_v4_xcopy_seat_3_fleet_ranked_and_filled_in():
-    """r75 addendum v4 (2026-10-14): the operator seated xcopy.uk at 3 after the
-    full-coverage test (8/8 accounts, nitter.cf parity); a probe round ranked the
-    remaining members (meowing 4 -- 5/5 body, the only non-token-gated member besides
-    the operator pair with positive runner deliveries; eir-nya 5 -- serving, retryable
-    429s; thepixora 7 -- clean body, GE runners 403'd all handles 2026-10-13;
-    miningtcup 8 -- token fallback; kareem.one 10 -- 3/5 accounts); and the fill-in
-    sweep added two new members: freedit.eu (6 -- 5/5 accounts body-verified, wiki
-    'rate limited' tag, zero runner evidence, TRIAL) and gravitywell.xyz (9 -- 3/5,
-    gaps complementary to kareem.one's, so together they span all five accounts).
-    Nothing deleted; the operator pair untouched; membership grows to twelve."""
+check("r76 source fleet: Twitter V3 has the reviewed exact 12-member order",
+      _literal_list_constant("testing area/twitter_v3.py", "RSS_INSTANCES") == _r76_x_expected)
+def test_r76_runner_proven_head_xcopy_verdict_recorded_at_ten():
+    """r76 (2026-10-15): the rotation-5 trial got its verdict -- xcopy.uk returned
+    HTTP 403 to Game-Express's runners on all six handles in four consecutive
+    post-merge runs (#2662-#2665, four Azure regions, 24/24 fetches), the
+    kareem.one signature. The operator then set this round's rule -- no member
+    that blocks GitHub Actions / Azure datacenter IPs sits above one that
+    doesn't -- and directed the head: the operator pair, meowing (4->3) and the
+    token-gated miningtcup (8->4), making the chain head entirely runner-proven
+    for the first time. The probe round ranked the rest: freedit 5 (8/8 union
+    handles, nitter.cf parity, zero refusals anywhere), gravitywell 6 (5/8
+    union, deterministic not-found gaps: GenshinImpact new this round, plus
+    Wuthering_Waves and HonkaiNA), eir-nya 7 (passes the no-block rule but
+    holds the only measured runner non-deliveries: grace losses and
+    200-with-0-entries; 429'd every GE-handle probe this round), thepixora 8
+    (flapping runner 403, freshest measurement blocked), kareem 9 (hard 403,
+    clean body, gaps complementary to gravitywell's). xcopy records its verdict
+    at 10. Nothing deleted; the operator pair untouched; membership stays
+    twelve."""
     RSS_INSTANCES = x3.RSS_INSTANCES
-    assert RSS_INSTANCES[2] == "https://xcopy.uk"                 # operator-directed seat 3
-    assert RSS_INSTANCES[3] == "https://nitter.meowing.monster"   # revived; runner-proven
-    assert RSS_INSTANCES[4] == "https://tw.eir-nya.gay"           # serving, retryable 429s
-    assert RSS_INSTANCES[5] == "https://nitter.freedit.eu"        # NEW: 5/5 body, trial
-    assert RSS_INSTANCES[6] == "https://shitter.thepixora.com"    # clean body, runner-403 watch
-    assert RSS_INSTANCES[7] == "https://nitter.miningtcup.me"     # token fallback
-    assert RSS_INSTANCES[8] == "https://nitter.gravitywell.xyz"   # NEW: 3/5, complementary
-    assert RSS_INSTANCES[9] == "https://nitter.kareem.one"        # 3/5, the mirror gaps
-    assert RSS_INSTANCES[-2] == "https://nitter.netbub.com"       # walled tier
-    assert RSS_INSTANCES[-1] == "https://nitter.jaydenha.uk"      # walled, stays last
-    assert "https://nitter.meowing.monster" in RSS_INSTANCES      # never deleted
     assert RSS_INSTANCES[0] == "https://nitter.cf"                # operator pair untouched
     assert RSS_INSTANCES[1] == "https://xitter.cf"
-    assert len(RSS_INSTANCES) == 12                               # ten members + two new
+    assert RSS_INSTANCES[2] == "https://nitter.meowing.monster"   # operator-directed seat 3
+    assert RSS_INSTANCES[3] == "https://nitter.miningtcup.me"     # operator-directed seat 4
+    assert RSS_INSTANCES[4] == "https://nitter.freedit.eu"        # 8/8 union, TRIAL
+    assert RSS_INSTANCES[5] == "https://nitter.gravitywell.xyz"   # 5/8 union, TRIAL
+    assert RSS_INSTANCES[6] == "https://tw.eir-nya.gay"           # no block, but 0 runner deliveries
+    assert RSS_INSTANCES[7] == "https://shitter.thepixora.com"    # flapping runner 403
+    assert RSS_INSTANCES[8] == "https://nitter.kareem.one"        # hard 403, clean body
+    assert RSS_INSTANCES[9] == "https://xcopy.uk"                 # THE VERDICT: 403 x24, 4 regions
+    assert RSS_INSTANCES[-2] == "https://nitter.netbub.com"       # walled tier
+    assert RSS_INSTANCES[-1] == "https://nitter.jaydenha.uk"      # walled, stays last
+    assert len(RSS_INSTANCES) == len(set(RSS_INSTANCES)) == 12    # same twelve, nothing deleted
 
 
 # This suite runs as a linear script rather than through pytest's collector;
 # execute the named guard here and preserve the suite's PASS/FAIL summary.
 try:
-    test_r75_v4_xcopy_seat_3_fleet_ranked_and_filled_in()
-except AssertionError as _r75_v4_error:
-    check("r75 v4: xcopy seat 3, ranked fleet and fill-ins", False, str(_r75_v4_error))
+    test_r76_runner_proven_head_xcopy_verdict_recorded_at_ten()
+except AssertionError as _r76_error:
+    check("r76: runner-proven head, xcopy verdict recorded at ten", False, str(_r76_error))
 else:
-    check("r75 v4: xcopy seat 3, ranked fleet and fill-ins", True)
+    check("r76: runner-proven head, xcopy verdict recorded at ten", True)
 
 _r39_reddit_expected = [
     "https://www.reddit.com",
