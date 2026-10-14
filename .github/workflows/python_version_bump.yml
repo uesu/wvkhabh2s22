@@ -31,8 +31,9 @@
 #    2. `python -m compileall` over `testing area` and `tests`
 #    3. tests/test_smoke.py
 #    4. tests/test_reddit_signals.py
+#    5. tests/test_twitter_media.py
 #  The exact pin is then rewritten only in the explicit current-runtime
-#  allowlist, and 2-4 are run again on the rewritten tree. Historical records
+#  allowlist, and 2-5 are run again on the rewritten tree. Historical records
 #  under docs/history/ are protected and any unexpected file change fails the
 #  workflow closed.
 #
@@ -248,6 +249,7 @@ jobs:
           python -m compileall -q "testing area" tests
           python tests/test_smoke.py
           python tests/test_reddit_signals.py
+          python tests/test_twitter_media.py
 
       - name: Rewrite the allowlisted current-runtime files
         if: steps.resolve.outputs.bump == 'yes' && steps.wheels.outputs.ok == 'yes'
@@ -333,6 +335,7 @@ jobs:
           python -m compileall -q "testing area" tests
           python tests/test_smoke.py
           python tests/test_reddit_signals.py
+          python tests/test_twitter_media.py
 
       - name: Open the pull request
         if: steps.resolve.outputs.bump == 'yes' && steps.wheels.outputs.ok == 'yes'
@@ -385,9 +388,10 @@ jobs:
           * \`python -m compileall -q "testing area" tests\`
           * \`python tests/test_smoke.py\`
           * \`python tests/test_reddit_signals.py\`
+          * \`python tests/test_twitter_media.py\`
 
           The pin was then rewritten only in the explicit current-runtime
-          allowlist (workflows, current docs, and the round-39 guard in \`tests/test_smoke.py\`) and \`compileall\` plus both
+          allowlist (workflows, current docs, and the round-39 guard in \`tests/test_smoke.py\`) and \`compileall\` plus all three
           suites were run AGAIN on the rewritten tree.
 
           All of them passed — the PR is only created when they do.
