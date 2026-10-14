@@ -673,6 +673,20 @@ async def _fetch_new_listing(session, subreddit):
 # was found, so the list is intentionally unchanged and fails closed via
 # permalink validation. Re-audit bodies rather than trusting status codes or
 # the instance registry before promoting a mirror.
+# Round 75 (2026-10-14) body-audit record: every PUBLIC redlib candidate's
+# /r/<sub>/new.rss?limit=100 was fetched and read. All six return the same upstream
+# failure -- "Reddit error 400 \"null\": \"Bad Request\"" on the internal
+# new.rss.json?raw_json=1 call (the redlib-org issue #446/#518 breakage class: Reddit
+# changed what its JSON API accepts and unpatched redlib builds send a shape it now
+# rejects). nadeko.net additionally fronts a __goaway challenge; privadency
+# load-balances to redlib-2; artemislena self-reports 20+ commits behind; catsarch
+# runs a fork. The HTML /new listing path is UNAFFECTED (redlib.catsarch.com's
+# listing verified rendering current posts the same day), so the round-64
+# listing-confirmation and the retraction seatbelt keep their redlib sources. The
+# list stays intentionally unchanged, same verdict as Round 59 with a different
+# failure mode: it fails closed via permalink validation, costs nothing while
+# the native token feed answers, and the tier revives by itself once patched redlib
+# builds deploy. Re-audit bodies before promoting anything.
 REDDIT_RSS_INSTANCES = [
     "https://www.reddit.com",
     "https://old.reddit.com",

@@ -186,15 +186,77 @@ RSS_INSTANCES = [
     # DO NOT REMOVE without operator sign-off.
     "https://nitter.cf",
     "https://xitter.cf",
-    # Round 59 (2026-10-03): body-audited serving mirrors first; known
-    # interstitial-walled hosts are retained as last-resort probes.
-    "https://nitter.kareem.one",
-    "https://tw.eir-nya.gay",
+    # Round 75 addendum v3 (2026-10-14): OPERATOR-DIRECTED SEAT 3, up from the seat 5
+    # this PR first gave it. Earned by the full-coverage test — every monitored account
+    # across both monitors hand-probed, bodies read, top tweet ids matching the nitter.cf
+    # controls — 8/8, and re-verified on the three active News-Express accounts the same
+    # afternoon (TYPEII_EN, PomPom_HonkaiSR, Wuthering_Waves: identical top ids, entries
+    # current through Oct 14). On the shitter fork's working wiki; independent,
+    # non-token-gated. A clean off-runner body is a trial ticket, never proof -- this
+    # chain only probes seat 3 when the operator pair has failed, which is exactly when
+    # a verified independent spare matters.
+    "https://xcopy.uk",
+    # Round 75 addendum v3 (2026-10-14): the strongest of the rest, per the day's
+    # probes -- 5/5 monitored accounts body-verified (identical top ids, entries current
+    # through Oct 14 07:00) and the only non-token-gated member besides the operator
+    # pair with positive runner deliveries (Game-Express run #2323: 6/6; run #2621
+    # post-revival: 5/6). Dark ~8 h that morning (05:15-13:35 UTC) and d420 lists its
+    # connectivity as IPv6 (runners are IPv4-only), so expect slow-but-working.
+    # On watch; moves up the day it outdelivers xcopy.uk.
     "https://nitter.meowing.monster",
+    # Round 75 addendum v3 (2026-10-14): four probes on the day -- PomPom_HonkaiSR,
+    # Wuthering_Waves and (on re-probe) TYPEII_EN all full bodies with identical top
+    # ids, plus one 429 that cleared minutes later: an aggressive per-request rate
+    # limit, a fast fail, retryable, never a hard refusal. No hard runner refusal on
+    # record (Game-Express's ledger entry is LOSES_THE_RACE only). Demote only if a
+    # prod log shows 200-with-0-entries.
+    "https://tw.eir-nya.gay",
+    # Round 75 addendum v4 (2026-10-14): NEW, from the operator-ordered fill-in sweep
+    # of every instance not yet in the fleet. 5/5 monitored accounts body-verified the
+    # same day -- TYPEII_EN, PomPom_HonkaiSR, Wuthering_Waves current with identical
+    # top ids; HonkaiNA and Ananta_EN matching the quiet-account controls (pinned
+    # handling correct). Own backend, full fidelity. The fork's wiki lists it "active
+    # but rate limited"; every probe today answered clean. Not on d420, zero runner
+    # evidence: TRIAL -- seated above thepixora because unknown beats a runner 403
+    # that is one day old. Moves per evidence.
+    "https://nitter.freedit.eu",
+    # Round 75 addendum v3 (2026-10-14): served every probe of the round (TYPEII_EN,
+    # PomPom_HonkaiSR, Wuthering_Waves -- identical top ids, full fidelity) and d420
+    # shows it healthy all day (91%, RSS OK). Seated BELOW eir-nya and freedit by the
+    # kareem.one rule: Game-Express's runners measured HTTP 403 on all six handles on
+    # 2026-10-13 -- the freshest hard runner refusal in this fleet, and these monitors
+    # run from the same GitHub runners. Watch seat: the body is clean; a runner verdict
+    # the other way is what moves it up.
     "https://shitter.thepixora.com",
-    # Token-gated fallback; harmlessly skipped without NITTER_RSS_TOKEN.
+    # Token-gated fallback; harmlessly skipped without NITTER_RSS_TOKEN. Untestable
+    # off-runner, but the strongest spare if the token is set: d420 93%, IPv4, RSS OK,
+    # and Game-Express's runners prove it 6/6 from the hot path with the token. Seats
+    # above the 3/5 hosts: with the token it serves every account; without it the skip
+    # is instant and the chain falls through either way.
     "https://nitter.miningtcup.me",
-    # Round 59: demoted, not deleted; these currently serve challenge walls.
+    # Round 75 addendum v4 (2026-10-14): NEW, from the fill-in sweep -- and found by
+    # accident: Game-Express's x.n0g.xyz serves gravitywell-generated bodies, and the
+    # backend itself is not in either fleet. 3/5 monitored accounts -- TYPEII_EN,
+    # PomPom_HonkaiSR and Ananta_EN all current with identical ids (pinned handling
+    # correct); `User "Wuthering_Waves" not found` and `User "HonkaiNA" not found`,
+    # both reproduced 2/2 while its other feeds served: deterministic gaps, kareem
+    # style. Seats beside kareem.one on purpose -- their gap sets are COMPLEMENTARY
+    # (kareem fails exactly the two accounts gravitywell serves, and vice versa), so
+    # between them all five accounts are covered at the bottom of the chain. Not on
+    # d420, zero runner evidence: TRIAL.
+    "https://nitter.gravitywell.xyz",
+    # Round 75 addendum v3 (2026-10-14): 3/5 monitored accounts -- Wuthering_Waves,
+    # HonkaiNA and Ananta_EN serve current (identical top ids), but it hard-fails BOTH
+    # News-Express-exclusive accounts: `User "TYPEII_EN" not found` / `User
+    # "PomPom_HonkaiSR" not found`, each reproduced twice in batches where the game
+    # feeds served -- deterministic account-resolution failures, not downtime.
+    # Game-Express keeps it in its runner-blocked tier. Demoted, not deleted; its gaps
+    # are covered by gravitywell.xyz directly above it.
+    "https://nitter.kareem.one",
+    # Round 59: demoted, not deleted; these serve challenge walls (2026-10-14 probes:
+    # netbub fronts a go-away anti-scrape challenge, jaydenha a click-to-enter
+    # interstitial; d420 shows jaydenha flapping, 6 blips on the day, on an outdated
+    # build -- it stays last).
     "https://nitter.netbub.com",
     "https://nitter.jaydenha.uk",
 ]
