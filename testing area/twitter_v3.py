@@ -128,8 +128,8 @@ ACCOUNTS = [acc.strip() for acc in ACCOUNTS_STR.split(",") if acc.strip()]
 DEFAULT_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 CACHE_FILE = "posted_tweets.json"
-# Round 34 (2026-09-28): the old single global cap (MAX_CACHE_SIZE below) was
-# enforced as `sorted(posted_urls)[-MAX_CACHE_SIZE:]` — a LEXICOGRAPHIC
+# Round 34 (2026-09-28): the old single global cap (a 500-key MAX_CACHE_SIZE)
+# was enforced as `sorted(posted_urls)[-MAX_CACHE_SIZE:]` — a LEXICOGRAPHIC
 # eviction. The old comment claimed the keys are bare 19-digit tweet ids
 # (lexicographic == numeric) — WRONG: the keys are `{account}_{tweet_id}`,
 # so at the 500 cap the alphabetically-FIRST account's keys (Ananta_EN sorts
@@ -138,17 +138,20 @@ CACHE_FILE = "posted_tweets.json"
 # Reddit, latent here (the cache was at ~143/500 keys when round 34 landed).
 # Retention is now PER-ACCOUNT, newest-first (numeric tweet ids sort
 # chronologically within an account), with a generous global backstop.
-# Both are overridable via repo Variables.
+# Both are overridable via repo Variables. (The retired constant itself was
+# removed in the round-76 housekeeping pass — nothing referenced it.)
 # ---------------------------------------------------------------------------
-# ■ GHA-SAFE ENV READERS (round 49b, 2026-10-01)
+# ■ GHA-SAFE ENV READER (round 49b, 2026-10-01)
 # A repository Variable wired as `VAR: ${{ vars.VAR }}` arrives as an EMPTY
 # STRING when it is not set, so int("")/float("") raises at import. That is
 # exactly what killed the 20:10 UTC production runs:
 #   reddit_proxy  -> "reddit_proxy module unavailable - native media only:
 #                     could not convert string to float: ''"  (proxy chain OFF)
 #   twitter_v3    -> ValueError: invalid literal for int() with base 10: ''
-# Round 36 already learned this for reddit_main_v3 (_env_int); these are the
-# same guard for this module. Empty / blank / garbage -> the documented default.
+# Round 36 already learned this for reddit_main_v3 (_env_int); this is the
+# same guard for this module (every numeric Variable here is an int, so the
+# float twin lives only in reddit_proxy). Empty / blank / garbage -> the
+# documented default.
 # ---------------------------------------------------------------------------
 def _env_int(name: str, default: int) -> int:
     try:
@@ -157,106 +160,107 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float((os.getenv(name) or "").strip() or str(default))
-    except ValueError:
-        return default
-
 MAX_CACHE_SIZE_PER_ACCOUNT = _env_int("MAX_CACHE_SIZE_PER_ACCOUNT", 250)
 MAX_CACHE_SIZE_TOTAL = _env_int("MAX_CACHE_SIZE_TOTAL", 10000)
-# Round 34: retired pre-round-34 global cap (kept so old references still
-# resolve; the save no longer uses it).
-MAX_CACHE_SIZE = 500
-MAX_AGE_SECONDS = 3 * 3600
 
+# ■ X RSS SOURCE FLEET — a SERIAL fallback chain: the first instance that
+# answers HTTP 200 with entries wins, so every dead member above it costs a
+# full request timeout and nothing below the winner is ever probed.
 # Round 39 (2026-09-30): refresh from status.d420.de at 06:06 UTC.
 # Round 59 (2026-10-03): tracker method retired; audit RSS response bodies.
-# The first three hosts were healthy with RSS enabled and 87–96% all-time
-# availability; jaydenha was healthy/RSS-enabled but runs an older build, so it
-# remains a fallback. The previous unlisted, RSS-disabled, stale, or suspended
-# endpoints were retired: serial fallback means each one otherwise adds a full
-# request timeout on an outage. Keep this list short and ordered; revisit it
-# only after the tracker reports a current RSS-capable replacement.
+# A tracker row (or a clean body read off-runner) is a TRIAL ticket, never
+# proof — the production verdict comes from the GitHub Actions runners, and
+# Game-Express (the sister monitor on the same runners, probing every seat on
+# every run) is where it usually lands first.
+# Round 76 (2026-10-15) ranking rule: no member that blocks GitHub Actions /
+# Azure datacenter IPs (or datacenter IPs generally) sits above one that
+# doesn't. Members are demoted, not deleted — a blocked host moves back up the
+# day it answers the runners. tests/test_smoke.py pins the exact order; any
+# re-rank updates that guard in the same commit.
 RSS_INSTANCES = [
     # Round 40 (2026-09-30): operator decision — nitter.cf + xitter.cf restored as
     # the primary pair after live review (2026-09-30: both confirmed serving, plus
     # a 2-hour 100%-uptime fleet run). Unlisted on the d420 tracker (4cuck/teapot
     # operator; trust warnings on record, risk operator-accepted).
     # DO NOT REMOVE without operator sign-off.
+    # Round 76 (2026-10-15): seats 1-2 untouched, as every round.
     "https://nitter.cf",
     "https://xitter.cf",
-    # Round 75 addendum v3 (2026-10-14): OPERATOR-DIRECTED SEAT 3, up from the seat 5
-    # this PR first gave it. Earned by the full-coverage test — every monitored account
-    # across both monitors hand-probed, bodies read, top tweet ids matching the nitter.cf
-    # controls — 8/8, and re-verified on the three active News-Express accounts the same
-    # afternoon (TYPEII_EN, PomPom_HonkaiSR, Wuthering_Waves: identical top ids, entries
-    # current through Oct 14). On the shitter fork's working wiki; independent,
-    # non-token-gated. A clean off-runner body is a trial ticket, never proof -- this
-    # chain only probes seat 3 when the operator pair has failed, which is exactly when
-    # a verified independent spare matters.
-    "https://xcopy.uk",
-    # Round 75 addendum v3 (2026-10-14): the strongest of the rest, per the day's
-    # probes -- 5/5 monitored accounts body-verified (identical top ids, entries current
-    # through Oct 14 07:00) and the only non-token-gated member besides the operator
-    # pair with positive runner deliveries (Game-Express run #2323: 6/6; run #2621
-    # post-revival: 5/6). Dark ~8 h that morning (05:15-13:35 UTC) and d420 lists its
-    # connectivity as IPv6 (runners are IPv4-only), so expect slow-but-working.
-    # On watch; moves up the day it outdelivers xcopy.uk.
+    # Round 76 (2026-10-15): OPERATOR-DIRECTED SEAT 3, up from 4. This round's
+    # ranking rule: no member that blocks GitHub Actions / Azure datacenter IPs
+    # sits above one that doesn't (the xcopy.uk verdict at seat 10). meowing is
+    # one of only two non-token-gated members with positive runner deliveries
+    # (Game-Express run #2323: 6/6; run #2621 post-revival: 5/6) and its body
+    # re-verified this round (GenshinImpact + ZZZ_EN identical top ids to the
+    # nitter.cf controls; one transient HTTP 500 on GenshinImpact that cleared on
+    # retry). d420 lists the host IPv6 while the runners are IPv4-only, so expect
+    # slow-but-working; on watch — demote the day a prod log shows it failing
+    # where a lower member delivers.
     "https://nitter.meowing.monster",
-    # Round 75 addendum v3 (2026-10-14): four probes on the day -- PomPom_HonkaiSR,
-    # Wuthering_Waves and (on re-probe) TYPEII_EN all full bodies with identical top
-    # ids, plus one 429 that cleared minutes later: an aggressive per-request rate
-    # limit, a fast fail, retryable, never a hard refusal. No hard runner refusal on
-    # record (Game-Express's ledger entry is LOSES_THE_RACE only). Demote only if a
-    # prod log shows 200-with-0-entries.
-    "https://tw.eir-nya.gay",
-    # Round 75 addendum v4 (2026-10-14): NEW, from the operator-ordered fill-in sweep
-    # of every instance not yet in the fleet. 5/5 monitored accounts body-verified the
-    # same day -- TYPEII_EN, PomPom_HonkaiSR, Wuthering_Waves current with identical
-    # top ids; HonkaiNA and Ananta_EN matching the quiet-account controls (pinned
-    # handling correct). Own backend, full fidelity. The fork's wiki lists it "active
-    # but rate limited"; every probe today answered clean. Not on d420, zero runner
-    # evidence: TRIAL -- seated above thepixora because unknown beats a runner 403
-    # that is one day old. Moves per evidence.
-    "https://nitter.freedit.eu",
-    # Round 75 addendum v3 (2026-10-14): served every probe of the round (TYPEII_EN,
-    # PomPom_HonkaiSR, Wuthering_Waves -- identical top ids, full fidelity) and d420
-    # shows it healthy all day (91%, RSS OK). Seated BELOW eir-nya and freedit by the
-    # kareem.one rule: Game-Express's runners measured HTTP 403 on all six handles on
-    # 2026-10-13 -- the freshest hard runner refusal in this fleet, and these monitors
-    # run from the same GitHub runners. Watch seat: the body is clean; a runner verdict
-    # the other way is what moves it up.
-    "https://shitter.thepixora.com",
-    # Token-gated fallback; harmlessly skipped without NITTER_RSS_TOKEN. Untestable
-    # off-runner, but the strongest spare if the token is set: d420 93%, IPv4, RSS OK,
-    # and Game-Express's runners prove it 6/6 from the hot path with the token. Seats
-    # above the 3/5 hosts: with the token it serves every account; without it the skip
-    # is instant and the chain falls through either way.
+    # Round 76 (2026-10-15): OPERATOR-DIRECTED SEAT 4, up from 8. Token-gated
+    # fallback; harmlessly skipped without NITTER_RSS_TOKEN, and with the token
+    # the strongest spare in the fleet: Game-Express's runners prove it 6/6 from
+    # the hot path (d420 93%, IPv4, RSS OK). The chain's head is now entirely
+    # runner-proven for the first time.
     "https://nitter.miningtcup.me",
-    # Round 75 addendum v4 (2026-10-14): NEW, from the fill-in sweep -- and found by
-    # accident: Game-Express's x.n0g.xyz serves gravitywell-generated bodies, and the
-    # backend itself is not in either fleet. 3/5 monitored accounts -- TYPEII_EN,
-    # PomPom_HonkaiSR and Ananta_EN all current with identical ids (pinned handling
-    # correct); `User "Wuthering_Waves" not found` and `User "HonkaiNA" not found`,
-    # both reproduced 2/2 while its other feeds served: deterministic gaps, kareem
-    # style. Seats beside kareem.one on purpose -- their gap sets are COMPLEMENTARY
-    # (kareem fails exactly the two accounts gravitywell serves, and vice versa), so
-    # between them all five accounts are covered at the bottom of the chain. Not on
-    # d420, zero runner evidence: TRIAL.
+    # Round 76 (2026-10-15): up from 6. The only host in the fleet with FULL
+    # union coverage: all five News-Express accounts body-verified 2026-10-14,
+    # plus all three Game-Express-exclusive handles probed this round
+    # (GenshinImpact, honkaistarrail, ZZZ_EN — identical top ids to the nitter.cf
+    # controls, entries current through Oct 14 10:00 UTC) = 8/8, and zero
+    # refusals on record anywhere, from any vantage. Not on d420, zero runner
+    # evidence: TRIAL — seats 5+ only ever answer when the runner-proven head
+    # above has failed, which is exactly when a verified independent spare
+    # matters.
+    "https://nitter.freedit.eu",
+    # Round 76 (2026-10-15): up from 9. 5/8 union coverage: honkaistarrail,
+    # ZZZ_EN, TYPEII_EN, PomPom_HonkaiSR and Ananta_EN serve current with
+    # identical top ids; `User "GenshinImpact" not found` (first seen this
+    # round) plus the known Wuthering_Waves and HonkaiNA gaps — deterministic
+    # account-resolution failures, kareem style, not downtime. Together with
+    # kareem.one below (covers Wuthering_Waves, HonkaiNA, Ananta_EN) every
+    # union handle is covered somewhere in the chain. Zero runner evidence:
+    # TRIAL; moves per evidence.
     "https://nitter.gravitywell.xyz",
-    # Round 75 addendum v3 (2026-10-14): 3/5 monitored accounts -- Wuthering_Waves,
-    # HonkaiNA and Ananta_EN serve current (identical top ids), but it hard-fails BOTH
-    # News-Express-exclusive accounts: `User "TYPEII_EN" not found` / `User
-    # "PomPom_HonkaiSR" not found`, each reproduced twice in batches where the game
-    # feeds served -- deterministic account-resolution failures, not downtime.
-    # Game-Express keeps it in its runner-blocked tier. Demoted, not deleted; its gaps
-    # are covered by gravitywell.xyz directly above it.
+    # Round 76 (2026-10-15): down from 5. PASSES the no-block rule — it answers
+    # the runners HTTP 200 — but carries the fleet's only measured runner
+    # non-deliveries: lost the NITTER_GRACE race 2026-10-03, then answered slot
+    # 4 with HTTP 200 and 0 entries on all 6 handles (Game-Express rotation #4).
+    # This round it 429'd every Game-Exclusive-handle probe, retry included —
+    # reachable, throttled, never a hard refusal. Moves up the day a runner log
+    # shows a real delivery.
+    "https://tw.eir-nya.gay",
+    # Round 76 (2026-10-15): down from 7. FLAPPING runner 403: Game-Express's
+    # runners measured HTTP 403 on all 6 handles on 2026-10-13 (run #2312) three
+    # days after 25 ok / 0 fail on 2026-10-10 (runs #1378/#1386) — blocked as of
+    # the freshest measurement, so it sits below every member that has never
+    # refused the runners. Clean body off-runner; a 403 is a fast fail in a
+    # serial chain; moves back up the day it answers again.
+    "https://shitter.thepixora.com",
+    # Round 76 (2026-10-15): seat 9 (was 10 — the members above it moved; it did
+    # not). HTTP 403 on all 6 handles from Game-Express's runners (2026-10-03
+    # 04:25) with a clean feed off-runner — the archetype this round's rule
+    # exists for. Deterministic gaps on both News-Express-exclusive accounts
+    # (TYPEII_EN, PomPom_HonkaiSR); its passes are exactly gravitywell's gaps.
+    # Demoted, not deleted.
     "https://nitter.kareem.one",
+    # Round 76 (2026-10-15): THE ROTATION-5 VERDICT — demoted from seat 3 to 10.
+    # Game-Express's first four post-merge runs (#2662-#2665, 2026-10-14
+    # 17:19-17:30 UTC) measured HTTP 403 on all six handles, every run, across
+    # four Azure regions (westus, westus3, eastus2, centralus) — 24/24 fetches
+    # refused, the most thoroughly measured hard refusal in this fleet's
+    # history. The signature is exactly kareem.one's: a clean body off-runner
+    # (8/8 union handles, nitter.cf parity, 2026-10-14) and a flat refusal to
+    # GitHub Actions / Azure datacenter IPs. The trial did precisely what it
+    # was designed to do — the body evidence bought the seat, the every-run
+    # probe cashed it in for a runner verdict, and the quorum never depended
+    # on it. Demoted, not deleted; moves back up the day it answers the
+    # runners.
+    "https://xcopy.uk",
     # Round 59: demoted, not deleted; these serve challenge walls (2026-10-14 probes:
     # netbub fronts a go-away anti-scrape challenge, jaydenha a click-to-enter
     # interstitial; d420 shows jaydenha flapping, 6 blips on the day, on an outdated
-    # build -- it stays last).
+    # build -- it stays last). Round 76: unchanged.
     "https://nitter.netbub.com",
     "https://nitter.jaydenha.uk",
 ]
@@ -384,7 +388,7 @@ MEDIA_HEAL_ATTEMPTS = min(4, max(1, _env_int("MEDIA_HEAL_ATTEMPTS", 4)))
 # production, set the repo Variable MEDIA_HEAL_SCOPE=on (or all) to restore
 # the round-47 behaviour for every media type — no code change needed.
 # Accepted Variable values (56b): video (default) | on/all | off.
-# See docs/ROUND_56.md for the full decision record.
+# See docs/history/ROUND_56.md for the full decision record.
 # ---------------------------------------------------------------------------
 
 
@@ -1622,7 +1626,7 @@ async def main():
         logging.warning(f"dedup cache near cap: {len(posted_urls)} key(s) "
                         f"(per-account quota {MAX_CACHE_SIZE_PER_ACCOUNT}, "
                         f"backstop {MAX_CACHE_SIZE_TOTAL})"
-                        + (f"; hot: " + ", ".join(f"{a}={n}" for a, n in sorted(_hot.items()))
+                        + ("; hot: " + ", ".join(f"{a}={n}" for a, n in sorted(_hot.items()))
                            if _hot else ""))
 
     # Round 47: messages whose media Discord left unresolved; healed with an

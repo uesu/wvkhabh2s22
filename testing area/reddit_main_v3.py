@@ -287,8 +287,8 @@ REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
 REDDIT_API_USER_AGENT = "python:uesu.news-express:v3 (personal rss monitor)"
 
 CACHE_FILE = "posted_reddit.json"
-# Round 34 (2026-09-28): the old single global cap (MAX_CACHE_SIZE below) was
-# enforced as `sorted(posted)[-MAX_CACHE_SIZE:]` — a LEXICOGRAPHIC eviction.
+# Round 34 (2026-09-28): the old single global cap (a 500-key MAX_CACHE_SIZE)
+# was enforced as `sorted(posted)[-MAX_CACHE_SIZE:]` — a LEXICOGRAPHIC eviction.
 # Keys are `{sub}_{post_id}`, so once the six tracked subs crossed 500 total
 # keys, the alphabetically-FIRST sub's keys — AnantaLeaks_* sorts before
 # Genshin_Impact_Leaks / Honkai* / WutheringWavesLeaks /
@@ -298,6 +298,8 @@ CACHE_FILE = "posted_reddit.json"
 # 1wriz86 on every 5-min cron run). Retention is now PER-SUBREDDIT,
 # newest-first (leet post ids sort chronologically WITHIN a subreddit), with
 # a generous global backstop. All three are overridable via repo Variables.
+# (The retired constant itself was removed in the round-76 housekeeping pass —
+# nothing in the engine, tests, workflows or README referenced it.)
 # Round 36 hotfix / round 49b: an unset repo Variable arrives as "",
 # so every numeric env read goes through this guard.
 def _env_int(name: str, default: int) -> int:
@@ -309,9 +311,6 @@ def _env_int(name: str, default: int) -> int:
 
 MAX_CACHE_SIZE_PER_SUB = _env_int("MAX_CACHE_SIZE_PER_SUB", 250)
 MAX_CACHE_SIZE_TOTAL = _env_int("MAX_CACHE_SIZE_TOTAL", 10000)
-# Round 34: retired pre-round-34 global cap (kept so old references — e.g.
-# tests/README — still resolve; the save no longer uses it).
-MAX_CACHE_SIZE = 500
 # Round 34: per-run flood cap — one run posts at most this many NEW posts
 # (the newest ones); the rest retry next run inside the 48 h window. A loud
 # log line instead of a mass re-post storm if the dedup cache ever loses
@@ -5028,7 +5027,7 @@ async def main():
         logging.warning(f"dedup cache near cap: {len(posted)} key(s) (per-sub "
                         f"quota {MAX_CACHE_SIZE_PER_SUB}, backstop "
                         f"{MAX_CACHE_SIZE_TOTAL})"
-                        + (f"; hot: " + ", ".join(f"{s}={n}" for s, n in sorted(_hot.items()))
+                        + ("; hot: " + ", ".join(f"{s}={n}" for s, n in sorted(_hot.items()))
                            if _hot else ""))
 
     use_oauth = bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET)
