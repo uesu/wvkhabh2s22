@@ -2225,9 +2225,14 @@ _r39_x_expected = [
 _r59_x_walled_tail = ["https://nitter.netbub.com", "https://nitter.jaydenha.uk"]
 _r59_fleet = _literal_list_constant("testing area/twitter_v3.py", "RSS_INSTANCES")
 check("r59: operator pair remains in slots 1-2", _r59_fleet[:2] == ["https://nitter.cf", "https://xitter.cf"])
-check("r59: kareem mirror is ahead of token host", _r59_fleet.index("https://nitter.kareem.one") < _r59_fleet.index("https://nitter.miningtcup.me"))
-check("r59: kitter mirror is ahead of token host", _r59_fleet.index("https://tw.eir-nya.gay") < _r59_fleet.index("https://nitter.miningtcup.me"))
-check("r59: walled tail is retained at the end", _r59_fleet[-2:] == _r59_x_walled_tail)
+check("r75 v4: eir-nya keeps its retryable seat ahead of the token fallback",
+      _r59_fleet.index("https://tw.eir-nya.gay") < _r59_fleet.index("https://nitter.miningtcup.me"))
+check("r75 v4: token fallback precedes the complementary 3/5 mirrors",
+      _r59_fleet.index("https://nitter.miningtcup.me")
+      < _r59_fleet.index("https://nitter.gravitywell.xyz")
+      < _r59_fleet.index("https://nitter.kareem.one"))
+check("r75 v4: walled hosts remain the final two fallback probes",
+      _r59_fleet[-2:] == _r59_x_walled_tail)
 _r59_token_env = _literal_list_constant("testing area/twitter_v3.py", "RSS_TOKEN_ENV")
 check("r59: miningtcup token mapping unchanged", _r59_token_env == {"https://nitter.miningtcup.me": "NITTER_RSS_TOKEN"})
 with open(os.path.join(ROOT, "testing area", "twitter_v3.py"), encoding="utf-8") as _r59_f:
@@ -2237,10 +2242,65 @@ check("r59: demoted-not-deleted rationale recorded", "demoted, not deleted" in _
 for _r39_rel, _r39_expected in (
     ("testing area/twitter_v1.py", _r39_x_expected + _r59_x_walled_tail),
     ("testing area/twitter_v2_button_outside.py", _r39_x_expected + ["https://nitter.miningtcup.me"] + _r59_x_walled_tail),
-    ("testing area/twitter_v3.py", _r39_x_expected + ["https://nitter.miningtcup.me"] + _r59_x_walled_tail),
 ):
     check(f"r39 source fleet: {_r39_rel} has the reviewed X RSS order",
           _literal_list_constant(_r39_rel, "RSS_INSTANCES") == _r39_expected)
+
+# Round 75 addendum v4 (2026-10-14): the operator-directed seat 3, probe-ranked
+# remaining hosts and two fill-in sweep additions are pinned as the final 12-member
+# order. V1/V2 retain their separately reviewed lists.
+_r75_x_expected = [
+    "https://nitter.cf",
+    "https://xitter.cf",
+    "https://xcopy.uk",
+    "https://nitter.meowing.monster",
+    "https://tw.eir-nya.gay",
+    "https://nitter.freedit.eu",
+    "https://shitter.thepixora.com",
+    "https://nitter.miningtcup.me",
+    "https://nitter.gravitywell.xyz",
+    "https://nitter.kareem.one",
+    "https://nitter.netbub.com",
+    "https://nitter.jaydenha.uk",
+]
+check("r75 v4 source fleet: Twitter V3 has the reviewed exact 12-member order",
+      _literal_list_constant("testing area/twitter_v3.py", "RSS_INSTANCES") == _r75_x_expected)
+def test_r75_v4_xcopy_seat_3_fleet_ranked_and_filled_in():
+    """r75 addendum v4 (2026-10-14): the operator seated xcopy.uk at 3 after the
+    full-coverage test (8/8 accounts, nitter.cf parity); a probe round ranked the
+    remaining members (meowing 4 -- 5/5 body, the only non-token-gated member besides
+    the operator pair with positive runner deliveries; eir-nya 5 -- serving, retryable
+    429s; thepixora 7 -- clean body, GE runners 403'd all handles 2026-10-13;
+    miningtcup 8 -- token fallback; kareem.one 10 -- 3/5 accounts); and the fill-in
+    sweep added two new members: freedit.eu (6 -- 5/5 accounts body-verified, wiki
+    'rate limited' tag, zero runner evidence, TRIAL) and gravitywell.xyz (9 -- 3/5,
+    gaps complementary to kareem.one's, so together they span all five accounts).
+    Nothing deleted; the operator pair untouched; membership grows to twelve."""
+    RSS_INSTANCES = x3.RSS_INSTANCES
+    assert RSS_INSTANCES[2] == "https://xcopy.uk"                 # operator-directed seat 3
+    assert RSS_INSTANCES[3] == "https://nitter.meowing.monster"   # revived; runner-proven
+    assert RSS_INSTANCES[4] == "https://tw.eir-nya.gay"           # serving, retryable 429s
+    assert RSS_INSTANCES[5] == "https://nitter.freedit.eu"        # NEW: 5/5 body, trial
+    assert RSS_INSTANCES[6] == "https://shitter.thepixora.com"    # clean body, runner-403 watch
+    assert RSS_INSTANCES[7] == "https://nitter.miningtcup.me"     # token fallback
+    assert RSS_INSTANCES[8] == "https://nitter.gravitywell.xyz"   # NEW: 3/5, complementary
+    assert RSS_INSTANCES[9] == "https://nitter.kareem.one"        # 3/5, the mirror gaps
+    assert RSS_INSTANCES[-2] == "https://nitter.netbub.com"       # walled tier
+    assert RSS_INSTANCES[-1] == "https://nitter.jaydenha.uk"      # walled, stays last
+    assert "https://nitter.meowing.monster" in RSS_INSTANCES      # never deleted
+    assert RSS_INSTANCES[0] == "https://nitter.cf"                # operator pair untouched
+    assert RSS_INSTANCES[1] == "https://xitter.cf"
+    assert len(RSS_INSTANCES) == 12                               # ten members + two new
+
+
+# This suite runs as a linear script rather than through pytest's collector;
+# execute the named guard here and preserve the suite's PASS/FAIL summary.
+try:
+    test_r75_v4_xcopy_seat_3_fleet_ranked_and_filled_in()
+except AssertionError as _r75_v4_error:
+    check("r75 v4: xcopy seat 3, ranked fleet and fill-ins", False, str(_r75_v4_error))
+else:
+    check("r75 v4: xcopy seat 3, ranked fleet and fill-ins", True)
 
 _r39_reddit_expected = [
     "https://www.reddit.com",
@@ -2260,6 +2320,19 @@ for _r39_rel, _r39_expected in (
 ):
     check(f"r39 source fleet: {_r39_rel} has the reviewed Reddit RSS order",
           _literal_list_constant(_r39_rel, "REDDIT_RSS_INSTANCES") == _r39_expected)
+
+_r75_reddit_expected = {
+    "https://www.reddit.com", "https://old.reddit.com",
+    "https://redlib.miningtcup.me", "https://redlib.catsarch.com",
+    "https://redlib.nadeko.net", "https://redlib.privadency.com",
+    "https://safereddit.com", "https://red.artemislena.eu",
+    "https://redlib.privacyredirect.com",
+}
+_r75_reddit_fleet = _literal_list_constant(
+    "testing area/reddit_main_v3.py", "REDDIT_RSS_INSTANCES")
+check("r75: Reddit RSS mirror membership unchanged",
+      set(_r75_reddit_fleet) == _r75_reddit_expected
+      and _r75_reddit_fleet[0] == "https://www.reddit.com")
 
 for _r39_wf in (".github/workflows/ci.yml", ".github/workflows/reddit_monitor.yml",
                 ".github/workflows/twitter_monitor.yml"):
