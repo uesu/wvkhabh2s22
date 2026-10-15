@@ -107,7 +107,7 @@ jobs:
 
       - name: Lint Python helpers/tests (ruff, reading repo's own ruff.toml if present)
         continue-on-error: true
-        uses: astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aa889  # v4.1.0 — SHA-pinned
+        uses: astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aac89  # v4.1.0 — SHA-pinned
         with:
           args: check --output-format=github  # ruff.toml picked up automatically
 
