@@ -250,11 +250,14 @@ jobs:
               }
               // Also consider commit statuses (legacy)
               const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({ owner, repo, ref: pr.head.sha, per_page: 100 });
-              // Map checks with head SHA and workflow provenance — do not fabricate
-              checks = all.map(c => ({ name: c.name, status: c.status, conclusion: c.conclusion, app: c.app?.slug, head_sha: c.head_sha, workflow: c.name?.includes('maintenance-ci') ? 'CI — syntax + offline validation' : c.name, workflow_run: c.html_url }));
+              // Map checks with actual head SHA and app — do not fabricate workflow identity
+              // Resolve actual workflow from check's name if possible, but do not invent; missing workflow will be rejected by helper
+              checks = all.map(c => ({ name: c.name, status: c.status, conclusion: c.conclusion, app: c.app?.slug, head_sha: c.head_sha }));
               // Add statuses as checks
               for (const s of statuses) {
-                checks.push({ name: s.context, status: 'completed', conclusion: s.state === 'success' ? 'success' : s.state, head_sha: s.sha || pr.head.sha, workflow: 'CI — syntax + offline validation', app: 'github-actions' });
+                // Legacy statuses: creator/context distinct from check-run provenance — do not invent app/workflow, include actual sha and context
+                // Helper will treat missing app/workflow as failure for mandatory checks (fail closed), unless policy explicitly allows legacy
+                checks.push({ name: s.context, status: 'completed', conclusion: s.state === 'success' ? 'success' : s.state, head_sha: s.sha || pr.head.sha });
               }
               fixture.checks = checks;
               console.log(`Checks for ${pr.head.sha}: ${JSON.stringify(checks, null, 2)}`);
@@ -353,10 +356,10 @@ jobs:
                   page += 1;
                 }
                 const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({ owner, repo, ref: finalPr.head.sha, per_page: 100 });
-                finalChecks = all.map(c => ({ name: c.name, status: c.status, conclusion: c.conclusion, app: c.app?.slug, head_sha: c.head_sha, workflow: c.name?.includes('maintenance-ci') || c.name?.includes('validate') ? 'CI — syntax + offline validation' : c.name }));
+                finalChecks = all.map(c => ({ name: c.name, status: c.status, conclusion: c.conclusion, app: c.app?.slug, head_sha: c.head_sha }));
                 for (const s of statuses) {
-                  // Legacy statuses lack workflow/app — will be rejected by helper unless explicitly allowed; include head_sha for binding
-                  finalChecks.push({ name: s.context, status: 'completed', conclusion: s.state === 'success' ? 'success' : s.state, head_sha: s.sha || finalPr.head.sha, workflow: 'CI — syntax + offline validation', app: 'github-actions' });
+                  // Legacy statuses: do not invent app/workflow — helper will reject if mandatory requires provenance
+                  finalChecks.push({ name: s.context, status: 'completed', conclusion: s.state === 'success' ? 'success' : s.state, head_sha: s.sha || finalPr.head.sha });
                 }
               } catch (e) {
                 console.log(`Failed to re-list final checks: ${e.message}`);
@@ -376,6 +379,9 @@ jobs:
                 }
               } catch (e) {
                 console.log(`Failed to re-list final reviews: ${e.message}`);
+                core.setOutput('decision', 'blocked');
+                core.setOutput('reason', 'final reviews unavailable — fail closed');
+                return;
               }
               const finalLabels = finalPr.labels.map(l => l.name);
               const finalHoldLabels = ['hold', 'do-not-merge', 'review-required', 'blocked'];

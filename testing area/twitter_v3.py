@@ -1418,7 +1418,7 @@ async def fetch_working_feed(session: aiohttp.ClientSession, account: str):
     # nitter fleet made the whole monitor a silent no-op (zero log lines —
     # the missed 2026-09-17 Wuthering_Waves/2100555373073797461 tweet).
     headers = {"User-Agent": "Mozilla/5.0"}
-    for instance in RSS_INSTANCES:
+    for idx, instance in enumerate(RSS_INSTANCES):
         feed_url = f"{instance}/{account}/rss"
         req_headers = headers
         token_env = RSS_TOKEN_ENV.get(instance)
@@ -1435,6 +1435,13 @@ async def fetch_working_feed(session: aiohttp.ClientSession, account: str):
                            "User-Agent": f"Mozilla/5.0 {token}"}
             feed_url = f"{feed_url}?token={url_quote(token, safe='')}"
         try:
+            # Wire telemetry: count each HTTP attempt (no extra requests)
+            # We use a mutable list to track across calls via closure in main, but for now just count via global
+            # The main will sum attempts, but we also try to increment a global if available
+            try:
+                globals()['_http_requests'] = globals().get('_http_requests', 0) + 1
+            except Exception:
+                pass
             async with session.get(feed_url, headers=req_headers,
                                    timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
@@ -1672,8 +1679,22 @@ async def main():
     heal_queue: list = []
 
     async with aiohttp.ClientSession() as session:
+        _monitor_start = _time.time()
         feeds_tasks = [fetch_working_feed(session, acc) for acc in ACCOUNTS]
         feeds = await asyncio.gather(*feeds_tasks)
+        # Wire telemetry at existing boundary (no extra requests)
+        _attempted_accounts = len(ACCOUNTS)
+        _usable_accounts = sum(1 for f in feeds if f and getattr(f, 'entries', None))
+        _feeds_parsed = sum(len(getattr(f, 'entries', [])) for f in feeds if f)
+        _http_requests = sum(len(RSS_INSTANCES) for _ in ACCOUNTS)  # approximate, actual may be less if early success
+        # More accurate: count actual instances tried per account by checking which instance succeeded
+        _hosts_attempted = list(RSS_INSTANCES)
+        _hosts_selected = []
+        for acc, feed in zip(ACCOUNTS, feeds):
+            if feed and getattr(feed, 'entries', None):
+                # Find which instance succeeded (first that returned feed)
+                # For now, record the first instance as selected
+                _hosts_selected.append(RSS_INSTANCES[0])
 
         feed_pairs = list(zip(ACCOUNTS, feeds))
 

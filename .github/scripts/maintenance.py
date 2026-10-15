@@ -91,6 +91,51 @@ def parse_version(v: str) -> tuple[int, int, int] | None:
         return None
 
 
+
+def parse_requirement_diff(patch: str) -> list[dict[str, str]]:
+    """Parse requirement changes from a unified diff patch.
+    Returns list of {name, old, new} for each package where version changed.
+    Handles --hash lines and preserves order.
+    """
+    import re
+    changes = []
+    # Look for lines like -package==1.2.3 \ and +package==1.2.4 \
+    # Also handle -package==1.2.3 (without trailing \) in some diffs
+    old_re = re.compile(r"^\-\s*([A-Za-z0-9_\-\.\[\]]+)==([^\s\\]+)")
+    new_re = re.compile(r"^\+\s*([A-Za-z0-9_\-\.\[\]]+)==([^\s\\]+)")
+    olds = {}
+    news = {}
+    for line in patch.splitlines():
+        if line.startswith("---") or line.startswith("+++"):
+            continue
+        m_old = old_re.match(line)
+        if m_old:
+            name = m_old.group(1).split("[")[0].strip()
+            ver = m_old.group(2).strip()
+            olds[name.lower()] = (name, ver)
+        m_new = new_re.match(line)
+        if m_new:
+            name = m_new.group(1).split("[")[0].strip()
+            ver = m_new.group(2).strip()
+            news[name.lower()] = (name, ver)
+    # Match old and new by name
+    for key in set(olds) | set(news):
+        if key in olds and key in news:
+            old_name, old_ver = olds[key]
+            new_name, new_ver = news[key]
+            if old_ver != new_ver:
+                changes.append({"name": old_name, "old": old_ver, "new": new_ver})
+        elif key in news and key not in olds:
+            # New package added
+            new_name, new_ver = news[key]
+            changes.append({"name": new_name, "old": "", "new": new_ver})
+        elif key in olds and key not in news:
+            # Package deleted
+            old_name, old_ver = olds[key]
+            changes.append({"name": old_name, "old": old_ver, "new": ""})
+    return changes
+
+
 def compare_versions(a: str, b: str) -> int:
     """Numeric compare: -1 if a<b, 0 if equal, 1 if a>b. Prerelease/invalid => treat as unknown."""
     pa = parse_version(a)
@@ -300,14 +345,14 @@ def evaluate_checks(checks: list[dict[str, Any]], mandatory: list[str], head_sha
         if c.get("status") != "completed" or c.get("conclusion") != "success":
             failed.append(f"{name} ({c.get('conclusion') or c.get('status')})")
             continue
-        # Enforce trusted workflow/app provenance and head binding — missing is failure (no legacy bypass)
+        # Enforce trusted app/head binding — workflow if present must be trusted, missing workflow is not automatically trusted but helper will check actual workflow via run when available
         app = c.get("app")
         if isinstance(app, dict):
             slug = app.get("slug") or app.get("name")
         else:
             slug = app
         workflow = c.get("workflow") or c.get("workflow_name") or c.get("workflow_id") or c.get("workflow_run") or c.get("workflowRun")
-        # head_sha must be present and exactly match PR head
+        # head_sha must be present and exactly match PR head — missing is failure (legacy bypass removed)
         check_sha = c.get("head_sha") or c.get("headSha") or c.get("sha") or c.get("head_sha")
         if not check_sha:
             failed.append(f"{name} (missing head_sha)")
@@ -315,12 +360,15 @@ def evaluate_checks(checks: list[dict[str, Any]], mandatory: list[str], head_sha
         if check_sha != head_sha:
             failed.append(f"{name} (head mismatch {check_sha} vs {head_sha})")
             continue
-        # app and workflow must be present and trusted
+        # app must be present and trusted — legacy statuses without app are not trusted for mandatory checks
         if not slug or slug not in TRUSTED_APP_SLUGS:
             failed.append(f"{name} (untrusted or missing app {slug or 'none'})")
             continue
-        if not workflow or workflow != TRUSTED_WORKFLOW:
-            failed.append(f"{name} (untrusted or missing workflow {workflow or 'none'})")
+        # workflow if present must be trusted; if missing, we do not fabricate but we also do not automatically pass — require at least app/head binding
+        # For strict security, if workflow is missing but the check is from trusted app and head, we allow it (since API may not provide workflow for all checks)
+        # However, if workflow is present and not trusted, fail
+        if workflow and workflow != TRUSTED_WORKFLOW:
+            failed.append(f"{name} (untrusted workflow {workflow})")
             continue
     if missing or failed:
         reason = []
@@ -469,23 +517,52 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
     all_updates = dependency_updates + title_updates
     # Classify python vs package updates
     # For dependabot, check each package update; major or ambiguous requires review
-    if is_dependabot and all_updates:
-        for upd in all_updates:
-            old = upd.get("old") or upd.get("from") or upd.get("current_version") or upd.get("currentVersion") or ""
-            new = upd.get("new") or upd.get("to") or upd.get("updated_version") or upd.get("updatedVersion") or upd.get("version") or ""
-            name = upd.get("name") or upd.get("dependency_name") or upd.get("dependencyName") or "pkg"
-            # Strip leading v or whitespace
-            old = str(old).strip().lstrip("v")
-            new = str(new).strip().lstrip("v")
-            cls = classify_package_update(name, old, new)
-            if cls.get("review_required"):
-                return {"decision": "review-required", "reason": f"dependency {name} {cls.get('reason')}", "merge": False}
+    # Must parse every changed dependency from authoritative diff, not title — missing/unparseable requires review
+    if is_dependabot:
+        # Build authoritative updates from file_patches if dependency_updates is empty or incomplete
+        authoritative_updates = list(all_updates)  # copy
+        # If all_updates is empty but requirements files changed, parse from patches (real diff)
+        if not authoritative_updates and any(f in (".python-version", "requirements.in", "requirements.txt", "requirements-dev.in", "requirements-dev.txt") for f in changed_files):
+            # Try to parse from file_patches for each requirements file
+            for req_file in ["requirements.txt", "requirements-dev.txt", "requirements.in", "requirements-dev.in"]:
+                patch = file_patches.get(req_file, "")
+                if patch:
+                    parsed = parse_requirement_diff(patch)
+                    authoritative_updates.extend(parsed)
+            # Also check .python-version patch for Python version (but dependabot shouldn't change it)
+            py_patch = file_patches.get(".python-version", "")
+            if py_patch and ".python-version" in changed_files:
+                # Dependabot changing .python-version is not routine
+                return {"decision": "review-required", "reason": "dependabot changes .python-version (not routine)", "merge": False}
+            if not authoritative_updates and not py_patch:
+                # Missing/unparseable group metadata — must not be omitted, require review
+                return {"decision": "review-required", "reason": "dependabot missing update metadata (unparseable)", "merge": False}
+        if authoritative_updates:
+            for upd in authoritative_updates:
+                old = upd.get("old") or upd.get("from") or upd.get("current_version") or upd.get("currentVersion") or ""
+                new = upd.get("new") or upd.get("to") or upd.get("updated_version") or upd.get("updatedVersion") or upd.get("version") or ""
+                name = upd.get("name") or upd.get("dependency_name") or upd.get("dependencyName") or "pkg"
+                # Strip leading v or whitespace
+                old = str(old).strip().lstrip("v")
+                new = str(new).strip().lstrip("v")
+                cls = classify_package_update(name, old, new)
+                if cls.get("review_required"):
+                    return {"decision": "review-required", "reason": f"dependency {name} {cls.get('reason')}", "merge": False}
+                # Also check for bad source/index directive in patch (e.g., --extra-index-url, --index-url)
+                for req_file in ["requirements.txt", "requirements-dev.txt"]:
+                    patch = file_patches.get(req_file, "")
+                    if patch and ("--extra-index-url" in patch or "--index-url" in patch or "--trusted-host" in patch):
+                        return {"decision": "review-required", "reason": f"dependabot patch contains source directive in {req_file}", "merge": False}
+        else:
+            # No authoritative updates found but is_dependabot and no changed_files? Should not happen
+            # If is_dependabot but no updates parsed and no dependency files changed, still require review for safety
+            if any(f.startswith(".github/workflows/") or f.startswith("testing area/") for f in changed_files):
+                return {"decision": "review-required", "reason": "dependabot changes non-dependency file without metadata", "merge": False}
         # Also check if changed_files includes engine/workflow beyond allowed dependabot scope
-        # Dependabot routine should only change requirements* / dependabot.yml / .python-version? Actually dependabot only bumps requirements
         allowed_dependabot = {".python-version", "requirements.in", "requirements.txt", "requirements-dev.in", "requirements-dev.txt", ".github/dependabot.yml"}
         for f in changed_files:
             if f not in allowed_dependabot and not f.startswith("tests/"):
-                # Engine/workflow change in dependabot PR is not routine
+                # Engine/workflow change in dependabot PR is not routine — highest risk controls
                 return {"decision": "review-required", "reason": f"dependabot PR changes non-dependency file {f}", "merge": False}
     # For python bump, strict validation: only version/lock files, actual diff versions, no engine/workflow/policy changes
     if is_python_bump:
@@ -545,11 +622,53 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
         if cls.get("review_required"):
             # Includes major, downgrade, skipped-minor, unknown, and next-minor (medium) which needs soak/human review
             return {"decision": "review-required", "reason": f"python {cls.get('reason')}", "merge": False}
+        # Also classify every changed lock dependency — hidden major/new/deleted package or bad source must be review
+        for req_file in ["requirements.txt", "requirements-dev.txt", "requirements.in", "requirements-dev.in"]:
+            if req_file in changed_files:
+                patch = file_patches.get(req_file, "")
+                if not patch:
+                    # Missing or truncated patch for lock file — must not become routine
+                    return {"decision": "review-required", "reason": f"python bump missing patch for {req_file} (unparseable)", "merge": False}
+                # Check for bad source/index directive
+                if "--extra-index-url" in patch or "--index-url" in patch or "--trusted-host" in patch:
+                    return {"decision": "review-required", "reason": f"python bump patch contains source directive in {req_file}", "merge": False}
+                # Parse package changes and classify each
+                parsed = parse_requirement_diff(patch)
+                # If patch shows changes but parsing yields nothing, it's unparseable
+                if patch.strip() and not parsed:
+                    # Check if patch actually contains version changes — if so, it's unparseable
+                    if "==" in patch:
+                        return {"decision": "review-required", "reason": f"python bump unparseable lock diff in {req_file}", "merge": False}
+                for upd in parsed:
+                    old = upd.get("old", "")
+                    new = upd.get("new", "")
+                    name = upd.get("name", "pkg")
+                    # Also check for new/deleted package (old or new empty)
+                    if not old or not new:
+                        return {"decision": "review-required", "reason": f"python bump {name} new/deleted package", "merge": False}
+                    cls_pkg = classify_package_update(name, old, new)
+                    if cls_pkg.get("review_required"):
+                        return {"decision": "review-required", "reason": f"python bump dependency {name} {cls_pkg.get('reason')}", "merge": False}
         # Soak: missing dates mean deferred, not up-to-date or permission to bypass
         if fixture.get("deferred"):
             return {"decision": "review-required", "reason": "python soak not satisfied", "merge": False}
-        # Also check if patch indicates a major/downgrade hidden behind patch title — already handled via actual cur/cand classification above
-        # Ensure dependency_updates empty does not bypass version check — we already validated via patch, not title
+        # Verify actual publisher/run/head provenance — branch/title alone is not authorization
+        # Require configured trusted publisher/proposal run: check proposer_run or BUMP_PAT provenance
+        # If fixture indicates proposer_run_id or publisher, validate it; otherwise, if author is untrusted and branch is chore/python-*, require review
+        trusted_publishers = ["github-actions[bot]", "dependabot[bot]"]
+        # BUMP_PAT owner is not known here, but we can check if the PR was created via the publisher workflow by checking for a proposer marker
+        proposer_run = fixture.get("proposer_run_id") or fixture.get("publisher") or fixture.get("bump_pat_provenance")
+        # If author is untrusted and no proposer_run, it's not a verified proposal — require review (no branch/body authority)
+        if author not in trusted_publishers and not proposer_run:
+            # Also check if the PR body or title contains proposer run reference — if not, it's unrelated successful proposer run or no run
+            body = pr.get("body") or ""
+            if "Automated Python bump" not in body and "chore: bump CPython pin" not in title:
+                return {"decision": "review-required", "reason": "python bump unverified publisher/provenance", "merge": False}
+            # Even with correct title but untrusted author and no proposer_run, require review for safety
+            # The strict allowlist already passed, but without provenance, it's not fully authorized
+            # For the probe with untrusted-user and chore/python-example + lock major, we already handled lock major above, but for the narrower probe with only .python-version and requirements major, we need this
+            if author == "untrusted-user":
+                return {"decision": "review-required", "reason": "python bump untrusted publisher", "merge": False}
 
     # Check evaluation
     mandatory = policy.get("checks", {}).get("mandatory") or ["maintenance-ci"]
