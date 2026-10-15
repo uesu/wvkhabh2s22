@@ -56,20 +56,28 @@ jobs:
           git reset --hard FETCH_HEAD
           echo "Now at $(git log -1 --format=%H) (live ${CACHE_BRANCH:-main} tip)."
 
+      - name: Capture checked-out code SHA (before execution)
+        run: |
+          echo "CODE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "Checked-out code SHA: $(git rev-parse HEAD)"
+
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7 — SHA-pinned (round 57)
         with:
-          # Exact stable CPython pin; update deliberately after CI validates it.
           python-version: '3.14.8'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install dependencies (frozen, hash-verified)
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip==26.1.1
+          python -m pip install --require-hashes --only-binary=:all: -r requirements.txt
 
       - name: Run Twitter Feed Monitor
         env:
+          CODE_SHA: ${{ env.CODE_SHA }}
+          REPORT_PATH: ${{ runner.temp }}/twitter_report.json
+          LOCK_DIGEST: ${{ hashFiles('requirements.txt') }}
+          RUNNER_IMAGE: ${{ runner.os }}-${{ runner.arch }}
           ACCOUNTS: ${{ secrets.ACCOUNTS }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           WEBHOOK_TYPEII_EN: ${{ secrets.WEBHOOK_TYPEII_EN }}
@@ -127,11 +135,19 @@ jobs:
         # ───────────────────────────────────────────────────────────────────
         run: |
           echo "TWITTER_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+          echo "REPORT_PATH=${{ runner.temp }}/twitter_report.json" >> "$GITHUB_ENV"
+          echo "PERSISTENCE_PATH=${{ runner.temp }}/twitter_persistence.json" >> "$GITHUB_ENV"
           set -o pipefail
           set +e
           python "testing area/twitter_v3.py" 2>&1 | tee twitter_monitor.log   # ← V3
           statuses=("${PIPESTATUS[@]}")
           echo "TWITTER_END_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+          if [ ! -f "${{ runner.temp }}/twitter_report.json" ]; then
+            echo '{"schema_version":1,"workflow_mode":"twitter","code_sha":"'"$CODE_SHA"'","execution_result":"failed","warnings":["report not written — early failure"]}' > "${{ runner.temp }}/twitter_report.json" || true
+          fi
+          if [ ! -f "${{ runner.temp }}/twitter_persistence.json" ]; then
+            echo "{\"local_save\":\"unavailable\",\"commit\":\"unavailable\",\"push\":\"${TWITTER_CACHE_RESULT:-unavailable}\"}" > "${{ runner.temp }}/twitter_persistence.json" || true
+          fi
           if [ "${statuses[0]}" -ne 0 ] || [ "${statuses[1]}" -ne 0 ]; then
             exit 1
           fi
@@ -208,39 +224,27 @@ jobs:
           fi
           if [ "$cache_result" != "no-changes" ]; then echo "TWITTER_CACHE_RESULT=success" >> "$GITHUB_ENV"; fi
 
-      - name: Write Twitter monitor run summary
+      - name: Record persistence status for report
         if: always()
         run: |
+          mkdir -p "$(dirname "${{ runner.temp }}/twitter_persistence.json")"
+          cat > "${{ runner.temp }}/twitter_persistence.json" <<EOF
+          {"local_save":"$( [ "${{ job.status }}" = "success" ] && echo "success" || echo "failed")","commit":"${TWITTER_CACHE_RESULT:-failed}","push":"${TWITTER_CACHE_RESULT:-failed}"}
+          EOF
+
+      - name: Write structured monitor report (bounded JSON)
+        if: always()
+        run: |
+          [ -f "${{ runner.temp }}/twitter_report.json" ] || echo '{"schema_version":1,"workflow_mode":"twitter","code_sha":"'"$CODE_SHA"'","python_version":"'"$(python -V 2>&1 | cut -d" " -f2)"'","lock_digest":"'"$(sha256sum requirements.txt | cut -d" " -f1)"'","runner_image":"${{ runner.os }}","execution_result":"failed","warnings":["report missing — early failure"]}' > "${{ runner.temp }}/twitter_report.json"
+          cat "${{ runner.temp }}/twitter_report.json" | python -m json.tool | head -n 50 || true
+
+      - name: Render run summary (versioned JSON → Markdown)
+        if: always()
+        run: |
+          python .github/scripts/render_run_summary.py --report "${{ runner.temp }}/twitter_report.json" --persistence "${{ runner.temp }}/twitter_persistence.json" --output "${{ runner.temp }}/twitter_summary.md" || true
+          cat "${{ runner.temp }}/twitter_summary.md" >> "$GITHUB_STEP_SUMMARY" || true
           [ -f twitter_monitor.log ] || : > twitter_monitor.log
           count_matches() { local pattern="$1"; grep -Ec "$pattern" twitter_monitor.log 2>/dev/null || true; }
-          total_feed_entries() { local total; total=$(grep 'feed OK via' twitter_monitor.log 2>/dev/null | grep -Eo '[0-9]+ entries' | grep -Eo '[0-9]+' | awk '{ total += $1 } END { print total + 0 }' || true); printf '%s\n' "${total:-0}"; }
-          feed_failures() { awk '/^\[[^]]+\] NO working nitter instance this run/ { n++ } END { print n + 0 }' twitter_monitor.log 2>/dev/null || true; }
           runtime=$(( ${TWITTER_END_EPOCH:-$(date +%s)} - ${TWITTER_START_EPOCH:-$(date +%s)} ))
-          feeds_ok=$(count_matches 'feed OK via')
-          feeds_failed=$(feed_failures)
-          feeds_empty=$(count_matches 'skipping — no feed / 0 entries')
-          entries_read=$(total_feed_entries)
-          {
-            echo "## Twitter Feed Monitor — run summary"
-            echo
-            if [ "${{ job.status }}" = "success" ]; then echo "**Result:** success"; else echo "**Result:** failure"; fi
-            echo "**Runtime:** ${runtime}s"
-            echo
-            echo "### Feeds"
-            accounts_checked=$(awk '/^\[[^]]+\] feed OK via/ || /^\[[^]]+\] NO working nitter instance this run/ || /^\[[^]]+\] skipping — no feed \/ 0 entries/ { account=$0; sub(/^\[/, "", account); sub(/\].*$/, "", account); print account }' twitter_monitor.log 2>/dev/null | sort -u | wc -l | tr -d ' ' || true)
-            echo "- accounts checked: ${accounts_checked}"
-            echo "- entries read: ${entries_read}"
-            echo "- successful feeds: ${feeds_ok}"
-            echo "- failed feeds: ${feeds_failed}"
-            echo "- empty feeds: ${feeds_empty}"
-            echo
-            echo "### Posts"
-            echo "- new posts found: $(count_matches 'new posts|new tweet')"
-            echo "- posts delivered: $(count_matches 'V3 Posted:')"
-            echo "- skip log lines: $(count_matches 'skipping')"
-            echo "- retry/fallback log lines: $(count_matches 'trying next|retry')"
-            echo
-            echo "### State"
-            echo "- cache: ${TWITTER_CACHE_RESULT:-failed}"
-            echo "- summary source: local twitter_monitor.log only; no additional requests"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "_Legacy log counters (no extra requests): runtime ${runtime}s, posts delivered $(count_matches 'V3 Posted:')_" >> "$GITHUB_STEP_SUMMARY"

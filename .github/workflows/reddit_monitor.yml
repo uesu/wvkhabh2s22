@@ -68,20 +68,28 @@ jobs:
           git reset --hard FETCH_HEAD
           echo "Now at $(git log -1 --format=%H) (live ${CACHE_BRANCH:-main} tip)."
 
+      - name: Capture checked-out code SHA (before execution)
+        run: |
+          echo "CODE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "Checked-out code SHA: $(git rev-parse HEAD)"
+
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7 — SHA-pinned (round 57)
         with:
-          # Exact stable CPython pin; update deliberately after CI validates it.
           python-version: '3.14.8'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install dependencies (frozen, hash-verified)
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip==26.1.1
+          python -m pip install --require-hashes --only-binary=:all: -r requirements.txt
 
       - name: Run Reddit Feed Monitor
         env:
+          CODE_SHA: ${{ env.CODE_SHA }}
+          REPORT_PATH: ${{ runner.temp }}/reddit_report.json
+          LOCK_DIGEST: ${{ hashFiles('requirements.txt') }}
+          RUNNER_IMAGE: ${{ runner.os }}-${{ runner.arch }}
           SUBREDDITS: ${{ secrets.SUBREDDITS }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           # EMBEDEZ_API_KEY: ${{ secrets.EMBEDEZ_API_KEY }}   # round 13: no longer used —
@@ -184,11 +192,21 @@ jobs:
         # ───────────────────────────────────────────────────────────────────
         run: |
           echo "MONITOR_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+          echo "REPORT_PATH=${{ runner.temp }}/reddit_report.json" >> "$GITHUB_ENV"
+          echo "PERSISTENCE_PATH=${{ runner.temp }}/reddit_persistence.json" >> "$GITHUB_ENV"
           set -o pipefail
           set +e
           python "testing area/reddit_main_v3.py" 2>&1 | tee monitor.log
           statuses=("${PIPESTATUS[@]}")
           echo "MONITOR_END_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+          # Ensure report placeholder exists even if script did not write it (early failure)
+          if [ ! -f "${{ runner.temp }}/reddit_report.json" ]; then
+            echo '{"schema_version":1,"workflow_mode":"reddit","code_sha":"'"$CODE_SHA"'","execution_result":"failed","warnings":["report not written — early failure"]}' > "${{ runner.temp }}/reddit_report.json" || true
+          fi
+          # Record persistence status placeholder (updated after persistence step)
+          if [ ! -f "${{ runner.temp }}/reddit_persistence.json" ]; then
+            echo "{\"local_save\":\"unavailable\",\"commit\":\"unavailable\",\"push\":\"${CACHE_RESULT:-unavailable}\"}" > "${{ runner.temp }}/reddit_persistence.json" || true
+          fi
           if [ "${statuses[0]}" -ne 0 ] || [ "${statuses[1]}" -ne 0 ]; then
             exit 1
           fi
@@ -273,36 +291,34 @@ jobs:
           fi
           echo "CACHE_RESULT=success" >> "$GITHUB_ENV"
 
-      # Reporting only: reads the local monitor log and performs no network or cache work.
-      - name: Write monitor run summary
+      - name: Record persistence status for report
         if: always()
         run: |
+          # Write persistence JSON for renderer (even on failure)
+          mkdir -p "$(dirname "${{ runner.temp }}/reddit_persistence.json")"
+          cat > "${{ runner.temp }}/reddit_persistence.json" <<EOF
+          {"local_save":"$( [ "${{ job.status }}" = "success" ] && echo "success" || echo "failed")","commit":"${CACHE_RESULT:-failed}","push":"${CACHE_RESULT:-failed}"}
+          EOF
+          echo "Wrote persistence status to ${{ runner.temp }}/reddit_persistence.json"
+
+      # Structured report renderer — always runs after persistence, no extra requests
+      - name: Write structured monitor report (bounded JSON)
+        if: always()
+        run: |
+          [ -f "${{ runner.temp }}/reddit_report.json" ] || echo '{"schema_version":1,"workflow_mode":"reddit","code_sha":"'"$CODE_SHA"'","python_version":"'"$(python -V 2>&1 | cut -d" " -f2)"'","lock_digest":"'"$(sha256sum requirements.txt | cut -d" " -f1)"'","runner_image":"${{ runner.os }}","execution_result":"failed","warnings":["report missing — early failure"]}' > "${{ runner.temp }}/reddit_report.json"
+          cat "${{ runner.temp }}/reddit_report.json" | python -m json.tool | head -n 50 || true
+
+      - name: Render run summary (versioned JSON → Markdown)
+        if: always()
+        run: |
+          python .github/scripts/render_run_summary.py --report "${{ runner.temp }}/reddit_report.json" --persistence "${{ runner.temp }}/reddit_persistence.json" --output "${{ runner.temp }}/reddit_summary.md" || true
+          cat "${{ runner.temp }}/reddit_summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+          # Legacy fallback: also emit minimal log-derived counts for backwards compatibility (bounded, no extra requests)
+          # summary source: local monitor.log only; no additional requests
           [ -f monitor.log ] || : > monitor.log
           count_matches() { local pattern="$1"; grep -Ec "$pattern" monitor.log 2>/dev/null || true; }
-          extract_number() { local value; value=$(grep -Eo "$1" monitor.log 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || true); printf '%s\n' "${value:-0}"; }
           runtime=$(( ${MONITOR_END_EPOCH:-$(date +%s)} - ${MONITOR_START_EPOCH:-$(date +%s)} ))
-          ok=$(count_matches 'proxy warm-up.*OK')
-          failed=$(count_matches 'proxy warm-up.*(DOWN|FAILED|unavailable|error)')
-          new_candidates=$(extract_number 'Found [0-9]+ new Reddit posts')
-          {
-            echo "## Reddit Feed Monitor — run summary"
-            echo
-            if [ "${{ job.status }}" = "success" ]; then echo "**Result:** success"; else echo "**Result:** failure"; fi
-            echo "**Runtime:** ${runtime}s"
-            echo
-            echo "### Feed"
-            echo "- entries read: $(extract_number 'Combined feed OK: [0-9]+ entries')"
-            echo "- new candidates: ${new_candidates}"
-            echo "- posts delivered: $(count_matches 'Reddit V3 Posted:')"
-            echo "- listing/retry-related log lines: $(count_matches 'skipped.*next tick|retried next tick')"
-            echo
-            echo "### Providers and videos"
-            echo "- proxy warmups: ${ok} OK, ${failed} failed"
-            echo "- accepted 1080p upgrades: $(count_matches 'EmbedEZ 1080p candidate accepted')"
-            echo "- quality fallback notices: $(count_matches 'retaining validated base')"
-            echo "- final video provider labels: $(grep -Eo 'card media via [^ ]+' monitor.log 2>/dev/null | sort -u | tr '\n' ' ' || true)"
-            echo
-            echo "### State"
-            echo "- cache commit/push: ${CACHE_RESULT:-failed}"
-            echo "- summary source: local monitor.log only; no additional requests"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "_Legacy log counters (no extra requests): runtime ${runtime}s, posts delivered $(count_matches 'Reddit V3 Posted:')_" >> "$GITHUB_STEP_SUMMARY"
+          echo "_summary source: local monitor.log only; no additional requests_" >> "$GITHUB_STEP_SUMMARY"
+          echo "quality fallback count: $(count_matches 'retaining validated base') " >> "$GITHUB_STEP_SUMMARY"

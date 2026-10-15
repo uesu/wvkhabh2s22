@@ -1,73 +1,11 @@
-#  Automatic CPython version bump (round 46, revised 2026-10-06)
-#
-#  WHY THIS EXISTS
-#  Dependabot cannot update `python-version: '3.14.8'` because that value is
-#  repository workflow configuration, not a dependency manifest entry. New
-#  CPython releases therefore need a dedicated, validated PR path.
-#
-#  VERSION TERMINOLOGY
-#    MAJOR.MINOR.PATCH
-#    3.14.7 -> 3.14.8  = PATCH update inside the current series
-#    3.14.8 -> 3.15.0  = new MINOR series
-#    3.x    -> 4.x     = MAJOR update
-#
-#  SCOPE: PATCH PROPOSALS, AND NEXT-MINOR PRS AFTER REVIEW GATES
-#  The workflow first looks for the newest stable patch of the current series.
-#  If none is newer, it may propose the newest stable patch of the next minor
-#  series after the configured soak period and validation gates. It never skips
-#  a minor series and never proposes a major-version migration. Python 4 (or
-#  any other major change) is deliberate manual migration work, not an ordinary
-#  runtime bump.
-#
-#  VALIDATION GATES
-#  No PR is opened unless, under the candidate interpreter, all of this passed:
-#    1. every dependency installed FROM A PREBUILT WHEEL
-#       (`--only-binary=:all:`). This is the single most likely way a new
-#       CPython minor breaks this repo: aiohttp ships compiled wheels per
-#       interpreter ABI, and so do multidict / yarl / frozenlist / propcache.
-#       A brand-new CPython minor may not have those wheels yet; without this
-#       flag pip could compile from source. Wheels missing => DEFERRED, not
-#       merged.
-#    2. `python -m compileall` over `testing area` and `tests`
-#    3. tests/test_smoke.py
-#    4. tests/test_reddit_signals.py
-#    5. tests/test_twitter_media.py
-#  The exact pin is then rewritten only in the explicit current-runtime
-#  allowlist, and 2-5 are run again on the rewritten tree. Historical records
-#  under docs/history/ are protected and any unexpected file change fails the
-#  workflow closed.
-#
-#  SOAK PERIOD FOR A NEW MINOR
-#  A x.y.0 release is the least-tested build of its series. A minor bump is
-#  therefore only proposed once the release has been in the runner image
-#  manifest for PYTHON_BUMP_SOAK_DAYS days (repository Variable, default 30).
-#  Patch releases have no soak: a patch usually keeps the same series ABI and
-#  may contain security fixes.
-#
-#  AUTO-MERGE (repository Variable AUTO_MERGE_PYTHON_BUMP)
-#    unset / anything else -> never merges, just opens the PR
-#    'yes'                 -> merges green PATCH bumps only
-#  There is intentionally no `all` mode. A MINOR bump such as Python 3.15
-#  always waits for manual review even when every validation gate passes.
-#
-#  AUTHENTICATION AND PUBLICATION
-#  This workflow uses secrets.BUMP_PAT for checkout, PR creation, and the
-#  optional patch auto-merge. BUMP_PAT must remain a GitHub Actions secret
-#  reference only; no token value belongs in this repository. If the token is
-#  missing or invalid, the job fails safely. There is no direct-to-main
-#  fallback.
-#
-#  NOTE ON PR CHECKS
-#  The job runs the same offline gates as ci.yml under the candidate interpreter
-#  before it opens the PR. The PR may also receive normal CI checks depending on
-#  repository settings and token behavior; those checks are an additional review
-#  signal, not a replacement for the pre-PR runtime validation above.
-
 name: Python version bump (auto)
+
+# Thin runtime proposer — selection/validation/publisher stages only.
+# No self-merge; no doc rewrites; reads exact pin from .python-version.
+# Weekly schedule + manual dispatch preserved, cancel-in-progress false.
 
 on:
   schedule:
-    # Mondays 06:00 UTC. Frequent enough to pick up a security release fast.
     - cron: '0 6 * * 1'
   workflow_dispatch:
     inputs:
@@ -82,25 +20,41 @@ on:
         default: false
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: python-bump-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  bump:
+  select-and-validate:
     runs-on: ubuntu-latest
-    # Round 57: hard cap — full validation gate; normal run is minutes.
     timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      bump: ${{ steps.resolve.outputs.bump }}
+      current: ${{ steps.resolve.outputs.current }}
+      latest: ${{ steps.resolve.outputs.latest }}
+      kind: ${{ steps.resolve.outputs.kind }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7 — SHA-pinned (round 57, immutable supply chain)
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7 — SHA-pinned
         with:
-          token: ${{ secrets.BUMP_PAT }}
+          persist-credentials: false
 
-      - name: Work out the current pin and the next version to try
+      - name: Set up Python (current pin)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7 — SHA-pinned
+        with:
+          python-version-file: '.python-version'
+          cache: 'pip'
+
+      - name: Install helper dependencies (frozen, hash-verified)
+        run: |
+          python -m pip install --upgrade pip==26.1.1
+          python -m pip install --require-hashes --only-binary=:all: -r requirements.txt
+
+      - name: Resolve candidate version
         id: resolve
         env:
           FORCE_VERSION: ${{ inputs.force_version }}
@@ -109,326 +63,147 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-
-          CURRENT="$(grep -oP "python-version: '\K3\.[0-9]+\.[0-9]+" .github/workflows/ci.yml | head -1)"
+          CURRENT="$(cat .python-version | tr -d ' \r\n')"
           if [ -z "$CURRENT" ]; then
-            echo "::error::Could not read the current python-version from ci.yml"
+            echo "::error::Could not read current pin from .python-version"
             exit 1
           fi
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
           echo "Currently pinned: $CURRENT"
-
-          if [ -n "$FORCE_VERSION" ]; then
+          if [ -n "${FORCE_VERSION:-}" ]; then
             echo "Manual override requested: $FORCE_VERSION"
-            echo "latest=$FORCE_VERSION" >> "$GITHUB_OUTPUT"
+            # Validate syntax via helper
+            python -c "import sys; sys.path.insert(0, '.github/scripts'); import maintenance; assert maintenance.parse_version('${FORCE_VERSION}') is not None, 'invalid forced version'"
+            echo "latest=${FORCE_VERSION}" >> "$GITHUB_OUTPUT"
             echo "kind=forced" >> "$GITHUB_OUTPUT"
             echo "bump=yes" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
-          # The manifest setup-python itself resolves from. A version that is
-          # not in here cannot be installed by any workflow.
-          curl -fsSL -o manifest.json \
-            https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json
-
-          # Candidate = newest stable patch of the current series; if the
-          # current series has nothing newer, the newest stable patch of the
-          # NEXT series (one minor step only — never a double jump).
-          python3 - "$CURRENT" <<'PY' > candidate.txt
-          import json, sys
-
-          current = tuple(int(p) for p in sys.argv[1].split("."))
-          series_now = current[:2]
-          series_next = (current[0], current[1] + 1)
-
-          with open("manifest.json", encoding="utf-8") as fh:
-              data = json.load(fh)
-
-          def newest(series):
-              best, url = None, ""
-              for entry in data:
-                  raw = entry.get("version", "")
-                  if not entry.get("stable"):
-                      continue                      # skips rc / beta / alpha
-                  parts = raw.split(".")
-                  if len(parts) != 3 or not all(p.isdigit() for p in parts):
-                      continue
-                  version = tuple(int(p) for p in parts)
-                  if version[:2] != series:
-                      continue
-                  if not any(f.get("platform") == "linux" and f.get("arch") == "x64"
-                             for f in entry.get("files", [])):
-                      continue                      # runners are linux x64
-                  if best is None or version > best:
-                      best, url = version, entry.get("release_url", "")
-              return best, url
-
-          for series, kind in ((series_now, "patch"), (series_next, "minor")):
-              best, url = newest(series)
-              if best and best > current:
-                  print(".".join(str(p) for p in best))
-                  print(kind)
-                  print(url)
-                  break
-          else:
-              print("")
-              print("none")
-              print("")
-          PY
-
-          LATEST="$(sed -n 1p candidate.txt)"
-          KIND="$(sed -n 2p candidate.txt)"
-          RELEASE_URL="$(sed -n 3p candidate.txt)"
-
-          if [ -z "$LATEST" ]; then
-            echo "Already on the newest usable CPython — nothing to do."
+          curl -fsSL -o manifest.json https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json
+          python .github/scripts/python_version_bump.py --manifest manifest.json --current "$CURRENT" --check || true
+          # python_version_bump.py writes bump/latest/kind to GITHUB_OUTPUT; ensure defaults
+          if ! grep -q "bump=" "$GITHUB_OUTPUT" 2>/dev/null; then
             echo "bump=no" >> "$GITHUB_OUTPUT"
-            exit 0
           fi
-          echo "Candidate: $LATEST ($KIND bump)"
+          cat "$GITHUB_OUTPUT"
 
-          # --- soak period, minor bumps only -------------------------------
-          if [ "$KIND" = "minor" ] && [ "$IGNORE_SOAK" != "true" ]; then
-            DAYS="${SOAK_DAYS:-30}"
-            TAG="${RELEASE_URL##*/}"
-            PUBLISHED="$(gh api "repos/actions/python-versions/releases/tags/${TAG}" \
-                           --jq '.published_at' 2>/dev/null || true)"
-            if [ -n "$PUBLISHED" ]; then
-              AGE=$(( ( $(date -u +%s) - $(date -u -d "$PUBLISHED" +%s) ) / 86400 ))
-              echo "Release $TAG published $PUBLISHED (${AGE} days ago); soak = ${DAYS} days."
-              if [ "$AGE" -lt "$DAYS" ]; then
-                echo "::notice::$LATEST is a new minor series and is only ${AGE} days old (soak ${DAYS}). Deferred."
-                echo "bump=no" >> "$GITHUB_OUTPUT"
-                echo "deferred=soak (${AGE}/${DAYS} days)" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-            else
-              echo "::warning::Could not read the release date for $TAG — soak check skipped."
-            fi
-          fi
-
-          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
-          echo "kind=$KIND"     >> "$GITHUB_OUTPUT"
-          echo "bump=yes"       >> "$GITHUB_OUTPUT"
-
-      # ---- THE GATE: install the candidate and run the offline validation --
-      - name: Install the candidate interpreter
+      - name: Set up candidate interpreter
         if: steps.resolve.outputs.bump == 'yes'
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7 — SHA-pinned (round 57)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7 — SHA-pinned
         with:
           python-version: ${{ steps.resolve.outputs.latest }}
-          cache: 'pip'
 
-      # --only-binary=:all: is the load-bearing flag here. aiohttp, multidict,
-      # yarl, frozenlist and propcache are C extensions built per interpreter
-      # ABI tag. A brand-new CPython minor has no such wheels for days or
-      # weeks. Without this flag pip would quietly compile them from source;
-      # with it, the bump is DEFERRED until the ecosystem has caught up.
-      - name: Dependency wheels must exist for this interpreter
+      - name: Verify candidate — wheels exist and CI passes
         if: steps.resolve.outputs.bump == 'yes'
-        id: wheels
         run: |
-          set +e
+          set -euo pipefail
           python --version
-          python -m pip install --upgrade pip >/dev/null
-          pip install --only-binary=:all: -r requirements.txt
-          STATUS=$?
-          set -e
-          if [ $STATUS -ne 0 ]; then
-            echo "::notice::No prebuilt wheels yet for $(python --version) — deferring this bump."
-            echo "ok=no" >> "$GITHUB_OUTPUT"
-          else
-            echo "ok=yes" >> "$GITHUB_OUTPUT"
-            pip list
-          fi
-
-      - name: Verify the repository under the candidate interpreter
-        if: steps.resolve.outputs.bump == 'yes' && steps.wheels.outputs.ok == 'yes'
-        run: |
-          set -euo pipefail
-          python -m compileall -q "testing area" tests
-          python tests/test_smoke.py
-          python tests/test_reddit_signals.py
-          python tests/test_twitter_media.py
-
-      - name: Rewrite the allowlisted current-runtime files
-        if: steps.resolve.outputs.bump == 'yes' && steps.wheels.outputs.ok == 'yes'
-        id: rewrite
-        env:
-          CURRENT: ${{ steps.resolve.outputs.current }}
-          LATEST: ${{ steps.resolve.outputs.latest }}
-        run: |
-          set -euo pipefail
-          # Deliberate scope: these files are maintained current-runtime
-          # surfaces. Historical records and unrelated source/configuration
-          # files are never eligible for an automatic replacement.
-          ALLOWLIST=(
-            .github/workflows/ci.yml
-            .github/workflows/reddit_monitor.yml
-            .github/workflows/twitter_monitor.yml
-            README.md
-            docs/PYTHON_RUNTIME.md
-            docs/CI_SMOKE.md
-            docs/DEPENDABOT.md
-            tests/test_smoke.py
-          )
-          printf 'Allowlisted files to update:\n'
-          printf '  %s\n' "${ALLOWLIST[@]}"
-          for file in "${ALLOWLIST[@]}"; do
-            test -f "$file" || { echo "::error::Expected runtime file missing: $file"; exit 1; }
-            grep -Fq "$CURRENT" "$file" || { echo "::error::$file does not contain expected current pin $CURRENT"; exit 1; }
-          done
-          for file in "${ALLOWLIST[@]}"; do
-            sed -i "s/${CURRENT}/${LATEST}/g" "$file"
-          done
-          OLD_SLUG="python-$(echo "$CURRENT" | tr -d '.')"
-          NEW_SLUG="python-$(echo "$LATEST" | tr -d '.')"
-          sed -i "s/${OLD_SLUG}/${NEW_SLUG}/g" docs/PYTHON_RUNTIME.md
-          for file in "${ALLOWLIST[@]}"; do
-            grep -Fq "$LATEST" "$file" || { echo "::error::$file was not updated"; exit 1; }
-          done
-          # Protect the complete historical tree and reject edits outside the
-          # explicit allowlist (apart from this workflow's own run metadata).
-          if git diff --name-only -- docs/history/ | grep -q .; then
-            echo '::error::Historical files changed by runtime rewrite'; exit 1
-          fi
-          UNEXPECTED="$(
-            git diff --name-only |
-              grep -vFxf <(printf '%s\n' "${ALLOWLIST[@]}" .github/workflows/python_version_bump.yml) ||
-              true
-          )"
-          if [ -n "$UNEXPECTED" ]; then
-            echo '::error::Unexpected file changed:'
-            printf '%s\n' "$UNEXPECTED"
+          CANDIDATE="${{ steps.resolve.outputs.latest }}"
+          ACTUAL="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")')"
+          if [ "$ACTUAL" != "$CANDIDATE" ]; then
+            echo "::error::Interpreter mismatch: expected $CANDIDATE got $ACTUAL"
             exit 1
           fi
-          if git diff --no-ext-diff | grep -Eiq '(ghp_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|BUMP_PAT=[^ $}]+)'; then
-            echo '::error::Token-like value found in diff'; exit 1
-          fi
-          OLD_SERIES="${CURRENT%.*}"
-          NEW_SERIES="${LATEST%.*}"
-          LEFTOVERS=""
-          if [ "$OLD_SERIES" != "$NEW_SERIES" ]; then
-            LEFTOVERS="$(grep -rn \
-              --include='*.md' --include='*.yml' --include='*.yaml' \
-              -E "(CPython|Python) ${OLD_SERIES}([^.0-9]|$)|python-${OLD_SERIES//./}" . \
-              | grep -v '^./docs/history/' \
-              | head -40 || true)"
-          fi
-          {
-            echo 'leftovers<<EOF'
-            echo "${LEFTOVERS:-}"
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
-          echo '---- final diff/stat before PR ----'
-          git --no-pager diff --stat
-          git --no-pager diff -- .github/workflows/ci.yml .github/workflows/reddit_monitor.yml .github/workflows/twitter_monitor.yml README.md docs/PYTHON_RUNTIME.md docs/CI_SMOKE.md docs/DEPENDABOT.md tests/test_smoke.py
+          python -m pip install --upgrade pip==26.1.1
+          python -m pip install --require-hashes --only-binary=:all: -r requirements.txt
+          python -m compileall -q "testing area" tests .github/scripts
+          python .github/scripts/ci.py --profile production
 
-      # The rewrite touches the test suite itself (the round-39 pin guard),
-      # so the tree is verified AGAIN afterwards. This is the gate that
-      # decides whether a PR is opened at all: if the bumped tree is not
-      # green, the job fails here and nothing is proposed.
-      - name: Re-verify the REWRITTEN tree
-        if: steps.resolve.outputs.bump == 'yes' && steps.wheels.outputs.ok == 'yes'
-        run: |
-          set -euo pipefail
-          python -m compileall -q "testing area" tests
-          python tests/test_smoke.py
-          python tests/test_reddit_signals.py
-          python tests/test_twitter_media.py
-
-      - name: Open the pull request
-        if: steps.resolve.outputs.bump == 'yes' && steps.wheels.outputs.ok == 'yes'
-        id: pr
-        env:
-          GH_TOKEN: ${{ secrets.BUMP_PAT }}
-          CURRENT: ${{ steps.resolve.outputs.current }}
-          LATEST: ${{ steps.resolve.outputs.latest }}
-          KIND: ${{ steps.resolve.outputs.kind }}
-          LEFTOVERS: ${{ steps.rewrite.outputs.leftovers }}
-        run: |
-          set -euo pipefail
-          BRANCH="chore/python-${LATEST}"
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
-          git commit -aqm "chore: bump CPython pin ${CURRENT} -> ${LATEST}"
-          git push -q --force-with-lease origin "$BRANCH"
-
-          NOTE=""
-          if [ "$KIND" = "minor" ]; then
-            NOTE=$'\n### ⚠️ This is a MINOR series bump\n\nIt was only proposed because every gate above passed on the new series, including a wheels-only dependency install. Prose in `docs/` that names the old series is **not** rewritten automatically (a blind series-wide replace would also corrupt unrelated numbers such as `aiohttp>=3.14.3`). Leftovers to review:\n\n```\n'"${LEFTOVERS:-none found}"$'\n```\n'
-          fi
-
-          # Settings -> Actions -> General -> Workflow permissions ->
-          # "Allow GitHub Actions to create and approve pull requests" may be
-          # off (GitHub's default); fail safely rather than bypassing review.
-          URL="$(gh pr create \
-            --base main --head "$BRANCH" \
-            --title "chore: bump CPython pin ${CURRENT} -> ${LATEST} (${KIND})" \
-            --body "$(cat <<EOF
-          Automated ${KIND} bump of the pinned CPython runtime.
-
-          | | |
-          |---|---|
-          | From | \`${CURRENT}\` |
-          | To | \`${LATEST}\` |
-          | Kind | ${KIND} |
-          | Release notes | https://www.python.org/downloads/release/python-$(echo "${LATEST}" | tr -d '.')/ |
-
-          ### Verified before this PR was opened
-
-          \`${LATEST}\` was installed from the actions/python-versions manifest
-          (the same source \`setup-python\` resolves from, so the pin is known to
-          be installable), and under that interpreter this job ran:
-
-          * \`pip install --only-binary=:all: -r requirements.txt\` — every
-            dependency came from a prebuilt wheel for this interpreter; nothing
-            was compiled from source
-          * \`python -m compileall -q "testing area" tests\`
-          * \`python tests/test_smoke.py\`
-          * \`python tests/test_reddit_signals.py\`
-          * \`python tests/test_twitter_media.py\`
-
-          The pin was then rewritten only in the explicit current-runtime
-          allowlist (workflows, current docs, and the round-39 guard in \`tests/test_smoke.py\`) and \`compileall\` plus all three
-          suites were run AGAIN on the rewritten tree.
-
-          All of them passed — the PR is only created when they do.
-          ${NOTE}
-          > The commands above are the same offline gates CI runs, executed
-          > under the candidate interpreter before this PR was opened. Any
-          > normal PR checks that appear below are an additional signal.
-          EOF
-          )" 2>pr_error.txt)"
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-          echo "Opened $URL"
-
-      # AUTO_MERGE_PYTHON_BUMP: 'yes' = eligible patch bumps only.
-      - name: Merge it (only when AUTO_MERGE_PYTHON_BUMP allows this kind)
-        if: >-
-          steps.pr.outputs.url != '' &&
-          vars.AUTO_MERGE_PYTHON_BUMP == 'yes' &&
-          steps.resolve.outputs.kind == 'patch'
-        env:
-          GH_TOKEN: ${{ secrets.BUMP_PAT }}
-          URL: ${{ steps.pr.outputs.url }}
-        run: |
-          set -euo pipefail
-          gh pr merge "$URL" --squash --delete-branch
-          echo "Merged $URL"
-
-      - name: Summary
+      - name: Summary (selection)
         if: always()
         run: |
           {
-            echo "### Python version bump"
+            echo "### Python version bump — selection"
             echo ""
-            echo "* current pin: \`${{ steps.resolve.outputs.current }}\`"
+            echo "* current pin: \`${{ steps.resolve.outputs.current || 'unknown' }}\`"
             echo "* candidate: \`${{ steps.resolve.outputs.latest || 'none' }}\` (${{ steps.resolve.outputs.kind || 'n/a' }})"
-            echo "* wheels available: \`${{ steps.wheels.outputs.ok || 'n/a' }}\`"
-            echo "* deferred: \`${{ steps.resolve.outputs.deferred || 'no' }}\`"
-            echo "* pull request: ${{ steps.pr.outputs.url || 'none opened' }}"
-            echo "* branch: \`${{ steps.pr.outputs.branch || 'none' }}\`"
+            echo "* bump: \`${{ steps.resolve.outputs.bump || 'no' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: select-and-validate
+    if: needs.select-and-validate.outputs.bump == 'yes'
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out repository (publisher, with BUMP_PAT)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7 — SHA-pinned
+        with:
+          token: ${{ secrets.BUMP_PAT }}
+
+      - name: Verify BUMP_PAT is configured
+        env:
+          BUMP_PAT: ${{ secrets.BUMP_PAT }}
+        run: |
+          if [ -z "${BUMP_PAT:-}" ]; then
+            echo "::error::BUMP_PAT secret is not configured — publisher cannot create PR (explicit configuration error)"
+            exit 1
+          fi
+          echo "Publisher token present (value redacted)"
+
+      - name: Create deterministic proposal (only .python-version)
+        env:
+          CURRENT: ${{ needs.select-and-validate.outputs.current }}
+          LATEST: ${{ needs.select-and-validate.outputs.latest }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LATEST:-}" ] || [ -z "${CURRENT:-}" ]; then
+            echo "No candidate to publish"
+            exit 0
+          fi
+          # Validate current pin still present (production without docs must work; docs are not required)
+          if ! grep -Fq "$CURRENT" .python-version; then
+            echo "::error::.python-version does not contain expected current pin $CURRENT"
+            exit 1
+          fi
+          echo "$LATEST" > .python-version
+          if git diff --quiet; then
+            echo "No changes to publish (empty diff — already up-to-date)"
+            exit 0
+          fi
+          # Structural diff validation via shared helper — fails closed if disallowed files would change
+          python - <<'PY'
+          import subprocess, sys
+          sys.path.insert(0, ".github/scripts")
+          import maintenance
+          changed = subprocess.check_output(["git", "diff", "--name-only"]).decode().splitlines()
+          changed = [c.strip() for c in changed if c.strip()]
+          print(f"Changed files: {changed}")
+          result = maintenance.validate_changed_files(changed)
+          print(result)
+          if not result["ok"]:
+              print(f"::error::{result['reason']}", file=sys.stderr)
+              sys.exit(1)
+          PY
+          BRANCH="chore/python-${LATEST}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add .python-version
+          git commit -m "chore: bump CPython pin ${CURRENT} -> ${LATEST}"
+          git push --force-with-lease origin "$BRANCH"
+          # Publish/update one deterministic PR; never execute candidate dependencies with write credentials
+          PR_BODY="Automated Python bump ${CURRENT} -> ${LATEST}. Validation passed under candidate interpreter (frozen hash install, CI gates). No self-merge; maintenance controller will decide."
+          # Use gh to create or update PR
+          if gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
+            echo "PR for $BRANCH already exists — updating"
+            gh pr edit "$BRANCH" --title "chore: bump CPython pin ${CURRENT} -> ${LATEST}" --body "$PR_BODY" || true
+          else
+            gh pr create --base main --head "$BRANCH" --title "chore: bump CPython pin ${CURRENT} -> ${LATEST}" --body "$PR_BODY"
+          fi
+          echo "Published PR for $LATEST"
+        env:
+          GH_TOKEN: ${{ secrets.BUMP_PAT }}
+
+      - name: Report published
+        if: always()
+        run: |
+          {
+            echo "### Python version bump — published"
+            echo "* current: \`${{ needs.select-and-validate.outputs.current }}\`"
+            echo "* candidate: \`${{ needs.select-and-validate.outputs.latest }}\`"
+            echo "* branch: \`chore/python-${{ needs.select-and-validate.outputs.latest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

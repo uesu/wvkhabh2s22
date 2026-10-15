@@ -998,12 +998,55 @@ def parse_embeddit_component_page(page_html: str):
 
 def _media_from_og(meta: dict) -> list:
     """og: tags -> media list. og:video (muxed mp4 with audio) first, then
-    every og:image in order (galleries emit one per photo)."""
+    every og:image in order (galleries emit one per photo).
+
+    2026-10-15: distinguish motion video from audio-cover metadata; service
+    order and request budgets are preserved, and cover 1920x1080 must not
+    outrank motion video. EmbedEZ video-plus-audio-cover produces motion
+    tile, not cover renderer or duplicate; second render/audio?...&cover=...
+    is audio-cover, not motion-video evidence or upgrade.
+    """
     media = []
-    video_url = meta.get("og:video:secure_url") or meta.get("og:video")
-    if video_url:
-        media.append({"kind": "video", "url": video_url})
+    # og:video may be a single string or list; handle both
+    video_candidates = []
+    for key in ("og:video:secure_url", "og:video"):
+        val = meta.get(key)
+        if isinstance(val, list):
+            video_candidates.extend([v for v in val if isinstance(v, str) and v])
+        elif isinstance(val, str) and val:
+            video_candidates.append(val)
+    # Deduplicate while preserving order
+    seen_v = set()
+    uniq_videos = []
+    for v in video_candidates:
+        if v not in seen_v:
+            seen_v.add(v)
+            uniq_videos.append(v)
+    # Select motion video only — filter audio-cover renders
+    motion_video = None
+    for v in uniq_videos:
+        low = v.lower()
+        # EmbedEZ audio-cover pattern: render/audio?...&cover=...
+        # It is not motion video and must not be counted as second video
+        # or prioritized for 1920x1080 cover.
+        if "cover=" in low and "render/audio" in low:
+            continue
+        if "cover=" in low and "/audio/" in low:
+            continue
+        # First valid motion video is the tile; do not add duplicate
+        if motion_video is None:
+            motion_video = v
+            break
+    if motion_video:
+        media.append({"kind": "video", "url": motion_video})
     for img in meta.get("og:image", []):
+        if not isinstance(img, str) or not img:
+            continue
+        # Do not duplicate motion video URL as image, and do not treat
+        # audio-cover render as video; og:image cover thumbnails are ok
+        # but are deduped downstream via external-preview logic.
+        if motion_video and img == motion_video:
+            continue
         kind = "gif" if img.split("?")[0].lower().endswith(".gif") else "image"
         media.append({"kind": kind, "url": img})
     return media

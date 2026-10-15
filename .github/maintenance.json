@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "project": "news-express",
+  "python": {
+    "pin_file": ".python-version",
+    "current_version": "3.14.8",
+    "supported_versions": ["3.14.8"],
+    "soak_days": 30,
+    "soak_days_default": 30,
+    "next_minor_only": true
+  },
+  "checks": {
+    "mandatory": [
+      "maintenance-ci",
+      "smoke",
+      "reddit-signals",
+      "twitter-media",
+      "maintenance",
+      "run-summary",
+      "configuration-contract",
+      "lock-consistency",
+      "workflow-lint"
+    ],
+    "trusted_workflow": "ci.yml",
+    "final_gate": "maintenance-ci",
+    "allowed_conclusions": ["success", "skipped", "neutral"],
+    "required_conclusions": ["success"]
+  },
+  "test_commands": {
+    "development": [
+      "python -m compileall -q \"testing area\" tests .github/scripts",
+      "python tests/test_smoke.py",
+      "python tests/test_reddit_signals.py",
+      "python tests/test_twitter_media.py",
+      "python tests/test_maintenance.py",
+      "python tests/test_run_summary.py",
+      "python tests/test_configuration_contract.py"
+    ],
+    "production": [
+      "python -m compileall -q \"testing area\" tests .github/scripts",
+      "python tests/test_smoke.py",
+      "python tests/test_reddit_signals.py",
+      "python tests/test_twitter_media.py",
+      "python tests/test_maintenance.py",
+      "python tests/test_run_summary.py",
+      "python tests/test_configuration_contract.py"
+    ]
+  },
+  "update_policy": {
+    "python_patch": "auto",
+    "python_next_minor": "review-required",
+    "python_major": "review-required",
+    "package_patch_minor": "auto",
+    "package_major": "review-required",
+    "package_prerelease": "review-required",
+    "action_patch_minor": "auto",
+    "action_major": "review-required",
+    "security": "review-required",
+    "hold_labels": ["hold", "do-not-merge", "review-required"],
+    "auto_merge_variables": ["AUTO_MERGE_DEPENDABOT", "AUTO_MERGE_PYTHON_BUMP"]
+  },
+  "paths": {
+    "runtime_files": [
+      ".python-version",
+      "requirements.in",
+      "requirements.txt",
+      "requirements-dev.in",
+      "requirements-dev.txt",
+      ".github/maintenance.json",
+      ".github/scripts/maintenance.py",
+      ".github/scripts/python_version_bump.py",
+      ".github/scripts/ci.py",
+      ".github/scripts/render_run_summary.py",
+      ".github/scripts/merge_monitor_caches.py",
+      ".github/workflows/ci.yml",
+      ".github/workflows/python_version_bump.yml",
+      ".github/workflows/maintenance_merge.yml",
+      ".github/workflows/reddit_monitor.yml",
+      ".github/workflows/twitter_monitor.yml",
+      ".github/dependabot.yml",
+      ".env.example",
+      ".gitignore",
+      "testing area/reddit_main_v3.py",
+      "testing area/reddit_proxy.py",
+      "testing area/twitter_v3.py"
+    ],
+    "generated_files": [
+      "requirements.txt",
+      "requirements-dev.txt"
+    ],
+    "state_files": [
+      "posted_reddit.json",
+      "posted_tweets.json",
+      "pending_reddit.json",
+      "proxy_health.json",
+      "posted_messages.json"
+    ],
+    "excluded_from_copy": [
+      "README.md",
+      "AGENTS.md",
+      "PRIVACY_POLICY.md",
+      "TERMS_OF_SERVICE.md",
+      "docs/",
+      "pending_reddit.json",
+      "posted_reddit.json",
+      "posted_tweets.json",
+      "proxy_health.json",
+      "posted_messages.json"
+    ]
+  },
+  "risk_rules": {
+    "group_highest_risk_wins": true,
+    "major_separate_from_routine": true,
+    "unknown_version": "review-required",
+    "missing_release_date": "deferred",
+    "soak_bypass_without_review": false
+  },
+  "labels": {
+    "human_review": ["review-required", "hold", "do-not-merge"],
+    "dependencies": ["dependencies", "python"],
+    "python_bump": ["python-bump"]
+  }
+}

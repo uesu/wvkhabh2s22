@@ -20,6 +20,14 @@ __pycache__/
 # Local logs
 *.log
 
+# Generated run reports and tool caches (local scratch, never committed)
+reddit_report.json
+twitter_report.json
+/tmp/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
 # Virtual environments
 venv/
 .venv/

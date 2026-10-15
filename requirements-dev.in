@@ -1,0 +1,6 @@
+# Development/runtime constraints — exact Python pin via .python-version (3.14.8)
+# Hashes are frozen for runtime; dev lock mirrors runtime and adds test/lint helpers.
+-r requirements.in
+ruff==0.14.3
+pyyaml>=6.0,<7
+pip-tools>=7.4,<8
