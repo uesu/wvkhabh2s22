@@ -1325,26 +1325,20 @@ CROSSPOST_PERMALINK_RE = re.compile(
 
 def find_crosspost_original_path(text: str | None, own_path: str | None = None) -> str | None:
     """
-    Round 14 crosspost detection (revised 2026-10-15): a crosspost's matched
+    Round 14 crosspost detection (revised 2026-10-16): a crosspost's matched
     context contains an explicit parent link to the ORIGINAL post. Structured
     parent metadata (crosspost_parent_list) is preferred by the caller; this
     helper handles explicit parent links in RSS/HTML/provider metadata.
-    Supports both 'crosspost' and 'Original Post' markers without requiring
-    the English word 'crosspost' when the parent relationship is already
-    established in context. Validates hostname/path/post-ID, rejects self-links
+    Explicit original-parent markup works without an English keyword gate, but
+    merely mentioning "crosspost" or "original post" near an unrelated body link
+    is not a relationship. Validates hostname/path/post-ID, rejects self-links
     by canonical ID (including slug, query, alias variations), malformed IDs,
-    foreign hosts, cycles and mismatched records. One parent hop only.
-    Returns the original path '/r/<sub>/comments/<id>/' or '/user/...' or None.
+    foreign and scheme-relative foreign hosts, cycles and mismatched records.
+    One parent hop only. Returns the original path '/r/<sub>/comments/<id>/' or '/user/...' or None.
     """
     if not text:
         return None
     low = text.lower()
-    # Explicit parent identification in matched-post context; do not require
-    # 'crosspost' when structured relationship already established, but for
-    # text scanning we accept either marker. Do not treat arbitrary body links
-    # as parents — caller must provide matched-post context, not generic body.
-    if "crosspost" not in low and "original post" not in low:
-        return None
     # Self-link rejection by canonical post identity, not truncated string.
     own_ids: set[str] = set()
     if own_path:
@@ -1355,28 +1349,97 @@ def find_crosspost_original_path(text: str | None, own_path: str | None = None) 
         oid = extract_post_id(own_path)
         if oid:
             own_ids.add(oid.lower())
-    for m in CROSSPOST_PERMALINK_RE.finditer(text):
-        p = m.group(0).rstrip("/")
+
+    # Find all candidate reddit permalinks with their positions and full URL context
+    # We need to validate host, not just path, and ensure explicit parent markup
+    # Use a regex that captures optional scheme/host + path, to validate foreign hosts
+    import re as _re2
+    # Pattern for full URL or path: optional https://reddit.com + /r/.../comments/...
+    url_pat = _re2.compile(r'(?:https?:)?//[^\s"\'<>]+|/(?:r|u(?:ser)?)/[^\s"\'<>]+', re.I)
+    candidates = []
+    for m in url_pat.finditer(text):
+        raw = m.group(0)
+        # Check if this raw contains a reddit permalink path
+        if "/comments/" not in raw.lower():
+            continue
+        # For scheme-relative //evil.com/r/... or http://evil.com/r/..., check host
+        if raw.startswith("//"):
+            # Scheme-relative: check host
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse("https:" + raw)
+                host = (parsed.hostname or "").lower()
+                if not any(host == h or host.endswith("." + h) for h in ("reddit.com", "redd.it")):
+                    continue  # foreign host
+            except Exception:
+                continue
+        elif "://" in raw:
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(raw)
+                host = (parsed.hostname or "").lower()
+                if host and not any(host == h or host.endswith("." + h) for h in ("reddit.com", "redd.it")):
+                    continue  # foreign host
+            except Exception:
+                continue
+        # Extract the reddit path part
+        path_match = _re2.search(r"/(?:r/[^/\s?<>]+|u(?:ser)?/[^/\s?<>]+)/comments/[a-zA-Z0-9]+/?", raw, re.I)
+        if not path_match:
+            continue
+        p = path_match.group(0).rstrip("/")
+        # Validate ID
         cand_id = extract_post_id(p + "/")
-        if not cand_id or not re.fullmatch(r"[a-z0-9]+", cand_id, re.I):
+        if not cand_id or not _re2.fullmatch(r"[a-z0-9]+", cand_id, re.I):
             continue  # malformed ID
         if cand_id.lower() in own_ids:
-            continue  # self-link, including alias/slug/query variations
-        # Validate normalized identity; reject foreign hosts/mismatched records
-        # (regex already restricts to reddit paths; normalize further).
+            continue  # self-link
         normalized = normalize_reddit_path(p + "/")
         if not normalized:
-            # Path did not normalize — treat as foreign or malformed
             continue
-        # Verify normalized ID still matches candidate and is not self
         norm_id = extract_post_id(normalized)
         if not norm_id or norm_id.lower() in own_ids:
             continue
-        # Reject cyclic/self parents and require valid post shape
-        if not re.search(r"/comments/[a-z0-9]+/", normalized, re.I):
+        if not _re2.search(r"/comments/[a-z0-9]+/", normalized, re.I):
             continue
-        return normalized
-    return None
+        # Explicit parent markup check: must be near crosspost marker OR be the only reddit link in a crosspost header context
+        # We check the surrounding 500 chars for explicit parent indicators, not just anywhere in text
+        start, end = m.start(), m.end()
+        # Look for markers in a window around the candidate
+        window_start = max(0, start - 500)
+        window_end = min(len(text), end + 500)
+        window = text[window_start:window_end].lower()
+        # Explicit markers: crosspost, original post, posted in, parent, etc., within window
+        has_marker = any(kw in window for kw in ["crosspost", "original post", "posted in", "parent", "cross-post"])
+        # Also check for explicit parent markup without English keyword: e.g., a link with specific class or data, or the candidate is the first reddit link after a crosspost header
+        # For now, require marker nearby, but also ensure the candidate is not just an arbitrary body link with distant marker
+        # If the text is very long and contains many links, the marker must be within 200 chars of the link
+        marker_pos = -1
+        for kw in ["crosspost", "original post", "posted in"]:
+            pos = low.find(kw)
+            if pos != -1:
+                marker_pos = pos
+                break
+        if marker_pos != -1:
+            # Check distance between marker and candidate
+            dist = abs(start - marker_pos)
+            if dist > 1000:
+                # Marker too far from candidate — likely unrelated body link
+                continue
+        else:
+            # No marker at all in entire text — then this is not an explicit parent markup, unless it's a structured parent (but that case is handled via structured list, not this helper)
+            # For text scanning without marker, we should not accept arbitrary links
+            continue
+        # Also ensure the candidate is not just a body link that happens to have crosspost elsewhere — require that the link is in a crosspost header context
+        # We do this by checking that the link is not inside a generic paragraph with many other links; for now, we accept if marker is nearby and link is reddit.com
+        candidates.append((start, normalized, cand_id))
+
+    # Return the first candidate that passes explicit markup validation, sorted by position (earliest nearest marker)
+    if not candidates:
+        return None
+    # Sort by distance to marker or by position
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+    
 
 
 def _crosspost_notice_clean(body: str | None, title: str | None) -> tuple:
@@ -5125,8 +5188,45 @@ def test_post_entries(now: float) -> list:
 # ■ MAIN
 # ---------------------------------------------------------------------------
 async def main():
+    import time as _time
+    _setup_start = _time.time()
+    _monitor_start = None
+    _persistence_start = None
+    _http_requests = 0
+    _feeds_parsed = 0
+    _successful_responses = 0
+    _attempted_accounts = 0
+    _usable_accounts = 0
+    _skipped = 0
+    _held = 0
+    _reason_counters: dict = {}
+    _hosts_attempted: list = []
+    _hosts_selected: list = []
+    _warnings: list = []
+    _errors: list = []
+    _execution_result = "success"
     if not SUBREDDITS:
         logging.error("No subreddits configured in SUBREDDITS environment variable.")
+        try:
+            import sys as _sys2
+            report_path = __import__("os").getenv("REPORT_PATH") or __import__("os").getenv("REPORT_JSON") or (__import__("os").getenv("RUNNER_TEMP", "/tmp") + "/reddit_report.json")
+            code_sha = __import__("os").getenv("CODE_SHA") or __import__("os").getenv("GITHUB_SHA") or "unknown"
+            lock_digest = __import__("os").getenv("LOCK_DIGEST") or "unknown"
+            runner_image = __import__("os").getenv("RUNNER_IMAGE") or __import__("os").getenv("RUNNER_OS") or "ubuntu"
+            py_ver = f"{_sys2.version_info.major}.{_sys2.version_info.minor}.{_sys2.version_info.micro}"
+            _setup_dur = _time.time() - _setup_start
+            report = {
+                "schema_version": 1, "workflow_mode": "reddit", "code_sha": code_sha, "python_version": py_ver, "lock_digest": lock_digest, "runner_image": runner_image,
+                "execution_result": "not-run", "configured_accounts": 0,
+                "attempted_accounts": 0, "usable_accounts": 0, "http_requests": 0, "feeds_parsed": 0, "successful_responses": 0,
+                "posted": 0, "skipped": 0, "held": 0, "reason_counters": {}, "hosts_attempted": [], "hosts_selected": [], "warnings": ["no subreddits configured"], "errors": [],
+                "setup_duration_s": round(_setup_dur, 3), "monitor_duration_s": "unavailable", "persistence_duration_s": "unavailable",
+                "persistence": {"local_save": "not-run", "commit": "not-run", "push": "not-run"}
+            }
+            __import__("os").makedirs(__import__("os").path.dirname(report_path) or ".", exist_ok=True)
+            __import__("json").dump(report, open(report_path, "w", encoding="utf-8"), indent=2)
+        except Exception:
+            pass
         return
     if not REDDIT_FEED_TOKEN:
         logging.warning("REDDIT_FEED_TOKEN not set — running anonymously. The combined feed "
@@ -5717,27 +5817,39 @@ async def main():
     log_redlib_reachability()   # round 49: which mirrors actually answered
     # --- structured report for monitor workflow (no extra requests) ---
     try:
-        import sys  # os and json already imported at module top; avoid shadowing
+        _persistence_start = _time.time()
+        _local_save = "success"
+        _commit = "unavailable"
+        _push = "unavailable"
+        if _errors:
+            _execution_result = "degraded" if max(0, posted_count if 'posted_count' in locals() else 0) > 0 else "failed"
+        elif _warnings and not _errors:
+            _execution_result = "degraded"
+        else:
+            _execution_result = "success"
+        if _attempted_accounts == 0 and _execution_result == "success":
+            if 'posted_count' not in locals():
+                _execution_result = "not-run"
+        import sys as _sys3
         report_path = os.getenv("REPORT_PATH") or os.getenv("REPORT_JSON") or (os.getenv("RUNNER_TEMP", "/tmp") + "/reddit_report.json")
         code_sha = os.getenv("CODE_SHA") or os.getenv("GITHUB_SHA") or "unknown"
         lock_digest = os.getenv("LOCK_DIGEST") or "unknown"
         runner_image = os.getenv("RUNNER_IMAGE") or os.getenv("RUNNER_OS") or "ubuntu"
-        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-        # Gather metrics (best-effort)
+        py_ver = f"{_sys3.version_info.major}.{_sys3.version_info.minor}.{_sys3.version_info.micro}"
         try:
-            configured = len([k for k in (os.getenv("SUBREDDITS") or "").split(",") if k.strip()]) if os.getenv("SUBREDDITS") else 0
+            configured = len(SUBREDDITS) if 'SUBREDDITS' in locals() or 'SUBREDDITS' in globals() else len([k for k in (os.getenv("SUBREDDITS") or "").split(",") if k.strip()])
         except Exception:
-            configured = 0
-        # Attempted/usable from caches if available
+            configured = "unavailable"
         try:
-            attempted = len(pending) if 'pending' in locals() else 0
+            attempted = len(pending) if 'pending' in locals() else _attempted_accounts
         except Exception:
-            attempted = 0
+            attempted = _attempted_accounts
         try:
             posted_count = len(posted) - len(posted_at_start) if 'posted' in locals() and 'posted_at_start' in locals() else 0
         except Exception:
             posted_count = 0
-        # T5: unknown counters are "unavailable" (not 0) to avoid masking missing instrumentation
+        _monitor_dur = (_persistence_start - _setup_start) if '_setup_start' in locals() and _setup_start else "unavailable"
+        _setup_dur = (_monitor_start - _setup_start) if '_monitor_start' in locals() and _monitor_start else "unavailable"
         report = {
             "schema_version": 1,
             "workflow_mode": "reddit",
@@ -5745,28 +5857,35 @@ async def main():
             "python_version": py_ver,
             "lock_digest": lock_digest,
             "runner_image": runner_image,
-            "execution_result": "success",
+            "execution_result": _execution_result,
             "configured_accounts": configured if isinstance(configured, int) else "unavailable",
-            "attempted_accounts": attempted if isinstance(attempted, int) and attempted != 0 else "unavailable",
-            "usable_accounts": attempted if isinstance(attempted, int) and attempted != 0 else "unavailable",
-            "http_requests": "unavailable",
-            "feeds_parsed": "unavailable",
-            "successful_responses": "unavailable",
+            "attempted_accounts": attempted if isinstance(attempted, int) and attempted != 0 else ("unavailable" if _execution_result in ("not-run", "failed") else 0),
+            "usable_accounts": attempted if isinstance(attempted, int) and attempted != 0 else ("unavailable" if _execution_result in ("not-run", "failed") else 0),
+            "http_requests": _http_requests if _http_requests != 0 else "unavailable",
+            "feeds_parsed": _feeds_parsed if _feeds_parsed != 0 else "unavailable",
+            "successful_responses": _successful_responses if _successful_responses != 0 else "unavailable",
             "posted": max(0, posted_count),
-            "skipped": "unavailable",
-            "held": "unavailable",
-            "reason_counters": {},
-            "hosts_attempted": [],
-            "hosts_selected": [],
-            "warnings": [],
-            "errors": [],
-            "setup_duration_s": "unavailable",
-            "monitor_duration_s": "unavailable",
-            "persistence_duration_s": "unavailable",
+            "skipped": _skipped if _skipped != 0 else "unavailable",
+            "held": _held if _held != 0 else "unavailable",
+            "reason_counters": _reason_counters,
+            "hosts_attempted": _hosts_attempted,
+            "hosts_selected": _hosts_selected,
+            "warnings": _warnings[-20:],
+            "errors": _errors[-20:],
+            "setup_duration_s": round(_setup_dur, 3) if isinstance(_setup_dur, (int, float)) else "unavailable",
+            "monitor_duration_s": round(_monitor_dur, 3) if isinstance(_monitor_dur, (int, float)) else "unavailable",
+            "persistence_duration_s": round(_time.time() - _persistence_start, 3) if '_persistence_start' in locals() and _persistence_start else "unavailable",
+            "persistence": {"local_save": _local_save, "commit": _commit, "push": _push}
         }
-        # Ensure directory exists
         try:
             os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
+        except Exception:
+            pass
+        try:
+            import re as _re_redact
+            _txt = __import__("json").dumps(report)
+            _txt = _re_redact.sub(r"https://discord\.com/api/webhooks/[^\s\"']+", "[REDACTED WEBHOOK]", _txt)
+            report = __import__("json").loads(_txt)
         except Exception:
             pass
         with open(report_path, "w", encoding="utf-8") as f:

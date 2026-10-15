@@ -117,12 +117,18 @@ def test_select_candidate():
 
 def test_evaluate_checks():
     checks = [
-        {"name": "maintenance-ci", "status": "completed", "conclusion": "success"},
-        {"name": "smoke", "status": "completed", "conclusion": "success"},
+        {"name": "maintenance-ci", "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}, "workflow": "CI — syntax + offline validation", "head_sha": "abc"},
+        {"name": "smoke", "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}, "workflow": "CI — syntax + offline validation", "head_sha": "abc"},
     ]
     mandatory = ["maintenance-ci", "smoke"]
     r = maintenance.evaluate_checks(checks, mandatory, "abc", "abc")
     assert r["ok"] is True
+    # missing provenance must fail
+    checks_no_prov = [
+        {"name": "maintenance-ci", "status": "completed", "conclusion": "success"},
+    ]
+    r = maintenance.evaluate_checks(checks_no_prov, ["maintenance-ci"], "abc", "abc")
+    assert r["ok"] is False and "missing" in r["reason"].lower() or "head_sha" in r["reason"]
     # missing check
     r = maintenance.evaluate_checks(checks, ["maintenance-ci", "missing-check"], "abc", "abc")
     assert r["ok"] is False and "missing" in r["reason"]
@@ -145,15 +151,15 @@ def test_decision_from_fixture():
     fixture = {
         "pr": {"state": "open", "draft": False, "mergeable": True, "mergeable_state": "clean", "title": "Bump dependencies", "user": {"login": "dependabot[bot]"}, "head": {"sha": "abc"}},
         "checks": [
-            {"name": "maintenance-ci", "status": "completed", "conclusion": "success"},
-            {"name": "smoke", "status": "completed", "conclusion": "success"},
-            {"name": "reddit-signals", "status": "completed", "conclusion": "success"},
-            {"name": "twitter-media", "status": "completed", "conclusion": "success"},
-            {"name": "maintenance", "status": "completed", "conclusion": "success"},
-            {"name": "run-summary", "status": "completed", "conclusion": "success"},
-            {"name": "configuration-contract", "status": "completed", "conclusion": "success"},
-            {"name": "lock-consistency", "status": "completed", "conclusion": "success"},
-            {"name": "workflow-lint", "status": "completed", "conclusion": "success"},
+            {"name": "maintenance-ci", "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}, "workflow": "CI — syntax + offline validation", "head_sha": "abc"},
+            {"name": "smoke", "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}, "workflow": "CI — syntax + offline validation", "head_sha": "abc"},
+            {"name": "reddit-signals", "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}, "workflow": "CI — syntax + offline validation", "head_sha": "abc"},
+            {"name": "twitter-media", "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}, "workflow": "CI — syntax + offline validation", "head_sha": "abc"},
+            {"name": "maintenance", "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}, "workflow": "CI — syntax + offline validation", "head_sha": "abc"},
+            {"name": "run-summary", "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}, "workflow": "CI — syntax + offline validation", "head_sha": "abc"},
+            {"name": "configuration-contract", "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}, "workflow": "CI — syntax + offline validation", "head_sha": "abc"},
+            {"name": "lock-consistency", "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}, "workflow": "CI — syntax + offline validation", "head_sha": "abc"},
+            {"name": "workflow-lint", "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}, "workflow": "CI — syntax + offline validation", "head_sha": "abc"},
         ],
         "changed_files": [".python-version", "requirements.txt"],
         "auto_merge_vars": {"AUTO_MERGE_DEPENDABOT": "yes"},

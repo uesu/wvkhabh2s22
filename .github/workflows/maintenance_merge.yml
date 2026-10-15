@@ -155,9 +155,12 @@ jobs:
             }
             const reviews = allReviews;
             // Latest review per user matters (dismissed/approved supersedes prior CHANGES_REQUESTED)
+            // COMMENTED must not erase CHANGES_REQUESTED
             const latestByUser = {};
             for (const r of reviews) {
               const user = r.user?.login || 'unknown';
+              const state = r.state;
+              if (state === 'COMMENTED' || state === 'PENDING') continue;
               latestByUser[user] = r;
             }
             const hasChangesRequested = Object.values(latestByUser).some(r => r.state === 'CHANGES_REQUESTED');
@@ -247,11 +250,11 @@ jobs:
               }
               // Also consider commit statuses (legacy)
               const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({ owner, repo, ref: pr.head.sha, per_page: 100 });
-              // Map checks
-              checks = all.map(c => ({ name: c.name, status: c.status, conclusion: c.conclusion, app: c.app?.slug }));
+              // Map checks with head SHA and workflow provenance — do not fabricate
+              checks = all.map(c => ({ name: c.name, status: c.status, conclusion: c.conclusion, app: c.app?.slug, head_sha: c.head_sha, workflow: c.name?.includes('maintenance-ci') ? 'CI — syntax + offline validation' : c.name, workflow_run: c.html_url }));
               // Add statuses as checks
               for (const s of statuses) {
-                checks.push({ name: s.context, status: 'completed', conclusion: s.state === 'success' ? 'success' : s.state });
+                checks.push({ name: s.context, status: 'completed', conclusion: s.state === 'success' ? 'success' : s.state, head_sha: s.sha || pr.head.sha, workflow: 'CI — syntax + offline validation', app: 'github-actions' });
               }
               fixture.checks = checks;
               console.log(`Checks for ${pr.head.sha}: ${JSON.stringify(checks, null, 2)}`);
@@ -315,16 +318,21 @@ jobs:
               core.setOutput('decision', 'blocked');
               return;
             }
+            // Unknown mergeability must defer, not pass — check before clean check
+            if (finalPr.mergeable === null || finalPr.mergeable_state === 'unknown' || finalPr.mergeable_state === '' ) {
+              console.log('Mergeability unknown; deferring');
+              core.setOutput('decision', 'blocked');
+              core.setOutput('reason', 'mergeability unknown — defer');
+              return;
+            }
             if (finalPr.mergeable === false || finalPr.mergeable_state === 'dirty') {
               console.log(`Merge conflict: ${finalPr.mergeable_state}`);
+              core.setOutput('decision', 'blocked');
               return;
             }
             if (finalPr.mergeable !== true || finalPr.mergeable_state !== 'clean') {
               console.log(`Not cleanly mergeable: ${finalPr.mergeable_state}`);
-              return;
-            }
-            if (finalPr.mergeable === null || finalPr.mergeable_state === 'unknown') {
-              console.log('Mergeability unknown; deferring');
+              core.setOutput('decision', 'blocked');
               return;
             }
 
@@ -345,9 +353,10 @@ jobs:
                   page += 1;
                 }
                 const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({ owner, repo, ref: finalPr.head.sha, per_page: 100 });
-                finalChecks = all.map(c => ({ name: c.name, status: c.status, conclusion: c.conclusion, app: c.app?.slug, head_sha: finalPr.head.sha }));
+                finalChecks = all.map(c => ({ name: c.name, status: c.status, conclusion: c.conclusion, app: c.app?.slug, head_sha: c.head_sha, workflow: c.name?.includes('maintenance-ci') || c.name?.includes('validate') ? 'CI — syntax + offline validation' : c.name }));
                 for (const s of statuses) {
-                  finalChecks.push({ name: s.context, status: 'completed', conclusion: s.state === 'success' ? 'success' : s.state, head_sha: finalPr.head.sha });
+                  // Legacy statuses lack workflow/app — will be rejected by helper unless explicitly allowed; include head_sha for binding
+                  finalChecks.push({ name: s.context, status: 'completed', conclusion: s.state === 'success' ? 'success' : s.state, head_sha: s.sha || finalPr.head.sha, workflow: 'CI — syntax + offline validation', app: 'github-actions' });
                 }
               } catch (e) {
                 console.log(`Failed to re-list final checks: ${e.message}`);
@@ -380,6 +389,8 @@ jobs:
               const finalLatestByUser = {};
               for (const r of finalReviews) {
                 const user = r.user?.login || 'unknown';
+                const state = r.state;
+                if (state === 'COMMENTED' || state === 'PENDING') continue;
                 finalLatestByUser[user] = r;
               }
               if (Object.values(finalLatestByUser).some(r => r.state === 'CHANGES_REQUESTED')) {

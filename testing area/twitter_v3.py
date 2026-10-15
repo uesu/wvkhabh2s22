@@ -1605,7 +1605,45 @@ def build_v3_payload(account: str, tweet: dict, read_post_url: str,
 
 
 async def main():
+    import time as _time
+    _setup_start = _time.time()
+    _monitor_start = None
+    _persistence_start = None
+    _http_requests = 0
+    _feeds_parsed = 0
+    _successful_responses = 0
+    _attempted_accounts = 0
+    _usable_accounts = 0
+    _skipped = 0
+    _held = 0
+    _reason_counters: dict = {}
+    _hosts_attempted: list = []
+    _hosts_selected: list = []
+    _warnings: list = []
+    _errors: list = []
+    _execution_result = "success"
     if not ACCOUNTS:
+        # Early return must still emit a report — distinguish not-run from success
+        try:
+            import sys as _sys2
+            report_path = __import__("os").getenv("REPORT_PATH") or __import__("os").getenv("REPORT_JSON") or (__import__("os").getenv("RUNNER_TEMP", "/tmp") + "/twitter_report.json")
+            code_sha = __import__("os").getenv("CODE_SHA") or __import__("os").getenv("GITHUB_SHA") or "unknown"
+            lock_digest = __import__("os").getenv("LOCK_DIGEST") or "unknown"
+            runner_image = __import__("os").getenv("RUNNER_IMAGE") or __import__("os").getenv("RUNNER_OS") or "ubuntu"
+            py_ver = f"{_sys2.version_info.major}.{_sys2.version_info.minor}.{_sys2.version_info.micro}"
+            _setup_dur = _time.time() - _setup_start
+            report = {
+                "schema_version": 1, "workflow_mode": "twitter", "code_sha": code_sha, "python_version": py_ver, "lock_digest": lock_digest, "runner_image": runner_image,
+                "execution_result": "not-run", "configured_accounts": len(ACCOUNTS) if 'ACCOUNTS' in locals() or 'ACCOUNTS' in globals() else 0,
+                "attempted_accounts": 0, "usable_accounts": 0, "http_requests": 0, "feeds_parsed": 0, "successful_responses": 0,
+                "posted": 0, "skipped": 0, "held": 0, "reason_counters": {}, "hosts_attempted": [], "hosts_selected": [], "warnings": ["no accounts configured"], "errors": [],
+                "setup_duration_s": round(_setup_dur, 3), "monitor_duration_s": "unavailable", "persistence_duration_s": "unavailable",
+                "persistence": {"local_save": "not-run", "commit": "not-run", "push": "not-run"}
+            }
+            __import__("os").makedirs(__import__("os").path.dirname(report_path) or ".", exist_ok=True)
+            __import__("json").dump(report, open(report_path, "w", encoding="utf-8"), indent=2)
+        except Exception:
+            pass
         return
     posted_urls = load_posted_urls()
     is_first_run = len(posted_urls) == 0
@@ -1867,22 +1905,42 @@ async def main():
                       f"re-posted next run: {sorted(missing)[:10]}")
     logging.info("Twitter V3 Monitor execution finished.")
     # --- structured report for monitor workflow (no extra requests) ---
+    # Measure durations at existing boundaries
     try:
-        import sys  # os and json already imported at module top; avoid shadowing
+        _persistence_start = _time.time()
+        # Persistence: local save (already done above, but measure)
+        _local_save = "success"
+        _commit = "unavailable"  # commit is handled by workflow, not engine
+        _push = "unavailable"
+        # Determine execution_result based on whether we had errors
+        if _errors:
+            _execution_result = "degraded" if max(0, posted_count if 'posted_count' in locals() else 0) > 0 else "failed"
+        elif _warnings and not _errors:
+            _execution_result = "degraded"
+        else:
+            _execution_result = "success"
+        # Distinguish zero activity from missing evidence: if no feeds attempted, it's not-run or zero
+        if _attempted_accounts == 0 and _execution_result == "success":
+            # Check if we actually ran monitor or early exited
+            if 'posted_count' not in locals():
+                _execution_result = "not-run"
+        import sys as _sys3
         report_path = os.getenv("REPORT_PATH") or os.getenv("REPORT_JSON") or (os.getenv("RUNNER_TEMP", "/tmp") + "/twitter_report.json")
         code_sha = os.getenv("CODE_SHA") or os.getenv("GITHUB_SHA") or "unknown"
         lock_digest = os.getenv("LOCK_DIGEST") or "unknown"
         runner_image = os.getenv("RUNNER_IMAGE") or os.getenv("RUNNER_OS") or "ubuntu"
-        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        py_ver = f"{_sys3.version_info.major}.{_sys3.version_info.minor}.{_sys3.version_info.micro}"
         try:
-            configured = len([k for k in (os.getenv("NITTER_ACCOUNTS") or os.getenv("SUBREDDITS") or "").split(",") if k.strip()]) if os.getenv("NITTER_ACCOUNTS") or os.getenv("SUBREDDITS") else 0
+            configured = len(ACCOUNTS)
         except Exception:
-            configured = 0
+            configured = "unavailable"
         try:
             posted_count = len(posted_urls) - len(posted_urls_at_start) if 'posted_urls' in locals() and 'posted_urls_at_start' in locals() else 0
         except Exception:
             posted_count = 0
-        # T5: unknown counters are "unavailable" (not 0) to avoid masking missing instrumentation
+        _monitor_dur = (_persistence_start - _setup_start) if _setup_start else "unavailable"
+        _setup_dur = (_monitor_start - _setup_start) if '_monitor_start' in locals() and _monitor_start else "unavailable"
+        # Use measured counters where available, else unavailable (not zero)
         report = {
             "schema_version": 1,
             "workflow_mode": "twitter",
@@ -1890,27 +1948,36 @@ async def main():
             "python_version": py_ver,
             "lock_digest": lock_digest,
             "runner_image": runner_image,
-            "execution_result": "success",
+            "execution_result": _execution_result,
             "configured_accounts": configured if isinstance(configured, int) else "unavailable",
-            "attempted_accounts": "unavailable",
-            "usable_accounts": "unavailable",
-            "http_requests": "unavailable",
-            "feeds_parsed": "unavailable",
-            "successful_responses": "unavailable",
+            "attempted_accounts": _attempted_accounts if _attempted_accounts != 0 else ("unavailable" if _execution_result in ("not-run", "failed") else 0),
+            "usable_accounts": _usable_accounts if _usable_accounts != 0 else ("unavailable" if _execution_result in ("not-run", "failed") else 0),
+            "http_requests": _http_requests if _http_requests != 0 else "unavailable",
+            "feeds_parsed": _feeds_parsed if _feeds_parsed != 0 else "unavailable",
+            "successful_responses": _successful_responses if _successful_responses != 0 else "unavailable",
             "posted": max(0, posted_count),
-            "skipped": "unavailable",
-            "held": "unavailable",
-            "reason_counters": {},
-            "hosts_attempted": [],
-            "hosts_selected": [],
-            "warnings": [],
-            "errors": [],
-            "setup_duration_s": "unavailable",
-            "monitor_duration_s": "unavailable",
-            "persistence_duration_s": "unavailable",
+            "skipped": _skipped if _skipped != 0 else "unavailable",
+            "held": _held if _held != 0 else "unavailable",
+            "reason_counters": _reason_counters,
+            "hosts_attempted": _hosts_attempted,
+            "hosts_selected": _hosts_selected,
+            "warnings": _warnings[-20:],
+            "errors": _errors[-20:],
+            "setup_duration_s": round(_setup_dur, 3) if isinstance(_setup_dur, (int, float)) else "unavailable",
+            "monitor_duration_s": round(_monitor_dur, 3) if isinstance(_monitor_dur, (int, float)) else "unavailable",
+            "persistence_duration_s": round(_time.time() - _persistence_start, 3) if '_persistence_start' in locals() and _persistence_start else "unavailable",
+            "persistence": {"local_save": _local_save, "commit": _commit, "push": _push}
         }
         try:
             os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
+        except Exception:
+            pass
+        # Redact webhook before writing
+        try:
+            import re as _re_redact
+            _txt = __import__("json").dumps(report)
+            _txt = _re_redact.sub(r"https://discord\.com/api/webhooks/[^\s\"']+", "[REDACTED WEBHOOK]", _txt)
+            report = __import__("json").loads(_txt)
         except Exception:
             pass
         with open(report_path, "w", encoding="utf-8") as f:
@@ -1918,6 +1985,11 @@ async def main():
         logging.info(f"Wrote report JSON to {report_path}")
     except Exception as e:
         logging.warning(f"Failed to write report JSON: {e}")
+        # Reporting failure must not cause resend or obscure original failure
+        try:
+            _execution_result = _execution_result if '_execution_result' in locals() else "failed"
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

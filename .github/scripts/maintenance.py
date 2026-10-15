@@ -300,24 +300,27 @@ def evaluate_checks(checks: list[dict[str, Any]], mandatory: list[str], head_sha
         if c.get("status") != "completed" or c.get("conclusion") != "success":
             failed.append(f"{name} ({c.get('conclusion') or c.get('status')})")
             continue
-        # Enforce trusted workflow/app provenance (fail closed on unrelated app when identity is present)
+        # Enforce trusted workflow/app provenance and head binding — missing is failure (no legacy bypass)
         app = c.get("app")
         if isinstance(app, dict):
             slug = app.get("slug") or app.get("name")
         else:
             slug = app
-        workflow = c.get("workflow") or c.get("workflow_name") or c.get("workflow_id")
-        # If app/workflow is provided, it must be trusted; allow absent (legacy statuses) but do not trust unrelated app
-        if slug and slug not in TRUSTED_APP_SLUGS:
-            failed.append(f"{name} (untrusted app {slug})")
+        workflow = c.get("workflow") or c.get("workflow_name") or c.get("workflow_id") or c.get("workflow_run") or c.get("workflowRun")
+        # head_sha must be present and exactly match PR head
+        check_sha = c.get("head_sha") or c.get("headSha") or c.get("sha") or c.get("head_sha")
+        if not check_sha:
+            failed.append(f"{name} (missing head_sha)")
             continue
-        if workflow and workflow != TRUSTED_WORKFLOW:
-            failed.append(f"{name} (untrusted workflow {workflow})")
-            continue
-        # Also check head_sha if provided — must match exact head; allow missing for legacy statuses
-        check_sha = c.get("head_sha") or c.get("headSha") or c.get("sha")
-        if check_sha and check_sha != head_sha:
+        if check_sha != head_sha:
             failed.append(f"{name} (head mismatch {check_sha} vs {head_sha})")
+            continue
+        # app and workflow must be present and trusted
+        if not slug or slug not in TRUSTED_APP_SLUGS:
+            failed.append(f"{name} (untrusted or missing app {slug or 'none'})")
+            continue
+        if not workflow or workflow != TRUSTED_WORKFLOW:
+            failed.append(f"{name} (untrusted or missing workflow {workflow or 'none'})")
             continue
     if missing or failed:
         reason = []
@@ -360,13 +363,23 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
     reviews = fixture.get("reviews", [])
     labels = fixture.get("labels", [])
 
-    # Basic PR state gates
+    # Basic PR state gates — unknown mergeability must defer, not pass
     if pr.get("state") != "open":
         return {"decision": "blocked", "reason": "PR not open", "merge": False}
     if pr.get("draft"):
         return {"decision": "blocked", "reason": "draft PR", "merge": False}
-    if pr.get("mergeable") is False or pr.get("mergeable_state") == "dirty":
+    mergeable = pr.get("mergeable")
+    mergeable_state = pr.get("mergeable_state")
+    if mergeable is False or mergeable_state == "dirty":
         return {"decision": "blocked", "reason": "merge conflict", "merge": False}
+    if mergeable is None or mergeable_state in (None, "unknown", ""):
+        # GitHub reports mergeable as null/unknown while computing — defer, do not pass
+        return {"decision": "blocked", "reason": f"mergeability unknown ({mergeable_state or mergeable}) — defer", "merge": False}
+    if mergeable_state not in ("clean", "unstable", "has_hooks"):
+        # Only clean/unstable/has_hooks are potentially mergeable; others (blocked, behind, etc.) require review
+        # For maintenance, require clean explicitly
+        if mergeable_state != "clean":
+            return {"decision": "blocked", "reason": f"not cleanly mergeable: {mergeable_state}", "merge": False}
     # Same-repository association check — fork PRs must not be auto-merged even with matching branch/title
     base_repo = (pr.get("base") or {}).get("repo", {}).get("full_name") or ""
     head_repo = (pr.get("head") or {}).get("repo", {}).get("full_name") or base_repo
@@ -384,11 +397,22 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
         if lab in mandatory_hold:
             return {"decision": "blocked", "reason": f"hold label: {lab}", "merge": False}
     # Latest review per user matters; dismissed/approved supersedes prior CHANGES_REQUESTED
+    # COMMENTED must not erase an active CHANGES_REQUESTED — only APPROVED/DISMISSED or new CHANGES_REQUESTED counts
     latest_by_user: dict[str, dict] = {}
     for rev in reviews:
         user = (rev.get("user") or {}).get("login") or (rev.get("author") or {}).get("login") or str(rev.get("user") or "unknown")
+        state = rev.get("state")
+        # Ignore COMMENTED and PENDING for decision — they do not override CHANGES_REQUESTED
+        if state in ("COMMENTED", "PENDING", "commented", "pending"):
+            continue
         # Use submitted_at if present to determine order; otherwise last occurrence wins
-        latest_by_user[user] = rev
+        # Only track states that affect decision: CHANGES_REQUESTED, APPROVED, DISMISSED
+        if state in ("CHANGES_REQUESTED", "APPROVED", "DISMISSED", "CHANGES_REQUESTED", "APPROVED"):
+            latest_by_user[user] = rev
+        else:
+            # For other states, still track if no prior decision-affecting review
+            if user not in latest_by_user:
+                latest_by_user[user] = rev
     for rev in latest_by_user.values():
         if rev.get("state") == "CHANGES_REQUESTED":
             return {"decision": "blocked", "reason": "changes requested", "merge": False}
@@ -407,17 +431,14 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
             # Missing patch for workflow file is ambiguous -> fail closed as review-required
             if not patch:
                 return {"decision": "review-required", "reason": f"workflow change {wf} missing patch (ambiguous)", "merge": False}
-            # Detect trigger/permission/policy changes reliably in diff (handle +/- markers)
+            # Structural workflow changes (triggers/permissions) always require human review — keyword presence is not proof
             if re.search(r"^[+\-\s]*\s*(on|permissions)\s*:", patch, re.M):
-                # Allow version pin comments but flag structural changes
-                if "python-version" not in patch and "AUTO_MERGE" not in patch:
-                    return {"decision": "review-required", "reason": f"workflow structural change in {wf}", "merge": False}
-            # Any workflow file change that is not just a version pin comment should be review-required
-            # Check for uses:/run: changes beyond python pin as well
+                return {"decision": "review-required", "reason": f"workflow structural change in {wf}", "merge": False}
+            # Any workflow logic change (jobs/uses/run) also requires review — not just python pin
             if re.search(r"^[+\-\s]*\s*(jobs|uses|run)\s*:", patch, re.M):
-                if "python-version" not in patch:
-                    # If patch modifies workflow logic (jobs/uses/run) not just pin, require review
-                    return {"decision": "review-required", "reason": f"workflow logic change in {wf}", "merge": False}
+                return {"decision": "review-required", "reason": f"workflow logic change in {wf}", "merge": False}
+            # Even a single line like `echo python-version` in a run step is not a valid python bump diff
+            # Python bump must only touch version/lock files, not workflows (handled below)
             # Also, if workflow changed alongside engine changes in a dependabot PR, it's not routine
             # Dependabot routine should only touch requirements* and dependabot.yml
 
@@ -427,9 +448,10 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
     title = pr.get("title") or ""
     author = pr.get("user", {}).get("login", "")
     is_dependabot = author == "dependabot[bot]"
-    is_python_bump = head_ref.startswith("chore/python-") or re.search(r"bump CPython pin", title, re.I) or "python" in title.lower() and "chore: bump" in title.lower()
+    # Python bump is chore/python-* branch OR explicit bump title; branch alone is NOT trusted publisher — provenance must be validated via diff
+    is_python_bump = head_ref.startswith("chore/python-") or re.search(r"bump CPython pin", title, re.I)
     # For python bump, verify author is not strict; BUMP_PAT owner will be PR author, not github-actions[bot]
-    # So we accept any author when head_ref matches chore/python-*
+    # So we accept any author when head_ref matches chore/python-* only for subsequent diff validation, not as authorization
     if is_python_bump:
         is_dependabot = False  # Don't treat as dependabot even if author is dependabot
     # Dependency updates: parse from title or fixture dependency_updates
@@ -465,22 +487,69 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
             if f not in allowed_dependabot and not f.startswith("tests/"):
                 # Engine/workflow change in dependabot PR is not routine
                 return {"decision": "review-required", "reason": f"dependabot PR changes non-dependency file {f}", "merge": False}
-    # For python bump, classify python version change
+    # For python bump, strict validation: only version/lock files, actual diff versions, no engine/workflow/policy changes
     if is_python_bump:
-        # Extract versions from title or head_ref or fixture
-        cur = fixture.get("current_version") or (pr.get("title") or "").split("->")[0].split()[-1] if "->" in title else None
-        # Try to get current from file_patches or fixture
-        # Use maintenance.json current or fixture's current_version
-        cand = fixture.get("candidate_version") or title.split("->")[-1].strip().split()[0] if "->" in title else None
-        if cur and cand:
-            cls = classify_python_update(cur, cand)
-            if cls.get("review_required") and cls.get("kind") in ("major", "minor", "unknown"):
-                # Next-minor/major requires human review even with AUTO_MERGE_PYTHON_BUMP=yes
-                # Soak also handled elsewhere
-                return {"decision": "review-required", "reason": f"python {cls.get('reason')}", "merge": False}
-        # Also check soak: if fixture indicates deferred, require review
+        # Strict allowlist for Python bump — only version and lock files, not engine/tests/workflows
+        strict_allowed = {".python-version", "requirements.in", "requirements.txt", "requirements-dev.in", "requirements-dev.txt"}
+        for f in changed_files:
+            if f not in strict_allowed:
+                return {"decision": "review-required", "reason": f"python bump changes non-allowed file {f}", "merge": False}
+        # Truncated or missing patch must not become routine
+        if fixture.get("files_truncated") or fixture.get("total_files", 0) > len(changed_files):
+            return {"decision": "review-required", "reason": "files pagination incomplete — fail closed", "merge": False}
+        if fixture.get("reviews_truncated") or fixture.get("total_reviews", 0) > len(reviews):
+            return {"decision": "review-required", "reason": "reviews pagination incomplete — fail closed", "merge": False}
+        # Need actual patch for .python-version to parse versions — do not trust title alone when dependency_updates is empty
+        py_patch = file_patches.get(".python-version", "")
+        if ".python-version" in changed_files and not py_patch:
+            return {"decision": "review-required", "reason": "python bump missing .python-version patch (unparsed)", "merge": False}
+        # Also if no file_patches at all but changed_files non-empty, treat as unparsed
+        if changed_files and not file_patches:
+            return {"decision": "review-required", "reason": "python bump missing patches (unparsed)", "merge": False}
+        # Parse actual versions from patch — handle +/- markers and version strings
+        cur_from_patch = None
+        cand_from_patch = None
+        if py_patch:
+            for line in py_patch.splitlines():
+                # Look for version in diff lines: -3.14.8 and +3.14.9, ignoring ---/+++
+                if line.startswith("-") and not line.startswith("---"):
+                    m = re.search(r"(\d+\.\d+\.\d+)", line)
+                    if m and not cur_from_patch:
+                        cur_from_patch = m.group(1)
+                if line.startswith("+") and not line.startswith("+++"):
+                    m = re.search(r"(\d+\.\d+\.\d+)", line)
+                    if m and not cand_from_patch:
+                        cand_from_patch = m.group(1)
+        # Prefer patch-derived versions, fallback to fixture, then title — but never trust title alone when patch disagrees
+        cur = cur_from_patch or fixture.get("current_version")
+        cand = cand_from_patch or fixture.get("candidate_version")
+        # Fallback to title "->" pattern only if patch missing and fixture missing
+        if not cur or not cand:
+            if "->" in title:
+                try:
+                    parts = title.split("->")
+                    cur_t = parts[0].split()[-1].strip().strip(",.")
+                    cand_t = parts[1].strip().split()[0].strip().strip(",.")
+                    if parse_version(cur_t) and parse_version(cand_t):
+                        cur = cur or cur_t
+                        cand = cand or cand_t
+                except Exception:
+                    pass
+        if not cur or not cand:
+            return {"decision": "review-required", "reason": "python version unparsed — missing patch or fixture versions", "merge": False}
+        # Verify candidate version actually appears in patch when patch exists (do not trust fixture/title alone)
+        if py_patch and cand not in py_patch:
+            return {"decision": "review-required", "reason": "candidate version not in .python-version patch", "merge": False}
+        # Classify actual version change — not reassuring title when dependency_updates is empty
+        cls = classify_python_update(cur, cand)
+        if cls.get("review_required"):
+            # Includes major, downgrade, skipped-minor, unknown, and next-minor (medium) which needs soak/human review
+            return {"decision": "review-required", "reason": f"python {cls.get('reason')}", "merge": False}
+        # Soak: missing dates mean deferred, not up-to-date or permission to bypass
         if fixture.get("deferred"):
             return {"decision": "review-required", "reason": "python soak not satisfied", "merge": False}
+        # Also check if patch indicates a major/downgrade hidden behind patch title — already handled via actual cur/cand classification above
+        # Ensure dependency_updates empty does not bypass version check — we already validated via patch, not title
 
     # Check evaluation
     mandatory = policy.get("checks", {}).get("mandatory") or ["maintenance-ci"]
