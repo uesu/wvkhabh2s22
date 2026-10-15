@@ -3,4 +3,4 @@
 -r requirements.in
 ruff==0.14.3
 pyyaml==6.0.3
-pip-tools==7.4.0
+pip-tools==7.5.3

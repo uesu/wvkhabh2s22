@@ -5717,7 +5717,7 @@ async def main():
     log_redlib_reachability()   # round 49: which mirrors actually answered
     # --- structured report for monitor workflow (no extra requests) ---
     try:
-        import os, json, sys
+        import sys  # os and json already imported at module top; avoid shadowing
         report_path = os.getenv("REPORT_PATH") or os.getenv("REPORT_JSON") or (os.getenv("RUNNER_TEMP", "/tmp") + "/reddit_report.json")
         code_sha = os.getenv("CODE_SHA") or os.getenv("GITHUB_SHA") or "unknown"
         lock_digest = os.getenv("LOCK_DIGEST") or "unknown"
@@ -5737,6 +5737,7 @@ async def main():
             posted_count = len(posted) - len(posted_at_start) if 'posted' in locals() and 'posted_at_start' in locals() else 0
         except Exception:
             posted_count = 0
+        # T5: unknown counters are "unavailable" (not 0) to avoid masking missing instrumentation
         report = {
             "schema_version": 1,
             "workflow_mode": "reddit",
@@ -5745,23 +5746,23 @@ async def main():
             "lock_digest": lock_digest,
             "runner_image": runner_image,
             "execution_result": "success",
-            "configured_accounts": configured,
-            "attempted_accounts": attempted,
-            "usable_accounts": attempted,
-            "http_requests": 0,
-            "feeds_parsed": 0,
-            "successful_responses": 0,
+            "configured_accounts": configured if isinstance(configured, int) else "unavailable",
+            "attempted_accounts": attempted if isinstance(attempted, int) and attempted != 0 else "unavailable",
+            "usable_accounts": attempted if isinstance(attempted, int) and attempted != 0 else "unavailable",
+            "http_requests": "unavailable",
+            "feeds_parsed": "unavailable",
+            "successful_responses": "unavailable",
             "posted": max(0, posted_count),
-            "skipped": 0,
-            "held": 0,
+            "skipped": "unavailable",
+            "held": "unavailable",
             "reason_counters": {},
             "hosts_attempted": [],
             "hosts_selected": [],
             "warnings": [],
             "errors": [],
-            "setup_duration_s": 0,
-            "monitor_duration_s": 0,
-            "persistence_duration_s": 0,
+            "setup_duration_s": "unavailable",
+            "monitor_duration_s": "unavailable",
+            "persistence_duration_s": "unavailable",
         }
         # Ensure directory exists
         try:

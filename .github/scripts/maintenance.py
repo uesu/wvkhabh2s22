@@ -300,22 +300,25 @@ def evaluate_checks(checks: list[dict[str, Any]], mandatory: list[str], head_sha
         if c.get("status") != "completed" or c.get("conclusion") != "success":
             failed.append(f"{name} ({c.get('conclusion') or c.get('status')})")
             continue
-        # Enforce trusted workflow/app provenance (fail closed on unrelated app)
+        # Enforce trusted workflow/app provenance (fail closed on unrelated app when identity is present)
         app = c.get("app")
         if isinstance(app, dict):
             slug = app.get("slug") or app.get("name")
         else:
             slug = app
         workflow = c.get("workflow") or c.get("workflow_name") or c.get("workflow_id")
+        # If app/workflow is provided, it must be trusted; allow absent (legacy statuses) but do not trust unrelated app
         if slug and slug not in TRUSTED_APP_SLUGS:
             failed.append(f"{name} (untrusted app {slug})")
             continue
         if workflow and workflow != TRUSTED_WORKFLOW:
-            # If workflow is provided and not trusted, fail; allow absent workflow (legacy statuses)
-            pass
-        # Also check head_sha if provided
-        if c.get("head_sha") and c["head_sha"] != head_sha:
-            failed.append(f"{name} (head mismatch)")
+            failed.append(f"{name} (untrusted workflow {workflow})")
+            continue
+        # Also check head_sha if provided — must match exact head; allow missing for legacy statuses
+        check_sha = c.get("head_sha") or c.get("headSha") or c.get("sha")
+        if check_sha and check_sha != head_sha:
+            failed.append(f"{name} (head mismatch {check_sha} vs {head_sha})")
+            continue
     if missing or failed:
         reason = []
         if missing:
@@ -364,6 +367,11 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
         return {"decision": "blocked", "reason": "draft PR", "merge": False}
     if pr.get("mergeable") is False or pr.get("mergeable_state") == "dirty":
         return {"decision": "blocked", "reason": "merge conflict", "merge": False}
+    # Same-repository association check — fork PRs must not be auto-merged even with matching branch/title
+    base_repo = (pr.get("base") or {}).get("repo", {}).get("full_name") or ""
+    head_repo = (pr.get("head") or {}).get("repo", {}).get("full_name") or base_repo
+    if base_repo and head_repo and base_repo != head_repo:
+        return {"decision": "blocked", "reason": f"fork PR: head {head_repo} != base {base_repo}", "merge": False}
 
     # Hold labels / changes requested — latest per user, pagination fail-closed
     # If reviews are paginated, fixture may indicate truncated; fail closed if so
@@ -396,12 +404,20 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
     if workflow_changed:
         for wf in workflow_changed:
             patch = file_patches.get(wf, "")
-            # If patch contains trigger/permission structural changes (not just python pin), require review
-            # Detect on: / permissions: / run: / uses: changes beyond pin
-            if patch and re.search(r"^\s*(on|permissions):", patch, re.M):
+            # Missing patch for workflow file is ambiguous -> fail closed as review-required
+            if not patch:
+                return {"decision": "review-required", "reason": f"workflow change {wf} missing patch (ambiguous)", "merge": False}
+            # Detect trigger/permission/policy changes reliably in diff (handle +/- markers)
+            if re.search(r"^[+\-\s]*\s*(on|permissions)\s*:", patch, re.M):
                 # Allow version pin comments but flag structural changes
                 if "python-version" not in patch and "AUTO_MERGE" not in patch:
                     return {"decision": "review-required", "reason": f"workflow structural change in {wf}", "merge": False}
+            # Any workflow file change that is not just a version pin comment should be review-required
+            # Check for uses:/run: changes beyond python pin as well
+            if re.search(r"^[+\-\s]*\s*(jobs|uses|run)\s*:", patch, re.M):
+                if "python-version" not in patch:
+                    # If patch modifies workflow logic (jobs/uses/run) not just pin, require review
+                    return {"decision": "review-required", "reason": f"workflow logic change in {wf}", "merge": False}
             # Also, if workflow changed alongside engine changes in a dependabot PR, it's not routine
             # Dependabot routine should only touch requirements* and dependabot.yml
 

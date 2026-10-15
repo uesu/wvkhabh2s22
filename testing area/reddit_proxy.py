@@ -405,9 +405,8 @@ def status_id_decode(encoded: str) -> str:
 def _og_meta(page_html: str) -> dict:
     """og:/twitter: meta tags -> dict. og:image and og:video* collect ALL occurrences in
     order (galleries emit one tag per photo, video fallbacks multiple tags); every other key keeps the
-    first value. HTML entities are unescaped and percent-encoding is handled."""
+    first value. HTML entities are unescaped. Video URLs are preserved exactly as emitted (no blind percent-decoding) — decode only for inspection when needed."""
     meta = {}
-    import urllib.parse as _up
     # Keys that should collect all occurrences (galleries, video fallbacks)
     _list_keys = {"og:image", "og:video", "og:video:secure_url", "og:video:url", "twitter:player", "twitter:player:stream"}
     for m in re.finditer(r"<meta[^>]+>", page_html, re.I):
@@ -423,17 +422,8 @@ def _og_meta(page_html: str) -> dict:
             if (k2, v2) == (key, val):
                 break
             key, val = k2, v2
-        # Percent-decode video URLs once (e.g., %3A%2F%2F -> ://) — keep if looks like URL
-        if key in _list_keys:
-            try:
-                decoded = _up.unquote(val)
-                if decoded.startswith("http"):
-                    val = decoded
-            except Exception:
-                pass
         if key in _list_keys:
             if key in meta:
-                # already a list
                 if isinstance(meta[key], list):
                     meta[key].append(val)
                 else:

@@ -1868,7 +1868,7 @@ async def main():
     logging.info("Twitter V3 Monitor execution finished.")
     # --- structured report for monitor workflow (no extra requests) ---
     try:
-        import os, json, sys
+        import sys  # os and json already imported at module top; avoid shadowing
         report_path = os.getenv("REPORT_PATH") or os.getenv("REPORT_JSON") or (os.getenv("RUNNER_TEMP", "/tmp") + "/twitter_report.json")
         code_sha = os.getenv("CODE_SHA") or os.getenv("GITHUB_SHA") or "unknown"
         lock_digest = os.getenv("LOCK_DIGEST") or "unknown"
@@ -1882,6 +1882,7 @@ async def main():
             posted_count = len(posted_urls) - len(posted_urls_at_start) if 'posted_urls' in locals() and 'posted_urls_at_start' in locals() else 0
         except Exception:
             posted_count = 0
+        # T5: unknown counters are "unavailable" (not 0) to avoid masking missing instrumentation
         report = {
             "schema_version": 1,
             "workflow_mode": "twitter",
@@ -1890,23 +1891,23 @@ async def main():
             "lock_digest": lock_digest,
             "runner_image": runner_image,
             "execution_result": "success",
-            "configured_accounts": configured,
-            "attempted_accounts": 0,
-            "usable_accounts": 0,
-            "http_requests": 0,
-            "feeds_parsed": 0,
-            "successful_responses": 0,
+            "configured_accounts": configured if isinstance(configured, int) else "unavailable",
+            "attempted_accounts": "unavailable",
+            "usable_accounts": "unavailable",
+            "http_requests": "unavailable",
+            "feeds_parsed": "unavailable",
+            "successful_responses": "unavailable",
             "posted": max(0, posted_count),
-            "skipped": 0,
-            "held": 0,
+            "skipped": "unavailable",
+            "held": "unavailable",
             "reason_counters": {},
             "hosts_attempted": [],
             "hosts_selected": [],
             "warnings": [],
             "errors": [],
-            "setup_duration_s": 0,
-            "monitor_duration_s": 0,
-            "persistence_duration_s": 0,
+            "setup_duration_s": "unavailable",
+            "monitor_duration_s": "unavailable",
+            "persistence_duration_s": "unavailable",
         }
         try:
             os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)

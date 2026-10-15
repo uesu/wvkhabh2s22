@@ -97,7 +97,20 @@ jobs:
             const isPythonBump = isPythonBumpBranch || /bump CPython pin/i.test(pr.title);
             const isDependabot = pr.user?.login === 'dependabot[bot]';
             const isTrustedAuthor = trustedAuthors.includes(pr.user?.login);
-            // Allow python bump PRs from BUMP_PAT owner when branch matches chore/python-*
+            // Same-repository check — fork PRs must not be auto-merged even with matching branch/title
+            if (pr.head.repo.full_name !== `${owner}/${repo}`) {
+              console.log(`Head repo ${pr.head.repo.full_name} != ${owner}/${repo} — fork PR, blocking`);
+              core.setOutput('decision', 'blocked');
+              core.setOutput('reason', `fork PR head ${pr.head.repo.full_name}`);
+              return;
+            }
+            if (pr.base.repo.full_name !== `${owner}/${repo}` || pr.base.ref !== defaultBranch) {
+              console.log('Unexpected PR association or target branch; skipping');
+              core.setOutput('decision', 'blocked');
+              return;
+            }
+            // Trusted publisher: python bump via BUMP_PAT is allowed when head is same-repo and branch matches, but diff must be strict version/lock-only (validated by helper)
+            // Do not trust arbitrary authors with matching branch from forks (already blocked above)
             if (!isTrustedAuthor && !isPythonBumpBranch) {
               console.log(`Author ${pr.user?.login} not trusted and not python bump branch; skipping`);
               core.setOutput('decision', 'blocked');
@@ -109,8 +122,9 @@ jobs:
               core.setOutput('decision', 'review-required');
               return;
             }
-            if (pr.base.repo.full_name !== `${owner}/${repo}` || pr.base.ref !== defaultBranch) {
-              console.log('Unexpected PR association or target branch; skipping');
+            // For python bump, require same-repo and strict diff; branch alone is not authorization (helper will enforce version/lock-only diff)
+            if (isPythonBumpBranch && pr.head.repo.full_name !== `${owner}/${repo}`) {
+              console.log(`Python bump from fork — blocking`);
               core.setOutput('decision', 'blocked');
               return;
             }
