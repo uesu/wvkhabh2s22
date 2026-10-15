@@ -433,9 +433,12 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
     # For dependabot, check each package update; major or ambiguous requires review
     if is_dependabot and all_updates:
         for upd in all_updates:
-            old = upd.get("old") or upd.get("from") or ""
-            new = upd.get("new") or upd.get("to") or ""
-            name = upd.get("name") or "pkg"
+            old = upd.get("old") or upd.get("from") or upd.get("current_version") or upd.get("currentVersion") or ""
+            new = upd.get("new") or upd.get("to") or upd.get("updated_version") or upd.get("updatedVersion") or upd.get("version") or ""
+            name = upd.get("name") or upd.get("dependency_name") or upd.get("dependencyName") or "pkg"
+            # Strip leading v or whitespace
+            old = str(old).strip().lstrip("v")
+            new = str(new).strip().lstrip("v")
             cls = classify_package_update(name, old, new)
             if cls.get("review_required"):
                 return {"decision": "review-required", "reason": f"dependency {name} {cls.get('reason')}", "merge": False}
