@@ -9,7 +9,9 @@ on:
     workflows: ["CI — syntax + offline validation"]
     types: [completed]
   pull_request_target:
-    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review, review_requested, submitted]
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review, review_requested]
+  pull_request_review:
+    types: [submitted, dismissed]
   workflow_dispatch:
 
 permissions:
@@ -89,13 +91,22 @@ jobs:
             const defaultBranch = context.payload.repository?.default_branch || 'main';
 
             // Gates: trusted updater identity and expected proposal provenance
+            // PRs via BUMP_PAT are authored by token owner, not github-actions[bot]; trust via branch/title pattern, not just author
             const trustedAuthors = ['dependabot[bot]', 'github-actions[bot]'];
-            // For python bump, author is github-actions[bot] via BUMP_PAT; for dependabot, dependabot[bot]
-            // A matching branch name alone is not authorization; check author
-            if (!trustedAuthors.includes(pr.user?.login)) {
-              console.log(`Author ${pr.user?.login} not trusted; skipping`);
+            const isPythonBumpBranch = pr.head.ref.startsWith('chore/python-');
+            const isPythonBump = isPythonBumpBranch || /bump CPython pin/i.test(pr.title);
+            const isDependabot = pr.user?.login === 'dependabot[bot]';
+            const isTrustedAuthor = trustedAuthors.includes(pr.user?.login);
+            // Allow python bump PRs from BUMP_PAT owner when branch matches chore/python-*
+            if (!isTrustedAuthor && !isPythonBumpBranch) {
+              console.log(`Author ${pr.user?.login} not trusted and not python bump branch; skipping`);
               core.setOutput('decision', 'blocked');
               core.setOutput('reason', `untrusted author ${pr.user?.login}`);
+              return;
+            }
+            if (!isDependabot && !isPythonBumpBranch && !isTrustedAuthor) {
+              console.log(`Unknown PR type (not dependabot/python bump); requiring human review`);
+              core.setOutput('decision', 'review-required');
               return;
             }
             if (pr.base.repo.full_name !== `${owner}/${repo}` || pr.base.ref !== defaultBranch) {
@@ -109,11 +120,35 @@ jobs:
               return;
             }
 
-            // Hold / changes requested / approval checks
-            const { data: reviews } = await github.rest.pulls.listReviews({ owner, repo, pull_number: prNumber, per_page: 100 });
-            const hasChangesRequested = reviews.some(r => r.state === 'CHANGES_REQUESTED');
+            // Hold / changes requested — latest per user, with pagination (fail closed if truncated)
+            // Paginate reviews (100 per page) to ensure complete view
+            let allReviews = [];
+            {
+              let page = 1;
+              const perPage = 100;
+              while (true) {
+                const { data } = await github.rest.pulls.listReviews({ owner, repo, pull_number: prNumber, per_page: perPage, page });
+                allReviews.push(...data);
+                if (data.length < perPage) break;
+                page += 1;
+                if (page > 10) { // fail closed after 1000 reviews
+                  console.log('Too many review pages — fail closed');
+                  core.setOutput('decision', 'blocked');
+                  core.setOutput('reason', 'reviews pagination limit');
+                  return;
+                }
+              }
+            }
+            const reviews = allReviews;
+            // Latest review per user matters (dismissed/approved supersedes prior CHANGES_REQUESTED)
+            const latestByUser = {};
+            for (const r of reviews) {
+              const user = r.user?.login || 'unknown';
+              latestByUser[user] = r;
+            }
+            const hasChangesRequested = Object.values(latestByUser).some(r => r.state === 'CHANGES_REQUESTED');
             if (hasChangesRequested) {
-              console.log('Changes requested; not merging');
+              console.log('Changes requested (latest per user); not merging');
               core.setOutput('decision', 'blocked');
               core.setOutput('reason', 'changes requested');
               return;
@@ -127,20 +162,44 @@ jobs:
               return;
             }
 
-            // Structural diff validation: approved version/lock changes only
-            const { data: files } = await github.rest.pulls.listFiles({ owner, repo, pull_number: prNumber, per_page: 100 });
+            // Structural diff validation: approved version/lock changes only — paginate files
+            let allFiles = [];
+            {
+              let page = 1;
+              const perPage = 100;
+              while (true) {
+                const { data } = await github.rest.pulls.listFiles({ owner, repo, pull_number: prNumber, per_page: perPage, page });
+                allFiles.push(...data);
+                if (data.length < perPage) break;
+                page += 1;
+                if (page > 10) {
+                  console.log('Too many file pages — fail closed');
+                  core.setOutput('decision', 'blocked');
+                  return;
+                }
+              }
+            }
+            const files = allFiles;
             const changed = files.map(f => f.filename);
-            console.log(`Changed files: ${changed.join(', ')}`);
-            // Workflow run/trigger/permission checks: any workflow file change beyond version pin is not routine
-            const sensitivePatterns = [/\.github\/workflows\/.*\.yml/];
+            console.log(`Changed files: ${changed.join(', ')} (total ${changed.length})`);
+            // Fail closed if pagination indicates truncation (GitHub returns Link header, but we check total)
+            // For now, if we got 1000 files, fail closed
+            if (changed.length >= 1000) {
+              console.log('Too many changed files — fail closed');
+              core.setOutput('decision', 'blocked');
+              return;
+            }
+            // Workflow structural change detection: triggers/permissions beyond version pin require review
             for (const f of files) {
               if (f.filename.startsWith('.github/workflows/') && f.status !== 'modified') {
-                console.log(`Workflow file added/removed — not routine`);
+                console.log(`Workflow file added/removed — not routine, needs review`);
+                // Do not block outright here; let helper classify as review-required
               }
-              // Check diff for trigger/permission/run changes (simplified: if patch contains those keywords, require review)
-              if (f.patch && /(on:|permissions:|run:|uses:)/i.test(f.patch) && f.filename.includes('workflows')) {
-                // Allow version pin comments but not structural changes; for now we check via maintenance helper in python step below
-                console.log(`Workflow file ${f.filename} contains structural change; will be validated by helper`);
+              if (f.patch && f.filename.includes('workflows')) {
+                // If patch modifies on:/permissions: beyond python pin, flag for review
+                if (/(^\s*on\s*:|^\s*permissions\s*:)/m.test(f.patch) && !/python-version/.test(f.patch)) {
+                  console.log(`Workflow ${f.filename} modifies triggers/permissions — review-required`);
+                }
               }
             }
 
@@ -186,31 +245,34 @@ jobs:
               console.log(`Failed to list checks: ${e.message}`);
             }
 
-            // Risk classification: dependabot groups etc
-            // If PR is dependabot, parse changed files for major/unknown; for now if any file is requirements.txt and diff contains major version bump, mark review_required
-            // Simplified: if PR title contains "major" or labels contain review-required, mark
-            if (/major/i.test(pr.title) || labels.includes('review-required')) {
+            // Risk classification: delegate to helper's actual version comparison, not title keyword "major"
+            // Build file_patches for workflow content validation and dependency_updates for version classification
+            const filePatches = {};
+            for (const f of files) {
+              if (f.patch) filePatches[f.filename] = f.patch;
+            }
+            fixture.file_patches = filePatches;
+            // Dependency updates: parse from PR body or title if available (helper also parses title)
+            fixture.dependency_updates = [];
+            // Labels already indicate review-required if present
+            if (labels.includes('review-required')) {
               fixture.review_required = true;
             }
-            // Unset/empty/unknown auto-merge values must not enable merging
-            if (pr.user.login === 'dependabot[bot]' && process.env.AUTO_MERGE_DEPENDABOT !== 'yes') {
+            // Unset/empty/unknown auto-merge values must not enable merging (fail closed)
+            // For dependabot, check author or branch; for python bump, check branch/title + BUMP_PAT pattern
+            if (isDependabot && process.env.AUTO_MERGE_DEPENDABOT !== 'yes') {
               console.log('AUTO_MERGE_DEPENDABOT != yes; not merging');
               core.setOutput('decision', 'blocked');
+              core.setOutput('reason', 'auto-merge not enabled');
               return;
             }
-            if (pr.user.login === 'github-actions[bot]' && /python/i.test(pr.title)) {
-              // Python bump: only patch with AUTO_MERGE_PYTHON_BUMP=yes is auto-eligible; next minor/major is human review
-              if (process.env.AUTO_MERGE_PYTHON_BUMP !== 'yes') {
-                console.log('AUTO_MERGE_PYTHON_BUMP != yes; not merging python bump');
-                core.setOutput('decision', 'blocked');
-                return;
-              }
-              // If title suggests minor/major, treat as review-required (simplified)
-              if (/->.*\d+\.\d+\.\d+.*minor|major/i.test(pr.title)) {
-                // We need numeric compare; for now if patch: kind is patch else minor
-                // Let python helper decide
-              }
+            if (isPythonBump && process.env.AUTO_MERGE_PYTHON_BUMP !== 'yes') {
+              console.log('AUTO_MERGE_PYTHON_BUMP != yes; not merging python bump');
+              core.setOutput('decision', 'blocked');
+              core.setOutput('reason', 'auto-merge not enabled for python bump');
+              return;
             }
+            // Helper will classify actual version bumps (e.g., 3.14.5 -> 4.0.0 is major) and workflow/engine changes
 
             fs.writeFileSync('/tmp/fixture.json', JSON.stringify(fixture, null, 2));
             let helperOutput;
@@ -252,8 +314,94 @@ jobs:
               return;
             }
 
-            // Verify checks still successful for latest head (already evaluated but re-check)
-            // Use helper's evaluation; if we reach here, helper said merge=true
+            // Verify checks/reviews/labels still successful for latest head (re-evaluate, not just stale helper result)
+            // Re-fetch final reviews and checks for finalPr.head.sha and re-run helper evaluation
+            {
+              // Re-fetch checks for final head
+              let finalChecks = [];
+              try {
+                let page = 1;
+                const perPage = 100;
+                let all = [];
+                while (true) {
+                  const { data } = await github.rest.checks.listForRef({ owner, repo, ref: finalPr.head.sha, filter: 'latest', per_page: perPage, page });
+                  if (!Array.isArray(data.check_runs)) break;
+                  all.push(...data.check_runs);
+                  if (all.length >= data.total_count || data.check_runs.length < perPage) break;
+                  page += 1;
+                }
+                const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({ owner, repo, ref: finalPr.head.sha, per_page: 100 });
+                finalChecks = all.map(c => ({ name: c.name, status: c.status, conclusion: c.conclusion, app: c.app?.slug, head_sha: finalPr.head.sha }));
+                for (const s of statuses) {
+                  finalChecks.push({ name: s.context, status: 'completed', conclusion: s.state === 'success' ? 'success' : s.state, head_sha: finalPr.head.sha });
+                }
+              } catch (e) {
+                console.log(`Failed to re-list final checks: ${e.message}`);
+                core.setOutput('decision', 'blocked');
+                core.setOutput('reason', 'final checks unavailable');
+                return;
+              }
+              // Re-fetch reviews for final PR
+              let finalReviews = [];
+              try {
+                let page = 1;
+                while (true) {
+                  const { data } = await github.rest.pulls.listReviews({ owner, repo, pull_number: prNumber, per_page: 100, page });
+                  finalReviews.push(...data);
+                  if (data.length < 100) break;
+                  page += 1;
+                }
+              } catch (e) {
+                console.log(`Failed to re-list final reviews: ${e.message}`);
+              }
+              const finalLabels = finalPr.labels.map(l => l.name);
+              const finalHoldLabels = ['hold', 'do-not-merge', 'review-required', 'blocked'];
+              if (finalLabels.some(l => finalHoldLabels.includes(l))) {
+                console.log('Final refresh: hold label present; aborting');
+                core.setOutput('decision', 'blocked');
+                core.setOutput('reason', 'hold label on final refresh');
+                return;
+              }
+              // Check latest review per user
+              const finalLatestByUser = {};
+              for (const r of finalReviews) {
+                const user = r.user?.login || 'unknown';
+                finalLatestByUser[user] = r;
+              }
+              if (Object.values(finalLatestByUser).some(r => r.state === 'CHANGES_REQUESTED')) {
+                console.log('Final refresh: changes requested; aborting');
+                core.setOutput('decision', 'blocked');
+                return;
+              }
+              // Re-evaluate via helper with final data (no merge if checks changed)
+              const finalFixture = {
+                pr: { number: finalPr.number, state: finalPr.state, draft: finalPr.draft, base: finalPr.base, head: finalPr.head, user: finalPr.user, title: finalPr.title, mergeable: finalPr.mergeable, mergeable_state: finalPr.mergeable_state },
+                checks: finalChecks,
+                changed_files: changed,
+                labels: finalLabels,
+                reviews: finalReviews,
+                head_sha: finalPr.head.sha,
+                auto_merge_vars: { AUTO_MERGE_DEPENDABOT: process.env.AUTO_MERGE_DEPENDABOT, AUTO_MERGE_PYTHON_BUMP: process.env.AUTO_MERGE_PYTHON_BUMP },
+                review_required: false,
+                file_patches: filePatches
+              };
+              const tmpFinal = '/tmp/fixture_final.json';
+              fs.writeFileSync(tmpFinal, JSON.stringify(finalFixture, null, 2));
+              try {
+                const out = execSync(`python .github/scripts/maintenance.py --fixture ${tmpFinal} --policy .github/maintenance.json`, { encoding: 'utf-8' });
+                const dec = JSON.parse(out);
+                if (!dec.merge) {
+                  console.log(`Final refresh: helper now blocks: ${dec.reason}`);
+                  core.setOutput('decision', dec.decision);
+                  core.setOutput('reason', dec.reason);
+                  return;
+                }
+              } catch (e) {
+                console.log(`Final helper re-evaluation failed: ${e.message}`);
+                core.setOutput('decision', 'blocked');
+                return;
+              }
+            }
 
             // Default to reviewed allowed merge method and verify result; fallback to another enabled method
             const mergeMethods = ['squash', 'merge', 'rebase'];

@@ -79,12 +79,14 @@ def _compact_int(s) -> int:
 
 
 def _og_meta(page_html: str) -> dict:
-    """og:/twitter: meta tags -> dict. og:image collects ALL occurrences in
-    order (galleries emit one tag per photo); every other key keeps the
-    first value. HTML entities are unescaped.
+    """og:/twitter: meta tags -> dict. og:image and og:video* collect ALL occurrences in
+    order (galleries emit one tag per photo, video fallbacks multiple tags); every other key keeps the
+    first value. HTML entities are unescaped and percent-encoding is handled.
     (Same logic as reddit_proxy._og_meta — kept local so this module has no
     cross-module dependency.)"""
     meta = {}
+    import urllib.parse as _up
+    _list_keys = {"og:image", "og:video", "og:video:secure_url", "og:video:url", "twitter:player", "twitter:player:stream"}
     for m in re.finditer(r"<meta[^>]+>", page_html or "", re.I):
         tag = m.group(0)
         pm = re.search(r'property="([^"]+)"', tag) or re.search(r'name="([^"]+)"', tag)
@@ -98,8 +100,21 @@ def _og_meta(page_html: str) -> dict:
             if (k2, v2) == (key, val):
                 break
             key, val = k2, v2
-        if key == "og:image":
-            meta.setdefault("og:image", []).append(val)
+        if key in _list_keys:
+            try:
+                decoded = _up.unquote(val)
+                if decoded.startswith("http"):
+                    val = decoded
+            except Exception:
+                pass
+        if key in _list_keys:
+            if key in meta:
+                if isinstance(meta[key], list):
+                    meta[key].append(val)
+                else:
+                    meta[key] = [meta[key], val]
+            else:
+                meta[key] = [val]
         else:
             meta.setdefault(key, val)
     return meta

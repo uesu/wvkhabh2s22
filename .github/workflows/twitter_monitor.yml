@@ -64,8 +64,9 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7 — SHA-pinned (round 57)
         with:
-          python-version: '3.14.8'
+          python-version-file: '.python-version'
           cache: 'pip'
+        # python-version: '3.14.8' via .python-version (smoke r39)
 
       - name: Install dependencies (frozen, hash-verified)
         run: |

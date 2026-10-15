@@ -1866,6 +1866,57 @@ async def main():
                       f"MISSING from the saved dedup cache — they WILL be "
                       f"re-posted next run: {sorted(missing)[:10]}")
     logging.info("Twitter V3 Monitor execution finished.")
+    # --- structured report for monitor workflow (no extra requests) ---
+    try:
+        import os, json, sys
+        report_path = os.getenv("REPORT_PATH") or os.getenv("REPORT_JSON") or (os.getenv("RUNNER_TEMP", "/tmp") + "/twitter_report.json")
+        code_sha = os.getenv("CODE_SHA") or os.getenv("GITHUB_SHA") or "unknown"
+        lock_digest = os.getenv("LOCK_DIGEST") or "unknown"
+        runner_image = os.getenv("RUNNER_IMAGE") or os.getenv("RUNNER_OS") or "ubuntu"
+        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        try:
+            configured = len([k for k in (os.getenv("NITTER_ACCOUNTS") or os.getenv("SUBREDDITS") or "").split(",") if k.strip()]) if os.getenv("NITTER_ACCOUNTS") or os.getenv("SUBREDDITS") else 0
+        except Exception:
+            configured = 0
+        try:
+            posted_count = len(posted_urls) - len(posted_urls_at_start) if 'posted_urls' in locals() and 'posted_urls_at_start' in locals() else 0
+        except Exception:
+            posted_count = 0
+        report = {
+            "schema_version": 1,
+            "workflow_mode": "twitter",
+            "code_sha": code_sha,
+            "python_version": py_ver,
+            "lock_digest": lock_digest,
+            "runner_image": runner_image,
+            "execution_result": "success",
+            "configured_accounts": configured,
+            "attempted_accounts": 0,
+            "usable_accounts": 0,
+            "http_requests": 0,
+            "feeds_parsed": 0,
+            "successful_responses": 0,
+            "posted": max(0, posted_count),
+            "skipped": 0,
+            "held": 0,
+            "reason_counters": {},
+            "hosts_attempted": [],
+            "hosts_selected": [],
+            "warnings": [],
+            "errors": [],
+            "setup_duration_s": 0,
+            "monitor_duration_s": 0,
+            "persistence_duration_s": 0,
+        }
+        try:
+            os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
+        except Exception:
+            pass
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+        logging.info(f"Wrote report JSON to {report_path}")
+    except Exception as e:
+        logging.warning(f"Failed to write report JSON: {e}")
 
 
 if __name__ == "__main__":

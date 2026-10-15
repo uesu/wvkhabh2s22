@@ -79,7 +79,14 @@ jobs:
             echo "bump=yes" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          curl -fsSL -o manifest.json https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json
+          # Fetch versions-manifest via GitHub API (raw.githubusercontent.com not allowlisted, use api.github.com)
+          if ! curl -fsSL -o manifest.json https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json 2>/dev/null; then
+            echo "raw fetch failed, trying api.github.com"
+            curl -fsSL -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3.raw" -o manifest.json https://api.github.com/repos/actions/python-versions/contents/versions-manifest.json || {
+              echo "::error::Could not fetch versions-manifest via api.github.com"
+              exit 1
+            }
+          fi
           python .github/scripts/python_version_bump.py --manifest manifest.json --current "$CURRENT" --check || true
           # python_version_bump.py writes bump/latest/kind to GITHUB_OUTPUT; ensure defaults
           if ! grep -q "bump=" "$GITHUB_OUTPUT" 2>/dev/null; then
@@ -144,10 +151,11 @@ jobs:
           fi
           echo "Publisher token present (value redacted)"
 
-      - name: Create deterministic proposal (only .python-version)
+      - name: Create deterministic proposal (publisher updates runtime pin consistently)
         env:
           CURRENT: ${{ needs.select-and-validate.outputs.current }}
           LATEST: ${{ needs.select-and-validate.outputs.latest }}
+          GH_TOKEN: ${{ secrets.BUMP_PAT }}
         run: |
           set -euo pipefail
           if [ -z "${LATEST:-}" ] || [ -z "${CURRENT:-}" ]; then
@@ -160,6 +168,19 @@ jobs:
             exit 1
           fi
           echo "$LATEST" > .python-version
+          # Keep runtime profile consistent: maintenance.json current_version and supported_versions must match the pin
+          python - <<'PY'
+          import json, pathlib, os
+          latest = os.environ["LATEST"]
+          p = pathlib.Path(".github/maintenance.json")
+          if p.is_file():
+              data = json.loads(p.read_text())
+              if "python" in data:
+                  data["python"]["current_version"] = latest
+                  data["python"]["supported_versions"] = [latest]
+                  p.write_text(json.dumps(data, indent=2) + "\n")
+                  print(f"Updated maintenance.json to {latest}")
+          PY
           if git diff --quiet; then
             echo "No changes to publish (empty diff — already up-to-date)"
             exit 0
@@ -177,17 +198,26 @@ jobs:
           if not result["ok"]:
               print(f"::error::{result['reason']}", file=sys.stderr)
               sys.exit(1)
+          # Also validate workflow contents: triggers/permissions/run changes require human review
+          # The helper will check workflow file diffs for structural changes beyond version pin
+          import pathlib
+          for f in changed:
+              if f.startswith(".github/workflows/"):
+                  text = pathlib.Path(f).read_text(errors="ignore")
+                  # Hard-coded version literals (other than .python-version) should be avoided; proposer updates via file
+                  if "python-version:" in text and ".python-version" not in text:
+                      print(f"WARNING: {f} uses literal python-version; prefer python-version-file")
           PY
           BRANCH="chore/python-${LATEST}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git add .python-version
+          git add .python-version .github/maintenance.json
           git commit -m "chore: bump CPython pin ${CURRENT} -> ${LATEST}"
           git push --force-with-lease origin "$BRANCH"
           # Publish/update one deterministic PR; never execute candidate dependencies with write credentials
           PR_BODY="Automated Python bump ${CURRENT} -> ${LATEST}. Validation passed under candidate interpreter (frozen hash install, CI gates). No self-merge; maintenance controller will decide."
-          # Use gh to create or update PR
+          # Use gh to create or update PR — PR author will be BUMP_PAT owner, not github-actions[bot]; controller checks branch/title, not author
           if gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
             echo "PR for $BRANCH already exists — updating"
             gh pr edit "$BRANCH" --title "chore: bump CPython pin ${CURRENT} -> ${LATEST}" --body "$PR_BODY" || true
@@ -195,8 +225,6 @@ jobs:
             gh pr create --base main --head "$BRANCH" --title "chore: bump CPython pin ${CURRENT} -> ${LATEST}" --body "$PR_BODY"
           fi
           echo "Published PR for $LATEST"
-        env:
-          GH_TOKEN: ${{ secrets.BUMP_PAT }}
 
       - name: Report published
         if: always()

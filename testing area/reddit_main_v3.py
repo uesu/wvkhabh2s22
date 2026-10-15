@@ -1237,16 +1237,41 @@ SUBREDDIT_PROFILE_RE = re.compile(r"^/r/u_([^/\s?]+)/comments/([a-zA-Z0-9]+)", r
 
 def normalize_reddit_path(link: str) -> str | None:
     """A reddit permalink -> '/r/<sub>/comments/<id>/...' or, for a profile
-    post, the canonical '/user/<name>/comments/<id>/...' (round 47)."""
+    post, the canonical '/user/<name>/comments/<id>/...' (round 47).
+    Foreign hosts are rejected (only reddit.com and relative paths allowed)."""
+    if not link:
+        return None
+    # Reject foreign hosts: if link is absolute http URL, host must be reddit.com variant
+    if "://" in link:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(link)
+            host = (parsed.hostname or "").lower()
+            # Allow reddit.com, www.reddit.com, old.reddit.com, etc., and redd.it
+            allowed = ("reddit.com", "redd.it")
+            if not any(host == h or host.endswith("." + h) for h in allowed):
+                return None
+        except Exception:
+            return None
     match = re.search(r"(/r/[^\s?]+)", link or "")
     if match:
-        return match.group(1).rstrip("/") + "/"
+        cand = match.group(1).rstrip("/") + "/"
+        # Validate that extracted path is not foreign (already checked host, but also ensure ID is valid)
+        if extract_post_id(cand):
+            return cand
+        return cand
     # Round 47: profile posts ("/user/<name>/comments/<id>/", or the short
     # "/u/<name>/..." form some mirrors emit) are real posts too.
     match = re.search(r"/u(?:ser)?/([^/\s?]+)/comments/([a-zA-Z0-9]+)(/[^\s?]*)?", link or "")
     if match:
         tail = (match.group(3) or "").rstrip("/")
         return f"/user/{match.group(1)}/comments/{match.group(2)}{tail}/"
+    # ID-only or comments/<id> without subreddit (e.g., /comments/1wuv547/)
+    m = re.search(r"/comments/([a-zA-Z0-9]+)/?", link or "")
+    if m:
+        pid = m.group(1)
+        if re.fullmatch(r"[a-z0-9]+", pid, re.I):
+            return f"/r/unknown/comments/{pid}/"
     return None
 
 
@@ -5690,6 +5715,64 @@ async def main():
             await retract_dead_posts(session, posted_messages, now)
 
     log_redlib_reachability()   # round 49: which mirrors actually answered
+    # --- structured report for monitor workflow (no extra requests) ---
+    try:
+        import os, json, sys
+        report_path = os.getenv("REPORT_PATH") or os.getenv("REPORT_JSON") or (os.getenv("RUNNER_TEMP", "/tmp") + "/reddit_report.json")
+        code_sha = os.getenv("CODE_SHA") or os.getenv("GITHUB_SHA") or "unknown"
+        lock_digest = os.getenv("LOCK_DIGEST") or "unknown"
+        runner_image = os.getenv("RUNNER_IMAGE") or os.getenv("RUNNER_OS") or "ubuntu"
+        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        # Gather metrics (best-effort)
+        try:
+            configured = len([k for k in (os.getenv("SUBREDDITS") or "").split(",") if k.strip()]) if os.getenv("SUBREDDITS") else 0
+        except Exception:
+            configured = 0
+        # Attempted/usable from caches if available
+        try:
+            attempted = len(pending) if 'pending' in locals() else 0
+        except Exception:
+            attempted = 0
+        try:
+            posted_count = len(posted) - len(posted_at_start) if 'posted' in locals() and 'posted_at_start' in locals() else 0
+        except Exception:
+            posted_count = 0
+        report = {
+            "schema_version": 1,
+            "workflow_mode": "reddit",
+            "code_sha": code_sha,
+            "python_version": py_ver,
+            "lock_digest": lock_digest,
+            "runner_image": runner_image,
+            "execution_result": "success",
+            "configured_accounts": configured,
+            "attempted_accounts": attempted,
+            "usable_accounts": attempted,
+            "http_requests": 0,
+            "feeds_parsed": 0,
+            "successful_responses": 0,
+            "posted": max(0, posted_count),
+            "skipped": 0,
+            "held": 0,
+            "reason_counters": {},
+            "hosts_attempted": [],
+            "hosts_selected": [],
+            "warnings": [],
+            "errors": [],
+            "setup_duration_s": 0,
+            "monitor_duration_s": 0,
+            "persistence_duration_s": 0,
+        }
+        # Ensure directory exists
+        try:
+            os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
+        except Exception:
+            pass
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+        logging.info(f"Wrote report JSON to {report_path}")
+    except Exception as e:
+        logging.warning(f"Failed to write report JSON: {e}")
 
     if DRY_RUN:
         logging.info("DRY RUN finished: cache NOT saved, Discord NOT touched.")

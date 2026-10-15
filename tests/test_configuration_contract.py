@@ -96,10 +96,11 @@ def test_maintenance_json():
     data = json.loads(p.read_text())
     assert data.get("schema_version") == 1
     assert data["python"]["current_version"] == "3.14.8"
-    # must include mandatory checks
+    # must include mandatory checks — now single final gate maintenance-ci (CI aggregates)
     mandatory = data["checks"]["mandatory"]
-    for need in ("maintenance-ci", "smoke", "reddit-signals"):
-        assert need in mandatory
+    assert "maintenance-ci" in mandatory
+    # no longer requires nine separate checks; single gate is correct
+    assert len(mandatory) == 1, f"expected single final gate, got {mandatory}"
 
 def test_workflows():
     for wf in ("ci.yml", "reddit_monitor.yml", "twitter_monitor.yml"):

@@ -24,10 +24,10 @@ updates:
         patterns: ["*"]
         # Routine: allowlisted stable patch/minor within approved major — filtered by merge controller, not here.
         # Dependabot grouping excludes majors via update-types.
-        update-types: ["version-update:semver-patch", "version-update:semver-minor"]
+        update-types: ["patch", "minor"]
       python-review-required:
         patterns: ["*"]
-        update-types: ["version-update:semver-major"]
+        update-types: ["major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -43,7 +43,7 @@ updates:
     groups:
       actions-routine:
         patterns: ["*"]
-        update-types: ["version-update:semver-patch", "version-update:semver-minor"]
+        update-types: ["patch", "minor"]
       actions-review-required:
         patterns: ["*"]
-        update-types: ["version-update:semver-major"]
+        update-types: ["major"]

@@ -403,10 +403,13 @@ def status_id_decode(encoded: str) -> str:
 # ■ Parsing helpers (pure — unit-testable offline)
 # ---------------------------------------------------------------------------
 def _og_meta(page_html: str) -> dict:
-    """og:/twitter: meta tags -> dict. og:image collects ALL occurrences in
-    order (galleries emit one tag per photo); every other key keeps the
-    first value. HTML entities are unescaped."""
+    """og:/twitter: meta tags -> dict. og:image and og:video* collect ALL occurrences in
+    order (galleries emit one tag per photo, video fallbacks multiple tags); every other key keeps the
+    first value. HTML entities are unescaped and percent-encoding is handled."""
     meta = {}
+    import urllib.parse as _up
+    # Keys that should collect all occurrences (galleries, video fallbacks)
+    _list_keys = {"og:image", "og:video", "og:video:secure_url", "og:video:url", "twitter:player", "twitter:player:stream"}
     for m in re.finditer(r"<meta[^>]+>", page_html, re.I):
         tag = m.group(0)
         pm = re.search(r'property="([^"]+)"', tag) or re.search(r'name="([^"]+)"', tag)
@@ -420,8 +423,23 @@ def _og_meta(page_html: str) -> dict:
             if (k2, v2) == (key, val):
                 break
             key, val = k2, v2
-        if key == "og:image":
-            meta.setdefault("og:image", []).append(val)
+        # Percent-decode video URLs once (e.g., %3A%2F%2F -> ://) — keep if looks like URL
+        if key in _list_keys:
+            try:
+                decoded = _up.unquote(val)
+                if decoded.startswith("http"):
+                    val = decoded
+            except Exception:
+                pass
+        if key in _list_keys:
+            if key in meta:
+                # already a list
+                if isinstance(meta[key], list):
+                    meta[key].append(val)
+                else:
+                    meta[key] = [meta[key], val]
+            else:
+                meta[key] = [val]
         else:
             meta.setdefault(key, val)
     return meta
@@ -1022,23 +1040,22 @@ def _media_from_og(meta: dict) -> list:
         if v not in seen_v:
             seen_v.add(v)
             uniq_videos.append(v)
-    # Select motion video only — filter audio-cover renders
-    motion_video = None
+    # Select motion videos — filter audio-cover renders, keep all valid motion videos (primary + fallbacks)
+    motion_videos = []
     for v in uniq_videos:
         low = v.lower()
-        # EmbedEZ audio-cover pattern: render/audio?...&cover=...
-        # It is not motion video and must not be counted as second video
-        # or prioritized for 1920x1080 cover.
         if "cover=" in low and "render/audio" in low:
             continue
         if "cover=" in low and "/audio/" in low:
             continue
-        # First valid motion video is the tile; do not add duplicate
-        if motion_video is None:
-            motion_video = v
-            break
-    if motion_video:
-        media.append({"kind": "video", "url": motion_video})
+        # Percent-decode already handled in _og_meta, but also ensure URL is http
+        if not v.startswith("http"):
+            continue
+        if v not in motion_videos:
+            motion_videos.append(v)
+    for mv in motion_videos:
+        media.append({"kind": "video", "url": mv})
+    motion_video = motion_videos[0] if motion_videos else None
     for img in meta.get("og:image", []):
         if not isinstance(img, str) or not img:
             continue

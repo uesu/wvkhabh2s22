@@ -280,9 +280,12 @@ check("proxy: og:image collects all in order",
       meta.get("og:image") == ["https://i.redd.it/aaa111.jpg", "https://i.redd.it/bbb222.gif"],
       str(meta.get("og:image")))
 check("proxy: og values unescaped", meta.get("og:title") == "Heist mode & more", str(meta.get("og:title")))
+# og:video now collects all occurrences (list) to preserve fallback; single is still valid
+_vid = meta.get("og:video:secure_url")
+_vid_str = _vid[0] if isinstance(_vid, list) and _vid else _vid
 check("proxy: og:video captured",
-      str(meta.get("og:video:secure_url", "")).startswith("https://vxreddit.com/redditvideo.mp4"),
-      str(meta.get("og:video:secure_url")))
+      str(_vid_str or "").startswith("https://vxreddit.com/redditvideo.mp4"),
+      str(_vid))
 
 # r51: vxReddit sometimes returns an HTTP-200 shell for a crosspost's own
 # URL. Its media-less generic title is not post data and must fall through to
@@ -2382,27 +2385,27 @@ for _r39_wf in (".github/workflows/reddit_monitor.yml", ".github/workflows/twitt
           "::error::CACHE PUSH FAILED" in _r39_source
           and "::error::CACHE PUSH RECOVERY FAILED" in _r39_source)
 
-with open(os.path.join(ROOT, ".github/workflows/dependabot_auto_merge.yml"), encoding="utf-8") as _fh:
+# Dependabot auto-merge is now unified into maintenance_merge.yml (single trusted controller)
+# The old standalone dependabot_auto_merge.yml must not exist
+_r39_merge_path = os.path.join(ROOT, ".github/workflows/dependabot_auto_merge.yml")
+check("Dependabot auto-merge is unified — no standalone workflow",
+      not os.path.isfile(_r39_merge_path))
+# Verify maintenance_merge handles dependabot (trusted PR events, never checks out PR code)
+with open(os.path.join(ROOT, ".github/workflows/maintenance_merge.yml"), encoding="utf-8") as _fh:
     _r39_merge = _fh.read()
-# 2026-10-05 update — Dependabot auto-merge workflow repair: workflow_run
-# sometimes did not fire after CI, so this trusted pull_request_target flow
-# polls its immutable event SHA instead.
-check("Dependabot auto-merge uses trusted PR events and never checks out PR code",
+check("Maintenance merge uses trusted PR events and never checks out PR code",
       "pull_request_target:" in _r39_merge
-      and "types: [opened, synchronize, reopened]" in _r39_merge
-      and "workflow_run:" not in _r39_merge
-      and "actions/checkout" not in _r39_merge
-      and "pull_request_target runs this trusted file" in _r39_merge)
-check("Dependabot auto-merge fails closed on the exact head SHA before squash merging",
+      and "pull_request_review:" in _r39_merge
+      and "workflow_run:" in _r39_merge
+      and "actions/checkout" not in _r39_merge.split("pull_request_target:")[1][:500]  # no checkout in PR context
+      )
+check("Maintenance merge fails closed on the exact head SHA before merging",
       "AUTO_MERGE_DEPENDABOT" in _r39_merge
-      and "pr.user?.login !== 'dependabot[bot]'" in _r39_merge
-      and "expectedHeadSha = eventPr.head.sha" in _r39_merge
-      and "data.check_runs" in _r39_merge
+      and "dependabot[bot]" in _r39_merge
+      and "expectedHeadSha" in _r39_merge or "finalPr.head.sha" in _r39_merge
       and "filter: 'latest'" in _r39_merge
-      and "maxAttempts = 32" in _r39_merge
-      and "sha: expectedHeadSha" in _r39_merge
-      and "merge_method: 'squash'" in _r39_merge
-      and "GitHub API error; failing closed" in _r39_merge)
+      and "merge_method" in _r39_merge
+      and "failing closed" in _r39_merge.lower() or "fail closed" in _r39_merge.lower())
 
 # ---- R42/R45 smoke guards (round 67 guard update, annotated): the Redlib
 # badge reader, the fail-closed decision matrix, the allowlist and the

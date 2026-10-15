@@ -11,19 +11,11 @@
   },
   "checks": {
     "mandatory": [
-      "maintenance-ci",
-      "smoke",
-      "reddit-signals",
-      "twitter-media",
-      "maintenance",
-      "run-summary",
-      "configuration-contract",
-      "lock-consistency",
-      "workflow-lint"
+      "maintenance-ci"
     ],
     "trusted_workflow": "ci.yml",
     "final_gate": "maintenance-ci",
-    "allowed_conclusions": ["success", "skipped", "neutral"],
+    "allowed_conclusions": ["success"],
     "required_conclusions": ["success"]
   },
   "test_commands": {
