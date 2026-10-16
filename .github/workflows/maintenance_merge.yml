@@ -237,6 +237,7 @@ jobs:
               labels: labels,
               reviews: reviews,
               head_sha: pr.head.sha,
+              repository: `${owner}/${repo}`,
               auto_merge_vars: { AUTO_MERGE_DEPENDABOT: process.env.AUTO_MERGE_DEPENDABOT, AUTO_MERGE_PYTHON_BUMP: process.env.AUTO_MERGE_PYTHON_BUMP },
               review_required: false
             };
@@ -402,34 +403,64 @@ jobs:
             // Dependency updates: parse from PR body or title if available (helper also parses title)
             fixture.dependency_updates = [];
             // Proposer verification: for python bump, verify workflow run from trusted publisher workflow
-            // Do not trust branch/title/body markers alone — require verified workflow_run from API
+            // Publication provenance. The proposer runs on the base branch and publishes a NEW
+            // commit, so its head_sha is the source head and can never equal the published
+            // proposal head — matching on head_sha authenticated nothing and left the trusted
+            // author bypass as the only way in. Bind the actual publication instead, with raw
+            // payloads only; the helper fails closed on any gap:
+            //   * the trusted proposer workflow's completed run on the PR's base branch, and its
+            //     attempt history, so a stale attempt cannot authorize;
+            //   * the published head commit, whose identity must be the run's actor (the BUMP_PAT
+            //     user) and whose timestamp must fall inside the run's own execution window;
+            //   * the validated manifest the proposer itself resolves against, so the published
+            //     version has to be a real release rather than an arbitrary string.
             if (isPythonBumpBranch) {
               try {
-                // Paginate all workflow runs for this workflow to handle pagination correctly
-                const proposerRuns = await github.paginate(github.rest.actions.listWorkflowRuns, { owner, repo, workflow_id: 'python_version_bump.yml', per_page: 100 });
-                // Require exact head_sha match, path, and successful conclusion
-                const proposerRun = proposerRuns.find(r => r.head_sha === pr.head.sha && r.path === '.github/workflows/python_version_bump.yml' && r.conclusion === 'success');
-                if (proposerRun) {
-                  fixture.proposer_run_id = proposerRun.id;
-                  fixture.workflow_run = { id: proposerRun.id, head_sha: proposerRun.head_sha, path: proposerRun.path, workflow_id: proposerRun.workflow_id, conclusion: proposerRun.conclusion };
-                  // Must have head_sha matching PR head, path correct, and successful conclusion
-                  if (proposerRun.head_sha === pr.head.sha && proposerRun.path === '.github/workflows/python_version_bump.yml' && proposerRun.conclusion === 'success') {
-                    fixture.proposer_verified = true;
-                    fixture.publisher_verified = true;
-                    console.log(`Proposer verified: workflow_run ${proposerRun.id} conclusion ${proposerRun.conclusion}`);
-                  } else {
-                    console.log(`Proposer run found but not successful: ${proposerRun.path} ${proposerRun.conclusion}`);
-                    fixture.proposer_verified = false;
-                  }
+                const proposerRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                  owner, repo, workflow_id: 'python_version_bump.yml', branch: pr.base.ref, per_page: 100
+                });
+                const source = (proposerRuns || []).find(r =>
+                  r.path === '.github/workflows/python_version_bump.yml' &&
+                  r.head_branch === pr.base.ref &&
+                  r.status === 'completed');
+                if (!source) {
+                  console.log(`No completed proposer run on ${pr.base.ref} — publication unverified`);
                 } else {
-                  console.log('No proposer workflow run found — unverified');
-                  fixture.proposer_verified = false;
-                  fixture.publisher_verified = false;
+                  const { data: publisherRun } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: source.id });
+                  fixture.publisher_run = publisherRun;
+                  console.log(`Publisher run ${publisherRun.id} attempt ${publisherRun.run_attempt} ` +
+                    `source head ${publisherRun.head_sha} conclusion ${publisherRun.conclusion}`);
+                  try {
+                    const { data: attempts } = await github.rest.actions.listWorkflowRunAttempts({ owner, repo, run_id: source.id, per_page: 100 });
+                    fixture.publisher_attempts = attempts.workflow_run_attempts || [];
+                  } catch (e) {
+                    console.log(`Proposer attempt history unavailable: ${e.message} — publication unverified`);
+                  }
                 }
               } catch (e) {
-                console.log(`Failed to list proposer workflow runs: ${e.message} — unverified`);
-                fixture.proposer_verified = false;
-                fixture.publisher_verified = false;
+                console.log(`Proposer run lookup failed: ${e.message} — publication unverified`);
+              }
+              try {
+                const { data: publishedCommit } = await github.rest.repos.getCommit({ owner, repo, ref: pr.head.sha });
+                fixture.published_commit = publishedCommit;
+              } catch (e) {
+                console.log(`Published proposal commit unavailable: ${e.message} — publication unverified`);
+              }
+              try {
+                // The PR's own maintenance.json is PR content and is never the manifest; the
+                // proposer resolves against the upstream release manifest, so bind to that.
+                const { data: manifestFile } = await github.rest.repos.getContent({
+                  owner: 'actions', repo: 'python-versions', path: 'versions-manifest.json'
+                });
+                const manifestText = Buffer.from(manifestFile.content || '', 'base64').toString('utf8');
+                const manifest = JSON.parse(manifestText);
+                const entries = Array.isArray(manifest) ? manifest : (manifest.versions || []);
+                fixture.manifest_versions = entries
+                  .map(entry => entry && (entry.version || entry.python_version))
+                  .filter(Boolean);
+                console.log(`Validated manifest carries ${fixture.manifest_versions.length} published versions`);
+              } catch (e) {
+                console.log(`Validated manifest unavailable: ${e.message} — publication unverified`);
               }
             }
             // For dependabot, also attach workflow_run if present for provenance (helper will verify) — require exact head_sha

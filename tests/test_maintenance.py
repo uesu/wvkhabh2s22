@@ -422,8 +422,143 @@ def test_decision_from_fixture():
     assert "head mismatch" in other_head["reason"], other_head["reason"]
 
 
+# ---------------------------------------------------------------------------
+# Proposer publication binding. The proposer runs on the base branch and
+# publishes a NEW commit, so the run's head_sha is the source head and can never
+# equal the published proposal head. Publication has to be bound to the run that
+# produced it, not to a head-SHA coincidence.
+# ---------------------------------------------------------------------------
+
+PROPOSER_PATH = ".github/workflows/python_version_bump.yml"
+SOURCE_HEAD = "58547a93c000000000000000000000000000000a"
+PUBLISHED_HEAD = "abcdef1234567890abcdef1234567890abcdef12"
+PROPOSER_RUN_ID = 38849000001
+BUMP_ACTOR = "bump-bot"
+PYTHON_PATCH = "@@ -1 +1 @@\n-3.14.8\n+3.14.9\n"
+
+
+def api_proposer_run(*, run_id=PROPOSER_RUN_ID, attempt=1, head_sha=SOURCE_HEAD,
+                     status="completed", conclusion="success", path=PROPOSER_PATH,
+                     actor=BUMP_ACTOR, full_name=REPO, workflow_id=88,
+                     started="2026-10-16T02:00:00Z", updated="2026-10-16T02:05:00Z"):
+    """Shaped like GET /repos/{owner}/{repo}/actions/runs/{run_id} for the proposer."""
+    return {
+        "id": run_id, "name": "Python version proposer", "path": path, "workflow_id": workflow_id,
+        "head_branch": "main", "head_sha": head_sha, "run_number": 12, "run_attempt": attempt,
+        "event": "schedule", "status": status, "conclusion": conclusion,
+        "run_started_at": started, "created_at": started, "updated_at": updated,
+        "actor": {"id": 7, "login": actor, "type": "User"},
+        "repository": {"id": 1, "full_name": full_name, "name": full_name.split("/")[1]},
+        "head_repository": {"id": 1, "full_name": full_name, "name": full_name.split("/")[1]},
+    }
+
+
+def api_published_commit(*, sha=PUBLISHED_HEAD, login=BUMP_ACTOR, date="2026-10-16T02:03:00Z"):
+    """Shaped like GET /repos/{owner}/{repo}/commits/{ref} for the published proposal head."""
+    return {
+        "sha": sha,
+        "author": {"id": 7, "login": login, "type": "User"},
+        "committer": {"id": 7, "login": login, "type": "User"},
+        "commit": {
+            "author": {"name": login, "date": date},
+            "committer": {"name": login, "date": date},
+            "message": "chore: bump CPython pin 3.14.8 -> 3.14.9",
+        },
+    }
+
+
+def api_proposer_attempts(*numbers):
+    return [{"id": PROPOSER_RUN_ID, "run_attempt": n, "status": "completed", "conclusion": "success"}
+            for n in numbers]
+
+
+def _proposer_checks():
+    """The mandatory gate, resolved against the published proposal head."""
+    check = resolved_check("maintenance-ci", head_sha=PUBLISHED_HEAD)
+    check["job"] = api_job(head_sha=PUBLISHED_HEAD, run_id=PROPOSER_RUN_ID)
+    check["run"] = api_run(run_id=PROPOSER_RUN_ID, head_sha=PUBLISHED_HEAD)
+    return [check]
+
+
+def _proposer_decision(**overrides):
+    """Run the real decision path over an API-shaped python-bump proposal."""
+    fixture = {
+        "pr": {
+            "number": 31, "state": "open", "draft": False, "mergeable": True,
+            "mergeable_state": "clean", "base": {"ref": "main"},
+            "head": {"sha": PUBLISHED_HEAD, "ref": "chore/python-3.14.9"},
+            "title": "chore: bump CPython pin 3.14.8 -> 3.14.9",
+            "user": {"login": BUMP_ACTOR},
+        },
+        "checks": _proposer_checks(),
+        "changed_files": [".python-version"],
+        "file_patches": {".python-version": PYTHON_PATCH},
+        "auto_merge_vars": {"AUTO_MERGE_PYTHON_BUMP": "yes"},
+        "labels": [], "reviews": [], "head_sha": PUBLISHED_HEAD, "repository": REPO,
+        "review_required": False, "deferred": False,
+        "publisher_run": api_proposer_run(),
+        "publisher_attempts": api_proposer_attempts(1),
+        "published_commit": api_published_commit(),
+        "manifest_versions": ["3.14.8", "3.14.9"],
+    }
+    fixture.update(overrides)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+        json.dump(fixture, fh)
+        fname = fh.name
+    try:
+        return maintenance.decision_from_fixture(fname, str(ROOT / ".github" / "maintenance.json"))
+    finally:
+        os.unlink(fname)
+
+
+def test_proposer_publication_bound_to_the_real_run():
+    """A BUMP_PAT publication is authorized by evidence, with source head != published head."""
+    decision = _proposer_decision()
+    assert_eq(decision["decision"], "merge")
+    assert decision["merge"] is True, decision["reason"]
+    # the run's own head is the source head, deliberately not the published proposal head
+    assert_eq(api_proposer_run()["head_sha"], SOURCE_HEAD)
+    assert SOURCE_HEAD != PUBLISHED_HEAD
+
+
+def test_proposer_publication_rejects_incomplete_evidence():
+    """Every gap in the publication chain fails closed with a specific reason."""
+    cases = {
+        "publisher run unavailable": {"publisher_run": None},
+        "failed publisher run": {"publisher_run": api_proposer_run(conclusion="failure")},
+        "missing conclusion": {"publisher_run": api_proposer_run(conclusion=None)},
+        "run still in progress": {"publisher_run": api_proposer_run(status="in_progress", conclusion=None)},
+        "stale publisher attempt": {"publisher_attempts": api_proposer_attempts(1, 2)},
+        "attempt history unavailable": {"publisher_attempts": None},
+        "commit by another identity": {"published_commit": api_published_commit(login="someone-else")},
+        "commit outside the run window": {"published_commit": api_published_commit(date="2026-10-16T09:00:00Z")},
+        "commit before the run started": {"published_commit": api_published_commit(date="2026-10-16T01:00:00Z")},
+        "version absent from the manifest": {"manifest_versions": ["3.14.8"]},
+        "manifest unavailable": {"manifest_versions": None},
+        "published commit is not the PR head": {"published_commit": api_published_commit(sha="deadbeef")},
+        "run from a fork": {"publisher_run": api_proposer_run(full_name="someone/fork")},
+        "untrusted proposer workflow": {"publisher_run": api_proposer_run(path=".github/workflows/other.yml")},
+        "run without a workflow id": {"publisher_run": api_proposer_run(workflow_id=None)},
+        "repository not supplied": {"repository": None},
+        "published commit unavailable": {"published_commit": None},
+    }
+    for label, overrides in cases.items():
+        decision = _proposer_decision(**overrides)
+        assert decision["merge"] is False, f"{label} must not authorize a merge"
+        assert_eq(decision["decision"], "review-required")
+        assert "publication unverified" in decision["reason"], f"{label}: {decision['reason']}"
+
+
+def test_trusted_author_does_not_bypass_publication_provenance():
+    """A bot-authored proposal with no publication evidence is not authorized."""
+    for login in ("github-actions[bot]", "dependabot[bot]", BUMP_ACTOR):
+        decision = _proposer_decision(publisher_run=None)
+        assert decision["merge"] is False, f"{login} must not bypass provenance"
+        assert "publication unverified" in decision["reason"], decision["reason"]
+
+
 def main():
-    tests = [test_parse_version, test_compare_versions, test_classify_python, test_classify_package, test_classify_group, test_validate_changed_files, test_select_candidate, test_evaluate_checks, test_provenance_requires_the_exact_producer, test_provenance_accepts_the_current_attempt_only, test_decision_from_fixture]
+    tests = [test_parse_version, test_compare_versions, test_classify_python, test_classify_package, test_classify_group, test_validate_changed_files, test_select_candidate, test_evaluate_checks, test_provenance_requires_the_exact_producer, test_provenance_accepts_the_current_attempt_only, test_decision_from_fixture, test_proposer_publication_bound_to_the_real_run, test_proposer_publication_rejects_incomplete_evidence, test_trusted_author_does_not_bypass_publication_provenance]
     failed = []
     for fn in tests:
         try:

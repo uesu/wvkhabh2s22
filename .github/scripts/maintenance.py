@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -428,6 +429,119 @@ def resolve_check_provenance(
     )
 
 
+TRUSTED_PROPOSER_PATH = ".github/workflows/python_version_bump.yml"
+# The PR-creation API call can complete slightly after the run record's updated_at.
+_PUBLICATION_GRACE_SECONDS = 300
+
+
+def _iso_to_epoch(value: Any) -> float | None:
+    """Parse a GitHub timestamp; None when it is absent or unparseable."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def verify_proposer_publication(
+    fixture: dict[str, Any],
+    pr: dict[str, Any],
+    candidate_version: str | None,
+) -> tuple[bool, str]:
+    """Bind a published proposal to the run that actually published it.
+
+    The proposer runs on the base branch and publishes a NEW commit, so the run's head_sha is
+    the *source* head and can never equal the published proposal head. Requiring
+    ``run.head_sha == pr.head.sha`` therefore authenticated nothing: it is unsatisfiable for a
+    genuine publisher, which is why the lane could only ever be entered through the
+    trusted-author bypass. Publication is bound instead to evidence that ties the run to the
+    published PR head:
+
+    * the run is the trusted proposer workflow, completed successfully, in this exact
+      repository, and is the current attempt of that run;
+    * the published PR head commit exists, equals ``pr.head.sha``, was authored or committed by
+      the identity that ran the proposer (the run's actor — the BUMP_PAT user or the bot), and
+      was created inside the run's own execution window;
+    * the version the PR actually publishes is the candidate this lane resolved and is a real
+      entry of the validated manifest on the default branch.
+
+    Every gap fails closed, a missing conclusion is never success, and no author identity —
+    trusted bot or otherwise — bypasses any of it.
+    """
+    run = fixture.get("publisher_run")
+    if not isinstance(run, dict):
+        return False, "publisher run unavailable"
+    repository = fixture.get("repository") or None
+    head_sha = (pr.get("head") or {}).get("sha")
+    if not head_sha:
+        return False, "published proposal head unavailable"
+    if run.get("path") != TRUSTED_PROPOSER_PATH:
+        return False, f"publisher run is not the proposer workflow ({run.get('path')})"
+    if not isinstance(run.get("workflow_id"), int) or run.get("workflow_id") <= 0:
+        return False, "publisher run carries no workflow id"
+    if not isinstance(run.get("id"), int) or run.get("id") <= 0:
+        return False, "publisher run carries no run id"
+    if run.get("status") != "completed":
+        return False, f"publisher run is not completed ({run.get('status')})"
+    if run.get("conclusion") != "success":
+        return False, f"publisher run conclusion is {run.get('conclusion') or 'missing'}"
+    if not repository:
+        return False, "repository not supplied — cannot verify the publisher"
+    for key in ("repository", "head_repository"):
+        record = run.get(key)
+        full_name = record.get("full_name") if isinstance(record, dict) else record
+        if full_name != repository:
+            return False, f"publisher run {key} {full_name} is not {repository}"
+
+    attempts = fixture.get("publisher_attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return False, "publisher attempt history unavailable"
+    latest = max((a.get("run_attempt") or 0) for a in attempts if isinstance(a, dict))
+    if run.get("run_attempt") != latest:
+        return False, f"publisher run attempt {run.get('run_attempt')} is stale (current {latest})"
+
+    commit = fixture.get("published_commit")
+    if not isinstance(commit, dict):
+        return False, "published proposal commit unavailable"
+    if commit.get("sha") != head_sha:
+        return False, f"published commit {commit.get('sha')} is not the proposal head {head_sha}"
+    actor = run.get("actor")
+    actor_login = actor.get("login") if isinstance(actor, dict) else None
+    if not actor_login:
+        return False, "publisher run has no actor identity"
+    identities = []
+    for side in ("author", "committer"):
+        user = commit.get(side)
+        if isinstance(user, dict) and user.get("login"):
+            identities.append(user["login"])
+    if actor_login not in identities:
+        return False, (
+            f"published commit was not created by the run actor {actor_login} "
+            f"(commit identities: {identities or 'none'})"
+        )
+    inner = commit.get("commit") if isinstance(commit.get("commit"), dict) else {}
+    committed = _iso_to_epoch((inner.get("committer") or {}).get("date"))
+    started = _iso_to_epoch(run.get("run_started_at"))
+    finished = _iso_to_epoch(run.get("updated_at"))
+    if committed is None or started is None or finished is None:
+        return False, "publisher run or commit timestamps unavailable"
+    if not (started <= committed <= finished + _PUBLICATION_GRACE_SECONDS):
+        return False, (
+            "published commit falls outside the publisher run window "
+            f"({committed} not within {started}..{finished})"
+        )
+
+    manifest = fixture.get("manifest_versions")
+    if not isinstance(manifest, list) or not manifest:
+        return False, "validated manifest unavailable"
+    if not candidate_version:
+        return False, "published version could not be parsed from the proposal diff"
+    if candidate_version not in manifest:
+        return False, f"published version {candidate_version} is not in the validated manifest"
+    return True, "publication bound to the proposer run, actor, head and manifest"
+
+
 def evaluate_checks(
     checks: list[dict[str, Any]],
     mandatory: list[str],
@@ -816,63 +930,17 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
         # Soak: missing dates mean deferred, not up-to-date or permission to bypass
         if fixture.get("deferred"):
             return {"decision": "review-required", "reason": "python soak not satisfied", "merge": False}
-        # Verify actual publisher/run/head provenance — branch/title alone is not authorization
-        # Unconditional gate for Python lane: a supplied marker is never proof, even if truthy/numeric
+        # Verify actual publication provenance. Branch, title and body markers are not
+        # authorization, and neither is a trusted author identity: the run that published this
+        # proposal has to be bound to the published head, the actor and the validated manifest.
         if is_python_bump:
-            trusted_publishers = ["github-actions[bot]", "dependabot[bot]"]
-            # Gather proposer evidence from fixture (must be validated via trusted API, not just truthy)
-            proposer_run = fixture.get("proposer_run_id") or fixture.get("publisher") or fixture.get("bump_pat_provenance") or fixture.get("verified_proposer")
-            # Verified flag must be explicitly True from trusted API verification, not just presence of marker
-            verified = fixture.get("proposer_verified") is True or fixture.get("publisher_verified") is True
-            # Workflow run must be from trusted workflow file and match exact head SHA
-            workflow_run = fixture.get("workflow_run") or fixture.get("proposer_workflow_run")
-            workflow_verified = False
-            if isinstance(workflow_run, dict):
-                # Must have id, head_sha matching PR head, path == python_version_bump.yml, and successful conclusion == "success"
-                if (workflow_run.get("head_sha") == (pr.get("head") or {}).get("sha")
-                    and workflow_run.get("path") == ".github/workflows/python_version_bump.yml"
-                    and workflow_run.get("conclusion") == "success"
-                    and workflow_run.get("id") is not None):
-                    # Also require that proposer_run is numeric and matches workflow_run id if both present
-                    if proposer_run is not None:
-                        try:
-                            if int(proposer_run) != int(workflow_run.get("id", -1)):
-                                workflow_verified = False
-                            else:
-                                workflow_verified = True
-                        except Exception:
-                            workflow_verified = False
-                    else:
-                        workflow_verified = True
-                # No fallback: path/head mismatch or non-success is not verification
-            # Additional checks: proposer_run must be numeric (not boolean), and if verified flag is set, proposer_run must be valid
-            # Boolean True is truthy but not proof — must be numeric and match workflow_run
-            if proposer_run is True or proposer_run == "true":
-                # Explicitly reject boolean true as marker
-                proposer_run_valid = False
-            elif isinstance(proposer_run, bool):
-                proposer_run_valid = False
-            elif proposer_run is not None:
-                try:
-                    # Must be int-like and not boolean
-                    if isinstance(proposer_run, str) and not proposer_run.isdigit():
-                        proposer_run_valid = False
-                    else:
-                        _id = int(proposer_run)
-                        proposer_run_valid = _id > 0 and verified
-                    # Also need workflow_verified to be True for full authorization
-                    if not workflow_verified:
-                        proposer_run_valid = False
-                except Exception:
-                    proposer_run_valid = False
-            else:
-                proposer_run_valid = False
-            # For Python bump, require either trusted author or fully verified proposer (numeric id + verified flag + workflow_verified)
-            # No branch/title/body marker alone grants trust
-            if author not in trusted_publishers and not (proposer_run_valid and workflow_verified):
-                return {"decision": "review-required", "reason": "python bump unverified publisher/provenance", "merge": False}
-            # If author is untrusted but has valid proposer, also require that workflow_run head matches PR head and version matches manifest
-            # (Additional manifest validation elsewhere)
+            verified, reason = verify_proposer_publication(fixture, pr, cand)
+            if not verified:
+                return {
+                    "decision": "review-required",
+                    "reason": f"python bump publication unverified: {reason}",
+                    "merge": False,
+                }
 
     # Check evaluation
     mandatory = policy.get("checks", {}).get("mandatory") or ["maintenance-ci"]
