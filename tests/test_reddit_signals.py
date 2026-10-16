@@ -358,6 +358,181 @@ async def _r64_checks():
 asyncio.run(_r64_checks())
 
 
+# ---------------------------------------------------------------------------
+# Feed-level entry-point cases (2026-10-16): mirror fallback, timeout/challenge,
+# empty feed and partial results are driven through the REAL main(), faking only
+# _fetch_feed — so the actual combined-feed-first ordering, the mirror list and
+# the rejection rules all run unchanged. A None result is what the real fetcher
+# returns for a non-200, a challenge page, a timeout or a feed with no entries.
+# ---------------------------------------------------------------------------
+
+def _feed_entry(post_id, sub="TestSub", age_seconds=120):
+    entry = _Entry(age_seconds)
+    entry.link = f"/r/{sub}/comments/{post_id}/title/"
+    return entry
+
+
+def _feed_of(*entries):
+    feed = _Feed()
+    feed.entries = list(entries)
+    return feed
+
+
+async def _run_feed_case(script, *, subreddits=("TestSub",), cached_keys=("TestSub_old",),
+                         delivery_status=204):
+    """Run the real main() with _fetch_feed scripted per URL substring.
+
+    Returns (webhook posts, fetch order, saved posted keys, pending writes).
+    """
+    names = [
+        "SUBREDDITS", "TEST_POST_ID", "DRY_RUN", "_fetch_feed", "_fetch_new_listing",
+        "verify_archive_post_live", "fetch_post_json", "resolve_post_media",
+        "create_discohook_share", "load_posted", "load_pending", "save_posted",
+        "save_pending", "save_posted_messages", "load_posted_messages",
+        "RETRACT_DEAD_POSTS", "aiohttp", "FEED_FETCH_STAGGER", "LISTING_CONFIRM",
+    ]
+    old = {name: getattr(v3, name) for name in names}
+    old_env = {key: os.environ.get(key) for key in
+               ("DISCORD_WEBHOOK_URL", "WEBHOOK_REDDIT_TESTSUB", "WEBHOOK_REDDIT_OTHERSUB")}
+    saved = {}
+    fetch_order = []
+    pending = {}
+
+    def fake_fetch(session, url, label=""):
+        fetch_order.append(label or url)
+        for needle, result in script.items():
+            if needle in url:
+                if isinstance(result, Exception):
+                    raise result
+                return _async_return(result)
+        return _async_return(None)
+
+    try:
+        os.environ["DISCORD_WEBHOOK_URL"] = "https://discord.test/webhook"
+        os.environ["WEBHOOK_REDDIT_TESTSUB"] = "https://discord.test/webhook"
+        os.environ["WEBHOOK_REDDIT_OTHERSUB"] = "https://discord.test/webhook"
+        v3.SUBREDDITS = list(subreddits)
+        v3.TEST_POST_ID = ""
+        v3.DRY_RUN = False
+        v3.RETRACT_DEAD_POSTS = False
+        v3.FEED_FETCH_STAGGER = 0
+        v3.LISTING_CONFIRM = False
+        v3._fetch_feed = fake_fetch
+        v3._fetch_new_listing = lambda session, sub: _async_return(None)
+        v3.verify_archive_post_live = lambda session, path, label="", feed_ok=True: _async_return((True, "live"))
+        v3.fetch_post_json = lambda session, pid, use_oauth=False: _async_return(None)
+        v3.resolve_post_media = lambda session, base, post_json, path="", label="": _async_return({
+            "title": base.get("title") or "T", "author": base.get("author") or "A",
+            "body": base.get("body") or "body", "media": [], "stats": None,
+            "crosspost": None, "op_comment": None, "youtube_url": None,
+            "youtube_id": None, "youtube_live": False, "full_mode": False,
+        })
+        v3.create_discohook_share = lambda session, payload, label: _async_return(None)
+        v3.load_posted = lambda: set(cached_keys)
+        v3.load_pending = lambda: pending
+        v3.save_posted = lambda posted, keep_newest=frozenset(): saved.setdefault("posted", set(posted))
+        v3.save_pending = lambda p: saved.setdefault("pending_writes", []).append(dict(p))
+        v3.load_posted_messages = lambda: {}
+        v3.save_posted_messages = lambda m: saved.setdefault("messages", dict(m))
+
+        class _Response:
+            status = delivery_status
+
+            async def text(self):
+                return ""
+
+            async def json(self, content_type=None):
+                return {"id": "msg1"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _Session:
+            last = None
+
+            def __init__(self):
+                type(self).last = self
+                self.posts = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def post(self, url, json=None, timeout=None):
+                self.posts.append((url, json))
+                return _Response()
+
+        class _Aio:
+            ClientSession = _Session
+            ClientTimeout = staticmethod(lambda total=None: None)
+
+        v3.aiohttp = _Aio
+        await v3.main()
+        return _Session.last.posts, fetch_order, saved.get("posted", set()), saved
+    finally:
+        for name, value in old.items():
+            setattr(v3, name, value)
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+# The combined feed is tried first; when it is rejected the per-subreddit mirrors
+# run in their real order, and a post still goes out exactly once.
+_mirror_posts, _mirror_order, _mirror_saved, _ = asyncio.run(_run_feed_case({
+    "r/TestSub+": None,                       # combined request rejected
+    "redlib.catsarch.com": _feed_of(_feed_entry("mirror1")),
+}))
+check("feed: a rejected combined feed falls back to the per-subreddit mirrors",
+      len(_mirror_posts) == 1 and "combined" in _mirror_order
+      and any("catsarch" in label for label in _mirror_order),
+      str((_mirror_posts, _mirror_order)))
+check("feed: the mirror-recovered post is delivered once and cached",
+      "TestSub_mirror1" in _mirror_saved, str(_mirror_saved))
+check("feed: mirror fallback tries the combined feed before any single mirror",
+      _mirror_order[0] == "combined", str(_mirror_order))
+
+# A timeout or challenge on every source is a degraded run, not a crash and not a post.
+_blocked_posts, _blocked_order, _blocked_saved, _ = asyncio.run(_run_feed_case({
+    ".rss": None, "new.rss": None,
+}))
+check("feed: every source rejected (timeout/challenge) posts nothing",
+      _blocked_posts == [], str(_blocked_posts))
+check("feed: a fully blocked run invents no cache entries",
+      not (_blocked_saved - {"TestSub_old"}), str(_blocked_saved))
+check("feed: a blocked run still reports which sources it tried",
+      len(_blocked_order) > 1, str(_blocked_order))
+
+# HTTP 200 with zero entries is an empty feed, not a successful "nothing new".
+_empty_posts, _empty_order, _empty_saved, _ = asyncio.run(_run_feed_case({
+    "r/TestSub+": _feed_of(),
+    ".rss": _feed_of(),
+}))
+check("feed: an empty combined feed falls through to the mirrors",
+      any("combined" != label for label in _empty_order) and _empty_posts == [],
+      str((_empty_posts, _empty_order)))
+check("feed: an empty feed caches nothing",
+      not (_empty_saved - {"TestSub_old"}), str(_empty_saved))
+
+# Partial results: one tracked subreddit has a post, the other yields nothing.
+_partial_posts, _partial_order, _partial_saved, _ = asyncio.run(_run_feed_case({
+    "r/TestSub+OtherSub+": None,
+    "r/TestSub/new": _feed_of(_feed_entry("good1")),
+    "r/OtherSub/new": None,
+}, subreddits=("TestSub", "OtherSub")))
+check("feed: a partial run delivers only the subreddit that actually yielded a post",
+      len(_partial_posts) == 1 and "TestSub_good1" in _partial_saved
+      and not any(key.startswith("OtherSub_") and key != "OtherSub_old"
+                  for key in _partial_saved),
+      str((_partial_posts, _partial_saved)))
+
 # 16 static/wiring cases ---------------------------------------------------
 _v3_src = inspect.getsource(v3)
 _main_src = inspect.getsource(v3.main)
