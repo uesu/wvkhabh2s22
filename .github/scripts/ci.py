@@ -18,6 +18,8 @@ Exit codes: 0 = every mandatory check passed, 1 = a mandatory check failed,
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -25,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 # The pinned build toolchain is defined once, in the shared maintenance helper, so the registry
 # and the merge controller validate against the same versions. Sibling modules resolve with no
@@ -57,6 +60,7 @@ COMMAND_REGISTRY: dict[str, list[str]] = {
     "configuration-contract": [sys.executable, "tests/test_configuration_contract.py"],
     "ci-registry": [sys.executable, "tests/test_ci_registry.py"],
     "lock-consistency": [sys.executable, "-c", "import pathlib; print('lock-consistency placeholder')"],
+    "shared-bytes": [sys.executable, "-c", "print('shared-bytes placeholder')"],
     "workflow-lint": [sys.executable, "-c", "import pathlib, yaml; yaml.safe_load(open('.github/workflows/ci.yml')) ; print('yaml ok')"],
     "actionlint": ["actionlint", *workflow_files()],
     "zizmor": ["zizmor", "--offline", "--min-severity", "high", ".github/workflows"],
@@ -569,6 +573,83 @@ def check_workflow_lint(gate: Gate, name: str) -> None:
         print(f"PASS workflow-lint: {len(workflows)} workflows linted by actionlint and zizmor")
 
 
+def shared_file_records(root: Path) -> tuple[list[Any] | None, str]:
+    """Read the recorded cross-repository identities. Returns (records, problem).
+
+    Anything that stops the record from being read is a problem, never an empty list: an
+    absent or unreadable record must not be reported as "nothing to verify".
+    """
+    profile = root / ".github" / "maintenance.json"
+    if not profile.is_file():
+        return None, ".github/maintenance.json is missing — the shared-file record cannot be read"
+    try:
+        data = json.loads(profile.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, f"cannot read .github/maintenance.json: {exc}"
+    if not isinstance(data, dict):
+        return None, ".github/maintenance.json is not a JSON object"
+    if "shared_files" not in data:
+        return None, ".github/maintenance.json declares no shared_files key — cross-repository byte identity is unverified"
+    records = data["shared_files"]
+    if not isinstance(records, list) or not records:
+        return None, "shared_files must be a non-empty list of records"
+    return records, ""
+
+
+def check_shared_bytes(gate: Gate, name: str) -> None:
+    """Block when a helper that must stay byte-identical across repositories has drifted.
+
+    Four repositories ship the same maintenance helpers, and editing those bytes — or their
+    executable bit — in one repository alone is how a shared safeguard silently stops being
+    shared. Lint pressure is a realistic motive for exactly that, so the trusted profile
+    records the agreed SHA-256 and mode of each shared file and divergence is blocking here
+    rather than advisory. Updating a record is a deliberate, reviewable act that has to land
+    together with the same change in the other repositories.
+    """
+    records, problem = shared_file_records(ROOT)
+    if records is None:
+        gate.fail(name, problem)
+        return
+    problems: list[str] = []
+    verified: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            problems.append(f"shared_files entry is not an object: {record!r}")
+            continue
+        rel = str(record.get("path") or "")
+        digest = str(record.get("sha256") or "").strip().lower()
+        if not rel or len(digest) != 64:
+            problems.append(f"shared_files entry needs a path and a 64-char sha256: {record!r}")
+            continue
+        target = ROOT / rel
+        if not target.is_file():
+            problems.append(f"{rel} is recorded as shared but is missing")
+            continue
+        try:
+            actual = hashlib.sha256(target.read_bytes()).hexdigest()
+        except OSError as exc:
+            problems.append(f"{rel} could not be read: {exc}")
+            continue
+        if actual != digest:
+            problems.append(
+                f"{rel} drifted from the agreed bytes: recorded {digest[:16]}…, actual {actual[:16]}… "
+                f"— shared helpers must change in every repository at once, not here alone")
+            continue
+        recorded_executable = bool(record.get("executable", False))
+        actual_executable = bool(os.access(target, os.X_OK))
+        if actual_executable is not recorded_executable:
+            problems.append(
+                f"{rel} executable bit drifted: recorded executable={recorded_executable}, "
+                f"actual executable={actual_executable}")
+            continue
+        verified.append(rel)
+    for line in problems:
+        gate.fail(name, line)
+    if problems:
+        return
+    print(f"OK shared-bytes: {len(verified)} shared helper(s) byte- and mode-identical to the recorded identity")
+
+
 def _run_external_linter(
     gate: Gate, name: str, tool: str, version_args: list[str], lint_args: list[str]
 ) -> None:
@@ -646,6 +727,12 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                 check_workflow_lint(gate, name)
             except Exception as exc:  # noqa: BLE001 - an unexpected error must not pass the gate
                 gate.fail(name, f"workflow-lint raised {type(exc).__name__}: {exc}")
+            continue
+        if name == "shared-bytes":
+            try:
+                check_shared_bytes(gate, name)
+            except Exception as exc:  # noqa: BLE001 - an unexpected error must not pass the gate
+                gate.fail(name, f"shared-bytes raised {type(exc).__name__}: {exc}")
             continue
         run_command(gate, name, cmd)
 

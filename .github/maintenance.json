@@ -16,6 +16,20 @@
     "required": [],
     "reason": "Deliberate declaration, not an omission: Dependabot security alerts are disabled for this repository and it configures no code-scanning workflow, so there is no scan evidence to collect. Dependency updates still run through .github/dependabot.yml under the review-required update policy. If code-scanning or secret-scanning is ever enabled, set mode to required and list the kinds; deleting this block is treated as unconfigured and blocks the merge rather than passing it."
   },
+  "shared_files": [
+    {
+      "path": ".github/scripts/maintenance_common.py",
+      "sha256": "67e5b379c5de0a4a86fa78a3af4a8389a39155c88d6f08679eb963ffe2ae1d2a",
+      "executable": false,
+      "shared_with": ["uesu/News-Express", "uesu/Game-Express", "uesu/7jkxmy9nvbc"]
+    },
+    {
+      "path": ".github/scripts/merge_monitor_caches.py",
+      "sha256": "0e53a8c1a450531003e4490ed6706055911e2c85eef883252808c87ca286491b",
+      "executable": false,
+      "shared_with": ["uesu/News-Express"]
+    }
+  ],
   "checks": {
     "mandatory": [
       "maintenance-ci"

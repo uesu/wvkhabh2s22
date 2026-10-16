@@ -10,8 +10,10 @@ NOT VALIDATED (2) — never PASS.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import io
+import json
 import os
 import subprocess
 import sys
@@ -61,6 +63,9 @@ jobs:
       - uses: actions/checkout@v7
       - run: echo hi
 """
+
+
+FIXTURE_SHARED_BYTES = "# shared helper bytes that must stay identical across repositories\nSHARED = 1\n"
 
 
 def load_ci():
@@ -139,6 +144,26 @@ class Fixture:
         self.zizmor_rc = 0
         self.missing: set[str] = set()
         self.calls: list[list[str]] = []
+
+        # A faithful repo model: the trusted profile records the shared helpers, and the shared
+        # helpers exist with exactly the recorded bytes and mode, so the shared-bytes check has
+        # something real to verify in every fixture-based case instead of failing closed for a
+        # reason unrelated to the case under test.
+        self.shared_rel = ".github/scripts/shared_helper.py"
+        self.shared_bytes = FIXTURE_SHARED_BYTES.encode("utf-8")
+        shared_path = self.tmp / self.shared_rel
+        shared_path.parent.mkdir(parents=True, exist_ok=True)
+        shared_path.write_bytes(self.shared_bytes)
+        shared_path.chmod(0o644)
+        (self.tmp / ".github" / "maintenance.json").write_text(json.dumps({
+            "schema_version": 1,
+            "shared_files": [{
+                "path": self.shared_rel,
+                "sha256": hashlib.sha256(self.shared_bytes).hexdigest(),
+                "executable": False,
+                "shared_with": ["uesu/News-Express"],
+            }],
+        }, indent=2) + "\n", encoding="utf-8")
 
     def router(self, cmd, **kwargs):
         self.calls.append(list(cmd))
@@ -707,6 +732,133 @@ def test_failing_registered_command_blocks():
         fixture.cleanup()
 
 
+
+# ---------------------------------------------------------------------------
+# Cross-repository shared-byte identity (drift prevention)
+# ---------------------------------------------------------------------------
+
+def test_shipped_record_matches_the_shipped_shared_helpers():
+    """The digests in the committed profile must be the real bytes, not a stale or typed value.
+
+    A drift gate that trusts a wrong record is worse than none: it would block the correct bytes
+    and pass the wrong ones. This reads the shipped profile against the shipped files.
+    """
+    ci = load_ci()
+    records, problem = ci.shared_file_records(ci.ROOT)
+    assert problem == "", problem
+    assert records, "the shipped profile must record at least one shared helper"
+    paths = [r["path"] for r in records]
+    assert ".github/scripts/maintenance_common.py" in paths, paths
+    for record in records:
+        target = ci.ROOT / record["path"]
+        assert target.is_file(), f"recorded shared helper is missing: {record['path']}"
+        actual = hashlib.sha256(target.read_bytes()).hexdigest()
+        assert actual == record["sha256"], (
+            f"{record['path']} records {record['sha256'][:16]}… but the file is {actual[:16]}…")
+        assert bool(os.access(target, os.X_OK)) is bool(record["executable"]), record["path"]
+
+
+def test_intact_shared_record_passes_the_gate():
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        code, out, err = run_registry(ci, fixture)
+        assert code != 1, f"an intact shared record must not block, got {code}: {err}"
+        assert "OK shared-bytes: 1 shared helper(s)" in out, out
+    finally:
+        fixture.cleanup()
+
+
+def test_shared_file_byte_drift_blocks():
+    """Editing a shared helper's bytes in this repository alone is blocking, not advisory."""
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        (fixture.tmp / fixture.shared_rel).write_bytes(fixture.shared_bytes + b"# a unilateral edit\n")
+        code, _, err = run_registry(ci, fixture)
+        assert code == 1, f"byte drift must fail closed, got {code}"
+        assert "drifted from the agreed bytes" in err, err
+        assert fixture.shared_rel in err, err
+    finally:
+        fixture.cleanup()
+
+
+def test_shared_file_mode_drift_blocks():
+    """The executable bit is part of the shared identity; a chmod alone must not slip through."""
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        os.chmod(fixture.tmp / fixture.shared_rel, 0o755)
+        code, _, err = run_registry(ci, fixture)
+        assert code == 1, f"mode drift must fail closed, got {code}"
+        assert "executable bit drifted" in err, err
+    finally:
+        fixture.cleanup()
+
+
+def test_missing_shared_file_blocks():
+    """Deleting a shared helper is drift too, not an empty verification set."""
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        (fixture.tmp / fixture.shared_rel).unlink()
+        code, _, err = run_registry(ci, fixture)
+        assert code == 1, f"a deleted shared helper must fail closed, got {code}"
+        assert "recorded as shared but is missing" in err, err
+    finally:
+        fixture.cleanup()
+
+
+def test_absent_shared_record_blocks():
+    """No record means unverified, and unverified blocks rather than passing silently."""
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        (fixture.tmp / ".github" / "maintenance.json").write_text(
+            json.dumps({"schema_version": 1}) + "\n", encoding="utf-8")
+        code, _, err = run_registry(ci, fixture)
+        assert code == 1, f"an absent record must fail closed, got {code}"
+        assert "declares no shared_files key" in err, err
+    finally:
+        fixture.cleanup()
+
+
+def test_empty_shared_record_blocks():
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        (fixture.tmp / ".github" / "maintenance.json").write_text(
+            json.dumps({"schema_version": 1, "shared_files": []}) + "\n", encoding="utf-8")
+        code, _, err = run_registry(ci, fixture)
+        assert code == 1, f"an empty record must fail closed, got {code}"
+        assert "must be a non-empty list" in err, err
+    finally:
+        fixture.cleanup()
+
+
+def test_malformed_shared_record_blocks():
+    """A record without a usable digest verifies nothing, so it must not count as verified."""
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        (fixture.tmp / ".github" / "maintenance.json").write_text(json.dumps({
+            "schema_version": 1,
+            "shared_files": [{"path": fixture.shared_rel, "sha256": "not-a-digest"}],
+        }) + "\n", encoding="utf-8")
+        code, _, err = run_registry(ci, fixture)
+        assert code == 1, f"a malformed record must fail closed, got {code}"
+        assert "needs a path and a 64-char sha256" in err, err
+    finally:
+        fixture.cleanup()
+
+
+def test_shared_bytes_runs_in_both_profiles():
+    """Both profiles run the same registry, so neither can skip the identity check."""
+    ci = load_ci()
+    for profile in ("development", "production"):
+        assert "shared-bytes" in ci.list_profiles()[profile], profile
+        assert "shared-bytes" in ci.COMMAND_REGISTRY, "the check must be registered"
+
 def main() -> None:
     tests = [
         test_registry_has_no_shell_wildcards,
@@ -740,6 +892,15 @@ def main() -> None:
         test_duplicate_yaml_key_blocks,
         test_unpinned_action_blocks,
         test_failing_registered_command_blocks,
+        test_shipped_record_matches_the_shipped_shared_helpers,
+        test_intact_shared_record_passes_the_gate,
+        test_shared_file_byte_drift_blocks,
+        test_shared_file_mode_drift_blocks,
+        test_missing_shared_file_blocks,
+        test_absent_shared_record_blocks,
+        test_empty_shared_record_blocks,
+        test_malformed_shared_record_blocks,
+        test_shared_bytes_runs_in_both_profiles,
     ]
     failed: list[str] = []
     for fn in tests:
