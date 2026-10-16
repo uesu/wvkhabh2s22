@@ -189,6 +189,10 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                             _sh2.copy2(str(ROOT / "requirements.txt"), str(Path(tmpdir) / "requirements.txt"))
                         except Exception:
                             pass
+                        try:
+                            _sh2.copy2(str(ROOT / "requirements.in"), str(Path(tmpdir) / "requirements.in"))
+                        except Exception:
+                            pass
                     try:
                         reg = _sp.run([sys.executable, "-m", "piptools", "compile", "--generate-hashes", "--allow-unsafe", "--resolver=backtracking", "--strip-extras", f"--output-file={tf_path}", str(Path(tmpdir) / src)], capture_output=True, text=True, timeout=60, cwd=tmpdir)
                         if reg.returncode != 0:
