@@ -320,7 +320,121 @@ def is_successful_check(check: dict[str, Any]) -> bool:
     return True
 
 
-def evaluate_checks(checks: list[dict[str, Any]], mandatory: list[str], head_sha: str, pr_head_sha: str) -> dict[str, Any]:
+TRUSTED_WORKFLOW_PATHS = {".github/workflows/ci.yml"}
+
+
+def resolve_check_provenance(
+    check: dict[str, Any],
+    *,
+    head_sha: str,
+    repository: str | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Resolve one check run to the Actions job and workflow run that actually produced it.
+
+    The Checks API does not return workflow identity: a real ``check_runs`` record carries
+    ``id``, ``name``, ``head_sha``, ``status``, ``conclusion``, ``app``, ``external_id`` and
+    ``html_url`` — but no ``workflow``, ``workflow_id``, ``path`` or ``workflow_run``. Reading
+    those keys off the check therefore rejects every genuine record. Provenance has to be
+    *resolved*: for Actions checks ``external_id`` is the job id, and the check's ``html_url``
+    is the canonical ``.../actions/runs/<run_id>/job/<job_id>`` link. The caller fetches those
+    records and attaches the raw payloads as ``job``, ``run`` and ``attempts``; nothing here
+    invents a field, and any gap fails closed.
+    """
+    name = check.get("name")
+    job = check.get("job") if isinstance(check.get("job"), dict) else None
+    run = check.get("run") if isinstance(check.get("run"), dict) else None
+    attempts = check.get("attempts") if isinstance(check.get("attempts"), list) else None
+
+    if not isinstance(check.get("id"), int) or check.get("id") <= 0:
+        return None, f"{name} (no check run id — cannot bind provenance)"
+    if check.get("head_sha") != head_sha:
+        return None, f"{name} (head mismatch {check.get('head_sha')} vs {head_sha})"
+    if check.get("status") != "completed" or check.get("conclusion") != "success":
+        return None, f"{name} ({check.get('conclusion') or check.get('status')})"
+    app = check.get("app")
+    slug = (app.get("slug") or app.get("name")) if isinstance(app, dict) else app
+    if slug not in TRUSTED_APP_SLUGS:
+        return None, f"{name} (untrusted or missing app {slug or 'none'})"
+    if slug and name not in TRUSTED_CHECKS:
+        return None, f"{name} (untrusted check identity)"
+
+    if job is None:
+        return None, f"{name} (producing job unavailable — provenance unresolved)"
+    external_id = check.get("external_id")
+    try:
+        job_id = int(external_id) if external_id is not None else None
+    except (TypeError, ValueError):
+        job_id = None
+    if job_id is None or job.get("id") != job_id:
+        return None, f"{name} (job {job.get('id')} is not the check's job {external_id})"
+    if job.get("name") != name:
+        return None, f"{name} (job name {job.get('name')} does not match the required check)"
+    if job.get("head_sha") != head_sha:
+        return None, f"{name} (job head mismatch {job.get('head_sha')} vs {head_sha})"
+    if job.get("status") != "completed" or job.get("conclusion") != "success":
+        return None, f"{name} (job {job.get('conclusion') or job.get('status')})"
+    if not isinstance(job.get("run_id"), int) or not isinstance(job.get("run_attempt"), int):
+        return None, f"{name} (job carries no run id/attempt)"
+
+    if run is None:
+        return None, f"{name} (producing workflow run unavailable — provenance unresolved)"
+    if run.get("id") != job.get("run_id"):
+        return None, f"{name} (run {run.get('id')} is not the job's run {job.get('run_id')})"
+    if run.get("run_attempt") != job.get("run_attempt"):
+        return None, (
+            f"{name} (run attempt {run.get('run_attempt')} is not the job's attempt "
+            f"{job.get('run_attempt')})"
+        )
+    if run.get("head_sha") != head_sha:
+        return None, f"{name} (run head mismatch {run.get('head_sha')} vs {head_sha})"
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        return None, f"{name} (run {run.get('conclusion') or run.get('status')})"
+    if run.get("path") not in TRUSTED_WORKFLOW_PATHS:
+        return None, f"{name} (untrusted workflow path {run.get('path')})"
+    if not isinstance(run.get("workflow_id"), int) or run.get("workflow_id") <= 0:
+        return None, f"{name} (run carries no workflow id)"
+    if not repository:
+        return None, f"{name} (repository not supplied — cannot verify provenance)"
+    for key in ("repository", "head_repository"):
+        owner_repo = run.get(key)
+        full_name = owner_repo.get("full_name") if isinstance(owner_repo, dict) else owner_repo
+        if full_name != repository:
+            return None, f"{name} (run {key} {full_name} is not {repository})"
+
+    if not attempts:
+        return None, f"{name} (attempt history unavailable — cannot confirm the current attempt)"
+    latest = max((a.get("run_attempt") or 0) for a in attempts if isinstance(a, dict))
+    if job.get("run_attempt") != latest:
+        return None, (
+            f"{name} (stale attempt {job.get('run_attempt')} — the current attempt is {latest})"
+        )
+
+    return (
+        {
+            "name": name,
+            "check_id": check.get("id"),
+            "job_id": job.get("id"),
+            "job_name": job.get("name"),
+            "run_id": run.get("id"),
+            "run_attempt": run.get("run_attempt"),
+            "workflow_id": run.get("workflow_id"),
+            "workflow_path": run.get("path"),
+            "workflow_name": run.get("name") or job.get("workflow_name"),
+            "head_sha": head_sha,
+            "repository": repository,
+            "app": slug,
+        },
+        None,
+    )
+
+
+def evaluate_checks(
+    checks: list[dict[str, Any]],
+    mandatory: list[str],
+    head_sha: str,
+    pr_head_sha: str,
+    repository: str | None = None,
+) -> dict[str, Any]:
     """
     Evaluate PR checks for merge controller.
     Returns {ok, reason, missing, failed}.
@@ -336,6 +450,7 @@ def evaluate_checks(checks: list[dict[str, Any]], mandatory: list[str], head_sha
     by_name = {c.get("name"): c for c in checks}
     missing = []
     failed = []
+    resolved: list[dict[str, Any]] = []
     for name in mandatory:
         c = by_name.get(name)
         if c is None:
@@ -345,64 +460,33 @@ def evaluate_checks(checks: list[dict[str, Any]], mandatory: list[str], head_sha
         if c.get("status") != "completed" or c.get("conclusion") != "success":
             failed.append(f"{name} ({c.get('conclusion') or c.get('status')})")
             continue
-        # Enforce trusted provenance — require real workflow ID/path/job/run/head binding, not just app+name
-        app = c.get("app")
-        if isinstance(app, dict):
-            slug = app.get("slug") or app.get("name")
-        else:
-            slug = app
-        # Workflow provenance must be present and verifiable — do not accept missing workflow (app+name insufficient)
-        workflow = c.get("workflow") or c.get("workflow_name") or c.get("workflow_id") or c.get("workflow_id") or c.get("workflowRun") or c.get("workflow_run")
-        workflow_id = c.get("workflow_id") or c.get("workflowId") or c.get("workflow_run_id") or (c.get("workflow_run") or {}).get("id") if isinstance(c.get("workflow_run"), dict) else None
-        workflow_path = c.get("workflow_path") or c.get("path") or (c.get("workflow_run") or {}).get("path") if isinstance(c.get("workflow_run"), dict) else None
-        job_name = c.get("job_name") or c.get("job") or c.get("jobName")
-        run_id = c.get("run_id") or c.get("runId") or (c.get("workflow_run") or {}).get("id") if isinstance(c.get("workflow_run"), dict) else None
-        # head_sha must be present and exactly match PR head — missing is failure (legacy bypass removed)
-        check_sha = c.get("head_sha") or c.get("headSha") or c.get("sha") or c.get("head_sha")
-        if not check_sha:
-            failed.append(f"{name} (missing head_sha)")
+        # Provenance is resolved, not read: the Checks API does not return workflow identity,
+        # so the producing job and run must be fetched and bound to this exact check.
+        _provenance, problem = resolve_check_provenance(c, head_sha=head_sha, repository=repository)
+        if problem:
+            failed.append(problem)
             continue
-        if check_sha != head_sha:
-            failed.append(f"{name} (head mismatch {check_sha} vs {head_sha})")
-            continue
-        # app must be present and trusted — legacy statuses without app are not trusted for mandatory checks
-        if not slug or slug not in TRUSTED_APP_SLUGS:
-            failed.append(f"{name} (untrusted or missing app {slug or 'none'})")
-            continue
-        # workflow provenance required: must have workflow identifier and be trusted, plus job/run/head binding
-        # Require at least workflow name/id and head_sha/run binding — missing workflow => fail closed
-        if not workflow and not workflow_id and not workflow_path:
-            failed.append(f"{name} (missing workflow provenance — require workflow ID/path/job/run)")
-            continue
-        # Normalize workflow identifier for trust check
-        wf_identifier = workflow or workflow_path or str(workflow_id) if workflow_id else None
-        # Trusted workflow is the CI workflow; must match exactly or be a trusted path
-        # Allow both name and path forms
-        trusted_identifiers = {TRUSTED_WORKFLOW, ".github/workflows/ci.yml", "ci.yml", "CI — syntax + offline validation"}
-        if wf_identifier and wf_identifier not in trusted_identifiers and str(wf_identifier) not in trusted_identifiers:
-            # Also allow workflow_id numeric that maps to trusted — for now, require name/path match
-            failed.append(f"{name} (untrusted workflow {wf_identifier})")
-            continue
-        # If run_id or job_name provided, verify they are present (non-empty)
-        # At minimum, if workflow_run dict is provided, verify its head_sha matches
-        wf_run = c.get("workflow_run") if isinstance(c.get("workflow_run"), dict) else None
-        if wf_run:
-            wf_head = wf_run.get("head_sha") or wf_run.get("headSha")
-            if wf_head and wf_head != head_sha:
-                failed.append(f"{name} (workflow_run head mismatch {wf_head} vs {head_sha})")
-                continue
-            wf_run_path = wf_run.get("path") or wf_run.get("workflow_path")
-            if wf_run_path and wf_run_path not in trusted_identifiers:
-                failed.append(f"{name} (untrusted workflow_run path {wf_run_path})")
-                continue
+        resolved.append(_provenance)
     if missing or failed:
         reason = []
         if missing:
             reason.append(f"missing: {', '.join(missing)}")
         if failed:
             reason.append(f"failed: {', '.join(failed)}")
-        return {"ok": False, "reason": "; ".join(reason), "missing": missing, "failed": failed}
-    return {"ok": True, "reason": "all mandatory checks successful", "missing": [], "failed": []}
+        return {
+            "ok": False,
+            "reason": "; ".join(reason),
+            "missing": missing,
+            "failed": failed,
+            "provenance": resolved,
+        }
+    return {
+        "ok": True,
+        "reason": "all mandatory checks successful",
+        "missing": [],
+        "failed": [],
+        "provenance": resolved,
+    }
 
 
 def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: str | os.PathLike | None = None) -> dict[str, Any]:
@@ -794,7 +878,8 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
     mandatory = policy.get("checks", {}).get("mandatory") or ["maintenance-ci"]
     head_sha = fixture.get("head_sha") or pr.get("head", {}).get("sha") or ""
     pr_head_sha = pr.get("head", {}).get("sha") or head_sha
-    eval_result = evaluate_checks(checks, mandatory, head_sha, pr_head_sha)
+    repository = fixture.get("repository") or None
+    eval_result = evaluate_checks(checks, mandatory, head_sha, pr_head_sha, repository)
     if not eval_result["ok"]:
         return {"decision": "blocked", "reason": eval_result["reason"], "merge": False}
 

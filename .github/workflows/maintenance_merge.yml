@@ -303,35 +303,89 @@ jobs:
                 workflowRuns = [];
                 trustedWorkflowRun = null;
               }
-              // Also consider commit statuses (legacy)
-              const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({ owner, repo, ref: pr.head.sha, per_page: 100 });
-              // Enrich checks with real workflow provenance — use check's own head_sha/app and workflow info, do not fabricate via job name
-              // The helper will verify workflow provenance and exact-head outcomes; missing provenance fails closed
-              checks = all.map(c => {
-                // Use check's own status/conclusion/head_sha/app; workflow provenance must be present in check object itself
-                // Do not match by job name or fabricate maintenance-ci fallback — require actual check-run producer identity
-                return {
+              // Resolve each check to the Actions job and workflow run that actually produced it.
+              // The Checks API returns no workflow identity: a real check_runs record carries id,
+              // name, head_sha, status, conclusion, app, external_id and html_url — never workflow,
+              // workflow_id, path or workflow_run. Reading those keys rejects every genuine record,
+              // so provenance is fetched instead: for Actions checks external_id is the job id and
+              // html_url is the canonical .../actions/runs/<run_id>/job/<job_id> link. The raw
+              // payloads are attached unchanged; when a fetch fails the check stays unresolved and
+              // the helper fails closed rather than accepting an unproven gate.
+              const repository = `${owner}/${repo}`;
+              const canonicalLink = (c) => /\/actions\/runs\/(\d+)\/job\/(\d+)/.exec(c.html_url || c.details_url || '');
+              const jobCache = new Map();
+              const runCache = new Map();
+              const attemptCache = new Map();
+              checks = [];
+              for (const c of all) {
+                const enriched = {
+                  id: c.id,
                   name: c.name,
                   status: c.status,
                   conclusion: c.conclusion,
-                  app: c.app?.slug,
                   head_sha: c.head_sha,
-                  workflow: c.workflow?.name || undefined,
-                  workflow_id: c.workflow_id || undefined,
-                  workflow_path: c.path || c.workflow?.path || undefined,
-                  workflow_run: c.workflow_run || null,
-                  job_name: c.name,
-                  run_attempt: c.run_attempt || undefined
+                  external_id: c.external_id,
+                  html_url: c.html_url,
+                  details_url: c.details_url,
+                  app: c.app && c.app.slug ? { slug: c.app.slug } : undefined
                 };
-              });
-              // Do NOT create synthetic maintenance-ci from workflow run if no check represents it — require actual gate
-              // The final gate must be present as a real check/job; inventing it hides missing evidence
-              // Add statuses as checks
-              for (const s of statuses) {
-                // Legacy statuses: creator/context distinct from check-run provenance — do not invent app/workflow, include actual sha and context
-                // Helper will treat missing app/workflow as failure for mandatory checks (fail closed), unless policy explicitly allows legacy
-                checks.push({ name: s.context, status: 'completed', conclusion: s.state === 'success' ? 'success' : s.state, head_sha: s.sha || pr.head.sha });
+                const link = canonicalLink(c);
+                const externalJob = Number.parseInt(c.external_id, 10);
+                const jobId = Number.isInteger(externalJob) && externalJob > 0 ? externalJob
+                  : (link ? Number.parseInt(link[2], 10) : null);
+                if (jobId !== null) {
+                  try {
+                    if (!jobCache.has(jobId)) {
+                      const { data } = await github.rest.actions.getJobForWorkflowRun({ owner, repo, job_id: jobId });
+                      jobCache.set(jobId, data);
+                    }
+                    enriched.job = jobCache.get(jobId);
+                  } catch (e) {
+                    console.log(`Job ${jobId} behind check "${c.name}" unavailable: ${e.message} — provenance unresolved`);
+                  }
+                }
+                const runId = (enriched.job && Number.isInteger(enriched.job.run_id)) ? enriched.job.run_id
+                  : (link ? Number.parseInt(link[1], 10) : null);
+                if (runId !== null) {
+                  try {
+                    if (!runCache.has(runId)) {
+                      const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: runId });
+                      runCache.set(runId, data);
+                    }
+                    enriched.run = runCache.get(runId);
+                  } catch (e) {
+                    console.log(`Run ${runId} behind check "${c.name}" unavailable: ${e.message} — provenance unresolved`);
+                  }
+                  try {
+                    if (!attemptCache.has(runId)) {
+                      const { data } = await github.rest.actions.listWorkflowRunAttempts({ owner, repo, run_id: runId, per_page: 100 });
+                      attemptCache.set(runId, data.workflow_run_attempts || []);
+                    }
+                    enriched.attempts = attemptCache.get(runId);
+                  } catch (e) {
+                    console.log(`Attempt history for run ${runId} unavailable: ${e.message} — provenance unresolved`);
+                  }
+                }
+                checks.push(enriched);
               }
+              // A synthetic maintenance-ci is never invented: if no real check represents the
+              // final gate, the gate is missing and the decision blocks.
+              // Legacy commit statuses carry no producing job or run, so they can never satisfy a
+              // mandatory check; they are recorded for the report only.
+              const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({ owner, repo, ref: pr.head.sha, per_page: 100 });
+              for (const s of statuses) {
+                checks.push({
+                  name: s.context,
+                  status: 'completed',
+                  conclusion: s.state === 'success' ? 'success' : s.state,
+                  head_sha: s.sha || pr.head.sha,
+                  app: { slug: s.creator && s.creator.login ? s.creator.login : undefined },
+                  provenance: 'legacy-commit-status'
+                });
+              }
+              fixture.repository = repository;
+              console.log(`Resolved ${checks.length} checks for ${pr.head.sha}; ` +
+                `${checks.filter(c => c.job && c.run && c.attempts).length} carry full job/run/attempt provenance`);
               fixture.checks = checks;
               console.log(`Checks for ${pr.head.sha}: ${JSON.stringify(checks, null, 2)}`);
             } catch (e) {
