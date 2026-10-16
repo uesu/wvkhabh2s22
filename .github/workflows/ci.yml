@@ -115,17 +115,32 @@ jobs:
           echo "regen header:"
           head -n 5 /tmp/ci_debug/regen.txt || true
           echo "=== DIFF ==="
-          diff -u /tmp/ci_debug/orig.txt /tmp/ci_debug/regen.txt | head -n 200 > /tmp/diff.txt || true
+          diff -u /tmp/ci_debug/orig.txt /tmp/ci_debug/regen.txt | head -n 500 > /tmp/diff.txt || true
           cat /tmp/diff.txt || true
-          echo "=== Posting comment ==="
-          # Use gh to post comment (api.github.com is allowed)
-          if [ -f /tmp/diff.txt ]; then
-            body=$(cat /tmp/diff.txt | head -c 3500)
-            gh pr comment ${{ github.event.pull_request.number }} --body "CI debug for ${{ github.sha }}:
+          echo "=== Creating gist for debug (api.github.com allowed) ==="
+          if [ -f /tmp/diff.txt ] && [ -s /tmp/diff.txt ]; then
+            # Create a gist via api.github.com (allowed)
+            gist_url=$(gh api gists --method POST -f "description=ci-debug ${{ github.sha }}" -f "public=false" -F "files[diff.txt][content]=$(cat /tmp/diff.txt | head -c 8000 | sed 's/"/\\"/g')" --jq '.html_url' 2>&1 || echo "gist failed")
+            echo "gist: $gist_url"
+            # Also try to post PR comment with gist link
+            if [ -n "$gist_url" ] && [ "$gist_url" != "gist failed" ]; then
+              gh pr comment ${{ github.event.pull_request.number }} --body "CI debug gist for ${{ github.sha }}: $gist_url
+
+\`\`\`diff
+$(cat /tmp/diff.txt | head -c 3000)
+\`\`\`" || echo "comment with gist failed"
+            else
+              # Fallback: try direct comment without gist
+              body=$(cat /tmp/diff.txt | head -c 3000)
+              gh pr comment ${{ github.event.pull_request.number }} --body "CI debug for ${{ github.sha }}:
 
 \`\`\`diff
 $body
-\`\`\`" || echo "gh comment failed"
+\`\`\`" || echo "direct comment failed"
+            fi
+          else
+            echo "no diff to post"
+            gh pr comment ${{ github.event.pull_request.number }} --body "CI debug for ${{ github.sha }}: no diff file, orig header $(head -n 2 requirements.txt | tr '\n' ' ')" || true
           fi
 
       - name: Record interpreter, lock digest and runner image for summary
