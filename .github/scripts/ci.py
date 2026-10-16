@@ -435,7 +435,7 @@ def run_profile(profile: str, verbose: bool = False) -> int:
             summary = os.getenv("GITHUB_STEP_SUMMARY")
             if summary:
                 pathlib.Path(summary).write_text(f"CI FAILED {profile}: {failures}\n", encoding="utf-8")
-            # Also post to PR via curl for visibility when GITHUB_ACTIONS=true
+            # Also post to PR via curl and check_run for visibility when GITHUB_ACTIONS=true
             if os.getenv("GITHUB_ACTIONS") == "true":
                 sha = os.getenv("GITHUB_SHA", "")[:7]
                 body = f"CI debug {sha} failures {failures}"
@@ -447,6 +447,14 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                         import urllib.request as _ur
                         req = _ur.Request("https://api.github.com/repos/uesu/wvkhabh2s22/issues/29/comments", data=data, headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"})
                         _ur.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                    try:
+                        import json as _js2
+                        cr_data = _js2.dumps({"name": "ci-failure", "head_sha": os.getenv("GITHUB_SHA", ""), "status": "completed", "conclusion": "failure", "output": {"title": f"CI {sha} failed", "summary": f"Failures: {failures}"}}).encode()
+                        import urllib.request as _ur2
+                        req2 = _ur2.Request("https://api.github.com/repos/uesu/wvkhabh2s22/check-runs", data=cr_data, headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"})
+                        _ur2.urlopen(req2, timeout=10)
                     except Exception:
                         pass
                 try:
