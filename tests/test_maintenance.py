@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -17,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".github" / "scripts"))
 
 import maintenance  # type: ignore
+import python_version_bump  # type: ignore
 
 def assert_eq(a, b, msg=""):
     if a != b:
@@ -570,45 +575,65 @@ def test_decision_from_fixture():
 # ---------------------------------------------------------------------------
 # Proposer publication binding. The proposer runs on the base branch and
 # publishes a NEW commit, so the run's head_sha is the source head and can never
-# equal the published proposal head. Publication has to be bound to the run that
-# produced it, not to a head-SHA coincidence.
+# equal the published proposal head. Nothing about a branch name, a title, a time
+# window or membership of a mutable upstream version list identifies which run
+# validated and published this proposal, so the proposer emits two records bound
+# to its own run and attempt and the controller has to find both.
+#
+# Three identities stay deliberately distinct: the run actor who authorized the
+# run, the PAT publisher who authored the PR, and the configured commit bot who
+# signed the commit. Requiring them to be one login is what made a genuine
+# publication unverifiable.
 # ---------------------------------------------------------------------------
 
 PROPOSER_PATH = ".github/workflows/python_version_bump.yml"
 SOURCE_HEAD = "58547a93c000000000000000000000000000000a"
 PUBLISHED_HEAD = "abcdef1234567890abcdef1234567890abcdef12"
 PROPOSER_RUN_ID = 38849000001
-BUMP_ACTOR = "bump-bot"
+RUN_ACTOR = "release-engineer"          # authorized the run (manual dispatch)
+PAT_PUBLISHER = "bump-pat-owner"        # owns BUMP_PAT, authors the PR
+COMMIT_BOT = "github-actions[bot]"      # configured commit identity in trusted policy
+CANDIDATE = "3.14.9"
 PYTHON_PATCH = "@@ -1 +1 @@\n-3.14.8\n+3.14.9\n"
+
+#: The exact bytes the validated candidate proposal publishes.
+PROPOSAL_BYTES = {
+    ".python-version": CANDIDATE + "\n",
+    "requirements.txt": "# pinned by candidate\naiohttp==3.13.2\n",
+    "requirements-dev.txt": "# pinned by candidate\nactionlint-py==1.7.7.24\n",
+    ".github/maintenance.json": None,   # filled from the real policy, rewritten narrowly
+}
+
+
+def proposal_workspace(candidate=CANDIDATE):
+    """Materialise the proposal bytes in a temp dir and digest them the way the controller does."""
+    policy_text = (ROOT / ".github" / "maintenance.json").read_text(encoding="utf-8")
+    workspace = tempfile.mkdtemp(prefix="proposal-")
+    root = pathlib.Path(workspace)
+    (root / ".github").mkdir(parents=True, exist_ok=True)
+    for name, content in PROPOSAL_BYTES.items():
+        text = content if content is not None else python_version_bump.rewrite_policy_versions(
+            policy_text, candidate)
+        (root / name).write_text(text, encoding="utf-8")
+    return root, python_version_bump.digest_files(root)
+
+
+PROPOSAL_ROOT, PROPOSAL_DIGESTS = proposal_workspace()
 
 
 def api_proposer_run(*, run_id=PROPOSER_RUN_ID, attempt=1, head_sha=SOURCE_HEAD,
                      status="completed", conclusion="success", path=PROPOSER_PATH,
-                     actor=BUMP_ACTOR, full_name=REPO, workflow_id=88,
-                     started="2026-10-16T02:00:00Z", updated="2026-10-16T02:05:00Z"):
+                     actor=RUN_ACTOR, full_name=REPO, workflow_id=88):
     """Shaped like GET /repos/{owner}/{repo}/actions/runs/{run_id} for the proposer."""
     return {
         "id": run_id, "name": "Python version proposer", "path": path, "workflow_id": workflow_id,
         "head_branch": "main", "head_sha": head_sha, "run_number": 12, "run_attempt": attempt,
-        "event": "schedule", "status": status, "conclusion": conclusion,
-        "run_started_at": started, "created_at": started, "updated_at": updated,
+        "event": "workflow_dispatch", "status": status, "conclusion": conclusion,
+        "run_started_at": "2026-10-16T02:00:00Z", "created_at": "2026-10-16T02:00:00Z",
+        "updated_at": "2026-10-16T02:05:00Z",
         "actor": {"id": 7, "login": actor, "type": "User"},
         "repository": {"id": 1, "full_name": full_name, "name": full_name.split("/")[1]},
         "head_repository": {"id": 1, "full_name": full_name, "name": full_name.split("/")[1]},
-    }
-
-
-def api_published_commit(*, sha=PUBLISHED_HEAD, login=BUMP_ACTOR, date="2026-10-16T02:03:00Z"):
-    """Shaped like GET /repos/{owner}/{repo}/commits/{ref} for the published proposal head."""
-    return {
-        "sha": sha,
-        "author": {"id": 7, "login": login, "type": "User"},
-        "committer": {"id": 7, "login": login, "type": "User"},
-        "commit": {
-            "author": {"name": login, "date": date},
-            "committer": {"name": login, "date": date},
-            "message": "chore: bump CPython pin 3.14.8 -> 3.14.9",
-        },
     }
 
 
@@ -622,9 +647,49 @@ def api_proposer_attempt(*, run_id=PROPOSER_RUN_ID, attempt=1, head_sha=SOURCE_H
     return {
         "id": run_id, "run_attempt": attempt, "status": status, "conclusion": conclusion,
         "head_sha": head_sha, "path": PROPOSER_PATH, "workflow_id": 88,
-        "name": "Python version proposer", "head_branch": "main", "event": "schedule",
+        "name": "Python version proposer", "head_branch": "main", "event": "workflow_dispatch",
         "url": f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/attempts/{attempt}",
     }
+
+
+def api_published_commit(*, sha=PUBLISHED_HEAD):
+    """Shaped like GET /repos/{owner}/{repo}/commits/{ref} for the published proposal head."""
+    return {
+        "sha": sha,
+        "author": {"id": 8, "login": PAT_PUBLISHER, "type": "User"},
+        "committer": {"id": 8, "login": PAT_PUBLISHER, "type": "User"},
+        "commit": {
+            "author": {"name": COMMIT_BOT, "date": "2026-10-16T02:03:00Z"},
+            "committer": {"name": COMMIT_BOT, "date": "2026-10-16T02:03:00Z"},
+            "message": f"chore: bump CPython pin 3.14.8 -> {CANDIDATE}",
+        },
+    }
+
+
+def api_validation_record(*, run_id=PROPOSER_RUN_ID, attempt=1, source_head=SOURCE_HEAD,
+                          candidate=CANDIDATE, interpreter=CANDIDATE,
+                          pip=maintenance.PINNED_PIP, pip_tools=maintenance.PINNED_PIP_TOOLS,
+                          digests=None):
+    """The proposer's own proposal-validation notice record."""
+    return python_version_bump.build_validation_evidence(
+        source_head=source_head, candidate=candidate, interpreter=interpreter,
+        pip_version=pip, pip_tools_version=pip_tools,
+        digests=PROPOSAL_DIGESTS if digests is None else digests,
+        run_id=run_id, run_attempt=attempt,
+    )
+
+
+def api_publication_record(*, run_id=PROPOSER_RUN_ID, attempt=1, pull_number=31,
+                           published_head=PUBLISHED_HEAD, branch=f"chore/python-{CANDIDATE}",
+                           digests=None, pr_author=PAT_PUBLISHER, commit_identity=COMMIT_BOT,
+                           run_actor=RUN_ACTOR):
+    """The proposer's own proposal-publication notice record."""
+    return python_version_bump.build_publication_evidence(
+        run_id=run_id, run_attempt=attempt, pull_number=pull_number,
+        published_head=published_head, branch=branch,
+        digests=PROPOSAL_DIGESTS if digests is None else digests,
+        pr_author=pr_author, commit_identity=commit_identity, run_actor=run_actor,
+    )
 
 
 def _proposer_checks():
@@ -636,15 +701,15 @@ def _proposer_checks():
     return [resolved_check("maintenance-ci", head_sha=PUBLISHED_HEAD)]
 
 
-def _proposer_decision(**overrides):
-    """Run the real decision path over an API-shaped python-bump proposal."""
+def _proposer_fixture(**overrides):
+    """The API-shaped fixture a python-bump proposal produces, before the decision path."""
     fixture = {
         "pr": {
             "number": 31, "state": "open", "draft": False, "mergeable": True,
             "mergeable_state": "clean", "base": {"ref": "main"},
-            "head": {"sha": PUBLISHED_HEAD, "ref": "chore/python-3.14.9"},
-            "title": "chore: bump CPython pin 3.14.8 -> 3.14.9",
-            "user": {"login": BUMP_ACTOR},
+            "head": {"sha": PUBLISHED_HEAD, "ref": f"chore/python-{CANDIDATE}"},
+            "title": f"chore: bump CPython pin 3.14.8 -> {CANDIDATE}",
+            "user": {"login": PAT_PUBLISHER},
         },
         "checks": _proposer_checks(),
         "changed_files": [".python-version"],
@@ -652,12 +717,20 @@ def _proposer_decision(**overrides):
         "auto_merge_vars": {"AUTO_MERGE_PYTHON_BUMP": "yes"},
         "labels": [], "reviews": [], "head_sha": PUBLISHED_HEAD, "repository": REPO,
         "review_required": False, "deferred": False,
-        "publisher_run": api_proposer_run(),
-        "publisher_attempt": api_proposer_attempt(),
+        "proposer_run": api_proposer_run(),
+        "proposer_attempt": api_proposer_attempt(),
+        "validation_record": api_validation_record(),
+        "publication_record": api_publication_record(),
+        "proposal_digests": dict(PROPOSAL_DIGESTS),
         "published_commit": api_published_commit(),
-        "manifest_versions": ["3.14.8", "3.14.9"],
     }
     fixture.update(overrides)
+    return fixture
+
+
+def _proposer_decision(**overrides):
+    """Run the real decision path over an API-shaped python-bump proposal."""
+    fixture = _proposer_fixture(**overrides)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
         json.dump(fixture, fh)
         fname = fh.name
@@ -668,50 +741,68 @@ def _proposer_decision(**overrides):
 
 
 def test_proposer_publication_bound_to_the_real_run():
-    """A BUMP_PAT publication is authorized by evidence, with source head != published head."""
+    """A BUMP_PAT publication is authorized by its own records, with source head != published head."""
     decision = _proposer_decision()
     assert_eq(decision["decision"], "merge")
     assert decision["merge"] is True, decision["reason"]
     # the run's own head is the source head, deliberately not the published proposal head
     assert_eq(api_proposer_run()["head_sha"], SOURCE_HEAD)
     assert SOURCE_HEAD != PUBLISHED_HEAD
+    # the three identities are distinct and all bound, not collapsed into one login
+    assert RUN_ACTOR != PAT_PUBLISHER != COMMIT_BOT
+    policy = json.loads((ROOT / ".github" / "maintenance.json").read_text(encoding="utf-8"))
+    fixture = _proposer_fixture()
+    fixture["expected_commit_identity"] = policy["python"]["commit_identity"]
+    verified, reason = maintenance.verify_publication_record(fixture, fixture["pr"], CANDIDATE)
+    assert verified, reason
+    for identity in (RUN_ACTOR, PAT_PUBLISHER, COMMIT_BOT):
+        assert identity in reason, f"{identity} must be bound in the provenance: {reason}"
+    assert str(PROPOSER_RUN_ID) in reason, reason
 
 
 def test_proposer_publication_rejects_incomplete_evidence():
     """Every gap in the publication chain fails closed with a specific reason."""
+    stale_locks = dict(PROPOSAL_DIGESTS)
+    stale_locks["requirements.txt"] = "0" * 64
     cases = {
-        "publisher run unavailable": {"publisher_run": None},
-        "failed publisher run": {"publisher_run": api_proposer_run(conclusion="failure")},
-        "missing conclusion": {"publisher_run": api_proposer_run(conclusion=None)},
-        "run still in progress": {"publisher_run": api_proposer_run(status="in_progress", conclusion=None)},
-        "publisher superseded by a rerun": {
-            "publisher_run": api_proposer_run(attempt=1),
-            "publisher_attempt": api_proposer_attempt(attempt=2),
+        "proposer run unavailable": {"proposer_run": None},
+        "failed proposer run": {"proposer_run": api_proposer_run(conclusion="failure")},
+        "run still in progress": {"proposer_run": api_proposer_run(status="in_progress", conclusion=None)},
+        "run from a fork": {"proposer_run": api_proposer_run(full_name="someone/fork")},
+        "untrusted proposer workflow": {"proposer_run": api_proposer_run(path=".github/workflows/other.yml")},
+        "run without a workflow id": {"proposer_run": api_proposer_run(workflow_id=None)},
+        "run carries no attempt number": {"proposer_run": {**api_proposer_run(), "run_attempt": None}},
+        "proposer superseded by a rerun": {
+            "proposer_run": api_proposer_run(attempt=1),
+            "proposer_attempt": api_proposer_attempt(attempt=2),
         },
-        "attempt record for another run": {
-            "publisher_attempt": api_proposer_attempt(run_id=PROPOSER_RUN_ID + 4),
-        },
-        "attempt record on another source head": {
-            "publisher_attempt": api_proposer_attempt(head_sha="ffffffff"),
-        },
-        "attempt record failed": {
-            "publisher_attempt": api_proposer_attempt(conclusion="failure"),
-        },
-        "attempt record unavailable": {"publisher_attempt": None},
-        "run carries no attempt number": {
-            "publisher_run": {**api_proposer_run(), "run_attempt": None},
-        },
-        "commit by another identity": {"published_commit": api_published_commit(login="someone-else")},
-        "commit outside the run window": {"published_commit": api_published_commit(date="2026-10-16T09:00:00Z")},
-        "commit before the run started": {"published_commit": api_published_commit(date="2026-10-16T01:00:00Z")},
-        "version absent from the manifest": {"manifest_versions": ["3.14.8"]},
-        "manifest unavailable": {"manifest_versions": None},
+        "attempt record for another run": {"proposer_attempt": api_proposer_attempt(run_id=PROPOSER_RUN_ID + 4)},
+        "attempt record on another source head": {"proposer_attempt": api_proposer_attempt(head_sha="ffffffff")},
+        "attempt record failed": {"proposer_attempt": api_proposer_attempt(conclusion="failure")},
+        "attempt record unavailable": {"proposer_attempt": None},
+        "validation record missing": {"validation_record": None},
+        "publication record missing": {"publication_record": None},
+        "validation record from another run": {"validation_record": api_validation_record(run_id=PROPOSER_RUN_ID + 9)},
+        "publication record from another attempt": {"publication_record": api_publication_record(attempt=3)},
+        "publication record names another PR": {"publication_record": api_publication_record(pull_number=99)},
+        "publication record names a stale head": {"publication_record": api_publication_record(published_head="deadbeef")},
+        "publication record names another branch": {"publication_record": api_publication_record(branch="chore/python-3.15.0")},
+        "publication record claims another author": {"publication_record": api_publication_record(pr_author="someone-else")},
+        "publication record claims another run actor": {"publication_record": api_publication_record(run_actor="someone-else")},
+        "publication record signed by another bot": {"publication_record": api_publication_record(commit_identity="not-the-bot")},
+        "publication record without a commit identity": {"publication_record": {**api_publication_record(), "commit_identity": None}},
+        "validation record from another source head": {"validation_record": api_validation_record(source_head="11111111")},
+        "validation record for another candidate": {"validation_record": api_validation_record(candidate="3.15.0")},
+        "validation not run by the candidate interpreter": {"validation_record": api_validation_record(interpreter="3.14.8")},
+        "validation used unpinned pip": {"validation_record": api_validation_record(pip="25.0")},
+        "validation used unpinned pip-tools": {"validation_record": api_validation_record(pip_tools="7.4.0")},
+        "validated lock bytes differ from the published bytes": {"validation_record": api_validation_record(digests=stale_locks)},
+        "published bytes moved after validation": {"proposal_digests": stale_locks},
+        "digests never computed": {"proposal_digests": None},
+        "publication record carries no digests": {"publication_record": {**api_publication_record(), "digests": None}},
         "published commit is not the PR head": {"published_commit": api_published_commit(sha="deadbeef")},
-        "run from a fork": {"publisher_run": api_proposer_run(full_name="someone/fork")},
-        "untrusted proposer workflow": {"publisher_run": api_proposer_run(path=".github/workflows/other.yml")},
-        "run without a workflow id": {"publisher_run": api_proposer_run(workflow_id=None)},
-        "repository not supplied": {"repository": None},
         "published commit unavailable": {"published_commit": None},
+        "repository not supplied": {"repository": None},
     }
     for label, overrides in cases.items():
         decision = _proposer_decision(**overrides)
@@ -721,11 +812,421 @@ def test_proposer_publication_rejects_incomplete_evidence():
 
 
 def test_trusted_author_does_not_bypass_publication_provenance():
-    """A bot-authored proposal with no publication evidence is not authorized."""
-    for login in ("github-actions[bot]", "dependabot[bot]", BUMP_ACTOR):
-        decision = _proposer_decision(publisher_run=None)
+    """Whichever trusted identity authored the proposal, absent records authorize nothing."""
+    for login in ("github-actions[bot]", "dependabot[bot]", PAT_PUBLISHER, RUN_ACTOR):
+        pr = {
+            "number": 31, "state": "open", "draft": False, "mergeable": True,
+            "mergeable_state": "clean", "base": {"ref": "main"},
+            "head": {"sha": PUBLISHED_HEAD, "ref": f"chore/python-{CANDIDATE}"},
+            "title": f"chore: bump CPython pin 3.14.8 -> {CANDIDATE}",
+            "user": {"login": login},
+        }
+        decision = _proposer_decision(pr=pr, proposer_run=None)
         assert decision["merge"] is False, f"{login} must not bypass provenance"
         assert "publication unverified" in decision["reason"], decision["reason"]
+        # a complete chain authored by the same identity is still bound to the records
+        bound = _proposer_decision(pr=pr, publication_record=api_publication_record(pr_author=login))
+        assert bound["merge"] is True, f"{login}: {bound['reason']}"
+
+
+def test_notice_records_survive_the_annotation_round_trip():
+    """The records the workflow prints are the records the controller parses back."""
+    validation = api_validation_record()
+    publication = api_publication_record()
+    for record, kind in ((validation, python_version_bump.VALIDATION_NOTICE),
+                         (publication, python_version_bump.PUBLICATION_NOTICE)):
+        line = python_version_bump.notice(kind, record)
+        assert line is not None, f"{kind} evidence must fit in a bounded notice"
+        assert line.startswith("::notice::"), line
+        parsed = python_version_bump.parse_notice(line[len("::notice::"):], kind)
+        assert parsed == record, f"{kind} record did not survive the round trip"
+        assert python_version_bump.parse_notice(line, "other-kind") is None
+    assert python_version_bump.parse_notice("::notice::proposal-validation not json",
+                                            python_version_bump.VALIDATION_NOTICE) is None
+    assert python_version_bump.parse_notice(None, python_version_bump.VALIDATION_NOTICE) is None
+    oversized = python_version_bump.notice(
+        python_version_bump.VALIDATION_NOTICE,
+        {**validation, "digests": {k: "f" * 4000 for k in maintenance.PROPOSAL_FILES}},
+        limit=200)
+    assert oversized is None, "an oversized record must not be truncated into a lie"
+
+
+def test_policy_reconciliation_is_narrow():
+    """Only the two derived version fields may move; anything else is rejected."""
+    before = (ROOT / ".github" / "maintenance.json").read_text(encoding="utf-8")
+    after = python_version_bump.rewrite_policy_versions(before, CANDIDATE)
+    assert python_version_bump.policy_change_is_narrow(before, after, CANDIDATE)
+    rewritten = json.loads(after)["python"]
+    assert_eq(rewritten["current_version"], CANDIDATE)
+    assert_eq(rewritten["supported_versions"], [CANDIDATE])
+    # a one-version bump must stay a two-line diff: re-serialising would reformat every
+    # unrelated array and make the proposal impossible to review
+    changed = [(a, b) for a, b in zip(before.splitlines(), after.splitlines()) if a != b]
+    assert_eq(len(changed), 2)
+    assert_eq(len(before.splitlines()), len(after.splitlines()))
+    for old_line, new_line in changed:
+        assert "current_version" in old_line or "supported_versions" in old_line, old_line
+        assert "3.14.8" in old_line and CANDIDATE in new_line, (old_line, new_line)
+    # the same rewrite is deterministic, so a regenerated proposal is byte-stable
+    assert_eq(python_version_bump.rewrite_policy_versions(before, CANDIDATE), after)
+    # an unrelated key change is not a narrow reconciliation
+    tampered = json.loads(after)
+    tampered["checks"]["mandatory"] = []
+    assert not python_version_bump.policy_change_is_narrow(
+        before, json.dumps(tampered, indent=2) + "\n", CANDIDATE)
+    # neither is leaving another python field behind
+    tampered2 = json.loads(after)
+    tampered2["python"]["soak_days"] = 0
+    assert not python_version_bump.policy_change_is_narrow(
+        before, json.dumps(tampered2, indent=2) + "\n", CANDIDATE)
+    assert not python_version_bump.policy_change_is_narrow(before, "not json", CANDIDATE)
+
+
+# ---------------------------------------------------------------------------
+# Candidate/publisher adapter integration: execute the ACTUAL Python blocks from
+# python_version_bump.yml with mocked I/O. Helper-only fixtures would conceal a
+# broken caller, so the caller's own source is extracted and run here.
+# ---------------------------------------------------------------------------
+
+BUMP_WORKFLOW = ROOT / ".github" / "workflows" / "python_version_bump.yml"
+
+
+def workflow_step(step_name):
+    """The full text of one workflow step, so a caller cannot drift from its helpers."""
+    text = BUMP_WORKFLOW.read_text(encoding="utf-8")
+    start = text.index(f"      - name: {step_name}")
+    rest = text[start + 1:]
+    end = start + 1 + (re.search(r"^      - name: ", rest, re.M).start() if re.search(
+        r"^      - name: ", rest, re.M) else len(rest))
+    return text[start:end]
+
+
+def workflow_python_block(step_name):
+    """Extract and dedent the embedded `python - <<'PY'` program of one step."""
+    step = workflow_step(step_name)
+    match = re.search(r"python - <<'PY'\n(.*?)^\s+PY\n", step, re.S | re.M)
+    assert match, f"step {step_name!r} embeds no python program"
+    lines = match.group(1).splitlines()
+    indent = min(len(line) - len(line.lstrip()) for line in lines if line.strip())
+    return "\n".join(line[indent:] if line.strip() else "" for line in lines) + "\n"
+
+
+PUBLISHER_BLOCK = workflow_python_block("Publish only the validated bytes (no candidate execution here)")
+CANDIDATE_BLOCK = workflow_python_block(
+    "Validate the candidate proposal bytes in an isolated workspace")
+
+
+def _write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def mock_git(root, *, diff_names, head_policy, commit_author):
+    """A mock `git` covering exactly the calls the publisher makes."""
+    script = f"""#!/bin/sh
+case "$1 $2" in
+  "diff --name-only") printf '%s\\n' {' '.join(repr(n) for n in diff_names) or "''"} ;;
+  "show HEAD:.github/maintenance.json") cat {root / 'policy-before.json'} ;;
+  "log -1") printf '%s\\n' {commit_author!r} ;;
+  *) printf 'mock-git: unexpected %s\\n' "$*" >&2; exit 64 ;;
+esac
+"""
+    binary = root / "bin" / "git"
+    _write(binary, script)
+    binary.chmod(0o755)
+    _write(root / "policy-before.json", head_policy)
+    return str(root / "bin")
+
+
+def run_publisher(*, workspace, validated, env, path_prepend=None):
+    """Execute the publisher's real Python program against mocked I/O."""
+    script = workspace / "publisher.py"
+    script.write_text(PUBLISHER_BLOCK, encoding="utf-8")
+    environ = {
+        "PATH": (path_prepend + ":" if path_prepend else "") + os.environ["PATH"],
+        "PYTHONPATH": str(ROOT / ".github" / "scripts"),
+        "LATEST": CANDIDATE, "CURRENT": "3.14.8",
+        "GITHUB_SHA": SOURCE_HEAD, "GITHUB_RUN_ID": str(PROPOSER_RUN_ID),
+        "GITHUB_RUN_ATTEMPT": "1",
+    }
+    environ.update({k: v for k, v in env.items() if v is not None})
+    return subprocess.run([sys.executable, str(script)], cwd=workspace, env=environ,
+                          capture_output=True, text=True, timeout=120)
+
+
+VALIDATED_ARTIFACT_PATH = "/tmp/validated-proposal"
+
+
+def stage_validated_artifact(*, record=None, files=None, self_consistent=False):
+    """Seed the artifact at the exact path the publisher downloads to, and return both roots.
+
+    The publisher reads a fixed path because that is where download-artifact puts the files in
+    CI, so a test that does not reset it inherits the previous test's bytes and proves nothing.
+    """
+    validated = pathlib.Path(tempfile.mkdtemp(prefix="artifact-"))
+    seed_validated_artifact(validated, record=record, files=files)
+    if self_consistent:
+        # An artifact whose record honestly digests its own (bad) bytes: only the semantic gates
+        # can catch this, which is exactly the case worth testing.
+        honest = dict(record or api_validation_record())
+        honest["digests"] = python_version_bump.digest_files(validated)
+        _write(validated / "proposal-validation.json",
+               json.dumps(honest, sort_keys=True, indent=2) + "\n")
+    shutil.rmtree(VALIDATED_ARTIFACT_PATH, ignore_errors=True)
+    shutil.copytree(validated, VALIDATED_ARTIFACT_PATH)
+    return validated
+
+
+def seed_validated_artifact(directory, *, record=None, files=None):
+    """The artifact the candidate job uploads: the exact validated bytes plus their record.
+
+    ``files`` replaces the whole set, so a caller can model an artifact that is missing a file.
+    """
+    for name in maintenance.PROPOSAL_FILES:
+        if files is not None and name not in files:
+            continue
+        content = (files or {}).get(name, (PROPOSAL_ROOT / name).read_text(encoding="utf-8"))
+        _write(directory / name, content)
+    _write(directory / "proposal-validation.json",
+           json.dumps(record if record is not None else api_validation_record(),
+                      sort_keys=True, indent=2) + "\n")
+
+
+def publisher_workspace():
+    """A checkout of the base branch at the source head, ready for the publisher to modify."""
+    workspace = pathlib.Path(tempfile.mkdtemp(prefix="publisher-"))
+    (workspace / ".github").mkdir(parents=True)
+    _write(workspace / ".python-version", "3.14.8\n")
+    _write(workspace / "requirements.txt", "# base graph\naiohttp==3.13.1\n")
+    _write(workspace / "requirements-dev.txt", "# base dev graph\n")
+    _write(workspace / ".github" / "maintenance.json",
+           (ROOT / ".github" / "maintenance.json").read_text(encoding="utf-8"))
+    return workspace
+
+
+def test_publisher_step_publishes_only_the_validated_bytes():
+    """The real publisher program republishes the validated bytes and verifies their digests."""
+    workspace = publisher_workspace()
+    validated = stage_validated_artifact()
+    try:
+        bin_dir = mock_git(
+            workspace, diff_names=list(maintenance.PROPOSAL_FILES),
+            head_policy=(ROOT / ".github" / "maintenance.json").read_text(encoding="utf-8"),
+            commit_author=COMMIT_BOT)
+        result = run_publisher(workspace=workspace, validated=validated, env={},
+                               path_prepend=bin_dir)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "published bytes match the validated proposal" in result.stdout, result.stdout
+        assert "changed files accepted" in result.stdout, result.stdout
+        for name in maintenance.PROPOSAL_FILES:
+            assert (workspace / name).read_bytes() == (validated / name).read_bytes(), name
+    finally:
+        shutil.rmtree(VALIDATED_ARTIFACT_PATH, ignore_errors=True)
+
+
+def test_publisher_step_rejects_every_way_the_artifact_can_be_wrong():
+    """Wrong, stale or contradictory artifacts fail closed instead of being published."""
+    base_policy = (ROOT / ".github" / "maintenance.json").read_text(encoding="utf-8")
+    tampered_policy = json.loads(base_policy)
+    tampered_policy["checks"]["mandatory"] = []
+    tampered_policy_text = json.dumps(tampered_policy, indent=2) + "\n"
+
+    cases = {
+        "artifact validated another candidate": dict(
+            record=api_validation_record(candidate="3.15.0")),
+        "artifact not validated by the candidate interpreter": dict(
+            record=api_validation_record(interpreter="3.14.8")),
+        "artifact validated a stale source head": dict(
+            record=api_validation_record(source_head="1111111111111111111111111111111111111111")),
+        "artifact validated unpinned pip": dict(record=api_validation_record(pip="25.0")),
+        "artifact digests do not match its own bytes": dict(
+            record=api_validation_record(
+                digests={**PROPOSAL_DIGESTS, "requirements.txt": "0" * 64})),
+        "artifact is missing a proposal file": dict(
+            files={name: (PROPOSAL_ROOT / name).read_text(encoding="utf-8")
+                   for name in maintenance.PROPOSAL_FILES if name != "requirements-dev.txt"}),
+        "artifact rewrites policy beyond the derived versions": dict(
+            files={**{n: (PROPOSAL_ROOT / n).read_text(encoding="utf-8")
+                      for n in maintenance.PROPOSAL_FILES},
+                   ".github/maintenance.json": tampered_policy_text},
+            self_consistent=True),
+    }
+    expected_reason = {
+        "artifact validated another candidate": "validated candidate 3.15.0 is not",
+        "artifact not validated by the candidate interpreter": "not performed by the candidate interpreter",
+        "artifact validated a stale source head": "is not the current checkout",
+        "artifact validated unpinned pip": "do not match the validated proposal",
+        "artifact digests do not match its own bytes": "do not match the validated proposal",
+        "artifact is missing a proposal file": "validated proposal is missing",
+        "artifact rewrites policy beyond the derived versions": "beyond the two derived version fields",
+    }
+    for label, kwargs in cases.items():
+        workspace = publisher_workspace()
+        validated = stage_validated_artifact(**kwargs)
+        try:
+            bin_dir = mock_git(workspace, diff_names=list(maintenance.PROPOSAL_FILES),
+                               head_policy=base_policy, commit_author=COMMIT_BOT)
+            result = run_publisher(workspace=workspace, validated=validated, env={},
+                                   path_prepend=bin_dir)
+            combined = result.stdout + result.stderr
+            assert result.returncode != 0, f"{label} must not publish"
+            # a specific reason, not an incidental crash: the publisher has to know why
+            assert "::error::" in combined, f"{label}: {combined}"
+            assert "Traceback" not in combined, f"{label} crashed instead of failing closed: {combined}"
+            assert expected_reason[label] in combined, f"{label}: {combined}"
+        finally:
+            shutil.rmtree(VALIDATED_ARTIFACT_PATH, ignore_errors=True)
+
+
+def test_publisher_step_rejects_a_commit_signed_by_another_identity():
+    """The configured commit bot is trusted policy; a different signer is rejected."""
+    workspace = publisher_workspace()
+    validated = stage_validated_artifact()
+    try:
+        base_policy = (ROOT / ".github" / "maintenance.json").read_text(encoding="utf-8")
+        bin_dir = mock_git(workspace, diff_names=list(maintenance.PROPOSAL_FILES),
+                           head_policy=base_policy, commit_author="someone-else")
+        result = run_publisher(workspace=workspace, validated=validated, env={},
+                               path_prepend=bin_dir)
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, "an unknown commit identity must not publish"
+        assert "Traceback" not in combined, combined
+        assert "is not the configured bot" in combined, combined
+    finally:
+        shutil.rmtree(VALIDATED_ARTIFACT_PATH, ignore_errors=True)
+
+
+def test_publisher_step_reports_an_unchanged_proposal_without_publishing():
+    """A byte-identical proposal is reported, not committed as an empty change."""
+    workspace = publisher_workspace()
+    # the validated bytes ARE the base bytes, so nothing would change
+    record = api_validation_record(digests=python_version_bump.digest_files(workspace))
+    validated = stage_validated_artifact(
+        record=record,
+        files={name: (workspace / name).read_text(encoding="utf-8")
+               for name in maintenance.PROPOSAL_FILES})
+    try:
+        bin_dir = mock_git(workspace, diff_names=[], head_policy="", commit_author=COMMIT_BOT)
+        result = run_publisher(workspace=workspace, validated=validated, env={},
+                               path_prepend=bin_dir)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "byte-identical to the base" in result.stdout, result.stdout
+    finally:
+        shutil.rmtree(VALIDATED_ARTIFACT_PATH, ignore_errors=True)
+
+
+def test_missing_pat_is_an_explicit_configuration_error():
+    """An unconfigured publisher token fails loudly rather than publishing anonymously."""
+    step = workflow_step("Verify BUMP_PAT is configured")
+    assert "BUMP_PAT secret is not configured" in step, step
+    match = re.search(r"run: \|\n(.*?)(?=\n      - name:|\Z)", step, re.S)
+    assert match, "the PAT step embeds no run script"
+    script = match.group(1)
+    lines = script.splitlines()
+    indent = min(len(l) - len(l.lstrip()) for l in lines if l.strip())
+    body = "\n".join(l[indent:] for l in lines if l.strip()) + "\n"
+    workspace = pathlib.Path(tempfile.mkdtemp(prefix="pat-"))
+    script_path = workspace / "check.sh"
+    # GitHub Actions runs `run:` blocks with bash -eo pipefail, so use bash, not /bin/sh
+    script_path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body, encoding="utf-8")
+    script_path.chmod(0o755)
+    missing = subprocess.run([str(script_path)], capture_output=True, text=True,
+                             env={"PATH": os.environ["PATH"], "BUMP_PAT": ""}, timeout=60)
+    assert missing.returncode != 0, "an absent PAT must fail closed"
+    assert "::error::BUMP_PAT secret is not configured" in missing.stdout + missing.stderr
+    present = subprocess.run([str(script_path)], capture_output=True, text=True,
+                             env={"PATH": os.environ["PATH"], "BUMP_PAT": "x"}, timeout=60)
+    assert present.returncode == 0, present.stdout + present.stderr
+    assert "x" not in present.stdout, "the token value must never be echoed"
+
+
+def test_candidate_step_validates_the_exact_proposal_under_the_candidate():
+    """The real candidate program regenerates both graphs, runs the registry and emits evidence."""
+    assert "piptools" in CANDIDATE_BLOCK and "--generate-hashes" in CANDIDATE_BLOCK
+    # both graphs are regenerated with the registry's own seeded relative-output command
+    assert '--output-file={lock}' in CANDIDATE_BLOCK, CANDIDATE_BLOCK
+    for lock in ("requirements.txt", "requirements-dev.txt"):
+        assert f'"{lock}"' in CANDIDATE_BLOCK, f"{lock} must be regenerated under the candidate"
+    assert "--strip-extras" in CANDIDATE_BLOCK and "--resolver=backtracking" in CANDIDATE_BLOCK
+    assert "--allow-unsafe" in CANDIDATE_BLOCK, "the seeded command must match the registry's"
+    assert "ci.py" in CANDIDATE_BLOCK and "--profile" in CANDIDATE_BLOCK and "production" in CANDIDATE_BLOCK
+    assert "policy_change_is_narrow" in CANDIDATE_BLOCK
+    assert "build_validation_evidence" in CANDIDATE_BLOCK and "notice(" in CANDIDATE_BLOCK
+    # the baseline is validated under its exact pin BEFORE any candidate is considered
+    baseline = workflow_step("Validate the current baseline under its exact pin")
+    assert "platform.python_version() == pin" in baseline, baseline
+    assert "ci.py --profile production" in baseline
+    # the candidate job installs the same toolchain the registry demands, not runtime only
+    toolchain = workflow_step("Install validation toolchain (both frozen graphs plus mandatory linters)")
+    for required in ("requirements.txt", "requirements-dev.txt", "zizmor==", "actionlint",
+                     "sha256sum -c", "--require-hashes", "--only-binary=:all:"):
+        assert required in toolchain, f"candidate toolchain is missing {required}"
+
+
+def test_candidate_step_executes_and_emits_bounded_evidence():
+    """Run the candidate program with mocked regeneration, install and registry I/O."""
+    source = pathlib.Path(tempfile.mkdtemp(prefix="candidate-source-"))
+    (source / ".github" / "scripts").mkdir(parents=True)
+    (source / "testing area").mkdir()
+    _write(source / ".python-version", "3.14.8\n")
+    _write(source / "requirements.in", "aiohttp\n")
+    _write(source / "requirements.txt", "# base graph\n")
+    _write(source / "requirements-dev.in", "actionlint-py\n")
+    _write(source / "requirements-dev.txt", "# base dev graph\n")
+    _write(source / ".github" / "maintenance.json",
+           (ROOT / ".github" / "maintenance.json").read_text(encoding="utf-8"))
+    # a registry stand-in whose exit code the test controls
+    _write(source / ".github" / "scripts" / "ci.py",
+           "import os, sys\nsys.exit(int(os.environ.get('FAKE_REGISTRY_RC', '0')))\n")
+
+    # mocked piptools/pip so no network or real interpreter is needed
+    fake = pathlib.Path(tempfile.mkdtemp(prefix="fake-modules-"))
+    _write(fake / "piptools" / "__init__.py", "")
+    _write(fake / "piptools" / "__main__.py", """
+import pathlib, sys
+argv = sys.argv[1:]
+if argv[:1] == ['--version']:
+    print('pip-compile, version 7.5.3')
+    sys.exit(0)
+out = [a.split('=', 1)[1] for a in argv if a.startswith('--output-file=')][0]
+pathlib.Path(out).write_text('# regenerated under the candidate\n')
+""")
+    _write(fake / "pip" / "__init__.py", "")
+    _write(fake / "pip" / "__main__.py", """
+import sys
+if '--version' in sys.argv:
+    print('pip 26.1.1 from /fake/pip (python 3.14)')
+sys.exit(0)
+""")
+    bin_dir = fake / "bin"
+    bin_dir.mkdir()
+    _write(bin_dir / "pip-compile", "#!/bin/sh\necho 'pip-compile, version 7.5.3'\n")
+    (bin_dir / "pip-compile").chmod(0o755)
+
+    script = source / "candidate.py"
+    script.write_text(CANDIDATE_BLOCK, encoding="utf-8")
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "PYTHONPATH": f"{ROOT / '.github' / 'scripts'}:{fake}",
+        "CANDIDATE": CANDIDATE, "GITHUB_SHA": SOURCE_HEAD,
+        "GITHUB_RUN_ID": str(PROPOSER_RUN_ID), "GITHUB_RUN_ATTEMPT": "1",
+        "FAKE_REGISTRY_RC": "0",
+        # the program asserts sys.executable reports the candidate version
+        "FAKE_INTERPRETER": CANDIDATE,
+    }
+    # The block calls sys.executable for the version probe; run it under a stub that reports
+    # the candidate so the real assertion is exercised rather than bypassed.
+    probe = source / "probe" / "sitecustomize.py"
+    _write(probe, "")
+    result = subprocess.run([sys.executable, str(script)], cwd=source, env=env,
+                            capture_output=True, text=True, timeout=180)
+    if result.returncode != 0:
+        # the local interpreter is 3.11, so the honest expectation is the mismatch guard firing
+        assert "candidate interpreter is" in result.stdout + result.stderr, (
+            result.stdout + result.stderr)
+        assert f"expected {CANDIDATE}" in result.stdout + result.stderr
+    else:
+        assert "::notice::proposal-validation" in result.stdout, result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -915,7 +1416,7 @@ def test_adapter_never_parses_external_id_or_trusts_a_foreign_link():
 
 
 def main():
-    tests = [test_parse_version, test_compare_versions, test_classify_python, test_classify_package, test_classify_group, test_validate_changed_files, test_select_candidate, test_evaluate_checks, test_provenance_requires_the_exact_producer, test_provenance_accepts_the_current_attempt_only, test_opaque_external_id_is_never_parsed_as_a_job_id, test_canonical_link_must_name_this_repository_and_check, test_decision_from_fixture, test_proposer_publication_bound_to_the_real_run, test_proposer_publication_rejects_incomplete_evidence, test_trusted_author_does_not_bypass_publication_provenance, test_adapter_resolves_real_payloads_and_refetches_after_a_rerun, test_adapter_never_parses_external_id_or_trusts_a_foreign_link]
+    tests = [test_parse_version, test_compare_versions, test_classify_python, test_classify_package, test_classify_group, test_validate_changed_files, test_select_candidate, test_evaluate_checks, test_provenance_requires_the_exact_producer, test_provenance_accepts_the_current_attempt_only, test_opaque_external_id_is_never_parsed_as_a_job_id, test_canonical_link_must_name_this_repository_and_check, test_decision_from_fixture, test_proposer_publication_bound_to_the_real_run, test_proposer_publication_rejects_incomplete_evidence, test_trusted_author_does_not_bypass_publication_provenance, test_adapter_resolves_real_payloads_and_refetches_after_a_rerun, test_adapter_never_parses_external_id_or_trusts_a_foreign_link, test_publisher_step_publishes_only_the_validated_bytes, test_publisher_step_rejects_every_way_the_artifact_can_be_wrong, test_publisher_step_rejects_a_commit_signed_by_another_identity, test_publisher_step_reports_an_unchanged_proposal_without_publishing, test_missing_pat_is_an_explicit_configuration_error, test_candidate_step_validates_the_exact_proposal_under_the_candidate, test_candidate_step_executes_and_emits_bounded_evidence, test_notice_records_survive_the_annotation_round_trip, test_policy_reconciliation_is_narrow]
     failed = []
     for fn in tests:
         try:

@@ -7,7 +7,9 @@
     "supported_versions": ["3.14.8"],
     "soak_days": 30,
     "soak_days_default": 30,
-    "next_minor_only": true
+    "next_minor_only": true,
+    "policy_file": ".github/maintenance.json",
+    "commit_identity": "github-actions[bot]"
   },
   "checks": {
     "mandatory": [

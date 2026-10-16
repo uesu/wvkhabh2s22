@@ -49,10 +49,38 @@ jobs:
           python-version-file: '.python-version'
           cache: 'pip'
 
-      - name: Install helper dependencies (frozen, hash-verified)
+      - name: Install validation toolchain (both frozen graphs plus mandatory linters)
         run: |
+          set -euo pipefail
+          # The candidate job runs the SAME registry as ordinary CI, so it needs the same
+          # toolchain: both hashed graphs, the pinned compiler and the real mandatory linters.
+          # Installing only the runtime graph left actionlint/zizmor missing, which the registry
+          # treats as a blocking failure in CI rather than a skip.
           python -m pip install --upgrade pip==26.1.1
           python -m pip install --require-hashes --only-binary=:all: -r requirements.txt
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-dev.txt
+          python -m pip install zizmor==1.12.1
+          version=1.7.7
+          base="https://github.com/rhysd/actionlint/releases/download/v${version}"
+          archive="actionlint_${version}_linux_amd64.tar.gz"
+          curl -fsSL -o "/tmp/${archive}" "${base}/${archive}"
+          curl -fsSL -o /tmp/actionlint_checksums.txt "${base}/actionlint_${version}_checksums.txt"
+          ( cd /tmp && grep -F "${archive}" actionlint_checksums.txt | sha256sum -c - )
+          tar -xzf "/tmp/${archive}" -C /tmp actionlint
+          sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
+          actionlint -version
+          zizmor --version
+
+      - name: Validate the current baseline under its exact pin
+        run: |
+          set -euo pipefail
+          # The baseline must be green under the pin that is actually checked out, before any
+          # candidate is considered. Running the registry against a candidate interpreter while
+          # .python-version still names the old pin can only report NOT VALIDATED.
+          python -c 'import pathlib, platform; pin = pathlib.Path(".python-version").read_text().strip(); assert platform.python_version() == pin, f"running {platform.python_version()} != pinned {pin}"'
+          python -m pip --version
+          pip-compile --version
+          python -u .github/scripts/ci.py --profile production
 
       - name: Resolve candidate version
         id: resolve
@@ -102,21 +130,122 @@ jobs:
         with:
           python-version: ${{ steps.resolve.outputs.latest }}
 
-      - name: Verify candidate — wheels exist and CI passes
+      - name: Validate the candidate proposal bytes in an isolated workspace
         if: steps.resolve.outputs.bump == 'yes'
+        env:
+          CANDIDATE: ${{ steps.resolve.outputs.latest }}
         run: |
           set -euo pipefail
-          python --version
-          CANDIDATE="${{ steps.resolve.outputs.latest }}"
-          ACTUAL="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")')"
-          if [ "$ACTUAL" != "$CANDIDATE" ]; then
-            echo "::error::Interpreter mismatch: expected $CANDIDATE got $ACTUAL"
-            exit 1
-          fi
-          python -m pip install --upgrade pip==26.1.1
-          python -m pip install --require-hashes --only-binary=:all: -r requirements.txt
-          python -m compileall -q "testing area" tests .github/scripts
-          python .github/scripts/ci.py --profile production
+          # The candidate is validated as the exact bytes that will be published, in an isolated
+          # copy of the repository: pin rewritten, policy reconciled narrowly, both lock graphs
+          # regenerated under the real candidate interpreter with the registry's own seeded
+          # relative-output commands, both hashed graphs installed, and the COMPLETE registry run
+          # against the proposal. There is no reduced candidate-only validation path, and the
+          # baseline workspace above is never modified.
+          python - <<'PY'
+          import os, pathlib, shutil, subprocess, sys
+
+          sys.path.insert(0, ".github/scripts")
+          import python_version_bump as proposer
+
+          candidate = os.environ["CANDIDATE"].strip()
+          source = pathlib.Path(".").resolve()
+          work = pathlib.Path("/tmp/candidate-proposal")
+
+          actual = subprocess.run(
+              [sys.executable, "-c",
+               'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")'],
+              capture_output=True, text=True, check=True,
+          ).stdout.strip()
+          if actual != candidate:
+              print(f"::error::candidate interpreter is {actual}, expected {candidate}")
+              raise SystemExit(1)
+
+          if work.exists():
+              shutil.rmtree(work)
+          shutil.copytree(source, work, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+
+          (work / ".python-version").write_text(candidate + "\n", encoding="utf-8")
+
+          policy_path = work / ".github" / "maintenance.json"
+          before = policy_path.read_text(encoding="utf-8")
+          after = proposer.rewrite_policy_versions(before, candidate)
+          if not proposer.policy_change_is_narrow(before, after, candidate):
+              print("::error::policy reconciliation would change more than the two derived version fields")
+              raise SystemExit(1)
+          policy_path.write_text(after, encoding="utf-8")
+
+          # Regenerate both graphs under the candidate, seeded with the locked resolution and
+          # using the registry's exact relative-output commands.
+          for src_name, lock in (("requirements.in", "requirements.txt"),
+                                 ("requirements-dev.in", "requirements-dev.txt")):
+              for seed in ("requirements.in", "requirements.txt", lock):
+                  origin = source / seed
+                  if origin.is_file() and not (work / seed).is_file():
+                      shutil.copy2(origin, work / seed)
+              result = subprocess.run(
+                  [sys.executable, "-m", "piptools", "compile", "--generate-hashes",
+                   "--allow-unsafe", "--resolver=backtracking", "--strip-extras",
+                   f"--output-file={lock}", src_name],
+                  cwd=work, capture_output=True, text=True, timeout=900,
+              )
+              if result.returncode != 0:
+                  print(f"::error::regenerating {lock} under {candidate} failed: "
+                        f"{(result.stderr or result.stdout or '')[-2000:]}")
+                  raise SystemExit(1)
+              print(f"regenerated {lock} under CPython {candidate}")
+
+          # Install both hashed graphs into the candidate, then run the complete registry.
+          subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip==26.1.1"], check=True)
+          for lock in ("requirements.txt", "requirements-dev.txt"):
+              subprocess.run([sys.executable, "-m", "pip", "install", "--require-hashes",
+                              "--only-binary=:all:", "-r", str(work / lock)], check=True)
+          registry = subprocess.run(
+              [sys.executable, "-u", str(work / ".github" / "scripts" / "ci.py"),
+               "--profile", "production"],
+              cwd=work, timeout=1800,
+          )
+          if registry.returncode != 0:
+              print(f"::error::the candidate proposal failed the registry (exit {registry.returncode})")
+              raise SystemExit(1)
+
+          pip_version = subprocess.run([sys.executable, "-m", "pip", "--version"],
+                                       capture_output=True, text=True, check=True).stdout.strip()
+          tools_version = subprocess.run(["pip-compile", "--version"],
+                                         capture_output=True, text=True, check=True).stdout.strip()
+          record = proposer.build_validation_evidence(
+              source_head=os.environ.get("GITHUB_SHA", ""),
+              candidate=candidate,
+              interpreter=actual,
+              pip_version=pip_version.split()[1] if len(pip_version.split()) > 1 else pip_version,
+              pip_tools_version=tools_version.split()[-1] if tools_version.split() else tools_version,
+              digests=proposer.digest_files(work),
+              run_id=int(os.environ["GITHUB_RUN_ID"]),
+              run_attempt=int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")),
+          )
+          line = proposer.notice(proposer.VALIDATION_NOTICE, record)
+          if line is None:
+              print("::error::validation evidence exceeds the bounded notice size")
+              raise SystemExit(1)
+          print(line)
+          pathlib.Path("/tmp/proposal-validation.json").write_text(
+              __import__("json").dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+          print("candidate proposal validated; evidence recorded")
+          PY
+
+      - name: Upload the exact validated proposal bytes
+        if: steps.resolve.outputs.bump == 'yes'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v4 — SHA-pinned
+        with:
+          name: python-bump-proposal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /tmp/candidate-proposal/.python-version
+            /tmp/candidate-proposal/requirements.txt
+            /tmp/candidate-proposal/requirements-dev.txt
+            /tmp/candidate-proposal/.github/maintenance.json
+            /tmp/proposal-validation.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Summary (selection)
         if: always()
@@ -153,80 +282,156 @@ jobs:
           fi
           echo "Publisher token present (value redacted)"
 
-      - name: Create deterministic proposal (publisher updates runtime pin consistently)
+      - name: Download the exact validated proposal bytes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4 — SHA-pinned
+        with:
+          name: python-bump-proposal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/validated-proposal
+          if-no-files-found: error
+
+      - name: Publish only the validated bytes (no candidate execution here)
         env:
           CURRENT: ${{ needs.select-and-validate.outputs.current }}
           LATEST: ${{ needs.select-and-validate.outputs.latest }}
           GH_TOKEN: ${{ secrets.BUMP_PAT }}
+          COMMIT_NAME: ${{ vars.PYTHON_BUMP_COMMIT_NAME }}
+          COMMIT_EMAIL: ${{ vars.PYTHON_BUMP_COMMIT_EMAIL }}
         run: |
           set -euo pipefail
-          if [ -z "${LATEST:-}" ] || [ -z "${CURRENT:-}" ]; then
-            echo "No candidate to publish"
-            exit 0
-          fi
-          # Validate current pin still present (production without docs must work; docs are not required)
-          if ! grep -Fq "$CURRENT" .python-version; then
-            echo "::error::.python-version does not contain expected current pin $CURRENT"
-            exit 1
-          fi
-          echo "$LATEST" > .python-version
-          # Keep runtime profile consistent: maintenance.json current_version and supported_versions must match the pin
+          # The credentialed publisher never compiles or installs the proposed dependencies; it
+          # republishes the bytes the read-only candidate job already validated, after verifying
+          # their digests, then records what it published so the controller can identify the run
+          # and attempt that produced this exact proposal head.
           python - <<'PY'
-          import json, pathlib, os
-          latest = os.environ["LATEST"]
-          p = pathlib.Path(".github/maintenance.json")
-          if p.is_file():
-              data = json.loads(p.read_text())
-              if "python" in data:
-                  data["python"]["current_version"] = latest
-                  data["python"]["supported_versions"] = [latest]
-                  p.write_text(json.dumps(data, indent=2) + "\n")
-                  print(f"Updated maintenance.json to {latest}")
-          PY
-          if git diff --quiet; then
-            echo "No changes to publish (empty diff — already up-to-date)"
-            exit 0
-          fi
-          # Structural diff validation via shared helper — fails closed if disallowed files would change
-          python - <<'PY'
-          import subprocess, sys
+          import json, os, pathlib, subprocess, sys
+
           sys.path.insert(0, ".github/scripts")
-          import maintenance
-          changed = subprocess.check_output(["git", "diff", "--name-only"]).decode().splitlines()
-          changed = [c.strip() for c in changed if c.strip()]
-          print(f"Changed files: {changed}")
-          result = maintenance.validate_changed_files(changed)
-          print(result)
+          import maintenance, python_version_bump as proposer
+
+          latest = os.environ["LATEST"].strip()
+          current = os.environ["CURRENT"].strip()
+          validated = pathlib.Path("/tmp/validated-proposal")
+          record = json.loads((validated / "proposal-validation.json").read_text(encoding="utf-8"))
+
+          if record.get("candidate_version") != latest:
+              print(f"::error::validated candidate {record.get('candidate_version')} is not {latest}")
+              raise SystemExit(1)
+          if record.get("interpreter") != latest:
+              print(f"::error::validation was not performed by the candidate interpreter")
+              raise SystemExit(1)
+          if record.get("source_head") and record["source_head"] != os.environ.get("GITHUB_SHA", ""):
+              print(f"::error::validated source head {record['source_head']} is not the current checkout "
+                    f"{os.environ.get('GITHUB_SHA', '')} — revalidate before publishing")
+              raise SystemExit(1)
+
+          # Publish the exact validated bytes; nothing is regenerated in this job.
+          for name in proposer.PROPOSAL_FILES:
+              src, dst = validated / name, pathlib.Path(name)
+              if not src.is_file():
+                  print(f"::error::validated proposal is missing {name}")
+                  raise SystemExit(1)
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              dst.write_bytes(src.read_bytes())
+
+          published = proposer.digest_files(pathlib.Path("."))
+          ok, reason = proposer.verify_validated_bytes(
+              record, published,
+              candidate=latest,
+              pinned_pip=maintenance.PINNED_PIP,
+              pinned_pip_tools=maintenance.PINNED_PIP_TOOLS,
+          )
+          if not ok:
+              print(f"::error::published bytes do not match the validated proposal: {reason}")
+              raise SystemExit(1)
+          print(f"published bytes match the validated proposal ({reason})")
+
+          # Trusted policy, not PR content, decides which files a routine bump may touch.
+          policy = maintenance.load_maintenance_profile()
+          allowed = [".python-version", "requirements.txt", "requirements-dev.txt"]
+          python_policy = policy.get("python") or {}
+          generated_policy = python_policy.get("policy_file")
+          commit_identity = python_policy.get("commit_identity")
+          if generated_policy:
+              allowed.append(generated_policy)
+          changed = [c.strip() for c in subprocess.check_output(
+              ["git", "diff", "--name-only"], text=True).splitlines() if c.strip()]
+          if not changed:
+              print("::notice::proposal is byte-identical to the base — nothing to publish")
+              raise SystemExit(0)
+          result = maintenance.validate_changed_files(changed, allowed=allowed)
           if not result["ok"]:
-              print(f"::error::{result['reason']}", file=sys.stderr)
-              sys.exit(1)
-          # Also validate workflow contents: triggers/permissions/run changes require human review
-          # The helper will check workflow file diffs for structural changes beyond version pin
-          import pathlib
-          for f in changed:
-              if f.startswith(".github/workflows/"):
-                  text = pathlib.Path(f).read_text(errors="ignore")
-                  # Hard-coded version literals (other than .python-version) should be avoided; proposer updates via file
-                  if "python-version:" in text and ".python-version" not in text:
-                      print(f"WARNING: {f} uses literal python-version; prefer python-version-file")
+              print(f"::error::{result['reason']}")
+              raise SystemExit(1)
+          if generated_policy in changed:
+              before = subprocess.check_output(
+                  ["git", "show", f"HEAD:{generated_policy}"], text=True)
+              after = pathlib.Path(generated_policy).read_text(encoding="utf-8")
+              if not proposer.policy_change_is_narrow(before, after, latest):
+                  print(f"::error::{generated_policy} changed beyond the two derived version fields")
+                  raise SystemExit(1)
+          actual_commit = subprocess.check_output(
+              ["git", "log", "-1", "--format=%an"], text=True).strip()
+          if commit_identity and actual_commit != commit_identity:
+              print(f"::error::commit identity {actual_commit!r} is not the configured bot "
+                    f"{commit_identity!r}")
+              raise SystemExit(1)
+          print(f"changed files accepted: {changed}")
           PY
+
           BRANCH="chore/python-${LATEST}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The commit identity is a configured bot; it is deliberately NOT the run actor and NOT
+          # necessarily the PR author. Each identity is recorded separately in the publication
+          # evidence rather than being forced to be one login.
+          git config user.name "${COMMIT_NAME:-github-actions[bot]}"
+          git config user.email "${COMMIT_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}"
           git checkout -b "$BRANCH"
-          git add .python-version .github/maintenance.json
+          git add .python-version requirements.txt requirements-dev.txt .github/maintenance.json
           git commit -m "chore: bump CPython pin ${CURRENT} -> ${LATEST}"
           git push --force-with-lease origin "$BRANCH"
-          # Publish/update one deterministic PR; never execute candidate dependencies with write credentials
-          PR_BODY="Automated Python bump ${CURRENT} -> ${LATEST}. Validation passed under candidate interpreter (frozen hash install, CI gates). No self-merge; maintenance controller will decide."
-          # Use gh to create or update PR — PR author will be BUMP_PAT owner, not github-actions[bot]; controller checks branch/title, not author
+
+          PR_BODY="Automated Python bump ${CURRENT} -> ${LATEST}, validated in an isolated candidate workspace under the candidate interpreter (both hashed graphs installed, full registry green). No self-merge; the maintenance controller decides."
           if gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
-            echo "PR for $BRANCH already exists — updating"
-            gh pr edit "$BRANCH" --title "chore: bump CPython pin ${CURRENT} -> ${LATEST}" --body "$PR_BODY" || true
+            gh pr edit "$BRANCH" --title "chore: bump CPython pin ${CURRENT} -> ${LATEST}" --body "$PR_BODY" >/dev/null
           else
             gh pr create --base main --head "$BRANCH" --title "chore: bump CPython pin ${CURRENT} -> ${LATEST}" --body "$PR_BODY"
           fi
-          echo "Published PR for $LATEST"
+
+          python - <<'PY'
+          import json, os, pathlib, subprocess, sys
+
+          sys.path.insert(0, ".github/scripts")
+          import python_version_bump as proposer
+
+          latest = os.environ["LATEST"].strip()
+          branch = f"chore/python-{latest}"
+          number = int(subprocess.check_output(
+              ["gh", "pr", "view", branch, "--json", "number", "--jq", ".number"], text=True).strip())
+          head = subprocess.check_output(
+              ["gh", "pr", "view", branch, "--json", "headRefOid", "--jq", ".headRefOid"],
+              text=True).strip()
+          author = subprocess.check_output(
+              ["gh", "pr", "view", branch, "--json", "author", "--jq", ".author.login"],
+              text=True).strip()
+          commit_name = subprocess.check_output(
+              ["git", "log", "-1", "--format=%an"], text=True).strip()
+          record = proposer.build_publication_evidence(
+              run_id=int(os.environ["GITHUB_RUN_ID"]),
+              run_attempt=int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")),
+              pull_number=number,
+              published_head=head,
+              branch=branch,
+              digests=proposer.digest_files(pathlib.Path(".")),
+              pr_author=author,
+              commit_identity=commit_name,
+              run_actor=os.environ.get("GITHUB_ACTOR") or None,
+          )
+          line = proposer.notice(proposer.PUBLICATION_NOTICE, record)
+          if line is None:
+              print("::error::publication evidence exceeds the bounded notice size")
+              raise SystemExit(1)
+          print(line)
+          print(f"published PR #{number} at {head[:12]} as author {author} committed by {commit_name}")
+          PY
 
       - name: Report published
         if: always()

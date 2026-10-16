@@ -170,34 +170,127 @@ jobs:
               return resolved;
             }
 
-            // Collect the evidence that binds a published proposal to the run that published it.
-            // The proposer runs on the base branch and publishes a NEW commit, so the run's
-            // head_sha is the source head and never equals the published proposal head.
-            async function collectPublicationEvidence(pr) {
-              const evidence = {};
+            // Bind a published proposal to the run and attempt that actually validated and
+            // published it. The proposer emits two machine-readable records as bounded notice
+            // annotations on its own check runs: one for the validated candidate bytes and one
+            // for the publication. Selection is by those identities — the record that names THIS
+            // pull request number and THIS head sha — never by first completed run, title, body
+            // marker, time proximity or membership of a mutable upstream version list.
+            const PROPOSER_WORKFLOW_PATH = '.github/workflows/python_version_bump.yml';
+            const PROPOSAL_FILES = ['.python-version', 'requirements.txt',
+                                    'requirements-dev.txt', '.github/maintenance.json'];
+
+            function parseNotice(message, kind) {
+              if (typeof message !== 'string') return null;
+              const prefix = `${kind} `;
+              if (!message.startsWith(prefix)) return null;
               try {
-                const proposerRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
-                  owner, repo, workflow_id: 'python_version_bump.yml', branch: pr.base.ref, per_page: 100
+                const record = JSON.parse(message.slice(prefix.length).trim());
+                return (record && typeof record === 'object' && !Array.isArray(record)) ? record : null;
+              } catch (e) {
+                return null;
+              }
+            }
+
+            // Every notice record published by one proposer run, across all of its jobs' check
+            // runs and every annotation level. Read-only.
+            async function recordsForRun(runId) {
+              const found = { validation: null, publication: null };
+              const { data: jobs } = await github.rest.actions.listJobsForWorkflowRun({
+                owner, repo, run_id: runId, per_page: 100
+              });
+              for (const job of (jobs || [])) {
+                if (!Number.isInteger(job.id)) continue;
+                let annotations = [];
+                try {
+                  annotations = await github.paginate(github.rest.checks.listAnnotations, {
+                    owner, repo, check_run_id: job.id, per_page: 100
+                  });
+                } catch (e) {
+                  console.log(`Annotations unavailable for job ${job.id}: ${e.message}`);
+                  continue;
+                }
+                for (const annotation of (annotations || [])) {
+                  const message = annotation && annotation.message;
+                  if (!found.publication) found.publication = parseNotice(message, 'proposal-publication');
+                  if (!found.validation) found.validation = parseNotice(message, 'proposal-validation');
+                }
+                if (found.validation && found.publication) break;
+              }
+              return found;
+            }
+
+            // Digests of the bytes the proposal ACTUALLY publishes at its head, computed here so a
+            // proposal can never vouch for itself with its own claimed digests.
+            async function proposalDigestsAt(sha) {
+              const digests = {};
+              for (const path of PROPOSAL_FILES) {
+                try {
+                  const { data: file } = await github.rest.repos.getContent({
+                    owner, repo, path, ref: sha
+                  });
+                  if (!file || typeof file.content !== 'string') {
+                    digests[path] = null;
+                    continue;
+                  }
+                  const bytes = Buffer.from(file.content, 'base64');
+                  digests[path] = require('crypto').createHash('sha256').update(bytes).digest('hex');
+                } catch (e) {
+                  console.log(`Proposal file ${path} unavailable at ${sha}: ${e.message}`);
+                  digests[path] = null;
+                }
+              }
+              return digests;
+            }
+
+            async function collectPublicationEvidence(pr) {
+              const evidence = { repository: trustedRepository };
+              try {
+                const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                  owner, repo, workflow_id: PROPOSER_WORKFLOW_PATH, branch: pr.base.ref, per_page: 100
                 });
-                const source = (proposerRuns || []).find(r =>
-                  r.path === '.github/workflows/python_version_bump.yml' &&
-                  r.head_branch === pr.base.ref &&
-                  r.status === 'completed');
-                if (!source) {
-                  console.log(`No completed proposer run on ${pr.base.ref} — publication unverified`);
+                const candidates = (runs || []).filter(r =>
+                  r && r.path === PROPOSER_WORKFLOW_PATH && r.head_branch === pr.base.ref);
+                console.log(`Inspecting ${candidates.length} proposer run(s) on ${pr.base.ref} for a publication record naming PR #${pr.number}`);
+                let selected = null;
+                for (const run of candidates) {
+                  if (!Number.isInteger(run.id)) continue;
+                  let records;
+                  try {
+                    records = await recordsForRun(run.id);
+                  } catch (e) {
+                    console.log(`Proposer run ${run.id} records unreadable: ${e.message}`);
+                    continue;
+                  }
+                  const publication = records.publication;
+                  if (!publication) continue;
+                  if (publication.pull_number !== pr.number || publication.published_head !== pr.head.sha) {
+                    console.log(`Proposer run ${run.id} published PR #${publication.pull_number} head ${String(publication.published_head || '').slice(0, 12)} — not this proposal`);
+                    continue;
+                  }
+                  selected = { run, records };
+                  break;
+                }
+                if (!selected) {
+                  console.log('No proposer run published this exact PR head — publication unverified');
                 } else {
-                  const { data: publisherRun } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: source.id });
-                  evidence.publisher_run = publisherRun;
-                  if (Number.isInteger(publisherRun.run_attempt)) {
+                  const { data: proposerRun } = await github.rest.actions.getWorkflowRun({
+                    owner, repo, run_id: selected.run.id
+                  });
+                  evidence.proposer_run = proposerRun;
+                  if (Number.isInteger(proposerRun.run_attempt)) {
                     try {
-                      const { data: attempt } = await github.rest.actions.getWorkflowRunAttempt({
-                        owner, repo, run_id: publisherRun.id, attempt_number: publisherRun.run_attempt
+                      const { data: proposerAttempt } = await github.rest.actions.getWorkflowRunAttempt({
+                        owner, repo, run_id: proposerRun.id, attempt_number: proposerRun.run_attempt
                       });
-                      evidence.publisher_attempt = attempt;
+                      evidence.proposer_attempt = proposerAttempt;
                     } catch (e) {
                       console.log(`Proposer attempt record unavailable: ${e.message} — publication unverified`);
                     }
                   }
+                  evidence.validation_record = selected.records.validation;
+                  evidence.publication_record = selected.records.publication;
+                  console.log(`Proposer run ${proposerRun.id} attempt ${proposerRun.run_attempt} published this proposal`);
                 }
               } catch (e) {
                 console.log(`Proposer run lookup failed: ${e.message} — publication unverified`);
@@ -208,22 +301,7 @@ jobs:
               } catch (e) {
                 console.log(`Published proposal commit unavailable: ${e.message} — publication unverified`);
               }
-              try {
-                // The PR's own maintenance.json is PR content and is never the manifest; the
-                // proposer resolves against the upstream release manifest, so bind to that.
-                // Fetched per call so the final snapshot cannot reuse a stale copy.
-                const { data: manifestFile } = await github.rest.repos.getContent({
-                  owner: 'actions', repo: 'python-versions', path: 'versions-manifest.json'
-                });
-                const manifest = JSON.parse(Buffer.from(manifestFile.content || '', 'base64').toString('utf8'));
-                const entries = Array.isArray(manifest) ? manifest : (manifest.versions || []);
-                evidence.manifest_versions = entries
-                  .map(entry => entry && (entry.version || entry.python_version))
-                  .filter(Boolean);
-                console.log(`Validated manifest carries ${evidence.manifest_versions.length} published versions`);
-              } catch (e) {
-                console.log(`Validated manifest unavailable: ${e.message} — publication unverified`);
-              }
+              evidence.proposal_digests = await proposalDigestsAt(pr.head.sha);
               return evidence;
             }
 

@@ -28,8 +28,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
-PINNED_PIP = "26.1.1"
-PINNED_PIP_TOOLS = "7.5.3"
+# The pinned build toolchain is defined once, in the shared maintenance helper, so the registry
+# and the merge controller validate against the same versions.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from maintenance import PINNED_PIP, PINNED_PIP_TOOLS  # noqa: E402  (single source of truth)
+
 WORKFLOW_DIR = ROOT / ".github" / "workflows"
 
 # Mandatory external linters. Present-but-failing and missing are both blocking in CI.

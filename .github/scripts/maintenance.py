@@ -20,6 +20,12 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 
+# Pinned build toolchain. These live here, not in the registry, so the merge controller and the
+# CI registry can never drift apart about which pip/pip-tools produced a validated lock graph:
+# publication evidence records the versions it actually used and is compared against these.
+PINNED_PIP = "26.1.1"
+PINNED_PIP_TOOLS = "7.5.3"
+
 # Allowed runtime files that may change in a valid maintenance PR.
 # Production without docs must work; docs/history are never runtime.
 ALLOWED_RUNTIME_PATTERNS = [
@@ -231,15 +237,32 @@ def classify_group_updates(updates: list[dict[str, Any]]) -> dict[str, Any]:
     return highest
 
 
-def validate_changed_files(changed: list[str]) -> dict[str, Any]:
-    """Validate that only allowed runtime files changed. Returns {ok, reason, disallowed}."""
+def validate_changed_files(
+    changed: list[str],
+    allowed: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Validate that only allowed runtime files changed. Returns {ok, reason, disallowed}.
+
+    ``allowed`` NARROWS the permitted set for a caller that knows exactly which files its own
+    proposal may touch — a routine Python bump publishes the pin, both generated lock graphs and
+    the two derived policy version fields, and nothing else. It can never widen it: a path has to
+    satisfy the trusted runtime patterns AND appear in ``allowed``, so a caller cannot authorize
+    a file the shared policy forbids.
+    """
+    narrowed = {str(path) for path in (allowed or ())}
     disallowed = []
     for f in changed:
-        allowed = any(re.match(pat, f) for pat in ALLOWED_RUNTIME_PATTERNS)
-        if not allowed:
+        if not any(re.match(pat, f) for pat in ALLOWED_RUNTIME_PATTERNS):
+            disallowed.append(f)
+        elif narrowed and f not in narrowed:
             disallowed.append(f)
     if disallowed:
-        return {"ok": False, "reason": f"disallowed files: {', '.join(disallowed)}", "disallowed": disallowed}
+        scope = "outside this proposal's permitted files" if narrowed else "disallowed"
+        return {
+            "ok": False,
+            "reason": f"disallowed files ({scope}): {', '.join(disallowed)}",
+            "disallowed": disallowed,
+        }
     return {"ok": True, "reason": "allowed", "disallowed": []}
 
 
@@ -497,121 +520,191 @@ def _iso_to_epoch(value: Any) -> float | None:
         return None
 
 
-def verify_proposer_publication(
+#: The only files a routine Python bump proposal may touch, in trusted policy order. The lock
+#: graphs are generated; the policy file is permitted only for the two derived version fields.
+PROPOSAL_FILES = (
+    ".python-version",
+    "requirements.txt",
+    "requirements-dev.txt",
+    ".github/maintenance.json",
+)
+
+
+def verify_publication_record(
     fixture: dict[str, Any],
     pr: dict[str, Any],
     candidate_version: str | None,
 ) -> tuple[bool, str]:
-    """Bind a published proposal to the run that actually published it.
+    """Bind a published proposal to the run and attempt that actually validated and published it.
 
-    The proposer runs on the base branch and publishes a NEW commit, so the run's head_sha is
-    the *source* head and can never equal the published proposal head. Requiring
-    ``run.head_sha == pr.head.sha`` therefore authenticated nothing: it is unsatisfiable for a
-    genuine publisher, which is why the lane could only ever be entered through the
-    trusted-author bypass. Publication is bound instead to evidence that ties the run to the
-    published PR head:
+    A branch name, a title, a time window or membership of a mutable upstream version list
+    identifies nothing: several proposer runs can share them, and the first completed run on the
+    default branch may have validated a different candidate. The proposer therefore emits two
+    machine-readable records bound to its own run and attempt — one for the validated candidate
+    bytes and one for the publication — and this verifier requires both, from the same attempt of
+    the same successful run of the trusted proposer workflow in this exact repository.
 
-    * the run is the trusted proposer workflow, completed successfully, in this exact
-      repository, and its attempt-specific record agrees with the run's current attempt;
-    * the published PR head commit exists, equals ``pr.head.sha``, was authored or committed by
-      the identity that ran the proposer (the run's actor — the BUMP_PAT user or the bot), and
-      was created inside the run's own execution window;
-    * the version the PR actually publishes is the candidate this lane resolved and is a real
-      entry of the validated manifest on the default branch.
-
-    Every gap fails closed, a missing conclusion is never success, and no author identity —
-    trusted bot or otherwise — bypasses any of it.
+    Three identities stay distinct and are never required to be one login: the run actor who
+    authorized the run, the PAT publisher who authored the PR, and the configured commit bot who
+    signed the commit. Each is bound through the actual publication record and the actual PR,
+    not assumed equal. The proposal digests compared here are computed by the caller from the
+    published file contents, so a proposal cannot vouch for itself.
     """
-    run = fixture.get("publisher_run")
-    if not isinstance(run, dict):
-        return False, "publisher run unavailable"
-    repository = fixture.get("repository") or None
-    head_sha = (pr.get("head") or {}).get("sha")
-    if not head_sha:
-        return False, "published proposal head unavailable"
-    if run.get("path") != TRUSTED_PROPOSER_PATH:
-        return False, f"publisher run is not the proposer workflow ({run.get('path')})"
-    if not isinstance(run.get("workflow_id"), int) or run.get("workflow_id") <= 0:
-        return False, "publisher run carries no workflow id"
-    if not isinstance(run.get("id"), int) or run.get("id") <= 0:
-        return False, "publisher run carries no run id"
-    if run.get("status") != "completed":
-        return False, f"publisher run is not completed ({run.get('status')})"
-    if run.get("conclusion") != "success":
-        return False, f"publisher run conclusion is {run.get('conclusion') or 'missing'}"
+    if not isinstance(fixture, dict):
+        return False, "publication evidence unavailable"
+    repository = str(fixture.get("repository") or "").strip()
     if not repository:
-        return False, "repository not supplied — cannot verify the publisher"
+        return False, "publication evidence carries no repository"
+
+    run = fixture.get("proposer_run")
+    if not isinstance(run, dict) or not run:
+        return False, "no proposer run record was supplied"
+    if run.get("path") != TRUSTED_PROPOSER_PATH:
+        return False, f"proposer run workflow {run.get('path')!r} is not {TRUSTED_PROPOSER_PATH}"
+    if not isinstance(run.get("id"), int) or run["id"] <= 0:
+        return False, "proposer run carries no numeric id"
+    if not isinstance(run.get("workflow_id"), int) or run["workflow_id"] <= 0:
+        return False, "proposer run carries no numeric workflow id"
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        return False, f"proposer run is {run.get('status')}/{run.get('conclusion')}"
     for key in ("repository", "head_repository"):
         record = run.get(key)
-        full_name = record.get("full_name") if isinstance(record, dict) else record
-        if full_name != repository:
-            return False, f"publisher run {key} {full_name} is not {repository}"
+        if not isinstance(record, dict) or record.get("full_name") != repository:
+            return False, f"proposer run {key} {record} is not {repository}"
+    if not isinstance(run.get("run_attempt"), int) or run["run_attempt"] <= 0:
+        return False, "proposer run carries no numeric current attempt"
 
-    # There is no listWorkflowRunAttempts endpoint: getWorkflowRun reports the run's current
-    # attempt, and getWorkflowRunAttempt returns that exact attempt's record. Currency is the
-    # agreement of those two supported calls, not a fabricated history array.
-    if not isinstance(run.get("run_attempt"), int) or run.get("run_attempt") <= 0:
-        return False, "publisher run carries no attempt number"
-    attempt = fixture.get("publisher_attempt")
-    if not isinstance(attempt, dict):
-        return False, "publisher attempt record unavailable"
-    if attempt.get("id") != run.get("id"):
-        return False, f"publisher attempt record is for run {attempt.get('id')}, not {run.get('id')}"
-    if attempt.get("run_attempt") != run.get("run_attempt"):
+    attempt = fixture.get("proposer_attempt")
+    if not isinstance(attempt, dict) or not attempt:
+        return False, "attempt-specific proposer record unavailable — currency unproven"
+    if attempt.get("id") != run["id"] or attempt.get("run_attempt") != run["run_attempt"]:
         return False, (
-            f"publisher attempt record {attempt.get('run_attempt')} is not the run's current "
-            f"attempt {run.get('run_attempt')} — the publication was superseded by a rerun"
+            f"proposer attempt record {attempt.get('id')}/{attempt.get('run_attempt')} is not "
+            f"run {run['id']} attempt {run['run_attempt']}"
         )
     if attempt.get("status") != "completed" or attempt.get("conclusion") != "success":
-        return False, (
-            f"publisher attempt {attempt.get('conclusion') or attempt.get('status')} is not a "
-            "completed success"
-        )
+        return False, f"proposer attempt is {attempt.get('status')}/{attempt.get('conclusion')}"
     if attempt.get("head_sha") != run.get("head_sha"):
         return False, (
-            f"publisher attempt head {attempt.get('head_sha')} is not the run source head "
-            f"{run.get('head_sha')}"
+            f"proposer attempt record is for source head {attempt.get('head_sha')}, "
+            f"not this run's {run.get('head_sha')}"
         )
+
+    validation = fixture.get("validation_record")
+    publication = fixture.get("publication_record")
+    if not isinstance(validation, dict) or not validation:
+        return False, "no proposal-validation record was published by that run"
+    if not isinstance(publication, dict) or not publication:
+        return False, "no proposal-publication record was published by that run"
+    for label, record in (("validation", validation), ("publication", publication)):
+        if record.get("run_id") != run["id"] or record.get("run_attempt") != run["run_attempt"]:
+            return False, (
+                f"{label} record names run {record.get('run_id')} attempt "
+                f"{record.get('run_attempt')}, not this run {run['id']}/{run['run_attempt']}"
+            )
+
+    head = str((pr.get("head") or {}).get("sha") or "")
+    branch = str((pr.get("head") or {}).get("ref") or "")
+    number = pr.get("number")
+    if not head:
+        return False, "proposal head sha unavailable"
+    if publication.get("pull_number") != number:
+        return False, f"publication record names PR {publication.get('pull_number')}, not #{number}"
+    if publication.get("published_head") != head:
+        return False, f"publication record names head {publication.get('published_head')}, not {head}"
+    if branch and publication.get("branch") != branch:
+        return False, f"publication record names branch {publication.get('branch')}, not {branch}"
+
+    # The record's claimed identities must match the real ones, each in its own role.
+    actual_author = ((pr.get("user") or {}).get("login")) or None
+    if not publication.get("pr_author"):
+        return False, "publication record carries no PR author"
+    if actual_author and publication["pr_author"] != actual_author:
+        return False, (
+            f"publication record names author {publication['pr_author']}, "
+            f"but the PR author is {actual_author}"
+        )
+    actor = ((run.get("actor") or {}).get("login")) or None
+    if not publication.get("run_actor"):
+        return False, "publication record carries no run actor"
+    if actor and publication["run_actor"] != actor:
+        return False, (
+            f"publication record names run actor {publication['run_actor']}, "
+            f"but the run actor is {actor}"
+        )
+    expected_commit = fixture.get("expected_commit_identity")
+    if not publication.get("commit_identity"):
+        return False, "publication record carries no commit identity"
+    if expected_commit and publication["commit_identity"] != expected_commit:
+        return False, (
+            f"commit identity {publication['commit_identity']} is not the configured "
+            f"{expected_commit}"
+        )
+
+    # The validated source head is the proposer run's own head — a real binding, not a window.
+    if not validation.get("source_head"):
+        return False, "validation record carries no source head"
+    if validation["source_head"] != run.get("head_sha"):
+        return False, (
+            f"validation record was produced from {validation['source_head']}, "
+            f"not this run's source head {run.get('head_sha')}"
+        )
+    if not candidate_version:
+        return False, "authoritative candidate version could not be parsed from the proposal"
+    if validation.get("candidate_version") != candidate_version:
+        return False, (
+            f"validation record validated {validation.get('candidate_version')}, "
+            f"not the proposed {candidate_version}"
+        )
+    if validation.get("interpreter") != candidate_version:
+        return False, (
+            f"validation was not performed by the candidate interpreter "
+            f"({validation.get('interpreter')} != {candidate_version})"
+        )
+    pinned_pip = fixture.get("pinned_pip") or PINNED_PIP
+    pinned_tools = fixture.get("pinned_pip_tools") or PINNED_PIP_TOOLS
+    if validation.get("pip") != pinned_pip or validation.get("pip_tools") != pinned_tools:
+        return False, (
+            f"validation used pip {validation.get('pip')} / pip-tools "
+            f"{validation.get('pip_tools')}, not the pinned {pinned_pip} / {pinned_tools}"
+        )
+
+    recorded = validation.get("digests")
+    if not isinstance(recorded, dict) or not recorded:
+        return False, "validation record carries no digests"
+    actual = fixture.get("proposal_digests")
+    if not isinstance(actual, dict) or not actual:
+        return False, "published proposal digests were not computed"
+    for name in PROPOSAL_FILES:
+        if name not in recorded:
+            return False, f"validation record has no digest for {name}"
+        if recorded[name] != actual.get(name):
+            return False, (
+                f"{name} digest {recorded[name]} does not match the published bytes "
+                f"{actual.get(name)}"
+            )
 
     commit = fixture.get("published_commit")
-    if not isinstance(commit, dict):
-        return False, "published proposal commit unavailable"
-    if commit.get("sha") != head_sha:
-        return False, f"published commit {commit.get('sha')} is not the proposal head {head_sha}"
-    actor = run.get("actor")
-    actor_login = actor.get("login") if isinstance(actor, dict) else None
-    if not actor_login:
-        return False, "publisher run has no actor identity"
-    identities = []
-    for side in ("author", "committer"):
-        user = commit.get(side)
-        if isinstance(user, dict) and user.get("login"):
-            identities.append(user["login"])
-    if actor_login not in identities:
-        return False, (
-            f"published commit was not created by the run actor {actor_login} "
-            f"(commit identities: {identities or 'none'})"
-        )
-    inner = commit.get("commit") if isinstance(commit.get("commit"), dict) else {}
-    committed = _iso_to_epoch((inner.get("committer") or {}).get("date"))
-    started = _iso_to_epoch(run.get("run_started_at"))
-    finished = _iso_to_epoch(run.get("updated_at"))
-    if committed is None or started is None or finished is None:
-        return False, "publisher run or commit timestamps unavailable"
-    if not (started <= committed <= finished + _PUBLICATION_GRACE_SECONDS):
-        return False, (
-            "published commit falls outside the publisher run window "
-            f"({committed} not within {started}..{finished})"
-        )
+    if not isinstance(commit, dict) or commit.get("sha") != head:
+        return False, f"published head {head[:12] if head else head} is not a real commit"
+    published = publication.get("digests")
+    if not isinstance(published, dict) or not published:
+        return False, "publication record carries no digests"
+    for name in PROPOSAL_FILES:
+        if published.get(name) != actual.get(name):
+            return False, (
+                f"publication record digest for {name} does not match the published bytes"
+            )
+    return True, (
+        f"proposal bound to {TRUSTED_PROPOSER_PATH} run {run['id']} attempt {run['run_attempt']}: "
+        f"source {validation['source_head'][:12]}, published PR #{number} head {head[:12]}, "
+        f"actor {publication['run_actor']}, author {publication['pr_author']}, "
+        f"commit {publication['commit_identity']}"
+    )
 
-    manifest = fixture.get("manifest_versions")
-    if not isinstance(manifest, list) or not manifest:
-        return False, "validated manifest unavailable"
-    if not candidate_version:
-        return False, "published version could not be parsed from the proposal diff"
-    if candidate_version not in manifest:
-        return False, f"published version {candidate_version} is not in the validated manifest"
-    return True, "publication bound to the proposer run, actor, head and manifest"
+
+# Legacy alias: earlier callers and fixtures used this name.
+verify_proposer_publication = verify_publication_record
 
 
 def evaluate_checks(
@@ -1003,10 +1096,16 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
         if fixture.get("deferred"):
             return {"decision": "review-required", "reason": "python soak not satisfied", "merge": False}
         # Verify actual publication provenance. Branch, title and body markers are not
-        # authorization, and neither is a trusted author identity: the run that published this
-        # proposal has to be bound to the published head, the actor and the validated manifest.
+        # authorization, and neither is a trusted author identity: the run and attempt that
+        # validated and published this proposal have to be bound to the published head, to the
+        # published bytes and to their own source head. The expected commit identity comes from
+        # trusted base policy, never from the fixture or from PR content.
         if is_python_bump:
-            verified, reason = verify_proposer_publication(fixture, pr, cand)
+            trusted_commit = ((policy or {}).get("python") or {}).get("commit_identity")
+            evidence_fixture = dict(fixture)
+            if trusted_commit:
+                evidence_fixture["expected_commit_identity"] = trusted_commit
+            verified, reason = verify_publication_record(evidence_fixture, pr, cand)
             if not verified:
                 return {
                     "decision": "review-required",
