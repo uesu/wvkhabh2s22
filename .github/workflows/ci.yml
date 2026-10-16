@@ -107,15 +107,24 @@ jobs:
         with:
           script: |
             const fs = require('fs');
+            const execSync = require('child_process').execSync;
             let diff = '';
             try {
               const orig = fs.readFileSync('requirements.txt', 'utf8').split('\n').slice(0,5).join('\n');
-              const regen = fs.existsSync('/tmp/ci_debug/regen.txt') ? fs.readFileSync('/tmp/ci_debug/regen.txt', 'utf8').split('\n').slice(0,5).join('\n') : 'no regen';
-              diff = `orig header:\n${orig}\n\nregen header:\n${regen}\n\n` + (fs.existsSync('/tmp/ci_debug/regen.txt') ? require('child_process').execSync('diff -u /tmp/ci_debug/orig.txt /tmp/ci_debug/regen.txt | head -n 100', {encoding: 'utf8'}) : 'no diff');
+              const regenPath = '/tmp/ci_debug/regen.txt';
+              const origPath = '/tmp/ci_debug/orig.txt';
+              const regen = fs.existsSync(regenPath) ? fs.readFileSync(regenPath, 'utf8').split('\n').slice(0,5).join('\n') : 'no regen';
+              let diffBody = 'no diff';
+              if (fs.existsSync(regenPath) && fs.existsSync(origPath)) {
+                try { diffBody = execSync(`diff -u ${origPath} ${regenPath} | head -n 200`, {encoding: 'utf8'}); } catch(e) { diffBody = e.stdout || e.message; }
+              }
+              diff = `orig header:\n${orig}\n\nregen header:\n${regen}\n\ndiff:\n${diffBody}`;
             } catch(e) { diff = `error: ${e.message} ${e.stdout || ''}`; }
-            const body = `CI debug for ${{ github.sha }}:\n\n\`\`\`diff\n${diff.slice(0, 4000)}\n\`\`\``;
-            await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body });
-            console.log(body);
+            const prNum = context.payload.pull_request?.number || context.issue?.number;
+            if (!prNum) { console.log('no PR number, diff: ' + diff.slice(0,2000)); return; }
+            const body = `CI debug for ${{ github.sha }}:\n\n\`\`\`diff\n${diff.slice(0, 3800)}\n\`\`\``;
+            await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNum, body });
+            console.log('posted comment for PR', prNum);
 
       - name: Record interpreter, lock digest and runner image for summary
         if: always()
