@@ -68,6 +68,39 @@ jobs:
         run: |
           python .github/scripts/ci.py --profile development
 
+      - name: Debug lock on failure
+        if: failure()
+        run: |
+          echo "=== DEBUG: pip versions ==="
+          python -V
+          pip --version
+          pip-compile --version || true
+          echo "=== DEBUG: lock headers ==="
+          head -n 5 requirements.txt || true
+          head -n 5 requirements-dev.txt || true
+          echo "=== DEBUG: attempt regen ==="
+          rm -rf /tmp/ci_debug && mkdir -p /tmp/ci_debug
+          cp requirements.in /tmp/ci_debug/ || true
+          cp requirements.txt /tmp/ci_debug/ || true
+          cp requirements-dev.in /tmp/ci_debug/ || true
+          cp requirements-dev.txt /tmp/ci_debug/ || true
+          cp requirements.txt /tmp/ci_debug/orig.txt || true
+          pip-compile --generate-hashes --allow-unsafe --resolver=backtracking --strip-extras --output-file=/tmp/ci_debug/regen.txt /tmp/ci_debug/requirements.in 2>&1 | head -n 20 || true
+          echo "=== regen header ==="
+          head -n 5 /tmp/ci_debug/regen.txt || true
+          echo "=== diff (first 100) ==="
+          diff -u /tmp/ci_debug/orig.txt /tmp/ci_debug/regen.txt | head -n 200 || true
+          echo "=== pip hash check ==="
+          pip install --dry-run --require-hashes --only-binary=:all: -r requirements.txt 2>&1 | head -n 20 || true
+
+      - name: Upload debug artifact on failure
+        if: failure()
+        uses: actions/upload-artifact@ea4e88a1ec967f0da49d7977f1ca8db0d5b650da  # v4 SHA-pinned
+        with:
+          name: ci-debug-${{ github.run_id }}
+          path: /tmp/ci_debug/
+          if-no-files-found: ignore
+
       - name: Record interpreter, lock digest and runner image for summary
         if: always()
         run: |
