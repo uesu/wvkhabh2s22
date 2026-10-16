@@ -15,6 +15,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -62,6 +63,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: echo hi
+"""
+
+
+FIXTURE_LINT_WORKFLOW = """name: fixture-ci
+on: push
+jobs:
+  advisory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aac89
+        with:
+          version: "{version}"
+          args: check
 """
 
 
@@ -155,8 +169,33 @@ class Fixture:
         shared_path.parent.mkdir(parents=True, exist_ok=True)
         shared_path.write_bytes(self.shared_bytes)
         shared_path.chmod(0o644)
+        # A faithful repo model for the lint-toolchain policy: the workflow pins the version the
+        # profile records, and any dependency declaration still naming another version is recorded
+        # as a pending alignment, exactly as the shipped profile does. Written only when this
+        # fixture has workflows at all, so the "zero workflows" case stays empty.
+        self.lint_policy_version = "0.17.1"
+        pending_alignment = []
+        if (self.wf_dir / "fixture.yml").is_file():
+            (self.wf_dir / "ci.yml").write_text(
+                FIXTURE_LINT_WORKFLOW.format(version=self.lint_policy_version), encoding="utf-8")
+            for lock in ("requirements.in", "requirements.txt",
+                         "requirements-dev.in", "requirements-dev.txt"):
+                target = self.tmp / lock
+                if not target.is_file():
+                    continue
+                found = re.search(r"^ruff==([^\s\\]+)", target.read_text(encoding="utf-8"), re.MULTILINE)
+                if found and found.group(1) != self.lint_policy_version:
+                    pending_alignment.append({
+                        "declaration": lock, "pinned": found.group(1),
+                        "reason": "recorded fixture divergence so the gate can be exercised"})
         (self.tmp / ".github" / "maintenance.json").write_text(json.dumps({
             "schema_version": 1,
+            "lint_toolchain": {
+                "tool": "ruff",
+                "version": self.lint_policy_version,
+                "declared_in": ".github/workflows/ci.yml",
+                "pending_alignment": pending_alignment,
+            },
             "shared_files": [{
                 "path": self.shared_rel,
                 "sha256": hashlib.sha256(self.shared_bytes).hexdigest(),
@@ -859,6 +898,149 @@ def test_shared_bytes_runs_in_both_profiles():
         assert "shared-bytes" in ci.list_profiles()[profile], profile
         assert "shared-bytes" in ci.COMMAND_REGISTRY, "the check must be registered"
 
+
+# ---------------------------------------------------------------------------
+# One reviewed lint version and rule set (no silent divergence, no silent narrowing)
+# ---------------------------------------------------------------------------
+
+def test_shipped_lint_policy_matches_the_shipped_workflow():
+    """The recorded policy must be the version the advisory lane actually runs.
+
+    A policy record that disagrees with the workflow is worse than none: it documents a rule set
+    nobody enforces. This reads the shipped profile against the shipped workflow and locks.
+    """
+    ci = load_ci()
+    record, problem = ci.recorded_lint_toolchain(ci.ROOT)
+    assert problem == "", problem
+    enforced, problem = ci.pinned_ruff_action_version(ci.ROOT)
+    assert problem == "", problem
+    assert enforced == record["version"], f"workflow runs {enforced}, policy records {record['version']}"
+    pending = {e["declaration"]: e["pinned"] for e in record["pending_alignment"]}
+    for declaration, pin in ci.declared_ruff_pins(ci.ROOT).items():
+        if pin != record["version"]:
+            assert pending.get(declaration) == pin, (declaration, pin, pending)
+
+
+def test_aligned_lint_toolchain_passes_the_gate():
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        code, out, err = run_registry(ci, fixture)
+        assert code != 1, f"an aligned lint toolchain must not block, got {code}: {err}"
+        assert "OK lint-toolchain: ruff 0.17.1 enforced" in out, out
+    finally:
+        fixture.cleanup()
+
+
+def test_workflow_pin_diverging_from_the_policy_blocks():
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        (fixture.wf_dir / "ci.yml").write_text(
+            FIXTURE_LINT_WORKFLOW.format(version="0.99.99"), encoding="utf-8")
+        code, _, err = run_registry(ci, fixture)
+        assert code == 1, f"a diverging enforced pin must fail closed, got {code}"
+        assert "the reviewed lint policy is 0.17.1" in err, err
+    finally:
+        fixture.cleanup()
+
+
+def test_unpinned_ruff_action_blocks():
+    """An action left on 'latest' has no reproducible rule set, which is the original defect."""
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        (fixture.wf_dir / "ci.yml").write_text(FIXTURE_LINT_WORKFLOW.format(
+            version="0.17.1").replace('\n          version: "0.17.1"', ""), encoding="utf-8")
+        code, _, err = run_registry(ci, fixture)
+        assert code == 1, f"an unpinned lint action must fail closed, got {code}"
+        assert "not reproducible" in err, err
+    finally:
+        fixture.cleanup()
+
+
+def test_unrecorded_ruff_config_blocks():
+    """A repository ruff config reshapes the rule set, so it has to be a recorded decision."""
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        (fixture.tmp / "ruff.toml").write_text('[lint]\nselect = ["E4"]\n', encoding="utf-8")
+        code, _, err = run_registry(ci, fixture)
+        assert code == 1, f"an unrecorded ruff config must fail closed, got {code}"
+        assert "would reshape the lint rule set" in err, err
+    finally:
+        fixture.cleanup()
+
+
+def test_unrecorded_dependency_pin_divergence_blocks():
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        # requirements.in declares no ruff pin in the fixture, so nothing is on record for it.
+        target = fixture.tmp / "requirements.in"
+        existing = target.read_text(encoding="utf-8") if target.is_file() else ""
+        target.write_text(existing + "ruff==0.9.9\n", encoding="utf-8")
+        code, _, err = run_registry(ci, fixture)
+        assert code == 1, f"an unrecorded pin divergence must fail closed, got {code}"
+        assert "divergence is not recorded" in err, err
+    finally:
+        fixture.cleanup()
+
+
+def test_stale_pending_alignment_blocks():
+    """Once the declarations agree, keeping the excuse on record must fail too."""
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        (fixture.tmp / "requirements-dev.in").write_text(
+            f"ruff=={fixture.lint_policy_version}\n", encoding="utf-8")
+        profile = json.loads((fixture.tmp / ".github" / "maintenance.json").read_text(encoding="utf-8"))
+        profile["lint_toolchain"]["pending_alignment"] = [
+            {"declaration": "requirements-dev.in", "pinned": fixture.lint_policy_version,
+             "reason": "no longer true"}]
+        (fixture.tmp / ".github" / "maintenance.json").write_text(
+            json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+        code, _, err = run_registry(ci, fixture)
+        assert code == 1, f"a stale pending_alignment entry must fail closed, got {code}"
+        assert "stale pending_alignment entry" in err, err
+    finally:
+        fixture.cleanup()
+
+
+def test_absent_lint_policy_blocks():
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        (fixture.tmp / ".github" / "maintenance.json").write_text(
+            json.dumps({"schema_version": 1}) + "\n", encoding="utf-8")
+        code, _, err = run_registry(ci, fixture)
+        assert code == 1, f"an absent lint policy must fail closed, got {code}"
+        assert "declares no lint_toolchain policy" in err, err
+    finally:
+        fixture.cleanup()
+
+
+def test_malformed_policy_version_blocks():
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        profile = json.loads((fixture.tmp / ".github" / "maintenance.json").read_text(encoding="utf-8"))
+        profile["lint_toolchain"]["version"] = "latest"
+        (fixture.tmp / ".github" / "maintenance.json").write_text(
+            json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+        code, _, err = run_registry(ci, fixture)
+        assert code == 1, f"a non-exact policy version must fail closed, got {code}"
+        assert "must be an exact X.Y.Z pin" in err, err
+    finally:
+        fixture.cleanup()
+
+
+def test_lint_toolchain_runs_in_both_profiles():
+    ci = load_ci()
+    for profile in ("development", "production"):
+        assert "lint-toolchain" in ci.list_profiles()[profile], profile
+        assert "lint-toolchain" in ci.COMMAND_REGISTRY, "the check must be registered"
+
 def main() -> None:
     tests = [
         test_registry_has_no_shell_wildcards,
@@ -901,6 +1083,16 @@ def main() -> None:
         test_empty_shared_record_blocks,
         test_malformed_shared_record_blocks,
         test_shared_bytes_runs_in_both_profiles,
+        test_shipped_lint_policy_matches_the_shipped_workflow,
+        test_aligned_lint_toolchain_passes_the_gate,
+        test_workflow_pin_diverging_from_the_policy_blocks,
+        test_unpinned_ruff_action_blocks,
+        test_unrecorded_ruff_config_blocks,
+        test_unrecorded_dependency_pin_divergence_blocks,
+        test_stale_pending_alignment_blocks,
+        test_absent_lint_policy_blocks,
+        test_malformed_policy_version_blocks,
+        test_lint_toolchain_runs_in_both_profiles,
     ]
     failed: list[str] = []
     for fn in tests:

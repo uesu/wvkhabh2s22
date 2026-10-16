@@ -61,6 +61,7 @@ COMMAND_REGISTRY: dict[str, list[str]] = {
     "ci-registry": [sys.executable, "tests/test_ci_registry.py"],
     "lock-consistency": [sys.executable, "-c", "import pathlib; print('lock-consistency placeholder')"],
     "shared-bytes": [sys.executable, "-c", "print('shared-bytes placeholder')"],
+    "lint-toolchain": [sys.executable, "-c", "print('lint-toolchain placeholder')"],
     "workflow-lint": [sys.executable, "-c", "import pathlib, yaml; yaml.safe_load(open('.github/workflows/ci.yml')) ; print('yaml ok')"],
     "actionlint": ["actionlint", *workflow_files()],
     "zizmor": ["zizmor", "--offline", "--min-severity", "high", ".github/workflows"],
@@ -573,6 +574,155 @@ def check_workflow_lint(gate: Gate, name: str) -> None:
         print(f"PASS workflow-lint: {len(workflows)} workflows linted by actionlint and zizmor")
 
 
+RUFF_CONFIG_CANDIDATES = ("ruff.toml", ".ruff.toml", "pyproject.toml")
+
+
+def recorded_lint_toolchain(root: Path) -> tuple[dict[str, Any] | None, str]:
+    """Read the reviewed lint-toolchain policy. Returns (record, problem); never an empty pass."""
+    profile = root / ".github" / "maintenance.json"
+    if not profile.is_file():
+        return None, ".github/maintenance.json is missing — the lint toolchain policy cannot be read"
+    try:
+        data = json.loads(profile.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, f"cannot read .github/maintenance.json: {exc}"
+    if not isinstance(data, dict):
+        return None, ".github/maintenance.json is not a JSON object"
+    if "lint_toolchain" not in data:
+        return None, ".github/maintenance.json declares no lint_toolchain policy"
+    record = data["lint_toolchain"]
+    if not isinstance(record, dict):
+        return None, "lint_toolchain must be an object"
+    return record, ""
+
+
+def pinned_ruff_action_version(root: Path) -> tuple[str | None, str]:
+    """The ruff version the advisory lane really runs, read from the workflow that runs it."""
+    workflow = root / ".github" / "workflows" / "ci.yml"
+    if not workflow.is_file():
+        return None, ".github/workflows/ci.yml is missing — the recorded lint toolchain is not enforced"
+    try:
+        import yaml
+    except ImportError as exc:
+        return None, f"pyyaml not installed — cannot read the enforced lint pin ({exc})"
+    try:
+        data = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, f"cannot parse .github/workflows/ci.yml: {exc}"
+    jobs = (data or {}).get("jobs") or {}
+    for job in jobs.values():
+        for step in (job or {}).get("steps") or []:
+            if not str(step.get("uses") or "").startswith("astral-sh/ruff-action@"):
+                continue
+            version = (step.get("with") or {}).get("version")
+            if version is None:
+                return None, ("the ruff-action step declares no version input, so the lane resolves to "
+                              "'latest' and its rule set is not reproducible")
+            return str(version).strip(), ""
+    return None, "no astral-sh/ruff-action step found — the recorded lint toolchain is not enforced"
+
+
+def declared_ruff_pins(root: Path) -> dict[str, str]:
+    """Every `ruff==X` declared by a dependency input or lock under root."""
+    pins: dict[str, str] = {}
+    for name in ("requirements.in", "requirements.txt", "requirements-dev.in", "requirements-dev.txt"):
+        target = root / name
+        if not target.is_file():
+            continue
+        found = re.search(r"^ruff==([^\s\\]+)", _read_lock(target), re.MULTILINE)
+        if found:
+            pins[name] = found.group(1)
+    return pins
+
+
+def check_lint_toolchain(gate: Gate, name: str) -> None:
+    """Hold the advisory lane to one reviewed lint version and rule set.
+
+    Two declarations of the same tool drifted apart here: the workflow ran whatever ruff the action
+    resolved to while the dev lock named another version, and ruff 0.17 widened its default rule
+    selection from about 40 rules to 407, so the reported finding set changed with no reviewed
+    decision. The enforced version is now explicit and blocking. The workflow pin must equal the
+    recorded policy; a repository ruff config, which would reshape the rule set, must itself be
+    recorded; and a divergence in the dependency declarations is tolerated only while it is
+    recorded with a reason. A recorded divergence that no longer exists fails as loudly as an
+    unrecorded one, so the record cannot rot into a permanent excuse.
+    """
+    record, problem = recorded_lint_toolchain(ROOT)
+    if record is None:
+        gate.fail(name, problem)
+        return
+    if str(record.get("tool") or "") != "ruff":
+        gate.fail(name, f"lint_toolchain.tool must name the enforced linter, got {record.get('tool')!r}")
+        return
+    policy_version = str(record.get("version") or "").strip()
+    if not re.fullmatch(r"\d+\.\d+\.\d+", policy_version):
+        gate.fail(name, f"lint_toolchain.version must be an exact X.Y.Z pin, got {policy_version!r}")
+        return
+
+    enforced, problem = pinned_ruff_action_version(ROOT)
+    if enforced is None:
+        gate.fail(name, problem)
+    elif enforced != policy_version:
+        gate.fail(
+            name,
+            f"the advisory lane runs ruff {enforced} but the reviewed lint policy is {policy_version} "
+            f"— change one of them in a reviewed step, not silently")
+
+    allowed_configs = {str(c) for c in (record.get("config_files") or ())}
+    for candidate in RUFF_CONFIG_CANDIDATES:
+        path = ROOT / candidate
+        if not path.is_file():
+            continue
+        if candidate == "pyproject.toml" and "[tool.ruff" not in _read_lock(path):
+            continue
+        if candidate not in allowed_configs:
+            gate.fail(
+                name,
+                f"{candidate} would reshape the lint rule set but is not recorded in "
+                f"lint_toolchain.config_files — findings must be dispositioned, not disabled")
+
+    pending = record.get("pending_alignment") or []
+    if not isinstance(pending, list):
+        gate.fail(name, "lint_toolchain.pending_alignment must be a list")
+        return
+    recorded_pending: dict[str, str] = {}
+    for entry in pending:
+        if not isinstance(entry, dict) or not entry.get("declaration") or not str(entry.get("reason") or "").strip():
+            gate.fail(name, f"pending_alignment entries need a declaration and a reason: {entry!r}")
+            continue
+        recorded_pending[str(entry["declaration"])] = str(entry.get("pinned") or "")
+
+    pins = declared_ruff_pins(ROOT)
+    for declaration, pin in sorted(pins.items()):
+        if pin == policy_version:
+            if declaration in recorded_pending:
+                gate.fail(
+                    name,
+                    f"{declaration} now pins ruff {pin}, matching the enforced policy — remove its "
+                    f"stale pending_alignment entry")
+            continue
+        if declaration not in recorded_pending:
+            gate.fail(
+                name,
+                f"{declaration} pins ruff {pin} while the enforced policy is {policy_version}, and the "
+                f"divergence is not recorded in lint_toolchain.pending_alignment")
+        elif recorded_pending[declaration] != pin:
+            gate.fail(
+                name,
+                f"{declaration} pins ruff {pin} but pending_alignment records "
+                f"{recorded_pending[declaration]!r}")
+    for declaration in sorted(recorded_pending):
+        if declaration not in pins:
+            gate.fail(
+                name,
+                f"pending_alignment names {declaration}, which declares no ruff pin — remove the "
+                f"stale entry")
+
+    if name not in gate.failures:
+        print(f"OK lint-toolchain: ruff {policy_version} enforced via {record.get('declared_in')}, "
+              f"rule set = that version's defaults, {len(recorded_pending)} recorded divergence(s)")
+
+
 def shared_file_records(root: Path) -> tuple[list[Any] | None, str]:
     """Read the recorded cross-repository identities. Returns (records, problem).
 
@@ -727,6 +877,12 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                 check_workflow_lint(gate, name)
             except Exception as exc:  # noqa: BLE001 - an unexpected error must not pass the gate
                 gate.fail(name, f"workflow-lint raised {type(exc).__name__}: {exc}")
+            continue
+        if name == "lint-toolchain":
+            try:
+                check_lint_toolchain(gate, name)
+            except Exception as exc:  # noqa: BLE001 - an unexpected error must not pass the gate
+                gate.fail(name, f"lint-toolchain raised {type(exc).__name__}: {exc}")
             continue
         if name == "shared-bytes":
             try:
