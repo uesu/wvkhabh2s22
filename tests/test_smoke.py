@@ -6293,6 +6293,130 @@ check("r72 main: retraction seatbelt still records original ID with no heal for 
       and _r72_records["TestSub_abc123"]["message_id"] == "msg1"
       and _r72_records["TestSub_abc123"]["payload"] == _r72_main_retract.posts[0][1])
 
+# ---------------------------------------------------------------------------
+# r77 (2026-10-16): both production incidents as end-to-end mocked regressions
+# through the real parser. A crosspost child that yields only a poster or text
+# must still recover the validated original's motion video — generally, with no
+# account or incident-ID special case anywhere in the runtime (asserted below).
+# Incident A: child 1x6h1mf, crosspost 1x6h1a5, original 1y2gic17nlvh1.
+# Incident B: child 1x6lgak, crosspost 1x6lbhb, original 22e7ve17smvh1.
+# ---------------------------------------------------------------------------
+_r77_video = "https://proxy.embedez.com/render/video.mp4?videoUrl=CMAF_1080.mp4"
+_r77_audio = "https://proxy.embedez.com/render/audio.mp3?audioUrl=CMAF_AUDIO_128.mp4"
+_r77_poster = "https://external-preview.redd.it/poster-v0.jpg?width=1080&format=pjpg&auto=webp"
+_r77_incidents = [
+    ("incident A", "1x6h1mf", "1x6h1a5", "1y2gic17nlvh1"),
+    ("incident B", "1x6lgak", "1x6lbhb", "22e7ve17smvh1"),
+    ("unrelated ids", "9zz0001", "9zz0002", "9zz0003"),
+]
+
+
+async def _r77_flow(child_id, original_id, original_media, *, child_body=""):
+    """Drive the real resolve_post_media orchestration with every I/O boundary faked."""
+    original_path = f"/r/AnantaLeaks/comments/{original_id}/title/"
+    original = {"id": original_id, "permalink": original_path, "selftext": "",
+                "ups": 12, "num_comments": 3,
+                "media": {"reddit_video": {"fallback_url": _r77_video,
+                                           "audio_url": _r77_audio,
+                                           "height": 1080, "width": 1920}}}
+    base = {"title": "Crosspost", "author": "name_", "body": child_body, "youtube_url": None,
+            "vred_id": None, "redgifs_url": None, "content_html": "", "thumb": _r77_poster}
+    calls = []
+
+    async def fake_fetch(session, path, **kwargs):
+        calls.append(path)
+        if path == original_path:
+            return {"service": "embedez", "media": original_media,
+                    "stats": {"ups": 40, "comments": 5}, "body": ""}
+        # the child itself only ever yields the poster/text fallback both incidents showed
+        return {"service": "vxreddit", "media": [{"kind": "image", "url": _r77_poster}],
+                "stats": None, "body": child_body}
+
+    proxy = SimpleNamespace(fetch_proxy_post=AsyncMock(side_effect=fake_fetch),
+                            fetch_embeddit_stats=AsyncMock(return_value=None))
+    with patch.object(v3, "reddit_proxy", proxy), patch.object(v3, "PROXY_MEDIA", True), \
+         patch.object(v3, "fetch_arctic_post",
+                      AsyncMock(return_value={"crosspost_parent_list": [original]})), \
+         patch.object(v3, "enrich_gallery_redlib", AsyncMock(return_value=[])), \
+         patch.object(v3, "media_url_ok", AsyncMock(return_value=(True, 4321))), \
+         patch.object(v3, "resolve_video_url", AsyncMock(return_value=_r77_video)):
+        result = await v3.resolve_post_media(None, base, None, f"/r/Sub/comments/{child_id}/title/")
+    return result, calls
+
+
+for _r77_label, _r77_child, _r77_cross, _r77_original in _r77_incidents:
+    _r77_result, _r77_calls = asyncio.run(
+        _r77_flow(_r77_child, _r77_original, [{"kind": "video", "url": _r77_video}]))
+    check(f"r77 {_r77_label}: the validated original's motion video is the only card tile",
+          _r77_result["media"] == [{"kind": "video", "url": _r77_video}],
+          str(_r77_result["media"]))
+    check(f"r77 {_r77_label}: the child's poster fallback never becomes card media",
+          not any(_r77_poster in str(tile.get("url", "")) for tile in _r77_result["media"])
+          and not any(tile.get("kind") == "image" for tile in _r77_result["media"]),
+          str(_r77_result["media"]))
+    check(f"r77 {_r77_label}: the audio variant is not turned into a second tile",
+          len(_r77_result["media"]) == 1
+          and not any(_r77_audio in str(tile) for tile in _r77_result["media"]),
+          str(_r77_result["media"]))
+    check(f"r77 {_r77_label}: the original is resolved and fetched exactly once (bounded)",
+          _r77_calls == [f"/r/AnantaLeaks/comments/{_r77_original}/title/"]
+          and _r77_result["crosspost"]["path"] == f"/r/AnantaLeaks/comments/{_r77_original}/title/",
+          str((_r77_calls, _r77_result.get("crosspost"))))
+    check(f"r77 {_r77_label}: live proxy stats are preferred over archive stats",
+          _r77_result["stats"]["ups"] == 40, str(_r77_result["stats"]))
+    # A text-only child must not change the recovered media either.
+    _r77_text, _ = asyncio.run(
+        _r77_flow(_r77_child, _r77_original, [{"kind": "video", "url": _r77_video}],
+                  child_body="Crosspost of the original leak."))
+    check(f"r77 {_r77_label}: a text-fallback child recovers the same motion video",
+          _r77_text["media"] == [{"kind": "video", "url": _r77_video}], str(_r77_text["media"]))
+
+# Recovery is bounded: when the original yields no motion video, none is invented
+# and the flow does not retry into a storm.
+_r77_no_video, _r77_no_calls = asyncio.run(
+    _r77_flow("1x6h1mf", "1y2gic17nlvh1", [{"kind": "image", "url": _r77_poster}]))
+check("r77: an original without motion video yields no invented video tile",
+      not any(tile.get("kind") == "video" for tile in _r77_no_video["media"]),
+      str(_r77_no_video["media"]))
+check("r77: an unrecoverable original is fetched once, not retried",
+      _r77_no_calls == ["/r/AnantaLeaks/comments/1y2gic17nlvh1/title/"], str(_r77_no_calls))
+
+# Facts stay honest for the recovered EmbedEZ video: URL text is a hint, never
+# proof of dimensions, and an unprobed audio track is never claimed as present.
+_r77_evidence = v3._video_evidence({"url": _r77_video, "size": 4321, "width": None,
+                                    "height": None, "has_audio": None, "quality_hint": None})
+check("r77: EmbedEZ 1080 URL text is not treated as verified quality or audio",
+      v3.video_quality_hint(_r77_video) is None
+      and "dimensions=unverified" in _r77_evidence
+      and "audio=unknown" in _r77_evidence
+      and "audio=present" not in _r77_evidence
+      and v3.media_url_is_durable(_r77_video) is True,
+      str((_r77_evidence, v3.video_quality_hint(_r77_video))))
+
+# No special cases: the incident identifiers are fixtures only and must appear
+# nowhere in the runtime modules or automation that this PR ships.
+_r77_ids = ("1x6h1mf", "1x6h1a5", "1y2gic17nlvh1", "1x6lgak", "1x6lbhb", "22e7ve17smvh1")
+import pathlib as _r77_pathlib
+
+_r77_runtime = sorted(
+    str(path.relative_to(ROOT))
+    for pattern in ("testing area/*.py", ".github/scripts/*.py", ".github/workflows/*.yml")
+    for path in _r77_pathlib.Path(ROOT).glob(pattern)
+)
+_r77_special = []
+for _r77_rel in _r77_runtime:
+    with open(_r77_pathlib.Path(ROOT) / _r77_rel, encoding="utf-8", errors="ignore") as _r77_fh:
+        _r77_text = _r77_fh.read()
+    for _r77_id in _r77_ids:
+        if _r77_id in _r77_text:
+            _r77_special.append(f"{_r77_rel}:{_r77_id}")
+check("r77: no incident-ID or account special case exists in shipped runtime code",
+      not _r77_special, str(_r77_special))
+check("r77: the runtime modules inspected for special cases were actually found",
+      any(name.endswith("reddit_main_v3.py") for name in _r77_runtime)
+      and len(_r77_runtime) >= 10, str(_r77_runtime))
+
+
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
     sys.exit(1)
