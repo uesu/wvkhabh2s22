@@ -28,9 +28,6 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      pull-requests: write
-      issues: write
-      checks: write
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7 — SHA-pinned
@@ -55,15 +52,22 @@ jobs:
         run: |
           python -m compileall -q "testing area" tests .github/scripts
 
-      - name: Install actionlint (pinned, immutable — no floating script)
+      - name: Install actionlint (immutable release, checksum-verified)
         run: |
-          # Pinned to v1.7.7 commit 03d0035246f3e81f36aed592ffb4bebf33a03106 (immutable, not main)
-          curl -sL https://raw.githubusercontent.com/rhysd/actionlint/03d0035246f3e81f36aed592ffb4bebf33a03106/scripts/download-actionlint.bash -o /tmp/download-actionlint.bash
-          # Verify script is from pinned commit (basic checksum — script is small, we check its SHA)
-          echo "03d0035246f3e81f36aed592ffb4bebf33a03106  /tmp/download-actionlint.bash" | sha256sum -c - || echo "script SHA check skipped — pinned URL is immutable"
-          bash /tmp/download-actionlint.bash 1.7.7
-          sudo mv ./actionlint /usr/local/bin/actionlint
-          actionlint -version
+          set -euo pipefail
+          version=1.7.7
+          base="https://github.com/rhysd/actionlint/releases/download/v${version}"
+          archive="actionlint_${version}_linux_amd64.tar.gz"
+          curl -fsSL -o "/tmp/${archive}" "${base}/${archive}"
+          curl -fsSL -o /tmp/actionlint_checksums.txt "${base}/actionlint_${version}_checksums.txt"
+          # Verify the downloaded bytes against the SHA-256 checksums upstream published for this
+          # immutable release. A mismatch fails the job; there is no fallthrough or "skipped" path.
+          ( cd /tmp && grep -F "${archive}" actionlint_checksums.txt | sha256sum -c - )
+          tar -xzf "/tmp/${archive}" -C /tmp actionlint
+          sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
+          actionlint -version > /tmp/actionlint-version.txt 2>&1
+          cat /tmp/actionlint-version.txt
+          grep -qF "${version}" /tmp/actionlint-version.txt
 
       - name: Install zizmor (pinned, for mandatory workflow-lint)
         run: |
@@ -71,9 +75,6 @@ jobs:
           zizmor --version
 
       - name: Run CI adapter — development profile
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set +e
           python .github/scripts/ci.py --profile development > /tmp/ci-adapter.log 2>&1
@@ -97,27 +98,26 @@ jobs:
       - name: Debug lock on failure
         if: failure()
         run: |
-          echo "=== DEBUG: pip versions ==="
+          set +e
+          echo "=== interpreter and pinned compiler ==="
           python -V
           pip --version
-          pip-compile --version || true
-          echo "=== DEBUG: lock headers ==="
-          head -n 5 requirements.txt || true
-          head -n 5 requirements-dev.txt || true
-          echo "=== DEBUG: attempt regen ==="
-          rm -rf /tmp/ci_debug && mkdir -p /tmp/ci_debug
-          cp requirements.in /tmp/ci_debug/ || true
-          cp requirements.txt /tmp/ci_debug/ || true
-          cp requirements-dev.in /tmp/ci_debug/ || true
-          cp requirements-dev.txt /tmp/ci_debug/ || true
-          cp requirements.txt /tmp/ci_debug/orig.txt || true
-          pip-compile --generate-hashes --allow-unsafe --resolver=backtracking --strip-extras --output-file=/tmp/ci_debug/regen.txt /tmp/ci_debug/requirements.in 2>&1 | head -n 20 || true
-          echo "=== regen header ==="
-          head -n 5 /tmp/ci_debug/regen.txt || true
-          echo "=== diff (first 100) ==="
-          diff -u /tmp/ci_debug/orig.txt /tmp/ci_debug/regen.txt | head -n 200 || true
-          echo "=== pip hash check ==="
-          pip install --dry-run --require-hashes --only-binary=:all: -r requirements.txt 2>&1 | head -n 20 || true
+          pip-compile --version
+          echo "=== committed lock headers ==="
+          head -n 6 requirements.txt
+          head -n 6 requirements-dev.txt
+          echo "=== seeded regeneration: same directory layout, filenames and command as the registry ==="
+          rm -rf /tmp/ci_debug
+          mkdir -p /tmp/ci_debug
+          cp requirements.in requirements.txt requirements-dev.in requirements-dev.txt /tmp/ci_debug/
+          cp requirements.txt /tmp/ci_debug/committed-requirements.txt
+          cp requirements-dev.txt /tmp/ci_debug/committed-requirements-dev.txt
+          cd /tmp/ci_debug || exit 1
+          python -m piptools compile --generate-hashes --allow-unsafe --resolver=backtracking --strip-extras --output-file=requirements.txt requirements.in 2>&1 | tail -n 10
+          python -m piptools compile --generate-hashes --allow-unsafe --resolver=backtracking --strip-extras --output-file=requirements-dev.txt requirements-dev.in 2>&1 | tail -n 10
+          echo "=== committed vs regenerated (identical filenames, no renaming artifacts) ==="
+          diff -u committed-requirements.txt requirements.txt | head -n 200
+          diff -u committed-requirements-dev.txt requirements-dev.txt | head -n 200
 
       - name: Upload debug artifact on failure
         if: failure()
@@ -127,45 +127,56 @@ jobs:
           path: /tmp/ci_debug/
           if-no-files-found: ignore
 
-      - name: Post debug summary on failure
+      - name: Bounded failure summary (read-only, redacted)
         if: failure()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          echo "=== CI FAILURE ==="
-          cat /tmp/ci-failure.txt 2>&1 || echo "no ci-failure.txt"
-          echo "=== DEBUG HEADERS ==="
-          head -n 5 requirements.txt || true
-          head -n 5 /tmp/ci_debug/regen.txt 2>&1 | head -n 5 || true
-          diff -u /tmp/ci_debug/orig.txt /tmp/ci_debug/regen.txt | head -n 500 > /tmp/diff.txt || true
-          cat /tmp/diff.txt || true
-          echo "=== Posting PR comment ==="
-          if [ -f /tmp/ci-failure.txt ]; then
-            cibody=$(head -c 800 /tmp/ci-failure.txt | tr '\n' ' ')
-            echo "CI failure body $cibody"
-            curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/uesu/wvkhabh2s22/issues/29/comments -d "$(printf '{"body":"CI debug %s failures %s"}' "$GITHUB_SHA" "$cibody")" 2>&1 | head -c 200 || echo "curl comment failed"
-          fi
-          if [ -f /tmp/diff.txt ]; then
-            body=$(head -c 3500 /tmp/diff.txt)
-            if [ -z "$body" ]; then
-              body="no diff, orig $(head -n 2 requirements.txt | tr '\n' ' ') regen $(head -n 2 /tmp/ci_debug/regen.txt | tr '\n' ' ')"
-            fi
-            if [ -f /tmp/ci-failure.txt ]; then
-              body="$body CI failure $(head -c 800 /tmp/ci-failure.txt | tr '\n' ' ')"
-            fi
-            gh pr comment 29 --body "CI debug $GITHUB_SHA diff $body" 2>&1 | head -c 500 || echo "pr comment failed"
-            gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI debug $GITHUB_SHA diff $body" 2>&1 | head -c 300 || echo "api comment failed"
-            curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/uesu/wvkhabh2s22/issues/29/comments -d "$(printf '{"body":"CI debug %s diff %s"}' "$GITHUB_SHA" "$body")" 2>&1 | head -c 200 || echo "curl diff comment failed"
-          fi
+          set +e
+          {
+            echo "### CI validation failed"
+            echo ""
+            echo "- code SHA: \`${GITHUB_SHA}\`"
+            echo "- interpreter: \`$(python -V 2>&1)\`"
+            echo "- runtime lock digest: \`$(sha256sum requirements.txt | cut -d' ' -f1)\`"
+            echo "- dev lock digest: \`$(sha256sum requirements-dev.txt | cut -d' ' -f1)\`"
+            echo ""
+            echo "Mandatory registry outcome (bounded):"
+            echo ""
+            echo '```'
+            head -c 1500 /tmp/ci-failure.txt 2>/dev/null || echo "no /tmp/ci-failure.txt"
+            echo '```'
+            echo ""
+            echo "Adapter failure lines (bounded):"
+            echo ""
+            echo '```'
+            grep -E "^(FAIL|NOT VALIDATED)" /tmp/ci-adapter.log 2>/dev/null | head -n 20
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Record interpreter, lock digest and runner image for summary
         if: always()
         run: |
-          echo "Python $(python -V) on $(uname -a)" | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "Lock digest: $(sha256sum requirements.txt | cut -d' ' -f1)" | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "Runner image: ${{ runner.os }} ${{ runner.arch }}" | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "Code SHA: ${{ github.sha }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          {
+            echo "Python $(python -V 2>&1) on $(uname -a)"
+            echo "Runtime lock digest: $(sha256sum requirements.txt | cut -d' ' -f1)"
+            echo "Dev lock digest: $(sha256sum requirements-dev.txt | cut -d' ' -f1)"
+            echo "Runner image: ${{ runner.os }} ${{ runner.arch }}"
+            echo "Code SHA: ${GITHUB_SHA}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Why typing-extensions is not part of the 3.14 graph: the actual Requires-Dist
+          # markers of the installed distributions, read under the pinned interpreter.
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY" 2>&1
+          from importlib.metadata import PackageNotFoundError, requires
+
+          print("typing-extensions requirements under this interpreter:")
+          for package in ("aiohttp", "aiosignal", "multidict", "propcache", "yarl", "pip-tools"):
+              try:
+                  entries = requires(package) or []
+              except PackageNotFoundError:
+                  print(f"  {package}: not installed")
+                  continue
+              hits = [entry for entry in entries if "typing" in entry.lower()]
+              print(f"  {package}: {hits if hits else 'no typing-extensions requirement'}")
+          PY
 
   # ---------------------------------------------------------------------------
   # Advisory checks — never block merge, but visible to merge controller as

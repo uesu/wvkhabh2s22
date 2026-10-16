@@ -122,6 +122,10 @@ class Fixture:
         self.regen_tamper: str | None = None  # e.g. "aiohttp==99.0.0"
         self.regen_identical = True
         self.install_rc = 0
+        self.clean_install_rc = 0
+        self.pip_check_rc = 0
+        self.regen_second_differs = False
+        self._regen_calls = 0
         self.actionlint_version_rc = 0
         self.actionlint_rc = 0
         self.zizmor_version_rc = 0
@@ -149,9 +153,26 @@ class Fixture:
             if "pip-compile" in self.missing:
                 raise FileNotFoundError(2, "No such file or directory", "pip-compile")
             return done(0, f"pip-compile, version {self.pip_tools_version}\n")
+        if args[:3] == [args[0], "-m", "venv"] or (len(args) > 2 and args[1] == "-m" and args[2] == "venv"):
+            return done(0, "created\n")
+        if "install" in args and "--python" in args:
+            if self.clean_install_rc != 0:
+                return done(self.clean_install_rc, "", "ERROR: hash mismatch installing into clean venv\n")
+            return done(0, "Successfully installed\n")
+        if args[-1] == "check" and "pip" in args:
+            if self.pip_check_rc != 0:
+                return done(self.pip_check_rc, "broken requires X\n", "")
+            return done(0, "No broken requirements found.\n")
         if "piptools" in args and "compile" in args:
             if self.regen_rc != 0:
                 return done(self.regen_rc, "", "ERROR: could not resolve requirements\n")
+            self._regen_calls += 1
+            if self.regen_second_differs and self._regen_calls % 2 == 0:
+                out_name2 = next((a.split("=", 1)[1] for a in args if a.startswith("--output-file=")), None)
+                cwd2 = Path(kwargs.get("cwd") or self.tmp)
+                seeded = (self.tmp / out_name2).read_text(encoding="utf-8")
+                (cwd2 / out_name2).write_text(seeded.rstrip("\n") + "\n# drift on the second pass\n", encoding="utf-8")
+                return done(0, "written\n")
             out_name = next((a.split("=", 1)[1] for a in args if a.startswith("--output-file=")), None)
             cwd = Path(kwargs.get("cwd") or self.tmp)
             assert out_name, "regeneration must name its output file"
@@ -388,6 +409,45 @@ def test_lock_without_hashes_blocks():
         fixture.cleanup()
 
 
+def test_non_idempotent_regeneration_blocks():
+    """A lock that only reproduces once is not frozen (master spec item 1)."""
+    ci = load_ci()
+    fixture = Fixture()
+    fixture.regen_second_differs = True
+    try:
+        code, out, err = run_registry(ci, fixture)
+        assert code == 1, f"a second regeneration that drifts must block, got {code}"
+        assert "not idempotent" in err, err
+        assert "PASS lock-consistency" not in out
+    finally:
+        fixture.cleanup()
+
+
+def test_clean_environment_install_failure_blocks():
+    """A real wheel install into an empty venv must be verified, not just a dry run."""
+    ci = load_ci()
+    fixture = Fixture()
+    fixture.clean_install_rc = 1
+    try:
+        code, _, err = run_registry(ci, fixture)
+        assert code == 1, f"a failed clean-environment install must block, got {code}"
+        assert "clean-environment" in err, err
+    finally:
+        fixture.cleanup()
+
+
+def test_clean_environment_inconsistency_blocks():
+    ci = load_ci()
+    fixture = Fixture()
+    fixture.pip_check_rc = 1
+    try:
+        code, _, err = run_registry(ci, fixture)
+        assert code == 1, f"an inconsistent clean-environment install must block, got {code}"
+        assert "inconsistent" in err, err
+    finally:
+        fixture.cleanup()
+
+
 # ---------------------------------------------------------------------------
 # Workflow/security lint (T1/T2: real execution, real outcomes, no silent skips)
 # ---------------------------------------------------------------------------
@@ -551,6 +611,9 @@ def main() -> None:
         test_wrong_pip_tools_version_blocks,
         test_hash_verified_install_failure_blocks,
         test_lock_without_hashes_blocks,
+        test_non_idempotent_regeneration_blocks,
+        test_clean_environment_install_failure_blocks,
+        test_clean_environment_inconsistency_blocks,
         test_actionlint_nonzero_blocks,
         test_zizmor_nonzero_blocks,
         test_actionlint_nonzero_blocks_in_ci,

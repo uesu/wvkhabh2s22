@@ -219,6 +219,57 @@ def _difference_summary(committed: list[str], regenerated: list[str], limit: int
     return " | ".join(parts)
 
 
+def _verify_clean_install(label: str, target: Path, gate: Gate, name: str) -> None:
+    """Install one frozen graph into a fresh virtual environment with the pinned pip.
+
+    A dry run against an already satisfied site-packages proves nothing about the graph, so the
+    wheels are really installed into an empty environment and then checked for consistency.
+    """
+    parent = Path(tempfile.mkdtemp(prefix="ci-venv-"))
+    venv_dir = parent / "venv"
+    try:
+        create = subprocess.run(
+            [sys.executable, "-m", "venv", str(venv_dir)], capture_output=True, text=True, timeout=180
+        )
+        if create.returncode != 0:
+            gate.fail(
+                name,
+                f"{label} clean-environment verification could not create a venv: "
+                f"{(create.stderr or create.stdout or '').strip()[:800]}",
+            )
+            return
+        venv_python = venv_dir / "bin" / "python"
+        if not venv_python.exists():
+            venv_python = venv_dir / "Scripts" / "python.exe"
+        install = subprocess.run(
+            [
+                sys.executable, "-m", "pip", "install", "--python", str(venv_python),
+                "--require-hashes", "--only-binary=:all:", "-r", str(target),
+            ],
+            capture_output=True, text=True, timeout=900,
+        )
+        if install.returncode != 0:
+            gate.fail(
+                name,
+                f"{label} clean-environment hash-verified wheel install failed: "
+                f"{(install.stderr or install.stdout or '').strip()[:2000]}",
+            )
+            return
+        check = subprocess.run(
+            [str(venv_python), "-m", "pip", "check"], capture_output=True, text=True, timeout=180
+        )
+        if check.returncode != 0:
+            gate.fail(
+                name,
+                f"{label} clean-environment install is inconsistent: "
+                f"{(check.stdout or check.stderr or '').strip()[:1000]}",
+            )
+            return
+        print(f"OK lock-consistency: {label} installs hash-verified, wheels only, into a clean venv")
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
 def _verify_lock_graph(label: str, src_name: str, gate: Gate, name: str) -> None:
     """Verify one lock graph: structure, pinned compiler, byte-stable regeneration, hashed install."""
     target = ROOT / label
@@ -277,6 +328,35 @@ def _verify_lock_graph(label: str, src_name: str, gate: Gate, name: str) -> None
             return
         print(f"OK lock-consistency: {label} byte-stable under pinned interpreter and compiler")
 
+        # Regenerate a second time: a lock that is only accidentally reproducible is not frozen.
+        second_dir = Path(tempfile.mkdtemp(prefix="ci-lock-again-"))
+        try:
+            shutil.copy2(src, second_dir / src_name)
+            shutil.copy2(target, second_dir / label)
+            try:
+                again = _regenerate_lock(label, src_name, second_dir)
+            except subprocess.TimeoutExpired:
+                gate.fail(name, f"{label} second regeneration timed out (240s)")
+                return
+            if again.returncode != 0:
+                gate.fail(
+                    name,
+                    f"{label} second regeneration failed (exit {again.returncode}): "
+                    f"{(again.stderr or again.stdout or '').strip()[:2000]}",
+                )
+                return
+            second = _read_lock(second_dir / label).splitlines()
+            if second != regenerated:
+                gate.fail(
+                    name,
+                    f"{label} regeneration is not idempotent — "
+                    f"{_first_difference(regenerated, second)}",
+                )
+                return
+            print(f"OK lock-consistency: {label} regeneration is idempotent")
+        finally:
+            shutil.rmtree(second_dir, ignore_errors=True)
+
         install_cmd = [
             sys.executable, "-m", "pip", "install", "--dry-run",
             "--require-hashes", "--only-binary=:all:", "-r", str(target),
@@ -298,9 +378,11 @@ def _verify_lock_graph(label: str, src_name: str, gate: Gate, name: str) -> None
                 f"{(inst.stderr or inst.stdout or '').strip()[:2000]}",
             )
             return
-        print(f"OK lock-consistency: {label} installs hash-verified, wheels only")
+        print(f"OK lock-consistency: {label} resolves hash-verified, wheels only (dry run)")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+    _verify_clean_install(label, target, gate, name)
 
 
 def check_lock_consistency(gate: Gate, name: str) -> None:
