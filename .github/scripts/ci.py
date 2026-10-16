@@ -469,6 +469,15 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                     _sp_gh.run(["gh", "api", "repos/uesu/wvkhabh2s22/issues/29/comments", "-f", f"body={body}"], capture_output=True, text=True, timeout=10)
                 except Exception:
                     pass
+                # Also try to create a new issue for visibility
+                try:
+                    import json as _js4
+                    issue_data = _js4.dumps({"title": f"CI {sha} failed", "body": f"Failures: {failures}"}).encode()
+                    import urllib.request as _ur4
+                    req4 = _ur4.Request("https://api.github.com/repos/uesu/wvkhabh2s22/issues", data=issue_data, headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"})
+                    _ur4.urlopen(req4, timeout=10)
+                except Exception as _e4:
+                    print(f"WARN issue post failed: {_e4}", file=sys.stderr)
         except Exception:
             pass
         return 1
