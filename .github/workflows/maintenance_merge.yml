@@ -305,46 +305,23 @@ jobs:
               }
               // Also consider commit statuses (legacy)
               const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({ owner, repo, ref: pr.head.sha, per_page: 100 });
-              // Enrich checks with real workflow provenance via job/run association — no same-SHA first-match, no synthetic gate
+              // Enrich checks with real workflow provenance — use check's own head_sha/app and workflow info, do not fabricate via job name
+              // The helper will verify workflow provenance and exact-head outcomes; missing provenance fails closed
               checks = all.map(c => {
-                // Find the workflow run whose job actually produced this check (via jobs list)
-                let matchedRun = null;
-                let matchedJob = null;
-                for (const wr of workflowRuns) {
-                  const job = (wr._jobs || []).find(j => j.name === c.name || j.name === c.name.replace(/-/g, ' '));
-                  if (job) {
-                    matchedRun = wr;
-                    matchedJob = job;
-                    break;
-                  }
-                  // Fallback: if check name is maintenance-ci, it corresponds to the workflow's final gate job
-                  if (c.name === 'maintenance-ci' && wr.path === '.github/workflows/ci.yml') {
-                    // Require that the workflow run actually has a job named maintenance-ci
-                    const jc = (wr._jobs || []).find(j => j.name === 'maintenance-ci' || j.name === 'validate' || j.name.includes('maintenance'));
-                    if (jc) {
-                      matchedRun = wr;
-                      matchedJob = jc;
-                      break;
-                    }
-                  }
-                }
-                // If no job match, do not fabricate workflow — leave provenance missing (helper will fail closed)
-                // This prevents same-SHA first-match from authenticating unrelated runs
-                const wfInfo = matchedRun ? { id: matchedRun.id, name: matchedRun.name, path: matchedRun.path, head_sha: matchedRun.head_sha, conclusion: matchedRun.conclusion, run_attempt: matchedRun.run_attempt || 1, workflow_id: matchedRun.workflow_id } : null;
-                // Also verify security scan findings if this check is workflow-lint or zizmor: require actual job conclusion
-                // (Helper will verify, but we can attach attempt)
+                // Use check's own status/conclusion/head_sha/app; workflow provenance must be present in check object itself
+                // Do not match by job name or fabricate maintenance-ci fallback — require actual check-run producer identity
                 return {
                   name: c.name,
-                  status: matchedJob ? matchedJob.conclusion === 'success' ? 'completed' : matchedJob.status : c.status,
-                  conclusion: matchedJob ? matchedJob.conclusion : c.conclusion,
+                  status: c.status,
+                  conclusion: c.conclusion,
                   app: c.app?.slug,
                   head_sha: c.head_sha,
-                  workflow: matchedRun ? matchedRun.name : undefined,
-                  workflow_id: matchedRun ? matchedRun.workflow_id : undefined,
-                  workflow_path: matchedRun ? matchedRun.path : undefined,
-                  workflow_run: wfInfo,
-                  job_name: matchedJob ? matchedJob.name : c.name,
-                  run_attempt: matchedRun ? matchedRun.run_attempt || 1 : undefined
+                  workflow: c.workflow?.name || undefined,
+                  workflow_id: c.workflow_id || undefined,
+                  workflow_path: c.path || c.workflow?.path || undefined,
+                  workflow_run: c.workflow_run || null,
+                  job_name: c.name,
+                  run_attempt: c.run_attempt || undefined
                 };
               });
               // Do NOT create synthetic maintenance-ci from workflow run if no check represents it — require actual gate
@@ -374,23 +351,24 @@ jobs:
             // Do not trust branch/title/body markers alone — require verified workflow_run from API
             if (isPythonBumpBranch) {
               try {
-                const { data: proposerRuns } = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: 'python_version_bump.yml', per_page: 20 });
-                const proposerRun = proposerRuns.workflow_runs.find(r => r.head_sha === pr.head.sha);
+                // Paginate all workflow runs for this workflow to handle pagination correctly
+                const proposerRuns = await github.paginate(github.rest.actions.listWorkflowRuns, { owner, repo, workflow_id: 'python_version_bump.yml', per_page: 100 });
+                // Require exact head_sha match, path, and successful conclusion
+                const proposerRun = proposerRuns.find(r => r.head_sha === pr.head.sha && r.path === '.github/workflows/python_version_bump.yml' && r.conclusion === 'success');
                 if (proposerRun) {
-                  // Verify head_sha, path, and workflow file match
                   fixture.proposer_run_id = proposerRun.id;
-                  fixture.workflow_run = { id: proposerRun.id, head_sha: proposerRun.head_sha, path: proposerRun.path, workflow_id: proposerRun.workflow_id };
-                  // Mark verified only if run is from trusted workflow path and head matches and run was successful or in_progress
-                  if (proposerRun.path === '.github/workflows/python_version_bump.yml' && proposerRun.head_sha === pr.head.sha) {
+                  fixture.workflow_run = { id: proposerRun.id, head_sha: proposerRun.head_sha, path: proposerRun.path, workflow_id: proposerRun.workflow_id, conclusion: proposerRun.conclusion };
+                  // Must have head_sha matching PR head, path correct, and successful conclusion
+                  if (proposerRun.head_sha === pr.head.sha && proposerRun.path === '.github/workflows/python_version_bump.yml' && proposerRun.conclusion === 'success') {
                     fixture.proposer_verified = true;
                     fixture.publisher_verified = true;
-                    console.log(`Proposer verified: workflow_run ${proposerRun.id} for ${pr.head.sha}`);
+                    console.log(`Proposer verified: workflow_run ${proposerRun.id} conclusion ${proposerRun.conclusion}`);
                   } else {
-                    console.log(`Proposer run found but path/head mismatch: ${proposerRun.path} ${proposerRun.head_sha}`);
+                    console.log(`Proposer run found but not successful: ${proposerRun.path} ${proposerRun.conclusion}`);
                     fixture.proposer_verified = false;
                   }
                 } else {
-                  console.log('No proposer workflow run found for this head — unverified');
+                  console.log('No proposer workflow run found — unverified');
                   fixture.proposer_verified = false;
                   fixture.publisher_verified = false;
                 }
@@ -400,12 +378,11 @@ jobs:
                 fixture.publisher_verified = false;
               }
             }
-            // For dependabot, also attach workflow_run if present for provenance (helper will verify)
+            // For dependabot, also attach workflow_run if present for provenance (helper will verify) — require exact head_sha
             if (isDependabot) {
-              // Dependabot provenance is via author trusted, but also attach workflow_run if available
               const depRun = workflowRuns.find(r => r.head_sha === pr.head.sha && r.path === '.github/workflows/ci.yml');
               if (depRun) {
-                fixture.workflow_run = { id: depRun.id, head_sha: depRun.head_sha, path: depRun.path, workflow_id: depRun.workflow_id };
+                fixture.workflow_run = { id: depRun.id, head_sha: depRun.head_sha, path: depRun.path, workflow_id: depRun.workflow_id, conclusion: depRun.conclusion };
               }
             }
             // Labels already indicate review-required if present
@@ -530,29 +507,18 @@ jobs:
                 }
                 const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({ owner, repo, ref: finalPr.head.sha, per_page: 100 });
                 finalChecks = all.map(c => {
-                  let matchedRun = null;
-                  let matchedJob = null;
-                  for (const wr of finalWorkflowRuns) {
-                    const job = (wr._jobs || []).find(j => j.name === c.name);
-                    if (job) { matchedRun = wr; matchedJob = job; break; }
-                    if (c.name === 'maintenance-ci' && wr.path === '.github/workflows/ci.yml') {
-                      const jc = (wr._jobs || []).find(j => j.name === 'maintenance-ci' || j.name === 'validate');
-                      if (jc) { matchedRun = wr; matchedJob = jc; break; }
-                    }
-                  }
-                  const wfInfo = matchedRun ? { id: matchedRun.id, name: matchedRun.name, path: matchedRun.path, head_sha: matchedRun.head_sha, conclusion: matchedRun.conclusion, run_attempt: matchedRun.run_attempt || 1, workflow_id: matchedRun.workflow_id } : null;
                   return {
                     name: c.name,
-                    status: matchedJob ? (matchedJob.conclusion === 'success' ? 'completed' : matchedJob.status) : c.status,
-                    conclusion: matchedJob ? matchedJob.conclusion : c.conclusion,
+                    status: c.status,
+                    conclusion: c.conclusion,
                     app: c.app?.slug,
                     head_sha: c.head_sha,
-                    workflow: matchedRun ? matchedRun.name : undefined,
-                    workflow_id: matchedRun ? matchedRun.workflow_id : undefined,
-                    workflow_path: matchedRun ? matchedRun.path : undefined,
-                    workflow_run: wfInfo,
-                    job_name: matchedJob ? matchedJob.name : c.name,
-                    run_attempt: matchedRun ? matchedRun.run_attempt || 1 : undefined
+                    workflow: c.workflow?.name || undefined,
+                    workflow_id: c.workflow_id || undefined,
+                    workflow_path: c.path || c.workflow?.path || undefined,
+                    workflow_run: c.workflow_run || null,
+                    job_name: c.name,
+                    run_attempt: c.run_attempt || undefined
                   };
                 });
                 // Do NOT synthesize maintenance-ci — require actual check/job

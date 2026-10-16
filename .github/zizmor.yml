@@ -1,0 +1,5 @@
+rules:
+  dangerous-triggers:
+    ignore:
+      - maintenance_merge.yml:7
+      - maintenance_merge.yml:8

@@ -63,7 +63,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          CURRENT="$(cat .python-version | tr -d ' \r\n')"
+          CURRENT="$(tr -d ' \r\n' < .python-version)"
           if [ -z "$CURRENT" ]; then
             echo "::error::Could not read current pin from .python-version"
             exit 1

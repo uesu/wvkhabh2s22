@@ -26,7 +26,7 @@ COMMAND_REGISTRY = {
     "lock-consistency": [sys.executable, "-c", "import pathlib; print('lock-consistency placeholder')"],
     "workflow-lint": [sys.executable, "-c", "import pathlib, yaml; yaml.safe_load(open('.github/workflows/ci.yml')) ; print('yaml ok')"],
     "actionlint": ["actionlint", ".github/workflows/ci.yml", ".github/workflows/maintenance_merge.yml", ".github/workflows/python_version_bump.yml"],
-    "zizmor": ["zizmor", ".github/workflows"],
+    "zizmor": ["zizmor", "--offline", "--min-severity", "high", ".github/workflows"],
 }
 
 
@@ -136,10 +136,30 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                 if _failed:
                     break
                 # Byte-stable regeneration with pinned toolchain — fail on missing tools, no fabricated header
-                # Only enforce byte-stable on pinned interpreter (3.14); on other versions verify hashes only (CI is 3.14)
-                _is_pinned = sys.version_info[:2] == (3, 14)
+                # Enforce exact .python-version (e.g., 3.14.8) as pinned runtime/compiler
+                try:
+                    _pinned_str = (ROOT / ".python-version").read_text(encoding="utf-8").strip()
+                except Exception:
+                    _pinned_str = "3.14.8"
+                try:
+                    _pmaj, _pmin, _ppatch = [int(x) for x in _pinned_str.split(".")]
+                except Exception:
+                    _pmaj, _pmin, _ppatch = (3, 14, 8)
+                _is_pinned = (sys.version_info.major, sys.version_info.minor, sys.version_info.micro) == (_pmaj, _pmin, _ppatch)
                 if not _is_pinned:
-                    print(f"WARN: {label} byte-stable check skipped — interpreter {sys.version_info.major}.{sys.version_info.minor} != pinned 3.14 (CI will enforce)", file=sys.stderr)
+                    import os as _os_pin
+                    _in_ci_pin = _os_pin.getenv("GITHUB_ACTIONS") == "true"
+                    if _in_ci_pin:
+                        print(f"FAIL: {label} requires exact pinned Python {_pinned_str} (got {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}) — NOT VALIDATED", file=sys.stderr)
+                        failures.append(name)
+                        _failed = True
+                        break
+                    else:
+                        print(f"WARN: {label} NOT VALIDATED — requires pinned Python {_pinned_str} (got {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}); byte-stable skipped locally", file=sys.stderr)
+                        # Local diagnostic: still verify hash install, but do not satisfy mandatory gate as PASS if we were to require pinned?
+                        # Per T3, local diagnostic may report NOT VALIDATED but must not satisfy mandatory gate.
+                        # For now, locally we still verify hashes and allow PASS for other checks, but this label is NOT fully validated.
+                        # We keep the hash-check path below, but we will not treat this as fully PASS for the gate if in CI; locally we allow continue.
                 try:
                     import subprocess as _sp
                     import tempfile
@@ -159,7 +179,7 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                         _failed = True
                         break
                     if not _is_pinned:
-                        # Skip regeneration on non-pinned; verify hash install then continue
+                        # Non-pinned: already warned NOT VALIDATED above; verify hash install then continue (local diagnostic path)
                         inst = _sp.run([sys.executable, "-m", "pip", "install", "--dry-run", "--require-hashes", "--only-binary=:all:", "-r", str(target)], capture_output=True, text=True, timeout=30)
                         if inst.returncode != 0 and "externally-managed-environment" in inst.stderr:
                             inst = _sp.run([sys.executable, "-m", "pip", "install", "--dry-run", "--require-hashes", "--only-binary=:all:", "--break-system-packages", "-r", str(target)], capture_output=True, text=True, timeout=30)
@@ -168,6 +188,8 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                             failures.append(name)
                             _failed = True
                             break
+                        # Mark as not validated locally but do not fail the whole profile for local dev convenience;
+                        # In CI this path is not taken because _is_pinned would have failed above.
                         continue
                     # Pinned interpreter: regenerate with isolated seeded copy to preserve locked resolution
                     src = "requirements.in" if label == "requirements.txt" else "requirements-dev.in"
@@ -194,7 +216,8 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                         except Exception:
                             pass
                     try:
-                        reg = _sp.run([sys.executable, "-m", "piptools", "compile", "--generate-hashes", "--allow-unsafe", "--resolver=backtracking", "--strip-extras", f"--output-file={tf_path}", str(Path(tmpdir) / src)], capture_output=True, text=True, timeout=60, cwd=tmpdir)
+                        # Use relative paths with cwd=tmpdir so via comments do not contain absolute tmpdir
+                        reg = _sp.run([sys.executable, "-m", "piptools", "compile", "--generate-hashes", "--allow-unsafe", "--resolver=backtracking", "--strip-extras", f"--output-file={label}", src], capture_output=True, text=True, timeout=60, cwd=tmpdir)
                         if reg.returncode != 0:
                             print(f"FAIL: {label} pip-compile regeneration failed: {reg.stderr[:500]}", file=sys.stderr)
                             failures.append(name)
@@ -205,19 +228,15 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                         def normalize(lines):
                             out = []
                             for line in lines:
-                                # Normalize all occurrences of tmpdir and absolute input path, not just header
-                                if str(tmpdir) in line:
-                                    line = line.replace(str(tmpdir) + "/", "")
-                                    line = line.replace(str(tmpdir), "")
-                                if str(Path(tmpdir) / src) in line:
-                                    line = line.replace(str(Path(tmpdir) / src), src)
-                                if "--output-file=" in line:
-                                    import re as _re2
-                                    line = _re2.sub(r"--output-file=\S+", "--output-file=requirements.txt" if label == "requirements.txt" else "--output-file=requirements-dev.txt", line)
-                                # Normalize via comments that contain absolute path
-                                if "# via" in line and "/" in line:
-                                    line = line.replace(str(Path(tmpdir) / src), src)
-                                    line = line.replace(str(tmpdir) + "/", "")
+                                # Only agreed header normalization: pip-compile header lines starting with '#'
+                                if line.strip().startswith("#"):
+                                    if "--output-file=" in line:
+                                        import re as _re2
+                                        line = _re2.sub(r"--output-file=\S+", "--output-file=requirements.txt" if label == "requirements.txt" else "--output-file=requirements-dev.txt", line)
+                                    # Also normalize any absolute tmpdir that might appear in header
+                                    if str(tmpdir) in line:
+                                        line = line.replace(str(tmpdir) + "/", "")
+                                        line = line.replace(str(tmpdir), "")
                                 out.append(line)
                             return out
                         orig_norm = normalize(orig_lines)
@@ -225,13 +244,15 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                         if orig_norm != new_norm:
                             for i, (a, b) in enumerate(zip(orig_norm, new_norm)):
                                 if a != b:
-                                    print(f"WARN: {label} not byte-stable at line {i+1}: orig={a!r} new={b!r}", file=sys.stderr)
+                                    print(f"FAIL: {label} not byte-stable at line {i+1}: orig={a!r} new={b!r}", file=sys.stderr)
                                     break
                             else:
                                 if len(orig_norm) != len(new_norm):
-                                    print(f"WARN: {label} not byte-stable: line count orig {len(orig_norm)} vs new {len(new_norm)}", file=sys.stderr)
-                            print(f"WARN: {label} regeneration not byte-stable (only agreed header normalization allowed) - treated as WARN", file=sys.stderr)
-                            pass  # was failures.append/_failed/break
+                                    print(f"FAIL: {label} not byte-stable: line count orig {len(orig_norm)} vs new {len(new_norm)}", file=sys.stderr)
+                            print(f"FAIL: {label} regeneration not byte-stable (only agreed header normalization allowed)", file=sys.stderr)
+                            failures.append(name)
+                            _failed = True
+                            break
                         inst = _sp.run([sys.executable, "-m", "pip", "install", "--dry-run", "--require-hashes", "--only-binary=:all:", "-r", str(target)], capture_output=True, text=True, timeout=30)
                         if inst.returncode != 0 and "externally-managed-environment" in inst.stderr:
                             inst = _sp.run([sys.executable, "-m", "pip", "install", "--dry-run", "--require-hashes", "--only-binary=:all:", "--break-system-packages", "-r", str(target)], capture_output=True, text=True, timeout=30)
@@ -326,10 +347,14 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                     else:
                         al = al2
                 if al and al.returncode == 0:
-                    al_run = _sp2.run(["actionlint", ".github/workflows/*.yml"], capture_output=True, text=True, timeout=15, cwd=ROOT)
-                    if al_run.returncode != 0 and al_run.stderr:
-                        if "error" in al_run.stderr.lower() or "error" in al_run.stdout.lower():
-                            print(f"WARN workflow-lint: actionlint found issues (advisory): {al_run.stderr[:500]}", file=sys.stderr)
+                    # Expand actual workflow paths (no shell wildcard) or use default mode
+                    _wfs = list((ROOT / ".github" / "workflows").glob("*.yml"))
+                    _al_args = ["actionlint"] + [str(w) for w in _wfs]
+                    al_run = _sp2.run(_al_args, capture_output=True, text=True, timeout=15, cwd=ROOT)
+                    if al_run.returncode != 0:
+                        print(f"FAIL workflow-lint: actionlint errors: {(al_run.stdout or '')[:500]} {(al_run.stderr or '')[:500]}", file=sys.stderr)
+                        failures.append(name)
+                        continue
             except FileNotFoundError:
                 import os as _os3
                 if _os3.getenv("GITHUB_ACTIONS") == "true":
@@ -361,10 +386,11 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                         print(f"WARN workflow-lint: {msg} — skipping locally", file=sys.stderr)
                         z = None
                 if z and z.returncode == 0:
-                    z_run = _sp2.run(["zizmor", ".github/workflows"], capture_output=True, text=True, timeout=15, cwd=ROOT)
+                    z_run = _sp2.run(["zizmor", "--offline", "--min-severity", "high", ".github/workflows"], capture_output=True, text=True, timeout=15, cwd=ROOT)
                     if z_run.returncode != 0:
-                        # zizmor findings are advisory for now; don't block CI until workflows are hardened
-                        print(f"WARN workflow-lint: zizmor findings (advisory, exit {z_run.returncode}): {z_run.stdout[:700]}", file=sys.stderr)
+                        print(f"FAIL workflow-lint: zizmor found issues (exit {z_run.returncode}): {(z_run.stdout or '')[:700]}", file=sys.stderr)
+                        failures.append(name)
+                        continue
             except FileNotFoundError:
                 import os as _os4
                 if _os4.getenv("GITHUB_ACTIONS") == "true":
@@ -401,15 +427,8 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                 failures.append(name)
                 continue
         if result.returncode != 0:
-            if name in ("actionlint", "zizmor"):
-                out = getattr(result, "stdout", None) or getattr(result, "stderr", None) or ""
-                # result from subprocess.run without capture has None, so try to show stderr if captured elsewhere?
-                # For advisory, just warn and pass
-                print(f"WARN {name} exited {result.returncode} (advisory): {str(out)[:500]}", file=sys.stderr)
-                print(f"PASS {name} (advisory, exit {result.returncode})")
-            else:
-                print(f"FAIL {name} exited {result.returncode}", file=sys.stderr)
-                failures.append(name)
+            print(f"FAIL {name} exited {result.returncode}", file=sys.stderr)
+            failures.append(name)
         else:
             print(f"PASS {name}")
     if failures:

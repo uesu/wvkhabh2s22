@@ -119,12 +119,12 @@ jobs:
           cat /tmp/diff.txt || true
           echo "=== Posting PR comment ==="
           if [ -f /tmp/diff.txt ]; then
-            body=$(cat /tmp/diff.txt | head -c 3500)
+            body=$(head -c 3500 /tmp/diff.txt)
             if [ -z "$body" ]; then
               body="no diff, orig $(head -n 2 requirements.txt | tr '\n' ' ') regen $(head -n 2 /tmp/ci_debug/regen.txt | tr '\n' ' ')"
             fi
             if [ -f /tmp/ci-failure.txt ]; then
-              body="$body CI failure $(cat /tmp/ci-failure.txt | head -c 800 | tr '\n' ' ')"
+              body="$body CI failure $(head -c 800 /tmp/ci-failure.txt | tr '\n' ' ')"
             fi
             gh pr comment 29 --body "CI debug $GITHUB_SHA diff $body" 2>&1 | head -c 500 || echo "pr comment failed"
             gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI debug $GITHUB_SHA diff $body" 2>&1 | head -c 300 || echo "api comment failed"
@@ -202,10 +202,12 @@ jobs:
     if: always()
     steps:
       - name: Aggregate mandatory checks
+        env:
+          VALIDATE_RESULT: ${{ needs.validate.result }}
         run: |
-          echo "validate result: ${{ needs.validate.result }}"
-          if [ "${{ needs.validate.result }}" != "success" ]; then
-            echo "::error::maintenance-ci: validate job failed or was not successful (result=${{ needs.validate.result }})"
+          echo "validate result: $VALIDATE_RESULT"
+          if [ "$VALIDATE_RESULT" != "success" ]; then
+            echo "::error::maintenance-ci: validate job failed or was not successful (result=$VALIDATE_RESULT)"
             exit 1
           fi
           echo "maintenance-ci: all mandatory checks successful"

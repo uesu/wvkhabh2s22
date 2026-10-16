@@ -744,27 +744,23 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
             workflow_run = fixture.get("workflow_run") or fixture.get("proposer_workflow_run")
             workflow_verified = False
             if isinstance(workflow_run, dict):
-                # Must have id, head_sha matching PR head, path == python_version_bump.yml, and successful conclusion
+                # Must have id, head_sha matching PR head, path == python_version_bump.yml, and successful conclusion == "success"
                 if (workflow_run.get("head_sha") == (pr.get("head") or {}).get("sha")
                     and workflow_run.get("path") == ".github/workflows/python_version_bump.yml"
-                    and workflow_run.get("conclusion") in (None, "success")):  # None for in-progress, but we check success elsewhere
+                    and workflow_run.get("conclusion") == "success"
+                    and workflow_run.get("id") is not None):
                     # Also require that proposer_run is numeric and matches workflow_run id if both present
                     if proposer_run is not None:
-                        # proposer_run should be numeric and equal to workflow_run id, not boolean True
                         try:
                             if int(proposer_run) != int(workflow_run.get("id", -1)):
                                 workflow_verified = False
                             else:
                                 workflow_verified = True
                         except Exception:
-                            # Non-numeric or boolean True fails verification
                             workflow_verified = False
                     else:
                         workflow_verified = True
-                # Also allow verification via separate proposer_run_id + workflow_run id match
-                if not workflow_verified and workflow_run.get("path") == ".github/workflows/python_version_bump.yml":
-                    # If workflow_run is present but proposer_run is boolean/arbitrary, it must not pass
-                    pass
+                # No fallback: path/head mismatch or non-success is not verification
             # Additional checks: proposer_run must be numeric (not boolean), and if verified flag is set, proposer_run must be valid
             # Boolean True is truthy but not proof — must be numeric and match workflow_run
             if proposer_run is True or proposer_run == "true":
@@ -790,7 +786,6 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
             # For Python bump, require either trusted author or fully verified proposer (numeric id + verified flag + workflow_verified)
             # No branch/title/body marker alone grants trust
             if author not in trusted_publishers and not (proposer_run_valid and workflow_verified):
-                # Also check body/title markers are not trusted — they are not proof
                 return {"decision": "review-required", "reason": "python bump unverified publisher/provenance", "merge": False}
             # If author is untrusted but has valid proposer, also require that workflow_run head matches PR head and version matches manifest
             # (Additional manifest validation elsewhere)
