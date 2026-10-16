@@ -12,12 +12,13 @@ import json
 import pathlib
 from typing import Any
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
-
-# Import shared helpers
-sys.path.insert(0, str(pathlib.Path(__file__).parent))
+# Shared helpers live beside this file. Reaching a sibling needs no sys.path manipulation:
+# running this file as a script puts its own directory on sys.path, and every importer — the
+# workflow's candidate and publisher blocks and the tests — inserts .github/scripts first.
 import maintenance  # type: ignore
-import maintenance_common as common  # type: ignore  # noqa: E402
+import maintenance_common as common  # type: ignore
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 def read_current_pin() -> str | None:
@@ -479,7 +480,7 @@ def main(argv: list[str] | None = None) -> int:
             out.write(f"current={current}\n")
             out.write(f"latest={cand}\n")
             out.write(f"kind={classification.get('kind')}\n")
-            out.write(f"bump=yes\n")
+            out.write("bump=yes\n")
 
     # In full workflow, next steps would install candidate, validate wheels, run ci.py, etc.
     # This adapter only reports selection; validation is separate job steps using ci.py.

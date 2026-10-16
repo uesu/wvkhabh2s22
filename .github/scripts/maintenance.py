@@ -14,11 +14,10 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Shared cross-repository maintenance authority. This module is byte-identical in every
 # repository that adopts it: the verification *semantics* (publication provenance, release-date
@@ -27,7 +26,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # workflow/check names, allowed runtime paths, the JS merge controller and the lock-regenerating
 # proposer. Adoption means delegating, not forking: a semantic fix lands once and applies
 # everywhere, and no repository is hidden behind a repository-name conditional.
-import maintenance_common as common  # noqa: E402
+#
+# Reaching a sibling module needs no sys.path manipulation: running this file as a script puts its
+# own directory on sys.path, and every importer — ci.py, python_version_bump.py, the workflow's
+# candidate/publisher blocks and the tests — inserts .github/scripts before importing.
+import maintenance_common as common
 
 SCHEMA_VERSION = common.SCHEMA_VERSION
 
