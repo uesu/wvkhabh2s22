@@ -541,10 +541,14 @@ def check_workflow_lint(gate: Gate, name: str) -> None:
             gate.fail(name, f"invalid YAML in {wf.name}: {exc}")
             return
         for line in text.splitlines():
-            if "uses:" in line and "@" in line and not _SHA_PIN.search(line):
-                if "sha-pinned" not in line.lower():
-                    gate.fail(name, f"unpinned action in {wf.name}: {line.strip()}")
-                    return
+            if (
+                "uses:" in line
+                and "@" in line
+                and not _SHA_PIN.search(line)
+                and "sha-pinned" not in line.lower()
+            ):
+                gate.fail(name, f"unpinned action in {wf.name}: {line.strip()}")
+                return
     print(f"OK workflow-lint: {len(workflows)} workflows parse strictly and use SHA-pinned actions")
 
     _run_external_linter(

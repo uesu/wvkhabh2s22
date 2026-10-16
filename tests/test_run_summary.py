@@ -16,6 +16,39 @@ sys.path.insert(0, str(ROOT / ".github" / "scripts"))
 
 import render_run_summary  # type: ignore
 
+def test_redaction_keeps_both_catch_all_branches():
+    """The KEY=value catch-all and its fall-through must behave exactly as before the lint cleanup.
+
+    Two nested conditions in this loop were merged into one. The inner branch ends in `continue`
+    and the outer fall-through appends the line unchanged, so the merge is only equivalent if both
+    paths are pinned. A secret-keyword line with no "=" is the fall-through: it must survive
+    verbatim rather than be dropped, rewritten, or half-redacted.
+    """
+    text = "\n".join([
+        "COOKIE=chocolate-chip",           # keyword + "=" -> value redacted, key kept
+        "AUTHORIZATION_COUNT=3",           # keyword + "=" -> value redacted
+        "SECRETSAUCE is tasty",            # keyword, no "=" -> fall-through, unchanged
+        "posted=12",                       # no keyword -> unchanged
+        "plain line",                      # no keyword, no "=" -> unchanged
+        "BUMP_PAT=ghp_supersecretvalue",   # token pattern redacts the whole line first
+        "WEBHOOK_URL=https://discord.com/api/webhooks/123/abc",
+        "NITTER_RSS_TOKEN: tokensecret",
+    ])
+    red = render_run_summary.redact_text(text)
+    assert red == "\n".join([
+        "COOKIE=[REDACTED]",
+        "AUTHORIZATION_COUNT=[REDACTED]",
+        "SECRETSAUCE is tasty",
+        "posted=12",
+        "plain line",
+        "[REDACTED]",
+        "WEBHOOK_URL=[REDACTED]",
+        "[REDACTED]",
+    ]), red
+    for secret in ("chocolate-chip", "ghp_supersecretvalue", "tokensecret", "webhooks/123/abc"):
+        assert secret not in red, f"{secret} leaked through redaction: {red}"
+
+
 def test_redaction():
     text = "https://discord.com/api/webhooks/123/abc token=secret Authorization: Bearer xyz"
     red = render_run_summary.redact_text(text)
@@ -107,7 +140,7 @@ def test_load_and_cli():
         os.unlink(fname)
 
 def main():
-    tests = [test_redaction, test_render_minimal, test_render_missing_file, test_load_and_cli]
+    tests = [test_redaction, test_redaction_keeps_both_catch_all_branches, test_render_minimal, test_render_missing_file, test_load_and_cli]
     failed = []
     for fn in tests:
         try:

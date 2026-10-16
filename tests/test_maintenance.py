@@ -2372,8 +2372,104 @@ def test_proposer_cli_soaks_against_the_release_date_authority():
 
 
 
+
+def test_allowed_scope_narrows_and_never_widens():
+    """`allowed=` may only subtract from the trusted runtime patterns, never add to them.
+
+    The two disallow branches were merged into one condition during lint cleanup. Merging is only
+    equivalent if both are pinned: a path the shared policy allows but this proposal does not, and
+    a path the shared policy forbids even when the caller names it explicitly.
+    """
+    # Inside the policy, outside the proposal scope -> disallowed.
+    narrowed = maintenance.validate_changed_files(
+        [".python-version", "requirements.txt"], allowed=[".python-version"])
+    assert narrowed["ok"] is False, narrowed
+    assert "requirements.txt" in narrowed["reason"], narrowed["reason"]
+
+    # Naming a forbidden path in `allowed` cannot authorize it. Note the trusted patterns do name
+    # the five real workflow files, so a workflow outside that set is the forbidden case here.
+    for forbidden in ("README.md", "posted_tweets.json", "docs/spec.md",
+                      ".github/workflows/not_a_real_workflow.yml", "AGENTS.md"):
+        widened = maintenance.validate_changed_files([forbidden], allowed=[forbidden])
+        assert widened["ok"] is False, f"{forbidden} must stay disallowed: {widened}"
+
+    # Inside both -> allowed.
+    ok = maintenance.validate_changed_files([".python-version"], allowed=[".python-version"])
+    assert ok["ok"] is True, ok
+    # An empty scope means "no narrowing", not "nothing allowed".
+    assert maintenance.validate_changed_files([".python-version"])["ok"] is True
+
+
+def test_iso_to_epoch_parses_github_timestamps_without_the_zero_offset_rewrite():
+    """Removing the `.replace("Z", "+00:00")` must not change any parsed instant.
+
+    fromisoformat accepts a trailing Z on the pinned runtime (3.14.8, and any 3.11+), so the
+    rewrite was dead weight; junk and absent values must still be None rather than an exception.
+    """
+    zulu = maintenance._iso_to_epoch("2026-10-16T02:03:00Z")
+    offset = maintenance._iso_to_epoch("2026-10-16T02:03:00+00:00")
+    assert isinstance(zulu, float) and isinstance(offset, float), (zulu, offset)
+    assert zulu == offset, (zulu, offset)
+    assert zulu == datetime.fromisoformat("2026-10-16T02:03:00+00:00").timestamp()
+    for bad in (None, "", "not-a-date", "2026-13-45T99:99:99Z", 12345, [], {}):
+        assert maintenance._iso_to_epoch(bad) is None, bad
+
+
+def test_soak_defers_on_an_unparseable_authoritative_date():
+    """The narrowed soak exception boundary still defers; it must never crash or guess an age."""
+    now_late = int(time.mktime(time.strptime("2026-11-20T00:00:00", "%Y-%m-%dT%H:%M:%S")))
+    manifest = [
+        {"version": "3.14.8", "stable": True, "files": [{"platform": "linux", "arch": "x64"}]},
+        {"version": "3.15.0", "stable": True, "published_at": "2025-01-01T00:00:00Z",
+         "files": [{"platform": "linux", "arch": "x64"}], "release_url": "u"},
+    ]
+    for bad_date in ("not-a-date", "", "3.15", "2026-99-99"):
+        r = maintenance.select_candidate("3.14.8", manifest, soak_days=30, now_ts=now_late,
+                                         release_dates={"3.15.0": bad_date} if bad_date else {},
+                                         release_date_state="ok")
+        assert r.get("deferred") is True, (bad_date, r)
+        assert_eq(r["reason"], "deferred: release-date-unavailable")
+
+
+def test_malformed_arrow_title_defers_instead_of_crashing_the_controller():
+    """PR titles are untrusted input to the merge authority; the fallback parse must not raise."""
+    def pr_titled(title):
+        return {
+            "number": 31, "state": "open", "draft": False, "mergeable": True,
+            "mergeable_state": "clean",
+            "base": {"ref": "main", "repo": repo_side()},
+            "head": {"sha": PUBLISHED_HEAD, "ref": f"chore/python-{CANDIDATE}", "repo": repo_side()},
+            "title": title,
+            "user": {"login": PAT_PUBLISHER},
+        }
+
+    # A patch with no parseable version and no fixture versions forces the title fallback to run,
+    # which is the block whose blind `except Exception: pass` became contextlib.suppress(...).
+    digit_free = ("--- a/.python-version\n+++ b/.python-version\n@@ -1 +1 @@\n"
+                  "-old-pin\n+new-pin\n")
+    scope = {"file_patches": {".python-version": digit_free},
+             "current_version": None, "candidate_version": None}
+
+    for title in ("chore: bump CPython pin ->", "->", "chore: bump ->  ", "-> -> ->"):
+        decision = _proposer_decision(pr=pr_titled(title), **scope)
+        assert decision["merge"] is False, f"{title!r} must not authorize a merge: {decision}"
+        assert_eq(decision["decision"], "review-required")
+        assert "python version unparsed" in decision["reason"], (title, decision)
+
+    # Control: a well-formed arrow title IS parsed by that fallback, so the decision moves past
+    # "unparsed" to the patch-agreement check. Without this, the malformed cases would pass even
+    # if the fallback never ran at all.
+    parsed = _proposer_decision(pr=pr_titled("chore: bump CPython pin 3.14.8 -> 3.14.9"), **scope)
+    assert parsed["merge"] is False, parsed
+    assert "python version unparsed" not in parsed["reason"], parsed
+
+
 def main():
-    tests = [test_parse_version, test_compare_versions, test_classify_python, test_classify_package, test_classify_group, test_validate_changed_files, test_select_candidate, test_soak_age_comes_from_python_org_not_from_the_setup_python_manifest,
+    tests = [test_parse_version, test_compare_versions, test_classify_python, test_classify_package, test_classify_group, test_validate_changed_files, test_allowed_scope_narrows_and_never_widens,
+           test_iso_to_epoch_parses_github_timestamps_without_the_zero_offset_rewrite,
+           test_soak_defers_on_an_unparseable_authoritative_date,
+           test_malformed_arrow_title_defers_instead_of_crashing_the_controller,
+           test_select_candidate, test_soak_age_comes_from_python_org_not_from_the_setup_python_manifest,
            test_evaluate_checks, test_provenance_requires_the_exact_producer, test_provenance_accepts_the_current_attempt_only, test_opaque_external_id_is_never_parsed_as_a_job_id, test_canonical_link_must_name_this_repository_and_check, test_decision_from_fixture, test_proposer_publication_bound_to_the_real_run, test_proposer_publication_rejects_incomplete_evidence, test_repository_association_binds_both_sides_of_the_pr,
            test_security_evidence_is_a_declared_policy_not_an_absence,
            test_trusted_author_does_not_bypass_publication_provenance, test_publication_verifies_the_fetched_commit_not_the_notice_claim, test_proposer_cli_soaks_against_the_release_date_authority, test_adapter_resolves_real_payloads_and_refetches_after_a_rerun, test_adapter_never_parses_external_id_or_trusts_a_foreign_link, test_publisher_step_publishes_only_the_validated_bytes, test_publisher_step_rejects_every_way_the_artifact_can_be_wrong, test_publisher_step_rejects_a_commit_signed_by_another_identity, test_publisher_step_reports_an_unchanged_proposal_without_publishing, test_missing_pat_is_an_explicit_configuration_error, test_candidate_step_validates_the_exact_proposal_under_the_candidate, test_candidate_step_executes_and_emits_bounded_evidence, test_notice_records_survive_the_annotation_round_trip, test_policy_reconciliation_is_narrow, test_staged_artifact_survives_a_real_archive_round_trip, test_unstaged_upload_layout_is_rejected_by_the_publisher, test_artifact_with_tampered_bytes_or_extra_paths_is_rejected, test_staging_refuses_to_package_an_incomplete_proposal, test_cold_candidate_bootstraps_the_compiler_before_the_first_compile, test_cold_candidate_without_the_bootstrap_fails_closed, test_publication_evidence_reads_the_real_jobs_envelope, test_publication_evidence_finds_notices_on_the_second_page, test_publication_evidence_fails_closed_on_malformed_lists, test_publication_evidence_ignores_a_run_that_published_a_different_proposal]

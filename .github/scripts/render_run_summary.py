@@ -17,17 +17,17 @@ SCHEMA_VERSION = 1
 
 # Fields that must never be logged in plain text
 REDACT_PATTERNS = [
-    re.compile(r"https://discord\.com/api/webhooks/[^\s\"']+", re.I),
-    re.compile(r"discord\.com/api/webhooks/[^\s\"']+", re.I),
-    re.compile(r"Authorization\s*:\s*[^\n]+", re.I),
-    re.compile(r"token=[^\s&\"']+", re.I),
-    re.compile(r"BUMP_PAT[^\n]*", re.I),
-    re.compile(r"REDDIT_FEED_TOKEN[^\n]*", re.I),
-    re.compile(r"NITTER_RSS_TOKEN[^\n]*", re.I),
+    re.compile(r"https://discord\.com/api/webhooks/[^\s\"']+", re.IGNORECASE),
+    re.compile(r"discord\.com/api/webhooks/[^\s\"']+", re.IGNORECASE),
+    re.compile(r"Authorization\s*:\s*[^\n]+", re.IGNORECASE),
+    re.compile(r"token=[^\s&\"']+", re.IGNORECASE),
+    re.compile(r"BUMP_PAT[^\n]*", re.IGNORECASE),
+    re.compile(r"REDDIT_FEED_TOKEN[^\n]*", re.IGNORECASE),
+    re.compile(r"NITTER_RSS_TOKEN[^\n]*", re.IGNORECASE),
 ]
 
-TOKEN_QUERY_RE = re.compile(r"([?&]token=)[^&\s\"']+", re.I)
-WEBHOOK_RE = re.compile(r"https://discord\.com/api/webhooks/[^\s\"']+", re.I)
+TOKEN_QUERY_RE = re.compile(r"([?&]token=)[^&\s\"']+", re.IGNORECASE)
+WEBHOOK_RE = re.compile(r"https://discord\.com/api/webhooks/[^\s\"']+", re.IGNORECASE)
 
 
 def redact_text(text: str) -> str:
@@ -44,12 +44,11 @@ def redact_text(text: str) -> str:
     # Catch-all env dump redaction: if text looks like env dump, redact lines with SECRET/TOKEN/WEBHOOK
     lines = []
     for line in text.splitlines():
-        if any(k in line.upper() for k in ["SECRET", "TOKEN", "WEBHOOK", "AUTHORIZATION", "COOKIE"]):
-            # If line contains =, redact value part after =
-            if "=" in line:
-                key, _ = line.split("=", 1)
-                lines.append(f"{key}=[REDACTED]")
-                continue
+        # If line contains =, redact value part after =
+        if any(k in line.upper() for k in ("SECRET", "TOKEN", "WEBHOOK", "AUTHORIZATION", "COOKIE")) and "=" in line:
+            key, _ = line.split("=", 1)
+            lines.append(f"{key}=[REDACTED]")
+            continue
         lines.append(line)
     return "\n".join(lines)
 
@@ -124,12 +123,12 @@ def render_markdown(report: dict, persistence: dict | None = None) -> str:
     lines.append("### Outcomes")
     lines.append(f"- posted: {posted}  •  edited: {edited}  •  skipped: {skipped}  •  held: {held}")
     if reasons:
-        lines.append(f"- reasons: " + ", ".join(f"{k}: {v}" for k, v in sorted(reasons.items())))
+        lines.append("- reasons: " + ", ".join(f"{k}: {v}" for k, v in sorted(reasons.items())))
     lines.append("")
     lines.append("### Hosts")
     lines.append(f"- attempted: {', '.join(hosts_attempted) if hosts_attempted else 'none'}")
     lines.append(f"- selected: {', '.join(hosts_selected) if hosts_selected else 'none'}")
-    lines.append(f"- challenge/invalid/timeout/rate-limit kept distinct in report")
+    lines.append("- challenge/invalid/timeout/rate-limit kept distinct in report")
     lines.append("")
     lines.append("### State Persistence")
     # Distinguish save vs push failure
@@ -137,7 +136,7 @@ def render_markdown(report: dict, persistence: dict | None = None) -> str:
     lines.append(f"- commit: {commit}")
     lines.append(f"- remote push: {push}")
     if push == "failed" and local_save == "success":
-        lines.append(f"  > push failure after local save — dedup cache not persisted remotely")
+        lines.append("  > push failure after local save — dedup cache not persisted remotely")
     lines.append("")
     if warnings:
         lines.append("### Warnings")
@@ -191,7 +190,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         report = load_report(args.report)
-    except Exception as e:
+    except (OSError, ValueError) as e:
         print(f"Failed to load report: {e}", file=sys.stderr)
         return 1
 
@@ -199,13 +198,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.persistence and os.path.isfile(args.persistence):
         try:
             persistence = load_report(args.persistence)
-        except Exception:
+        except (OSError, ValueError):
             persistence = None
 
     # Do not measure overhead as performance claim; just render once
     try:
         md = render_markdown(report, persistence)
-    except Exception as e:
+    except (KeyError, IndexError, AttributeError, TypeError, ValueError) as e:
+        # Rendering walks an arbitrary report dict, so the realistic failures are missing or
+        # wrongly typed fields. All of them stay an explicit error exit rather than a traceback.
         print(f"Failed to render report: {e}", file=sys.stderr)
         return 1
 
@@ -224,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
             if ghs:
                 with open(ghs, "a", encoding="utf-8") as fh:
                     fh.write(md + "\n")
-    except Exception as e:
+    except (OSError, TypeError, ValueError) as e:
         # Telemetry write failure must not fail the overall job with exception that masks original
         print(f"Warning: failed to write summary: {e}", file=sys.stderr)
         print(md)

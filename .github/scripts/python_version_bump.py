@@ -5,11 +5,11 @@ Delegates to .github/scripts/maintenance.py for version selection and validation
 """
 from __future__ import annotations
 
+import json
 import os
+import pathlib
 import re
 import sys
-import json
-import pathlib
 from typing import Any
 
 # Shared helpers live beside this file. Reaching a sibling needs no sys.path manipulation:
@@ -308,8 +308,7 @@ def parse_notice(message: str, kind: str) -> dict[str, Any] | None:
     if not isinstance(message, str):
         return None
     text = message.strip()
-    if text.startswith("::notice::"):
-        text = text[len("::notice::"):]
+    text = text.removeprefix("::notice::")
     prefix = f"{kind} "
     if not text.startswith(prefix):
         return None
@@ -412,7 +411,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with open(manifest_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-    except Exception as e:
+    except (OSError, ValueError) as e:
+        # Unreadable manifest or malformed JSON/encoding. Stays an explicit error exit, never a
+        # silent "nothing to do".
         print(f"::error::Failed to read manifest: {e}", file=sys.stderr)
         return 1
     # Soak age authority: the python.org downloads API, never a mirror timestamp.

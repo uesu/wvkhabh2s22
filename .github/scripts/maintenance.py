@@ -10,6 +10,7 @@ side-effects in decision mode.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -130,7 +131,7 @@ def parse_requirement_diff(patch: str) -> list[dict[str, str]]:
     olds = {}
     news = {}
     for line in patch.splitlines():
-        if line.startswith("---") or line.startswith("+++"):
+        if line.startswith(("---", "+++")):
             continue
         m_old = old_re.match(line)
         if m_old:
@@ -180,9 +181,7 @@ def is_stable_version(v: str) -> bool:
         return False
     # Prerelease markers contain -, rc, beta, alpha
     low = v.lower()
-    if any(x in low for x in ["-", "rc", "beta", "alpha", "dev"]):
-        return False
-    return True
+    return not any(x in low for x in ("-", "rc", "beta", "alpha", "dev"))
 
 
 def classify_python_update(current: str, candidate: str) -> dict[str, Any]:
@@ -269,9 +268,7 @@ def validate_changed_files(
     narrowed = {str(path) for path in (allowed or ())}
     disallowed = []
     for f in changed:
-        if not any(re.match(pat, f) for pat in ALLOWED_RUNTIME_PATTERNS):
-            disallowed.append(f)
-        elif narrowed and f not in narrowed:
+        if not any(re.match(pat, f) for pat in ALLOWED_RUNTIME_PATTERNS) or narrowed and f not in narrowed:
             disallowed.append(f)
     if disallowed:
         scope = "outside this proposal's permitted files" if narrowed else "disallowed"
@@ -362,7 +359,10 @@ def select_candidate(
                     age_days = (now - int(pub.timestamp())) / 86400
                     if age_days < soak_days:
                         return {"candidate": candidate, "kind": kind, "reason": f"deferred: soak {age_days:.1f}/{soak_days} days", "release_url": release_url, "deferred": True, "release_dates": date_summary}
-                except Exception:
+                except (ValueError, OverflowError, OSError):
+                    # parse_iso_date returns None for anything unparseable and is re-raised as
+                    # ValueError above; timestamp() can overflow or go out of platform range.
+                    # Every one of those defers rather than guessing an age or crashing the run.
                     return {"candidate": candidate, "kind": kind, "reason": "deferred: release-date-unavailable", "release_url": release_url, "deferred": True, "release_dates": date_summary}
             return {"candidate": candidate, "kind": kind, "reason": "available", "release_url": release_url, "deferred": False, "release_dates": date_summary}
     return {"candidate": None, "kind": "none", "reason": "up-to-date", "release_url": None, "deferred": False, "release_dates": date_summary}
@@ -378,11 +378,9 @@ def is_successful_check(check: dict[str, Any]) -> bool:
     if check.get("conclusion") != "success":
         return False
     # Identity check: trusted name
-    if check.get("name") not in TRUSTED_CHECKS:
-        # Also allow workflow/job qualified names? For now strict.
-        # But allow any check that is in mandatory list; if unknown, not successful.
-        return False
-    return True
+    # Also allow workflow/job qualified names? For now strict.
+    # But allow any check that is in mandatory list; if unknown, not successful.
+    return check.get("name") in TRUSTED_CHECKS
 
 
 TRUSTED_WORKFLOW_PATHS = {".github/workflows/ci.yml"}
@@ -556,7 +554,9 @@ def _iso_to_epoch(value: Any) -> float | None:
     if not isinstance(value, str) or not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        # fromisoformat parses a trailing "Z" itself on the pinned runtime (3.14.8, and any
+        # 3.11+), so the zero-offset string rewrite is dead weight.
+        return datetime.fromisoformat(value).timestamp()
     except ValueError:
         return None
 
@@ -709,7 +709,9 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
     try:
         with open(fixture_path, "r", encoding="utf-8") as fh:
             fixture = json.load(fh)
-    except Exception as e:
+    except (OSError, ValueError) as e:
+        # Unreadable file (OSError) or malformed JSON/encoding (ValueError, which covers
+        # json.JSONDecodeError and UnicodeDecodeError). Both stay a failed decision, never a pass.
         return {"decision": "failed", "reason": f"fixture load failed: {e}", "merge": False}
 
     # Load trusted policy (never from PR's changed maintenance profile)
@@ -718,7 +720,7 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
         try:
             with open(trusted_policy_path, "r", encoding="utf-8") as fh:
                 policy = json.load(fh)
-        except Exception:
+        except (OSError, ValueError):
             policy = None
     if policy is None:
         # Fallback to defaults, but never execute PR-supplied commands
@@ -742,11 +744,10 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
     if mergeable is None or mergeable_state in (None, "unknown", ""):
         # GitHub reports mergeable as null/unknown while computing — defer, do not pass
         return {"decision": "blocked", "reason": f"mergeability unknown ({mergeable_state or mergeable}) — defer", "merge": False}
-    if mergeable_state not in ("clean", "unstable", "has_hooks"):
-        # Only clean/unstable/has_hooks are potentially mergeable; others (blocked, behind, etc.) require review
-        # For maintenance, require clean explicitly
-        if mergeable_state != "clean":
-            return {"decision": "blocked", "reason": f"not cleanly mergeable: {mergeable_state}", "merge": False}
+    # Only clean/unstable/has_hooks are potentially mergeable; others (blocked, behind, etc.) require review
+    # For maintenance, require clean explicitly
+    if mergeable_state not in ("clean", "unstable", "has_hooks") and mergeable_state != "clean":
+        return {"decision": "blocked", "reason": f"not cleanly mergeable: {mergeable_state}", "merge": False}
     # Same-repository association check — fork PRs must not be auto-merged even with matching branch/title
     base_repo = (pr.get("base") or {}).get("repo", {}).get("full_name") or ""
     head_repo = (pr.get("head") or {}).get("repo", {}).get("full_name") or base_repo
@@ -823,10 +824,10 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
             if not patch:
                 return {"decision": "review-required", "reason": f"workflow change {wf} missing patch (ambiguous)", "merge": False}
             # Structural workflow changes (triggers/permissions) always require human review — keyword presence is not proof
-            if re.search(r"^[+\-\s]*\s*(on|permissions)\s*:", patch, re.M):
+            if re.search(r"^[+\-\s]*\s*(on|permissions)\s*:", patch, re.MULTILINE):
                 return {"decision": "review-required", "reason": f"workflow structural change in {wf}", "merge": False}
             # Any workflow logic change (jobs/uses/run) also requires review — not just python pin
-            if re.search(r"^[+\-\s]*\s*(jobs|uses|run)\s*:", patch, re.M):
+            if re.search(r"^[+\-\s]*\s*(jobs|uses|run)\s*:", patch, re.MULTILINE):
                 return {"decision": "review-required", "reason": f"workflow logic change in {wf}", "merge": False}
             # Even a single line like `echo python-version` in a run step is not a valid python bump diff
             # Python bump must only touch version/lock files, not workflows (handled below)
@@ -840,7 +841,7 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
     author = pr.get("user", {}).get("login", "")
     is_dependabot = author == "dependabot[bot]"
     # Python bump is chore/python-* branch OR explicit bump title; branch alone is NOT trusted publisher — provenance must be validated via diff
-    is_python_bump = head_ref.startswith("chore/python-") or re.search(r"bump CPython pin", title, re.I)
+    is_python_bump = head_ref.startswith("chore/python-") or re.search(r"bump CPython pin", title, re.IGNORECASE)
     # For python bump, verify author is not strict; BUMP_PAT owner will be PR author, not github-actions[bot]
     # So we accept any author when head_ref matches chore/python-* only for subsequent diff validation, not as authorization
     if is_python_bump:
@@ -850,7 +851,7 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
     # Also parse title for version bumps like "Bump aiohttp from 3.14.5 to 4.0.0"
     import re as _re
     title_updates = []
-    for m in _re.finditer(r"from\s+([0-9]+\.[0-9]+\.[0-9][^\s]*)[^\n]*to\s+([0-9]+\.[0-9]+\.[0-9][^\s]*)", title, re.I):
+    for m in _re.finditer(r"from\s+([0-9]+\.[0-9]+\.[0-9][^\s]*)[^\n]*to\s+([0-9]+\.[0-9]+\.[0-9][^\s]*)", title, _re.IGNORECASE):
         old, new = m.group(1).strip(",."), m.group(2).strip(",.")
         title_updates.append({"old": old, "new": new, "name": "title"})
     # Also handle "3.14.8 -> 3.14.9" style
@@ -933,7 +934,7 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
         else:
             # No authoritative updates found but is_dependabot and no changed_files? Should not happen
             # If is_dependabot but no updates parsed and no dependency files changed, still require review for safety
-            if any(f.startswith(".github/workflows/") or f.startswith("testing area/") for f in changed_files):
+            if any(f.startswith((".github/workflows/", "testing area/")) for f in changed_files):
                 return {"decision": "review-required", "reason": "dependabot changes non-dependency file without metadata", "merge": False}
         if authoritative_updates:
             for upd in authoritative_updates:
@@ -954,7 +955,7 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
         else:
             # No authoritative updates found but is_dependabot and no changed_files? Should not happen
             # If is_dependabot but no updates parsed and no dependency files changed, still require review for safety
-            if any(f.startswith(".github/workflows/") or f.startswith("testing area/") for f in changed_files):
+            if any(f.startswith((".github/workflows/", "testing area/")) for f in changed_files):
                 return {"decision": "review-required", "reason": "dependabot changes non-dependency file without metadata", "merge": False}
         # Also check if changed_files includes engine/workflow beyond allowed dependabot scope
         allowed_dependabot = {".python-version", "requirements.in", "requirements.txt", "requirements-dev.in", "requirements-dev.txt", ".github/dependabot.yml"}
@@ -999,17 +1000,19 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
         cur = cur_from_patch or fixture.get("current_version")
         cand = cand_from_patch or fixture.get("candidate_version")
         # Fallback to title "->" pattern only if patch missing and fixture missing
-        if not cur or not cand:
-            if "->" in title:
-                try:
-                    parts = title.split("->")
-                    cur_t = parts[0].split()[-1].strip().strip(",.")
-                    cand_t = parts[1].strip().split()[0].strip().strip(",.")
-                    if parse_version(cur_t) and parse_version(cand_t):
-                        cur = cur or cur_t
-                        cand = cand or cand_t
-                except Exception:
-                    pass
+        if (not cur or not cand) and "->" in title:
+            # Best-effort title fallback only. Every realistic failure here is a malformed title:
+            # a missing side of the arrow (IndexError), an empty fragment (IndexError), or a
+            # non-string title (AttributeError/TypeError). Suppressing them leaves cur/cand empty,
+            # and the very next block turns that into review-required, so the fallthrough is the
+            # fail-closed path rather than a swallowed error.
+            with contextlib.suppress(IndexError, AttributeError, TypeError, ValueError):
+                parts = title.split("->")
+                cur_t = parts[0].split()[-1].strip().strip(",.")
+                cand_t = parts[1].strip().split()[0].strip().strip(",.")
+                if parse_version(cur_t) and parse_version(cand_t):
+                    cur = cur or cur_t
+                    cand = cand or cand_t
         if not cur or not cand:
             return {"decision": "review-required", "reason": "python version unparsed — missing patch or fixture versions", "merge": False}
         # Verify candidate version actually appears in patch when patch exists (do not trust fixture/title alone)
@@ -1033,10 +1036,9 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
                 # Parse package changes and classify each
                 parsed = parse_requirement_diff(patch)
                 # If patch shows changes but parsing yields nothing, it's unparseable
-                if patch.strip() and not parsed:
-                    # Check if patch actually contains version changes — if so, it's unparseable
-                    if "==" in patch:
-                        return {"decision": "review-required", "reason": f"python bump unparseable lock diff in {req_file}", "merge": False}
+                # Check if patch actually contains version changes — if so, it's unparseable
+                if patch.strip() and not parsed and "==" in patch:
+                    return {"decision": "review-required", "reason": f"python bump unparseable lock diff in {req_file}", "merge": False}
                 for upd in parsed:
                     old = upd.get("old", "")
                     new = upd.get("new", "")
