@@ -46,8 +46,8 @@ jobs:
       - name: Install dependencies (frozen, hash-verified, wheels only)
         run: |
           python -m pip install --upgrade pip==26.1.1
-          python -m pip install --require-hashes --only-binary=:all: -r requirements.txt
-          python -m pip install --require-hashes --only-binary=:all: -r requirements-dev.txt
+          python -m pip install --require-hashes --only-binary=:all: -r requirements.txt 2>&1 | tee /tmp/pip-install.log; test ${PIPESTATUS[0]} -eq 0 || (echo "pip install requirements.txt failed"; cat /tmp/pip-install.log; exit 1)
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-dev.txt 2>&1 | tee -a /tmp/pip-install.log; test ${PIPESTATUS[0]} -eq 0 || (echo "pip install requirements-dev.txt failed"; cat /tmp/pip-install.log; exit 1)
 
       - name: Compile every .py file (syntax errors fail here)
         run: |
@@ -133,7 +133,14 @@ jobs:
             gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI FAILURE $GITHUB_SHA $failbody" 2>&1 | head -c 500 || echo "api fail failed"
           else
             echo "no ci-failure.txt to post"
-            gh pr comment 29 --body "CI debug $GITHUB_SHA no ci-failure.txt but validate failed" 2>&1 | head -c 500 || true
+            if [ -f /tmp/pip-install.log ]; then
+              piplog=$(cat /tmp/pip-install.log | head -c 3000 | tr '\n' ' ')
+              gh pr comment 29 --body "CI no-failure $GITHUB_SHA pipInstall $piplog" 2>&1 | head -c 800 || true
+              gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI no-failure $GITHUB_SHA pipInstall $piplog" 2>&1 | head -c 500 || true
+            else
+              gh pr comment 29 --body "CI debug $GITHUB_SHA no ci-failure.txt but validate failed (no pip log)" 2>&1 | head -c 500 || true
+              gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI debug $GITHUB_SHA no ci-failure.txt but validate failed (no pip log)" 2>&1 | head -c 500 || true
+            fi
           fi
           if [ -f /tmp/diff.txt ]; then
             body=$(cat /tmp/diff.txt | head -c 3500 | tr '\n' ' ' | head -c 3000)
