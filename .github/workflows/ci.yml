@@ -70,6 +70,9 @@ jobs:
           zizmor --version
 
       - name: Run CI adapter — development profile
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           python .github/scripts/ci.py --profile development
 

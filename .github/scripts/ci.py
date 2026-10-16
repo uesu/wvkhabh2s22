@@ -435,16 +435,22 @@ def run_profile(profile: str, verbose: bool = False) -> int:
             summary = os.getenv("GITHUB_STEP_SUMMARY")
             if summary:
                 pathlib.Path(summary).write_text(f"CI FAILED {profile}: {failures}\n", encoding="utf-8")
-            # Also post to PR via gh api for visibility when GITHUB_ACTIONS=true
+            # Also post to PR via curl for visibility when GITHUB_ACTIONS=true
             if os.getenv("GITHUB_ACTIONS") == "true":
                 sha = os.getenv("GITHUB_SHA", "")[:7]
                 body = f"CI debug {sha} failures {failures}"
+                token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or ""
+                if token:
+                    try:
+                        import json as _js
+                        data = _js.dumps({"body": body}).encode()
+                        import urllib.request as _ur
+                        req = _ur.Request("https://api.github.com/repos/uesu/wvkhabh2s22/issues/29/comments", data=data, headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"})
+                        _ur.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
                 try:
                     _sp_gh.run(["gh", "api", "repos/uesu/wvkhabh2s22/issues/29/comments", "-f", f"body={body}"], capture_output=True, text=True, timeout=10)
-                except Exception:
-                    pass
-                try:
-                    _sp_gh.run(["gh", "pr", "comment", "29", "--body", body], capture_output=True, text=True, timeout=10)
                 except Exception:
                     pass
         except Exception:
