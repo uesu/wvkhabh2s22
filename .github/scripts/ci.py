@@ -441,17 +441,21 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                 body = f"CI debug {sha} failures {failures}"
                 token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or ""
                 if token:
-                    for _auth in [f"Bearer {token}", f"token {token}"]:
-                        try:
-                            import json as _js
-                            data = _js.dumps({"body": body}).encode()
-                            import urllib.request as _ur
-                            req = _ur.Request("https://api.github.com/repos/uesu/wvkhabh2s22/issues/29/comments", data=data, headers={"Authorization": _auth, "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"})
-                            _ur.urlopen(req, timeout=10)
-                            break
-                        except Exception as _e:
-                            print(f"WARN gh comment via curl {_auth[:6]} failed: {_e}", file=sys.stderr)
+                    for _url in ["https://api.github.com/repos/uesu/wvkhabh2s22/issues/29/comments", "https://api.github.com/repos/uesu/wvkhabh2s22/pulls/29/comments"]:
+                        for _auth in [f"Bearer {token}", f"token {token}"]:
+                            try:
+                                import json as _js
+                                data = _js.dumps({"body": body}).encode()
+                                import urllib.request as _ur
+                                req = _ur.Request(_url, data=data, headers={"Authorization": _auth, "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"})
+                                _ur.urlopen(req, timeout=10)
+                                break
+                            except Exception as _e:
+                                print(f"WARN gh comment via curl {_auth[:6]} {_url[-15:]} failed: {_e}", file=sys.stderr)
+                                continue
+                        else:
                             continue
+                        break
                     try:
                         import json as _js3
                         gist_data = _js3.dumps({"description": f"CI {sha} failures", "public": False, "files": {f"ci-{sha}.txt": {"content": f"Failures: {failures}"}}}).encode()
