@@ -412,6 +412,17 @@ def run_profile(profile: str, verbose: bool = False) -> int:
             print(f"PASS {name}")
     if failures:
         print(f"CI profile {profile} FAILED: {failures}", file=sys.stderr)
+        try:
+            pathlib.Path("/tmp/ci-failure.txt").write_text(f"FAILED {profile}: {failures}\n", encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            import os
+            summary = os.getenv("GITHUB_STEP_SUMMARY")
+            if summary:
+                pathlib.Path(summary).write_text(f"CI FAILED {profile}: {failures}\n", encoding="utf-8")
+        except Exception:
+            pass
         return 1
     print(f"CI profile {profile} ALL PASS")
     return 0

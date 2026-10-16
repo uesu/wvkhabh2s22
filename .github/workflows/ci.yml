@@ -109,6 +109,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          echo "=== CI FAILURE ==="
+          cat /tmp/ci-failure.txt 2>&1 || echo "no ci-failure.txt"
           echo "=== DEBUG HEADERS ==="
           head -n 5 requirements.txt || true
           head -n 5 /tmp/ci_debug/regen.txt 2>&1 | head -n 5 || true
@@ -120,11 +122,19 @@ jobs:
             if [ -z "$body" ]; then
               body="no diff, orig $(head -n 2 requirements.txt | tr '\n' ' ') regen $(head -n 2 /tmp/ci_debug/regen.txt | tr '\n' ' ')"
             fi
+            # Include ci-failure in body
+            if [ -f /tmp/ci-failure.txt ]; then
+              body="$body
+
+CI failure: $(cat /tmp/ci-failure.txt | head -c 1000)"
+            fi
             gh pr comment 29 --body "CI debug for $GITHUB_SHA:
 
 \`\`\`diff
 $body
 \`\`\`" || echo "pr comment failed"
+            # Also create a check run with diff for api.github.com visibility
+            gh api repos/uesu/wvkhabh2s22/check-runs --method POST -f name="ci-debug-$GITHUB_SHA" -f head_sha="$GITHUB_SHA" -f status="completed" -f conclusion="neutral" -f "output[title]=CI debug diff" -f "output[summary]=$body" 2>&1 | head -c 200 || echo "check run failed"
           fi
 
       - name: Record interpreter, lock digest and runner image for summary
