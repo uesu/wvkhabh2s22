@@ -402,7 +402,10 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                 continue
         if result.returncode != 0:
             if name in ("actionlint", "zizmor"):
-                print(f"WARN {name} exited {result.returncode} (advisory): {result.stdout[:500] if hasattr(result, 'stdout') else ''}", file=sys.stderr)
+                out = getattr(result, "stdout", None) or getattr(result, "stderr", None) or ""
+                # result from subprocess.run without capture has None, so try to show stderr if captured elsewhere?
+                # For advisory, just warn and pass
+                print(f"WARN {name} exited {result.returncode} (advisory): {str(out)[:500]}", file=sys.stderr)
                 print(f"PASS {name} (advisory, exit {result.returncode})")
             else:
                 print(f"FAIL {name} exited {result.returncode}", file=sys.stderr)
