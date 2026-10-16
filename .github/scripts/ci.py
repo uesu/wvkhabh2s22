@@ -431,67 +431,10 @@ def run_profile(profile: str, verbose: bool = False) -> int:
         except Exception:
             pass
         try:
-            import os, subprocess as _sp_gh
+            import os
             summary = os.getenv("GITHUB_STEP_SUMMARY")
             if summary:
                 pathlib.Path(summary).write_text(f"CI FAILED {profile}: {failures}\n", encoding="utf-8")
-            # Also post to PR via curl, gist and check_run for visibility when GITHUB_ACTIONS=true
-            if os.getenv("GITHUB_ACTIONS") == "true":
-                sha = os.getenv("GITHUB_SHA", "")[:7]
-                body = f"CI debug {sha} failures {failures}"
-                token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or ""
-                if token:
-                    for _url in ["https://api.github.com/repos/uesu/wvkhabh2s22/issues/29/comments", "https://api.github.com/repos/uesu/wvkhabh2s22/pulls/29/comments"]:
-                        for _auth in [f"Bearer {token}", f"token {token}"]:
-                            try:
-                                import json as _js
-                                data = _js.dumps({"body": body}).encode()
-                                import urllib.request as _ur
-                                req = _ur.Request(_url, data=data, headers={"Authorization": _auth, "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"})
-                                _ur.urlopen(req, timeout=10)
-                                break
-                            except Exception as _e:
-                                print(f"WARN gh comment via curl {_auth[:6]} {_url[-15:]} failed: {_e}", file=sys.stderr)
-                                continue
-                        else:
-                            continue
-                        break
-                    try:
-                        import json as _js3
-                        gist_data = _js3.dumps({"description": f"CI {sha} failures", "public": False, "files": {f"ci-{sha}.txt": {"content": f"Failures: {failures}"}}}).encode()
-                        import urllib.request as _ur3
-                        req3 = _ur3.Request("https://api.github.com/gists", data=gist_data, headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"})
-                        _ur3.urlopen(req3, timeout=10)
-                    except Exception as _e2:
-                        print(f"WARN gist post failed: {_e2}", file=sys.stderr)
-                    for _auth2 in [f"Bearer {token}", f"token {token}"]:
-                        try:
-                            import json as _js2
-                            cr_data = _js2.dumps({"name": "ci-failure", "head_sha": os.getenv("GITHUB_SHA", ""), "status": "completed", "conclusion": "failure", "output": {"title": f"CI {sha} failed", "summary": f"Failures: {failures}"}}).encode()
-                            import urllib.request as _ur2
-                            req2 = _ur2.Request("https://api.github.com/repos/uesu/wvkhabh2s22/check-runs", data=cr_data, headers={"Authorization": _auth2, "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"})
-                            _ur2.urlopen(req2, timeout=10)
-                            break
-                        except Exception as _e3:
-                            print(f"WARN check_run post {_auth2[:6]} failed: {_e3}", file=sys.stderr)
-                            continue
-                try:
-                    import os as _os_gh
-                    _env = _os_gh.environ.copy()
-                    _env["GH_TOKEN"] = token
-                    _env["GITHUB_TOKEN"] = token
-                    _sp_gh.run(["gh", "api", "repos/uesu/wvkhabh2s22/issues/29/comments", "-f", f"body={body}"], capture_output=True, text=True, timeout=10, env=_env)
-                except Exception as _e_gh:
-                    print(f"WARN gh api via gh failed: {_e_gh}", file=sys.stderr)
-                # Also try to create a new issue for visibility
-                try:
-                    import json as _js4
-                    issue_data = _js4.dumps({"title": f"CI {sha} failed", "body": f"Failures: {failures}"}).encode()
-                    import urllib.request as _ur4
-                    req4 = _ur4.Request("https://api.github.com/repos/uesu/wvkhabh2s22/issues", data=issue_data, headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"})
-                    _ur4.urlopen(req4, timeout=10)
-                except Exception as _e4:
-                    print(f"WARN issue post failed: {_e4}", file=sys.stderr)
         except Exception:
             pass
         return 1

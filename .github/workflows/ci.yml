@@ -75,7 +75,24 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          python .github/scripts/ci.py --profile development
+          set +e
+          python .github/scripts/ci.py --profile development > /tmp/ci-adapter.log 2>&1
+          rc=$?
+          tail -n 60 /tmp/ci-adapter.log
+          if [ "$rc" -ne 0 ]; then
+            # Runner logs are not always retrievable; surface failures as check annotations.
+            grep -n -E "FAIL|ERROR|Traceback|workflows/[a-z_]+\.yml:[0-9]+" /tmp/ci-adapter.log \
+              | head -n 12 | while IFS= read -r _line; do
+              _safe=$(printf '%s' "$_line" | sed 's/%/%25/g' | cut -c1-800)
+              echo "::error::ci-adapter: $_safe"
+            done
+            tail -c 2400 /tmp/ci-adapter.log | tr '\n' '~' | sed 's/%/%25/g' > /tmp/ci-tail.txt
+            split -b 800 /tmp/ci-tail.txt /tmp/ci-chunk-
+            for _f in /tmp/ci-chunk-*; do
+              echo "::error::ci-adapter-tail rc=$rc: $(cat "$_f")"
+            done
+          fi
+          exit "$rc"
 
       - name: Debug lock on failure
         if: failure()
