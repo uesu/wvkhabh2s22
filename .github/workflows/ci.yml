@@ -55,6 +55,8 @@ jobs:
 
       - name: Install actionlint (pinned, immutable — no floating script)
         run: |
+          set -o pipefail
+          {
           # Pinned to v1.7.7 commit 03d0035246f3e81f36aed592ffb4bebf33a03106 (immutable, not main)
           curl -sL https://raw.githubusercontent.com/rhysd/actionlint/03d0035246f3e81f36aed592ffb4bebf33a03106/scripts/download-actionlint.bash -o /tmp/download-actionlint.bash
           # Verify script is from pinned commit (basic checksum — script is small, we check its SHA)
@@ -62,11 +64,13 @@ jobs:
           bash /tmp/download-actionlint.bash 1.7.7
           sudo mv ./actionlint /usr/local/bin/actionlint
           actionlint -version
+          } 2>&1 | tee /tmp/actionlint.log; test ${PIPESTATUS[0]} -eq 0 || (cat /tmp/actionlint.log; exit 1)
 
       - name: Install zizmor (pinned, for mandatory workflow-lint)
         run: |
-          python -m pip install zizmor==1.12.1
-          zizmor --version
+          set -o pipefail
+          python -m pip install zizmor==1.12.1 2>&1 | tee /tmp/zizmor.log; test ${PIPESTATUS[0]} -eq 0 || (cat /tmp/zizmor.log; exit 1)
+          zizmor --version 2>&1 | tee -a /tmp/zizmor.log
 
       - name: Run CI adapter — development profile
         run: |
@@ -100,6 +104,10 @@ jobs:
           diff -u /tmp/ci_debug/orig.txt /tmp/ci_debug/regen.txt | head -n 200 || true
           echo "=== pip hash check ==="
           pip install --dry-run --require-hashes --only-binary=:all: -r requirements.txt 2>&1 | head -n 100 || true
+          echo "=== actionlint log ==="
+          cat /tmp/actionlint.log 2>&1 | head -n 100 || echo "no actionlint.log"
+          echo "=== zizmor log ==="
+          cat /tmp/zizmor.log 2>&1 | head -n 100 || echo "no zizmor.log"
           echo "=== ci-failure.txt ==="
           cat /tmp/ci-failure.txt 2>&1 | head -n 100 || echo "no ci-failure.txt"
           cat /tmp/ci_debug/pip-compile.log 2>&1 | head -c 2000 > /tmp/pip_log_snippet.txt || true
@@ -133,14 +141,29 @@ jobs:
             gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI FAILURE $GITHUB_SHA $failbody" 2>&1 | head -c 500 || echo "api fail failed"
           else
             echo "no ci-failure.txt to post"
+            combined=""
             if [ -f /tmp/pip-install.log ]; then
-              piplog=$(cat /tmp/pip-install.log | head -c 3000 | tr '\n' ' ')
-              gh pr comment 29 --body "CI no-failure $GITHUB_SHA pipInstall $piplog" 2>&1 | head -c 800 || true
-              gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI no-failure $GITHUB_SHA pipInstall $piplog" 2>&1 | head -c 500 || true
-            else
-              gh pr comment 29 --body "CI debug $GITHUB_SHA no ci-failure.txt but validate failed (no pip log)" 2>&1 | head -c 500 || true
-              gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI debug $GITHUB_SHA no ci-failure.txt but validate failed (no pip log)" 2>&1 | head -c 500 || true
+              pip_snip=$(cat /tmp/pip-install.log | tail -c 1500 | tr '\n' ' ')
+              combined="$combined pipInstallTail $pip_snip"
             fi
+            if [ -f /tmp/actionlint.log ]; then
+              al_snip=$(cat /tmp/actionlint.log | tail -c 1500 | tr '\n' ' ')
+              combined="$combined actionlintLog $al_snip"
+            fi
+            if [ -f /tmp/zizmor.log ]; then
+              ziz_snip=$(cat /tmp/zizmor.log | tail -c 1500 | tr '\n' ' ')
+              combined="$combined zizmorLog $ziz_snip"
+            fi
+            if [ -f /tmp/ci_debug/pip-compile.log ]; then
+              pc_snip=$(cat /tmp/ci_debug/pip-compile.log | tail -c 1500 | tr '\n' ' ')
+              combined="$combined pipCompileLog $pc_snip"
+            fi
+            if [ -z "$combined" ]; then
+              combined="no logs found"
+            fi
+            combined=$(echo "$combined" | head -c 3500)
+            gh pr comment 29 --body "CI no-failure $GITHUB_SHA $combined" 2>&1 | head -c 900 || true
+            gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI no-failure $GITHUB_SHA $combined" 2>&1 | head -c 600 || true
           fi
           if [ -f /tmp/diff.txt ]; then
             body=$(cat /tmp/diff.txt | head -c 3500 | tr '\n' ' ' | head -c 3000)
