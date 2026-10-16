@@ -102,14 +102,18 @@ class Gate:
     def __init__(self) -> None:
         self.failures: list[str] = []
         self.not_validated: list[str] = []
+        self.failure_messages: list[tuple[str, str]] = []
+        self.unvalidated_messages: list[tuple[str, str]] = []
 
     def fail(self, name: str, message: str) -> None:
         print(f"FAIL: {message}", file=sys.stderr)
+        self.failure_messages.append((name, message))
         if name not in self.failures:
             self.failures.append(name)
 
     def unvalidated(self, name: str, message: str) -> None:
         print(f"NOT VALIDATED: {message}", file=sys.stderr)
+        self.unvalidated_messages.append((name, message))
         if name not in self.not_validated:
             self.not_validated.append(name)
 
@@ -219,17 +223,45 @@ def _difference_summary(committed: list[str], regenerated: list[str], limit: int
     return " | ".join(parts)
 
 
-def _notice(text: str) -> None:
-    """Publish bounded, sanitized evidence as a notice annotation when running in CI.
+def _annotation(level: str, text: str) -> None:
+    """Emit a bounded, sanitized GitHub workflow annotation when running in CI.
 
-    Job step summaries are not retrievable through the API, so evidence that must be
-    auditable after a green run is emitted as a notice annotation instead. This is
-    read-only, credential-free and bounded; it never changes a check outcome.
+    Job step summaries are not retrievable through the API, so evidence that must stay
+    auditable after a green run and the registry's own failures are published as
+    annotations. This is read-only, credential-free and bounded; it never changes a
+    check outcome, which is decided solely by the gate.
     """
     if not in_ci():
         return
     safe = text.replace("%", "%25").replace("\r", " ").replace("\n", " ")[:1500]
-    print(f"::notice::{safe}")
+    print(f"::{level}::{safe}")
+
+
+def _notice(text: str) -> None:
+    """Publish bounded evidence that survives a successful run."""
+    _annotation("notice", text)
+
+
+def _publish_outcome(profile: str, gate: Gate, code: int) -> None:
+    """Report the registry's own result, so no log grep can confuse it with test output.
+
+    Registered test suites deliberately produce ERROR strings as fixtures. Grepping a merged
+    log for them cannot distinguish an expected negative case from a real failure, so the
+    registry — which knows exactly what it concluded — is the only publisher.
+    """
+    for name, message in gate.failure_messages[:20]:
+        _annotation("error", f"{name}: {message}")
+    for name, message in gate.unvalidated_messages[:20]:
+        _annotation("warning", f"{name} NOT VALIDATED here: {message}")
+    if code == 1:
+        _annotation("error", f"CI profile {profile} FAILED: {gate.failures}")
+    elif code == 2:
+        _annotation(
+            "warning", f"CI profile {profile} NOT VALIDATED here: {gate.not_validated}"
+        )
+    elif code == 0:
+        _annotation("notice", f"CI profile {profile} ALL PASS: {len(gate.failure_messages)} failures, "
+                              f"{len(gate.unvalidated_messages)} unvalidated")
 
 
 def _marker_evidence(packages: tuple[str, ...], needle: str) -> str:
@@ -611,6 +643,7 @@ def run_profile(profile: str, verbose: bool = False) -> int:
     if gate.failures:
         print(f"CI profile {profile} FAILED: {gate.failures}", file=sys.stderr)
         _record_outcome(f"FAILED {profile}: {gate.failures}")
+        _publish_outcome(profile, gate, 1)
         return 1
     if gate.not_validated:
         print(
@@ -619,8 +652,10 @@ def run_profile(profile: str, verbose: bool = False) -> int:
             file=sys.stderr,
         )
         _record_outcome(f"NOT VALIDATED {profile}: {gate.not_validated}")
+        _publish_outcome(profile, gate, 2)
         return 2
     print(f"CI profile {profile} ALL PASS")
+    _publish_outcome(profile, gate, 0)
     return 0
 
 

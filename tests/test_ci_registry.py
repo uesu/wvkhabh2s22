@@ -448,8 +448,14 @@ def test_lock_evidence_notice_published_only_in_ci():
         code, out, _ = run_registry(ci, fixture, env={"GITHUB_ACTIONS": "true"})
         assert code == 0, f"evidence publication must not fail the gate, got {code}"
         notices = [line for line in out.splitlines() if line.startswith("::notice::")]
-        assert len(notices) == 2, f"one bounded notice per lock graph, got {notices}"
-        joined = "\n".join(notices)
+        lock_notices = [line for line in notices if "lock-consistency" in line]
+        outcome_notices = [line for line in notices if "ALL PASS" in line]
+        assert len(lock_notices) == 2, f"one bounded notice per lock graph, got {lock_notices}"
+        assert len(outcome_notices) == 1, f"one outcome notice, got {outcome_notices}"
+        assert not [line for line in out.splitlines() if line.startswith("::error::")], (
+            "a green profile must publish no error annotation"
+        )
+        joined = "\n".join(lock_notices)
         assert "byte-stable" in joined and "idempotent" in joined, joined
         assert "clean-venv" in joined, joined
         assert "typing-extensions markers" in joined, joined
@@ -465,6 +471,47 @@ def test_lock_evidence_notice_published_only_in_ci():
         assert "::notice::" not in out, "notices are a CI-only channel"
     finally:
         fixture_local.cleanup()
+
+
+def test_registry_publishes_its_own_failures_as_annotations():
+    """Real failures must be annotated by the registry, not by grepping merged log output.
+
+    The registered suites emit ERROR strings as fixtures for negative cases; a log grep cannot
+    tell those apart from a real failure, so the publisher has to be the registry itself.
+    """
+    ci = load_ci()
+    fixture = Fixture()
+    fixture.regen_tamper = "aiohttp==99.0.0"
+    try:
+        code, out, err = run_registry(ci, fixture, env={"GITHUB_ACTIONS": "true"})
+        assert code == 1, f"a tampered regeneration must block, got {code}"
+        errors = [line for line in out.splitlines() if line.startswith("::error::")]
+        assert errors, "the registry must publish its own failure annotations in CI"
+        assert any("lock-consistency" in line for line in errors), errors
+        assert any("CI profile development FAILED" in line for line in errors), errors
+        assert all(len(line) <= 1600 for line in errors), "annotations must stay bounded"
+        # the published text must be the gate's own wording, not fixture output
+        assert any("FAIL" in line or "byte-stable" in line or "differ" in line for line in errors), errors
+    finally:
+        fixture.cleanup()
+
+
+def test_unvalidated_gate_publishes_warning_not_error():
+    """A gate that could not be validated here is a warning, never a pass and never a failure."""
+    ci = load_ci()
+    other_pin = "3.14.8" if ci.running_python() != "3.14.8" else "3.13.1"
+    fixture = Fixture(pin=other_pin)
+    try:
+        code, out, err = run_registry(ci, fixture, env={"GITHUB_ACTIONS": "true"})
+        assert code == 2, f"a non-pinned interpreter must not satisfy the gate, got {code}"
+        warnings = [line for line in out.splitlines() if line.startswith("::warning::")]
+        assert warnings, "an unvalidated mandatory check must be published as a warning"
+        assert any("NOT VALIDATED" in line for line in warnings), warnings
+        assert not [line for line in out.splitlines() if "ALL PASS" in line and "::notice::" in line], (
+            "an unvalidated profile must not claim ALL PASS"
+        )
+    finally:
+        fixture.cleanup()
 
 
 def test_non_idempotent_regeneration_blocks():
@@ -670,6 +717,8 @@ def main() -> None:
         test_hash_verified_install_failure_blocks,
         test_lock_without_hashes_blocks,
         test_lock_evidence_notice_published_only_in_ci,
+        test_registry_publishes_its_own_failures_as_annotations,
+        test_unvalidated_gate_publishes_warning_not_error,
         test_clean_install_targets_venv_with_frozen_flags,
         test_non_idempotent_regeneration_blocks,
         test_clean_environment_install_failure_blocks,

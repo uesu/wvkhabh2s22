@@ -77,20 +77,18 @@ jobs:
       - name: Run CI adapter — development profile
         run: |
           set +e
-          python .github/scripts/ci.py --profile development > /tmp/ci-adapter.log 2>&1
-          rc=$?
-          tail -n 60 /tmp/ci-adapter.log
-          if [ "$rc" -ne 0 ]; then
-            # Runner logs are not always retrievable; surface failures as check annotations.
-            grep -n -E "FAIL|ERROR|Traceback|workflows/[a-z_]+\.yml:[0-9]+" /tmp/ci-adapter.log \
-              | head -n 12 | while IFS= read -r _line; do
-              _safe=$(printf '%s' "$_line" | sed 's/%/%25/g' | cut -c1-800)
-              echo "::error::ci-adapter: $_safe"
-            done
+          # tee, not redirection: the registry publishes its own annotations as workflow
+          # commands on stdout, which the runner only sees when stdout is not captured.
+          # -u keeps stdout unbuffered so merged output stays in real order.
+          python -u .github/scripts/ci.py --profile development 2>&1 | tee /tmp/ci-adapter.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ] && ! grep -q "^::error::" /tmp/ci-adapter.log; then
+            # Fallback only for a crash before the registry could report: never grep the log
+            # for ERROR strings, because the registered suites emit those as fixtures.
             tail -c 2400 /tmp/ci-adapter.log | tr '\n' '~' | sed 's/%/%25/g' > /tmp/ci-tail.txt
             split -b 800 /tmp/ci-tail.txt /tmp/ci-chunk-
             for _f in /tmp/ci-chunk-*; do
-              echo "::error::ci-adapter-tail rc=$rc: $(cat "$_f")"
+              echo "::error::ci-adapter crashed without reporting (rc=$rc): $(cat "$_f")"
             done
           fi
           exit "$rc"
