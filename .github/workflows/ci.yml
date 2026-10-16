@@ -115,6 +115,7 @@ jobs:
         if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           # shellcheck disable=SC2002,SC2129
           echo "=== CI FAILURE ==="
@@ -125,6 +126,11 @@ jobs:
           diff -u /tmp/ci_debug/orig.txt /tmp/ci_debug/regen.txt | head -n 500 > /tmp/diff.txt || true
           cat /tmp/diff.txt || true
           echo "=== Posting PR comment ==="
+          if [ -f /tmp/ci-failure.txt ]; then
+            cibody=$(head -c 800 /tmp/ci-failure.txt | tr '\n' ' ')
+            echo "CI failure body $cibody"
+            curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/uesu/wvkhabh2s22/issues/29/comments -d "$(printf '{"body":"CI debug %s failures %s"}' "$GITHUB_SHA" "$cibody")" 2>&1 | head -c 200 || echo "curl comment failed"
+          fi
           if [ -f /tmp/diff.txt ]; then
             body=$(head -c 3500 /tmp/diff.txt)
             if [ -z "$body" ]; then
@@ -135,6 +141,7 @@ jobs:
             fi
             gh pr comment 29 --body "CI debug $GITHUB_SHA diff $body" 2>&1 | head -c 500 || echo "pr comment failed"
             gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI debug $GITHUB_SHA diff $body" 2>&1 | head -c 300 || echo "api comment failed"
+            curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/uesu/wvkhabh2s22/issues/29/comments -d "$(printf '{"body":"CI debug %s diff %s"}' "$GITHUB_SHA" "$body")" 2>&1 | head -c 200 || echo "curl diff comment failed"
           fi
 
       - name: Record interpreter, lock digest and runner image for summary
