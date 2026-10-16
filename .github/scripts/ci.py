@@ -241,9 +241,10 @@ def _verify_clean_install(label: str, target: Path, gate: Gate, name: str) -> No
         venv_python = venv_dir / "bin" / "python"
         if not venv_python.exists():
             venv_python = venv_dir / "Scripts" / "python.exe"
+        # pip requires the --python option before the subcommand name.
         install = subprocess.run(
             [
-                sys.executable, "-m", "pip", "install", "--python", str(venv_python),
+                sys.executable, "-m", "pip", "--python", str(venv_python), "install",
                 "--require-hashes", "--only-binary=:all:", "-r", str(target),
             ],
             capture_output=True, text=True, timeout=900,

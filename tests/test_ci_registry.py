@@ -123,6 +123,7 @@ class Fixture:
         self.regen_identical = True
         self.install_rc = 0
         self.clean_install_rc = 0
+        self.clean_install_calls: list[list[str]] = []
         self.pip_check_rc = 0
         self.regen_second_differs = False
         self._regen_calls = 0
@@ -156,6 +157,8 @@ class Fixture:
         if args[:3] == [args[0], "-m", "venv"] or (len(args) > 2 and args[1] == "-m" and args[2] == "venv"):
             return done(0, "created\n")
         if "install" in args and "--python" in args:
+            # pip rejects --python after the subcommand, so the order is part of the contract
+            self.clean_install_calls.append(args)
             if self.clean_install_rc != 0:
                 return done(self.clean_install_rc, "", "ERROR: hash mismatch installing into clean venv\n")
             return done(0, "Successfully installed\n")
@@ -409,6 +412,34 @@ def test_lock_without_hashes_blocks():
         fixture.cleanup()
 
 
+def test_clean_install_targets_venv_with_frozen_flags():
+    """The clean-environment install must really target the new venv, hash-verified, wheels only."""
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        code, _, _ = run_registry(ci, fixture)
+        assert code == 0, f"a genuine frozen graph must pass, got {code}"
+        calls = fixture.clean_install_calls
+        assert len(calls) == 2, f"both graphs must be installed into clean venvs, got {len(calls)}"
+        installed = []
+        for argv in calls:
+            assert "--python" in argv and "install" in argv, f"malformed clean install: {argv}"
+            assert argv.index("--python") < argv.index("install"), (
+                "pip requires --python before the subcommand: " + " ".join(argv)
+            )
+            assert "--require-hashes" in argv, "the clean install must require hashes"
+            assert "--only-binary=:all:" in argv, "the clean install must be wheels only"
+            # the venv interpreter, not the ambient one, must receive the install
+            target = argv[argv.index("--python") + 1]
+            assert "venv" in target, f"install did not target a fresh venv: {target}"
+            assert "-r" in argv, f"the clean install must name a requirements file: {argv}"
+            installed.append(argv[argv.index("-r") + 1])
+        assert any(part.endswith("/requirements.txt") for part in installed), installed
+        assert any(part.endswith("/requirements-dev.txt") for part in installed), installed
+    finally:
+        fixture.cleanup()
+
+
 def test_non_idempotent_regeneration_blocks():
     """A lock that only reproduces once is not frozen (master spec item 1)."""
     ci = load_ci()
@@ -611,6 +642,7 @@ def main() -> None:
         test_wrong_pip_tools_version_blocks,
         test_hash_verified_install_failure_blocks,
         test_lock_without_hashes_blocks,
+        test_clean_install_targets_venv_with_frozen_flags,
         test_non_idempotent_regeneration_blocks,
         test_clean_environment_install_failure_blocks,
         test_clean_environment_inconsistency_blocks,
