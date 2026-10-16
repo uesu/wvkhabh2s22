@@ -431,10 +431,22 @@ def run_profile(profile: str, verbose: bool = False) -> int:
         except Exception:
             pass
         try:
-            import os
+            import os, subprocess as _sp_gh
             summary = os.getenv("GITHUB_STEP_SUMMARY")
             if summary:
                 pathlib.Path(summary).write_text(f"CI FAILED {profile}: {failures}\n", encoding="utf-8")
+            # Also post to PR via gh api for visibility when GITHUB_ACTIONS=true
+            if os.getenv("GITHUB_ACTIONS") == "true":
+                sha = os.getenv("GITHUB_SHA", "")[:7]
+                body = f"CI debug {sha} failures {failures}"
+                try:
+                    _sp_gh.run(["gh", "api", "repos/uesu/wvkhabh2s22/issues/29/comments", "-f", f"body={body}"], capture_output=True, text=True, timeout=10)
+                except Exception:
+                    pass
+                try:
+                    _sp_gh.run(["gh", "pr", "comment", "29", "--body", body], capture_output=True, text=True, timeout=10)
+                except Exception:
+                    pass
         except Exception:
             pass
         return 1
