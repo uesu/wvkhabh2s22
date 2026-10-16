@@ -103,28 +103,27 @@ jobs:
 
       - name: Post debug diff as PR comment on failure
         if: failure() && github.event_name == 'pull_request'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9 SHA-pinned
-        with:
-          script: |
-            const fs = require('fs');
-            const execSync = require('child_process').execSync;
-            let diff = '';
-            try {
-              const orig = fs.readFileSync('requirements.txt', 'utf8').split('\n').slice(0,5).join('\n');
-              const regenPath = '/tmp/ci_debug/regen.txt';
-              const origPath = '/tmp/ci_debug/orig.txt';
-              const regen = fs.existsSync(regenPath) ? fs.readFileSync(regenPath, 'utf8').split('\n').slice(0,5).join('\n') : 'no regen';
-              let diffBody = 'no diff';
-              if (fs.existsSync(regenPath) && fs.existsSync(origPath)) {
-                try { diffBody = execSync(`diff -u ${origPath} ${regenPath} | head -n 200`, {encoding: 'utf8'}); } catch(e) { diffBody = e.stdout || e.message; }
-              }
-              diff = `orig header:\n${orig}\n\nregen header:\n${regen}\n\ndiff:\n${diffBody}`;
-            } catch(e) { diff = `error: ${e.message} ${e.stdout || ''}`; }
-            const prNum = context.payload.pull_request?.number || context.issue?.number;
-            if (!prNum) { console.log('no PR number, diff: ' + diff.slice(0,2000)); return; }
-            const body = `CI debug for ${{ github.sha }}:\n\n\`\`\`diff\n${diff.slice(0, 3800)}\n\`\`\``;
-            await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNum, body });
-            console.log('posted comment for PR', prNum);
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=== DEBUG HEADERS ==="
+          echo "orig header:"
+          head -n 5 requirements.txt || true
+          echo "regen header:"
+          head -n 5 /tmp/ci_debug/regen.txt || true
+          echo "=== DIFF ==="
+          diff -u /tmp/ci_debug/orig.txt /tmp/ci_debug/regen.txt | head -n 200 > /tmp/diff.txt || true
+          cat /tmp/diff.txt || true
+          echo "=== Posting comment ==="
+          # Use gh to post comment (api.github.com is allowed)
+          if [ -f /tmp/diff.txt ]; then
+            body=$(cat /tmp/diff.txt | head -c 3500)
+            gh pr comment ${{ github.event.pull_request.number }} --body "CI debug for ${{ github.sha }}:
+
+\`\`\`diff
+$body
+\`\`\`" || echo "gh comment failed"
+          fi
 
       - name: Record interpreter, lock digest and runner image for summary
         if: always()
