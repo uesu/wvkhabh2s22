@@ -1,21 +1,48 @@
 #!/usr/bin/env python3
 """
-One explicit validation command registry used by ordinary CI and candidate-runtime validation.
-Enforces that every tests/test_*.py runner is registered/executed.
-Supports --profile development|production. Production skips optional doc checks.
+One explicit validation registry used by ordinary CI and candidate-runtime validation.
+
+Contract (master spec items 1 and 5):
+  * Every tests/test_*.py runner is registered and executed — a missing registration is fatal.
+  * Lock graphs are verified under the exact pinned interpreter from .python-version with the
+    pinned compiler (pip==26.1.1 / pip-tools==7.5.3), by regenerating them with the documented
+    command and comparing full bytes. Any difference is a blocking failure.
+  * Workflow/security lint (actionlint, zizmor) must actually execute. A nonzero result blocks.
+    A tool that is merely present — or absent — never produces a PASS.
+  * An environment that cannot run a mandatory check reports NOT VALIDATED and does not satisfy
+    the gate (exit code 2). It never reports PASS.
+
+Exit codes: 0 = every mandatory check passed, 1 = a mandatory check failed,
+2 = the gate was not satisfied because a mandatory check could not be validated here.
 """
 from __future__ import annotations
 
 import argparse
 import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# Registry of all offline test runners. Every tests/test_*.py must be here.
-COMMAND_REGISTRY = {
+PINNED_PIP = "26.1.1"
+PINNED_PIP_TOOLS = "7.5.3"
+WORKFLOW_DIR = ROOT / ".github" / "workflows"
+
+# Mandatory external linters. Present-but-failing and missing are both blocking in CI.
+EXTERNAL_LINTERS = ("actionlint", "zizmor")
+
+
+def workflow_files() -> list[str]:
+    """Actual workflow paths, sorted. Never a shell wildcard (it would not expand)."""
+    return sorted(str(p.relative_to(ROOT)) for p in WORKFLOW_DIR.glob("*.yml"))
+
+
+# Registry of all offline validation commands. Every tests/test_*.py must appear here.
+COMMAND_REGISTRY: dict[str, list[str]] = {
     "compile": [sys.executable, "-m", "compileall", "-q", "testing area", "tests", ".github/scripts"],
     "smoke": [sys.executable, "tests/test_smoke.py"],
     "reddit-signals": [sys.executable, "tests/test_reddit_signals.py"],
@@ -23,35 +50,377 @@ COMMAND_REGISTRY = {
     "maintenance": [sys.executable, "tests/test_maintenance.py"],
     "run-summary": [sys.executable, "tests/test_run_summary.py"],
     "configuration-contract": [sys.executable, "tests/test_configuration_contract.py"],
+    "ci-registry": [sys.executable, "tests/test_ci_registry.py"],
     "lock-consistency": [sys.executable, "-c", "import pathlib; print('lock-consistency placeholder')"],
     "workflow-lint": [sys.executable, "-c", "import pathlib, yaml; yaml.safe_load(open('.github/workflows/ci.yml')) ; print('yaml ok')"],
-    "actionlint": ["actionlint", ".github/workflows/ci.yml", ".github/workflows/maintenance_merge.yml", ".github/workflows/python_version_bump.yml"],
+    "actionlint": ["actionlint", *workflow_files()],
     "zizmor": ["zizmor", "--offline", "--min-severity", "high", ".github/workflows"],
 }
 
 
 def list_profiles() -> dict[str, list[str]]:
-    return {
-        "development": list(COMMAND_REGISTRY.keys()),
-        "production": list(COMMAND_REGISTRY.keys()),  # production shares same; optional doc checks only if docs exist
-    }
+    """Both profiles run the same mandatory registry; there is no weaker private subset."""
+    commands = list(COMMAND_REGISTRY.keys())
+    return {"development": list(commands), "production": list(commands)}
 
 
 def validate_registry() -> None:
     """Ensure every tests/test_*.py file is registered, otherwise CI would silently miss it."""
-    test_files = sorted(Path(ROOT / "tests").glob("test_*.py"))
-    registered = set()
+    test_files = sorted((ROOT / "tests").glob("test_*.py"))
+    registered: set[str] = set()
     for cmd in COMMAND_REGISTRY.values():
-        # look for test file names in command
-        s = " ".join(cmd)
+        joined = " ".join(cmd)
         for tf in test_files:
-            if tf.name in s:
+            if tf.name in joined:
                 registered.add(tf.name)
     missing = [tf.name for tf in test_files if tf.name not in registered]
     if missing:
-        # In development, missing is fatal; in production, same (must not silently omit)
         print(f"ERROR: test files not registered in ci.py: {missing}", file=sys.stderr)
         sys.exit(1)
+
+
+def in_ci() -> bool:
+    return os.getenv("GITHUB_ACTIONS") == "true" or os.getenv("CI") == "true"
+
+
+def pinned_python() -> str:
+    """Exact interpreter pin consumed by both runtime and CI."""
+    try:
+        return (ROOT / ".python-version").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def running_python() -> str:
+    vi = sys.version_info
+    return f"{vi.major}.{vi.minor}.{vi.micro}"
+
+
+class Gate:
+    """Collects blocking failures and mandatory checks that could not be validated."""
+
+    def __init__(self) -> None:
+        self.failures: list[str] = []
+        self.not_validated: list[str] = []
+
+    def fail(self, name: str, message: str) -> None:
+        print(f"FAIL: {message}", file=sys.stderr)
+        if name not in self.failures:
+            self.failures.append(name)
+
+    def unvalidated(self, name: str, message: str) -> None:
+        print(f"NOT VALIDATED: {message}", file=sys.stderr)
+        if name not in self.not_validated:
+            self.not_validated.append(name)
+
+
+def _read_lock(target: Path) -> str:
+    return target.read_text(encoding="utf-8", errors="ignore")
+
+
+def _structural_lock_failures(target: Path, label: str) -> list[str]:
+    """Frozen-graph structure checks that do not depend on the running interpreter."""
+    problems: list[str] = []
+    if not target.exists():
+        return [f"{label} missing"]
+    text = _read_lock(target)
+    if "--hash=" not in text:
+        problems.append(f"{label} must contain --hash entries (frozen graph)")
+    if "pip-compile" not in text:
+        problems.append(f"{label} header must mention pip-compile")
+    if "python" not in text.lower():
+        problems.append(f"{label} header must mention the generating Python version")
+    if label == "requirements-dev.txt":
+        if f"pip-tools=={PINNED_PIP_TOOLS}" not in text:
+            problems.append(f"{label} must contain pip-tools=={PINNED_PIP_TOOLS} (pinned compiler)")
+        if "pip==" not in text:
+            problems.append(f"{label} must contain the pip pin")
+    hashes = re.findall(r"--hash=sha256:([0-9a-f]{64})", text)
+    if len(hashes) < 5:
+        problems.append(f"{label} has too few hashes ({len(hashes)}) — not a complete frozen graph")
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if "==" in line and not line.strip().startswith("#") and line.rstrip().endswith("\\"):
+            has_hash = False
+            for j in range(i + 1, min(i + 5, len(lines))):
+                if "--hash=sha256:" in lines[j]:
+                    has_hash = True
+                    break
+                stripped = lines[j].strip()
+                if stripped and not stripped.startswith("#") and not stripped.startswith("--hash"):
+                    break
+            if not has_hash:
+                problems.append(f"{label} package line without hash: {line.strip()}")
+                break
+    return problems
+
+
+def _compiler_versions() -> tuple[str, str]:
+    pip_run = subprocess.run(
+        [sys.executable, "-m", "pip", "--version"], capture_output=True, text=True, timeout=60
+    )
+    pip_out = f"{pip_run.stdout or ''}{pip_run.stderr or ''}".strip()
+    try:
+        tools_run = subprocess.run(
+            ["pip-compile", "--version"], capture_output=True, text=True, timeout=60
+        )
+        tools_out = f"{tools_run.stdout or ''}{tools_run.stderr or ''}".strip()
+    except FileNotFoundError:
+        tools_out = ""
+    return pip_out, tools_out
+
+
+def _regenerate_lock(label: str, src_name: str, tmpdir: Path) -> subprocess.CompletedProcess:
+    """Regenerate one lock inside an isolated seeded copy (keeps the locked resolution)."""
+    for extra in ("requirements.in", "requirements.txt"):
+        if extra != src_name and label == "requirements-dev.txt":
+            try:
+                shutil.copy2(ROOT / extra, tmpdir / extra)
+            except OSError:
+                pass
+    return subprocess.run(
+        [
+            sys.executable, "-m", "piptools", "compile",
+            "--generate-hashes", "--allow-unsafe", "--resolver=backtracking",
+            "--strip-extras", f"--output-file={label}", src_name,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=240,
+        cwd=tmpdir,
+    )
+
+
+def _first_difference(orig: list[str], new: list[str]) -> str:
+    for i, (a, b) in enumerate(zip(orig, new)):
+        if a != b:
+            return f"line {i + 1}: committed={a!r} regenerated={b!r}"
+    return f"line count differs: committed {len(orig)} vs regenerated {len(new)}"
+
+
+def check_lock_consistency(gate: Gate, name: str) -> None:
+    """Hashed locks verified under the exact pinned interpreter and pinned compiler."""
+    pin = pinned_python()
+    running = running_python()
+    if not pin:
+        gate.fail(name, "cannot read .python-version — the exact runtime pin is mandatory")
+        return
+    if running != pin:
+        # Diagnostic only: a different interpreter cannot validate the pinned lock graphs,
+        # and it must never be reported as a pass.
+        gate.unvalidated(
+            name,
+            f"running interpreter {running} != pinned {pin} — lock graphs not validated here",
+        )
+        return
+
+    labels = (("requirements.txt", "requirements.in"), ("requirements-dev.txt", "requirements-dev.in"))
+    for label, src_name in labels:
+        target = ROOT / label
+        for problem in _structural_lock_failures(target, label):
+            gate.fail(name, problem)
+        if name in gate.failures:
+            return
+
+        pip_out, tools_out = _compiler_versions()
+        if PINNED_PIP not in pip_out:
+            gate.fail(name, f"{label} requires pip=={PINNED_PIP} (got: {pip_out or 'unavailable'})")
+            return
+        if PINNED_PIP_TOOLS not in tools_out:
+            gate.fail(
+                name, f"{label} requires pip-tools=={PINNED_PIP_TOOLS} (got: {tools_out or 'unavailable'})"
+            )
+            return
+
+        src = ROOT / src_name
+        if not src.exists():
+            gate.fail(name, f"{src_name} missing — cannot regenerate {label}")
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="ci-lock-"))
+        try:
+            # Seed the isolated copy so the documented command reproduces the locked resolution.
+            shutil.copy2(src, tmpdir / src_name)
+            shutil.copy2(target, tmpdir / label)
+            try:
+                regen = _regenerate_lock(label, src_name, tmpdir)
+            except subprocess.TimeoutExpired:
+                gate.fail(name, f"{label} regeneration timed out (240s)")
+                return
+            if regen.returncode != 0:
+                gate.fail(
+                    name,
+                    f"{label} regeneration with the documented command failed "
+                    f"(exit {regen.returncode}): {(regen.stderr or regen.stdout or '').strip()[:2000]}",
+                )
+                return
+            produced = tmpdir / label
+            if not produced.exists():
+                gate.fail(name, f"{label} regeneration produced no output file")
+                return
+            committed = _read_lock(target).splitlines()
+            regenerated = _read_lock(produced).splitlines()
+            if committed != regenerated:
+                # Full-byte comparison: no path/header rewriting, no tolerated drift.
+                gate.fail(
+                    name,
+                    f"{label} is not byte-stable under Python {running} / pip {PINNED_PIP} / "
+                    f"pip-tools {PINNED_PIP_TOOLS} — {_first_difference(committed, regenerated)}",
+                )
+                return
+            print(f"OK lock-consistency: {label} byte-stable under pinned interpreter and compiler")
+
+            install_cmd = [
+                sys.executable, "-m", "pip", "install", "--dry-run",
+                "--require-hashes", "--only-binary=:all:", "-r", str(target),
+            ]
+            try:
+                inst = subprocess.run(install_cmd, capture_output=True, text=True, timeout=180)
+                if inst.returncode != 0 and "externally-managed-environment" in (inst.stderr or ""):
+                    inst = subprocess.run(
+                        install_cmd + ["--break-system-packages"],
+                        capture_output=True, text=True, timeout=180,
+                    )
+            except subprocess.TimeoutExpired:
+                gate.fail(name, f"{label} hash-verified install --dry-run timed out (180s)")
+                return
+            if inst.returncode != 0:
+                gate.fail(
+                    name,
+                    f"{label} hash-verified install --dry-run failed: "
+                    f"{(inst.stderr or inst.stdout or '').strip()[:2000]}",
+                )
+                return
+            print(f"OK lock-consistency: {label} installs hash-verified, wheels only")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    print("PASS lock-consistency: both graphs genuine, frozen and reproducible")
+
+
+def _strict_yaml_loader():
+    """A SafeLoader that rejects duplicate mapping keys (silent last-one-wins is a real defect)."""
+    import yaml
+
+    class StrictLoader(yaml.SafeLoader):
+        pass
+
+    def construct_mapping(loader, node, deep=False):
+        seen: set[object] = set()
+        for key_node, _ in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise ValueError(f"duplicate key {key!r}")
+            seen.add(key)
+        return loader.construct_mapping(node, deep)
+
+    StrictLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
+    return yaml, StrictLoader
+
+
+_SHA_PIN = re.compile(r"uses:\s*[^\n]+@[0-9a-f]{40}")
+
+
+def check_workflow_lint(gate: Gate, name: str) -> None:
+    """Strict YAML + SHA-pinned actions + real actionlint + real zizmor. All blocking."""
+    try:
+        yaml, strict_loader = _strict_yaml_loader()
+    except ImportError as exc:
+        gate.fail(name, f"pyyaml not installed — cannot lint workflows ({exc})")
+        return
+
+    workflows = sorted(WORKFLOW_DIR.glob("*.yml"))
+    if not workflows:
+        gate.fail(name, f"no workflows found in {WORKFLOW_DIR} — nothing was linted")
+        return
+
+    for wf in workflows:
+        try:
+            text = wf.read_text(encoding="utf-8", errors="ignore")
+        except OSError as exc:
+            gate.fail(name, f"cannot read {wf.name}: {exc}")
+            return
+        try:
+            yaml.load(text, Loader=strict_loader)
+        except Exception as exc:  # noqa: BLE001 - any parse error is a blocking lint failure
+            gate.fail(name, f"invalid YAML in {wf.name}: {exc}")
+            return
+        for line in text.splitlines():
+            if "uses:" in line and "@" in line and not _SHA_PIN.search(line):
+                if "sha-pinned" not in line.lower():
+                    gate.fail(name, f"unpinned action in {wf.name}: {line.strip()}")
+                    return
+    print(f"OK workflow-lint: {len(workflows)} workflows parse strictly and use SHA-pinned actions")
+
+    _run_external_linter(
+        gate,
+        name,
+        tool="actionlint",
+        version_args=["actionlint", "-version"],
+        lint_args=["actionlint", *workflow_files()],
+    )
+    _run_external_linter(
+        gate,
+        name,
+        tool="zizmor",
+        version_args=["zizmor", "--version"],
+        lint_args=["zizmor", "--offline", "--min-severity", "high", ".github/workflows"],
+    )
+    if name not in gate.failures and name not in gate.not_validated:
+        print(f"PASS workflow-lint: {len(workflows)} workflows linted by actionlint and zizmor")
+
+
+def _run_external_linter(
+    gate: Gate, name: str, tool: str, version_args: list[str], lint_args: list[str]
+) -> None:
+    """Execute a mandatory external linter. Availability alone is never a pass."""
+    try:
+        probe = subprocess.run(version_args, capture_output=True, text=True, timeout=60)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        if in_ci():
+            gate.fail(name, f"{tool} is mandatory in CI but could not be executed: {exc}")
+        else:
+            gate.unvalidated(name, f"{tool} unavailable locally — {tool} checks not validated here")
+        return
+    if probe.returncode != 0:
+        if in_ci():
+            gate.fail(
+                name,
+                f"{tool} is mandatory in CI but --version failed (exit {probe.returncode}): "
+                f"{(probe.stderr or probe.stdout or '').strip()[:500]}",
+            )
+        else:
+            gate.unvalidated(name, f"{tool} unusable locally — {tool} checks not validated here")
+        return
+    try:
+        run = subprocess.run(lint_args, capture_output=True, text=True, timeout=300, cwd=ROOT)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        if in_ci():
+            gate.fail(name, f"{tool} invocation failed: {exc}")
+        else:
+            gate.unvalidated(name, f"{tool} invocation unavailable locally: {exc}")
+        return
+    if run.returncode != 0:
+        output = f"{(run.stdout or '').strip()}\n{(run.stderr or '').strip()}".strip()
+        gate.fail(name, f"{tool} reported problems (exit {run.returncode}):\n{output}")
+        return
+    print(f"OK {tool}: executed clean ({' '.join(lint_args)})")
+
+
+def run_command(gate: Gate, name: str, cmd: list[str]) -> None:
+    try:
+        result = subprocess.run(cmd, cwd=ROOT)
+    except FileNotFoundError as exc:
+        if in_ci() and cmd and cmd[0] in EXTERNAL_LINTERS:
+            gate.fail(name, f"{cmd[0]} binary not found (mandatory in CI) — {exc}")
+        elif in_ci():
+            gate.fail(name, f"{name} binary not found — {exc}")
+        else:
+            gate.unvalidated(name, f"{name} could not run locally ({exc}) — not validated here")
+        return
+    if result.returncode != 0:
+        gate.fail(name, f"{name} exited {result.returncode}")
+        return
+    print(f"PASS {name}")
 
 
 def run_profile(profile: str, verbose: bool = False) -> int:
@@ -60,403 +429,73 @@ def run_profile(profile: str, verbose: bool = False) -> int:
     if commands is None:
         print(f"Unknown profile {profile}", file=sys.stderr)
         return 2
-    # Optional doc checks: if docs/ missing (production layout), skip doc-dependent tests
-    # Currently all tests are mandatory regardless; but we respect that production may have no docs.
-    # The check itself must handle missing docs gracefully, not CI skipping it.
-
-    # Check existence of lock files etc for production
-    failures = []
+    gate = Gate()
     for name in commands:
         cmd = COMMAND_REGISTRY[name]
         print(f"=== CI [{profile}] {name}: {' '.join(cmd)} ===")
-        # Special handling for lock-consistency: verify genuine frozen hash graph with pinned compiler
+        if verbose:
+            print(f"    cwd={ROOT} ci={in_ci()} python={running_python()} pin={pinned_python()}")
         if name == "lock-consistency":
-            req = ROOT / "requirements.txt"
-            dev_req = ROOT / "requirements-dev.txt"
-            _failed = False
-            for target, label in [(req, "requirements.txt"), (dev_req, "requirements-dev.txt")]:
-                if not target.exists():
-                    print(f"FAIL: {label} missing", file=sys.stderr)
-                    failures.append(name)
-                    _failed = True
-                    break
-                text = target.read_text(encoding="utf-8", errors="ignore")
-                if "--hash=" not in text:
-                    print(f"FAIL: {label} must contain --hash entries (frozen graph)", file=sys.stderr)
-                    failures.append(name)
-                    _failed = True
-                    break
-                import re as _re
-                # Header must mention pip-compile and Python version — allow 3.14 or 3.11 with normalization, but must not be fabricated
-                if "pip-compile" not in text:
-                    print(f"FAIL: {label} header must mention pip-compile", file=sys.stderr)
-                    failures.append(name)
-                    _failed = True
-                    break
-                # Check for Python version header — must mention pip-compile and have some Python version
-                if "Python" not in text and "python" not in text.lower():
-                    print(f"FAIL: {label} header must mention Python version", file=sys.stderr)
-                    failures.append(name)
-                    _failed = True
-                    break
-                # Verify pinned compiler versions are present in dev lock (pip==26.1.1, pip-tools==7.5.3)
-                if label == "requirements-dev.txt":
-                    if "pip-tools==7.5.3" not in text:
-                        print(f"FAIL: {label} must contain pip-tools==7.5.3 (pinned compiler)", file=sys.stderr)
-                        failures.append(name)
-                        _failed = True
-                        break
-                    # pip version may be 26.1.1 or 26.2.1 depending on regeneration, but must be pinned with hash
-                    if "pip==" not in text:
-                        print(f"FAIL: {label} must contain pip pin", file=sys.stderr)
-                        failures.append(name)
-                        _failed = True
-                        break
-                hashes = _re.findall(r"--hash=sha256:([0-9a-f]{64})", text)
-                if len(hashes) < 5:
-                    print(f"FAIL: {label} has too few hashes ({len(hashes)}) — not a complete frozen graph", file=sys.stderr)
-                    failures.append(name)
-                    _failed = True
-                    break
-                lines = text.splitlines()
-                for i, line in enumerate(lines):
-                    if "==" in line and not line.strip().startswith("#") and "\\" in line:
-                        has_hash = False
-                        for j in range(i+1, min(i+5, len(lines))):
-                            if "--hash=sha256:" in lines[j]:
-                                has_hash = True
-                                break
-                            if lines[j].strip() and not lines[j].strip().startswith("#") and not lines[j].strip().startswith("--hash"):
-                                break
-                        if not has_hash:
-                            print(f"FAIL: {label} package line without hash: {line.strip()}", file=sys.stderr)
-                            failures.append(name)
-                            _failed = True
-                            break
-                if _failed:
-                    break
-                # Byte-stable regeneration with pinned toolchain — fail on missing tools, no fabricated header
-                # Enforce exact .python-version (e.g., 3.14.8) as pinned runtime/compiler
-                try:
-                    _pinned_str = (ROOT / ".python-version").read_text(encoding="utf-8").strip()
-                except Exception:
-                    _pinned_str = "3.14.8"
-                try:
-                    _pmaj, _pmin, _ppatch = [int(x) for x in _pinned_str.split(".")]
-                except Exception:
-                    _pmaj, _pmin, _ppatch = (3, 14, 8)
-                _is_pinned = (sys.version_info.major, sys.version_info.minor, sys.version_info.micro) == (_pmaj, _pmin, _ppatch)
-                if not _is_pinned:
-                    import os as _os_pin
-                    _in_ci_pin = _os_pin.getenv("GITHUB_ACTIONS") == "true"
-                    print(f"WARN: {label} NOT VALIDATED — requires pinned Python {_pinned_str} (got {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}); byte-stable skipped", file=sys.stderr)
-                    # In CI this would be FAIL, but for now WARN to unblock; hosted is 3.14.8 so this path not taken there
-                        # Local diagnostic: still verify hash install, but do not satisfy mandatory gate as PASS if we were to require pinned?
-                        # Per T3, local diagnostic may report NOT VALIDATED but must not satisfy mandatory gate.
-                        # For now, locally we still verify hashes and allow PASS for other checks, but this label is NOT fully validated.
-                        # We keep the hash-check path below, but we will not treat this as fully PASS for the gate if in CI; locally we allow continue.
-                try:
-                    import subprocess as _sp
-                    import tempfile
-                    import os
-                    # Verify pip and pip-tools versions are exactly pinned
-                    pip_ver = _sp.run([sys.executable, "-m", "pip", "--version"], capture_output=True, text=True, timeout=5)
-                    if pip_ver.returncode != 0 or "26.1.1" not in pip_ver.stdout:
-                        print(f"FAIL: {label} requires pip==26.1.1 (got: {pip_ver.stdout.strip()})", file=sys.stderr)
-                        failures.append(name)
-                        _failed = True
-                        break
-                    pt_ver = _sp.run(["pip-compile", "--version"], capture_output=True, text=True, timeout=5)
-                    pt_out = (pt_ver.stdout or "") + (pt_ver.stderr or "")
-                    if pt_ver.returncode != 0 or "7.5.3" not in pt_out:
-                        print(f"FAIL: {label} requires pip-tools==7.5.3 (got: {pt_out.strip()})", file=sys.stderr)
-                        failures.append(name)
-                        _failed = True
-                        break
-                    if not _is_pinned:
-                        # Non-pinned: already warned NOT VALIDATED above; verify hash install then continue (local diagnostic path)
-                        inst = _sp.run([sys.executable, "-m", "pip", "install", "--dry-run", "--require-hashes", "--only-binary=:all:", "-r", str(target)], capture_output=True, text=True, timeout=30)
-                        if inst.returncode != 0 and "externally-managed-environment" in inst.stderr:
-                            inst = _sp.run([sys.executable, "-m", "pip", "install", "--dry-run", "--require-hashes", "--only-binary=:all:", "--break-system-packages", "-r", str(target)], capture_output=True, text=True, timeout=30)
-                        if inst.returncode != 0:
-                            print(f"FAIL: {label} hash-verified install --dry-run failed: {inst.stderr[:500]}", file=sys.stderr)
-                            failures.append(name)
-                            _failed = True
-                            break
-                        # Mark as not validated locally but do not fail the whole profile for local dev convenience;
-                        # In CI this path is not taken because _is_pinned would have failed above.
-                        continue
-                    # Pinned interpreter: regenerate with isolated seeded copy to preserve locked resolution
-                    src = "requirements.in" if label == "requirements.txt" else "requirements-dev.in"
-                    import tempfile as _tf
-                    import shutil as _sh2
-                    tmpdir = _tf.mkdtemp()
-                    tf_path = Path(tmpdir) / label
-                    src_path = ROOT / src
-                    try:
-                        _sh2.copy2(str(src_path), str(Path(tmpdir) / src))
-                    except Exception:
-                        pass
-                    try:
-                        _sh2.copy2(str(target), str(tf_path))
-                    except Exception:
-                        pass
-                    if label == "requirements-dev.txt":
-                        try:
-                            _sh2.copy2(str(ROOT / "requirements.txt"), str(Path(tmpdir) / "requirements.txt"))
-                        except Exception:
-                            pass
-                        try:
-                            _sh2.copy2(str(ROOT / "requirements.in"), str(Path(tmpdir) / "requirements.in"))
-                        except Exception:
-                            pass
-                    try:
-                        # Use relative paths with cwd=tmpdir so via comments do not contain absolute tmpdir
-                        reg = _sp.run([sys.executable, "-m", "piptools", "compile", "--generate-hashes", "--allow-unsafe", "--resolver=backtracking", "--strip-extras", f"--output-file={label}", src], capture_output=True, text=True, timeout=60, cwd=tmpdir)
-                        if reg.returncode != 0:
-                            print(f"FAIL: {label} pip-compile regeneration failed: {reg.stderr[:500]}", file=sys.stderr)
-                            failures.append(name)
-                            _failed = True
-                            break
-                        orig_lines = target.read_text(encoding="utf-8").splitlines()
-                        new_lines = Path(tf_path).read_text(encoding="utf-8").splitlines()
-                        def normalize(lines):
-                            out = []
-                            for line in lines:
-                                # Only agreed header normalization: pip-compile header lines starting with '#'
-                                if line.strip().startswith("#"):
-                                    if "--output-file=" in line:
-                                        import re as _re2
-                                        line = _re2.sub(r"--output-file=\S+", "--output-file=requirements.txt" if label == "requirements.txt" else "--output-file=requirements-dev.txt", line)
-                                    # Also normalize any absolute tmpdir that might appear in header
-                                    if str(tmpdir) in line:
-                                        line = line.replace(str(tmpdir) + "/", "")
-                                        line = line.replace(str(tmpdir), "")
-                                out.append(line)
-                            return out
-                        orig_norm = normalize(orig_lines)
-                        new_norm = normalize(new_lines)
-                        if orig_norm != new_norm:
-                            for i, (a, b) in enumerate(zip(orig_norm, new_norm)):
-                                if a != b:
-                                    print(f"WARN: {label} not byte-stable at line {i+1}: orig={a!r} new={b!r}", file=sys.stderr)
-                                    break
-                            else:
-                                if len(orig_norm) != len(new_norm):
-                                    print(f"WARN: {label} not byte-stable: line count orig {len(orig_norm)} vs new {len(new_norm)}", file=sys.stderr)
-                            print(f"WARN: {label} regeneration not byte-stable (only agreed header normalization allowed) - treated as WARN", file=sys.stderr)
-                            pass
-                        inst = _sp.run([sys.executable, "-m", "pip", "install", "--dry-run", "--require-hashes", "--only-binary=:all:", "-r", str(target)], capture_output=True, text=True, timeout=30)
-                        if inst.returncode != 0 and "externally-managed-environment" in inst.stderr:
-                            inst = _sp.run([sys.executable, "-m", "pip", "install", "--dry-run", "--require-hashes", "--only-binary=:all:", "--break-system-packages", "-r", str(target)], capture_output=True, text=True, timeout=30)
-                        if inst.returncode != 0:
-                            print(f"FAIL: {label} hash-verified install --dry-run failed: {inst.stderr[:500]}", file=sys.stderr)
-                            failures.append(name)
-                            _failed = True
-                            break
-                    finally:
-                        try:
-                            import shutil as _sh
-                            _sh.rmtree(tmpdir, ignore_errors=True)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    print(f"FAIL: {label} regeneration check exception: {e}", file=sys.stderr)
-                    failures.append(name)
-                    _failed = True
-                    break
-                except Exception:
-                    pass
-                print(f"PASS lock-consistency: {label} genuine frozen hashes")
-            if _failed:
-                continue
-            print("PASS lock-consistency: hashes present and genuine")
+            try:
+                check_lock_consistency(gate, name)
+            except Exception as exc:  # noqa: BLE001 - an unexpected error must not pass the gate
+                gate.fail(name, f"lock-consistency raised {type(exc).__name__}: {exc}")
             continue
         if name == "workflow-lint":
-            # Real workflow/security lint: YAML strict + actionlint + zizmor (mandatory, not pseudo)
-            import subprocess as _sp2
             try:
-                import yaml  # noqa
-            except ImportError as e:
-                print(f"FAIL workflow-lint: yaml not installed — cannot lint ({e})", file=sys.stderr)
-                failures.append(name)
-                continue
-            workflows = list((ROOT / ".github" / "workflows").glob("*.yml"))
-            ok = True
-            # 1) Strict YAML parsing (duplicate keys, etc.)
-            class _StrictLoader(yaml.SafeLoader):
-                pass
-            def _construct_mapping(loader, node, deep=False):
-                keys = set()
-                for k, _ in node.value:
-                    key = loader.construct_object(k, deep=deep)
-                    if key in keys:
-                        raise ValueError(f"duplicate key {key!r}")
-                    keys.add(key)
-                return loader.construct_mapping(node, deep)
-            _StrictLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping)
-            for wf in workflows:
-                try:
-                    text = wf.read_text(encoding="utf-8")
-                    yaml.load(text, Loader=_StrictLoader)
-                except Exception as e:
-                    print(f"FAIL yaml parse {wf}: {e}", file=sys.stderr)
-                    ok = False
-            if not ok:
-                failures.append(name)
-                continue
-            import re
-            sha_pat = re.compile(r"uses:\s*[^\n]+@[0-9a-f]{40}")
-            for wf in workflows:
-                text = wf.read_text(encoding="utf-8", errors="ignore")
-                for line in text.splitlines():
-                    if "uses:" in line and "@" in line:
-                        if not sha_pat.search(line):
-                            if "SHA-pinned" not in line and "sha-pinned" not in line.lower():
-                                print(f"FAIL: unpinned action in {wf.name}: {line.strip()}", file=sys.stderr)
-                                ok = False
-            if not ok:
-                failures.append(name)
-                continue
-            # 2) Real actionlint execution (mandatory in CI, warn locally)
-            try:
-                # Check if running in CI — require tools, else warn
-                import os as _os2
-                in_ci = _os2.getenv("GITHUB_ACTIONS") == "true" or _os2.getenv("CI") == "true"
-                al = _sp2.run(["actionlint", "-version"], capture_output=True, text=True, timeout=5)
-                if al.returncode != 0:
-                    al2 = _sp2.run(["python", "-m", "actionlint", "--version"], capture_output=True, text=True, timeout=5)
-                    if al2.returncode != 0:
-                        msg = f"actionlint not available (mandatory) — {al.stderr[:200]}"
-                        if in_ci:
-                            print(f"FAIL workflow-lint: {msg}", file=sys.stderr)
-                            failures.append(name)
-                            continue
-                        else:
-                            print(f"WARN workflow-lint: {msg} — skipping locally", file=sys.stderr)
-                        # skip actionlint locally
-                        al = None
-                        al_run = None
-                    else:
-                        al = al2
-                if al and al.returncode == 0:
-                    # Expand actual workflow paths (no shell wildcard) or use default mode
-                    _wfs = list((ROOT / ".github" / "workflows").glob("*.yml"))
-                    _al_args = ["actionlint"] + [str(w) for w in _wfs]
-                    al_run = _sp2.run(_al_args, capture_output=True, text=True, timeout=15, cwd=ROOT)
-                    if al_run.returncode != 0:
-                        print(f"FAIL workflow-lint: actionlint errors: {(al_run.stdout or '')[:500]} {(al_run.stderr or '')[:500]}", file=sys.stderr)
-                        failures.append(name)
-                        continue
-            except FileNotFoundError:
-                import os as _os3
-                if _os3.getenv("GITHUB_ACTIONS") == "true":
-                    print(f"FAIL workflow-lint: actionlint binary not found (mandatory)", file=sys.stderr)
-                    failures.append(name)
-                    continue
-                else:
-                    print(f"WARN workflow-lint: actionlint binary not found — skipping locally", file=sys.stderr)
-            except Exception as e:
-                import os as _os3
-                if _os3.getenv("GITHUB_ACTIONS") == "true":
-                    print(f"FAIL workflow-lint: actionlint exception: {e}", file=sys.stderr)
-                    failures.append(name)
-                    continue
-                else:
-                    print(f"WARN workflow-lint: actionlint exception: {e} — skipping locally", file=sys.stderr)
-            # 3) Real zizmor execution (mandatory in CI, warn locally)
-            try:
-                import os as _os4
-                in_ci2 = _os4.getenv("GITHUB_ACTIONS") == "true" or _os4.getenv("CI") == "true"
-                z = _sp2.run(["zizmor", "--version"], capture_output=True, text=True, timeout=5)
-                if z.returncode != 0:
-                    msg = f"zizmor not available (mandatory) — {z.stderr[:200]}"
-                    if in_ci2:
-                        print(f"FAIL workflow-lint: {msg}", file=sys.stderr)
-                        failures.append(name)
-                        continue
-                    else:
-                        print(f"WARN workflow-lint: {msg} — skipping locally", file=sys.stderr)
-                        z = None
-                if z and z.returncode == 0:
-                    z_run = _sp2.run(["zizmor", "--offline", "--min-severity", "high", ".github/workflows"], capture_output=True, text=True, timeout=15, cwd=ROOT)
-                    if z_run.returncode != 0:
-                        print(f"FAIL workflow-lint: zizmor found issues (exit {z_run.returncode}): {(z_run.stdout or '')[:700]}", file=sys.stderr)
-                        failures.append(name)
-                        continue
-            except FileNotFoundError:
-                import os as _os4
-                if _os4.getenv("GITHUB_ACTIONS") == "true":
-                    print(f"FAIL workflow-lint: zizmor binary not found (mandatory)", file=sys.stderr)
-                    failures.append(name)
-                    continue
-                else:
-                    print(f"WARN workflow-lint: zizmor binary not found — skipping locally", file=sys.stderr)
-            except Exception as e:
-                import os as _os4
-                if _os4.getenv("GITHUB_ACTIONS") == "true":
-                    print(f"FAIL workflow-lint: zizmor exception: {e}", file=sys.stderr)
-                    failures.append(name)
-                    continue
-                else:
-                    print(f"WARN workflow-lint: zizmor exception: {e} — skipping locally", file=sys.stderr)
-            print("PASS workflow-lint")
+                check_workflow_lint(gate, name)
+            except Exception as exc:  # noqa: BLE001 - an unexpected error must not pass the gate
+                gate.fail(name, f"workflow-lint raised {type(exc).__name__}: {exc}")
             continue
-        try:
-            result = subprocess.run(cmd, cwd=ROOT)
-        except FileNotFoundError as e:
-            # For mandatory linters, fail in CI but warn locally
-            import os as _os5
-            if name in ("actionlint", "zizmor"):
-                if _os5.getenv("GITHUB_ACTIONS") == "true":
-                    print(f"FAIL {name} binary not found (mandatory) — {e}", file=sys.stderr)
-                    failures.append(name)
-                else:
-                    print(f"WARN {name} binary not found — skipping locally (CI will enforce)", file=sys.stderr)
-                    print(f"PASS {name} (skipped locally)")
-                continue
-            else:
-                print(f"FAIL {name} binary not found — {e}", file=sys.stderr)
-                failures.append(name)
-                continue
-        if result.returncode != 0:
-            print(f"FAIL {name} exited {result.returncode}", file=sys.stderr)
-            failures.append(name)
-        else:
-            print(f"PASS {name}")
-    if failures:
-        print(f"CI profile {profile} FAILED: {failures}", file=sys.stderr)
-        try:
-            pathlib.Path("/tmp/ci-failure.txt").write_text(f"FAILED {profile}: {failures}\n", encoding="utf-8")
-        except Exception:
-            pass
-        try:
-            import os
-            summary = os.getenv("GITHUB_STEP_SUMMARY")
-            if summary:
-                pathlib.Path(summary).write_text(f"CI FAILED {profile}: {failures}\n", encoding="utf-8")
-        except Exception:
-            pass
+        run_command(gate, name, cmd)
+
+    if gate.failures:
+        print(f"CI profile {profile} FAILED: {gate.failures}", file=sys.stderr)
+        _record_outcome(f"FAILED {profile}: {gate.failures}")
         return 1
+    if gate.not_validated:
+        print(
+            f"CI profile {profile} NOT VALIDATED: mandatory checks could not be validated here: "
+            f"{gate.not_validated}",
+            file=sys.stderr,
+        )
+        _record_outcome(f"NOT VALIDATED {profile}: {gate.not_validated}")
+        return 2
     print(f"CI profile {profile} ALL PASS")
     return 0
 
 
+def _record_outcome(text: str) -> None:
+    try:
+        Path("/tmp/ci-failure.txt").write_text(text + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    summary = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary:
+        try:
+            Path(summary).write_text(f"CI {text}\n", encoding="utf-8")
+        except OSError:
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="CI adapter")
-    parser.add_argument("--profile", choices=["development", "production"], default="development", help="Profile to run")
+    parser.add_argument(
+        "--profile", choices=["development", "production"], default="development", help="Profile to run"
+    )
     parser.add_argument("--list", action="store_true", help="List registered commands")
     parser.add_argument("--validate", action="store_true", help="Validate registry completeness")
+    parser.add_argument("--verbose", action="store_true", help="Print environment facts per check")
     args = parser.parse_args(argv)
     if args.list:
-        for k, v in COMMAND_REGISTRY.items():
-            print(f"{k}: {' '.join(v)}")
+        for key, value in COMMAND_REGISTRY.items():
+            print(f"{key}: {' '.join(value)}")
         return 0
     if args.validate:
         validate_registry()
         print("registry ok")
         return 0
-    return run_profile(args.profile)
+    return run_profile(args.profile, verbose=args.verbose)
 
 
 if __name__ == "__main__":

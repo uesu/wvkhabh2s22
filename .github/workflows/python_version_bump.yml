@@ -62,7 +62,6 @@ jobs:
           SOAK_DAYS: ${{ vars.PYTHON_BUMP_SOAK_DAYS }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # shellcheck disable=SC2002,SC2129
           set -euo pipefail
           CURRENT="$(tr -d ' \r\n' < .python-version)"
           if [ -z "$CURRENT" ]; then
@@ -75,9 +74,11 @@ jobs:
             echo "Manual override requested: $FORCE_VERSION"
             # Validate syntax via helper
             python -c "import sys; sys.path.insert(0, '.github/scripts'); import maintenance; assert maintenance.parse_version('${FORCE_VERSION}') is not None, 'invalid forced version'"
-            echo "latest=${FORCE_VERSION}" >> "$GITHUB_OUTPUT"
-            echo "kind=forced" >> "$GITHUB_OUTPUT"
-            echo "bump=yes" >> "$GITHUB_OUTPUT"
+            {
+              echo "latest=${FORCE_VERSION}"
+              echo "kind=forced"
+              echo "bump=yes"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Fetch versions-manifest via GitHub API (raw.githubusercontent.com not allowlisted, use api.github.com)

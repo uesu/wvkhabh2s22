@@ -192,9 +192,11 @@ jobs:
         #       run: python "testing area/reddit_main_v3.py"          <- rich card (native media, no key)
         # ───────────────────────────────────────────────────────────────────
         run: |
-          echo "MONITOR_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
-          echo "REPORT_PATH=${{ runner.temp }}/reddit_report.json" >> "$GITHUB_ENV"
-          echo "PERSISTENCE_PATH=${{ runner.temp }}/reddit_persistence.json" >> "$GITHUB_ENV"
+          {
+            echo "MONITOR_START_EPOCH=$(date +%s)"
+            echo "REPORT_PATH=${{ runner.temp }}/reddit_report.json"
+            echo "PERSISTENCE_PATH=${{ runner.temp }}/reddit_persistence.json"
+          } >> "$GITHUB_ENV"
           set -o pipefail
           set +e
           python "testing area/reddit_main_v3.py" 2>&1 | tee monitor.log
@@ -319,7 +321,9 @@ jobs:
           [ -f monitor.log ] || : > monitor.log
           count_matches() { local pattern="$1"; grep -Ec "$pattern" monitor.log 2>/dev/null || true; }
           runtime=$(( ${MONITOR_END_EPOCH:-$(date +%s)} - ${MONITOR_START_EPOCH:-$(date +%s)} ))
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "_Legacy log counters (no extra requests): runtime ${runtime}s, posts delivered $(count_matches 'Reddit V3 Posted:')_" >> "$GITHUB_STEP_SUMMARY"
-          echo "_summary source: local monitor.log only; no additional requests_" >> "$GITHUB_STEP_SUMMARY"
-          echo "quality fallback count: $(count_matches 'retaining validated base') " >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo ""
+            echo "_Legacy log counters (no extra requests): runtime ${runtime}s, posts delivered $(count_matches 'Reddit V3 Posted:')_"
+            echo "_summary source: local monitor.log only; no additional requests_"
+            echo "quality fallback count: $(count_matches 'retaining validated base') "
+          } >> "$GITHUB_STEP_SUMMARY"

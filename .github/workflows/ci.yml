@@ -97,7 +97,6 @@ jobs:
       - name: Debug lock on failure
         if: failure()
         run: |
-          # shellcheck disable=SC2002,SC2129
           echo "=== DEBUG: pip versions ==="
           python -V
           pip --version
@@ -134,7 +133,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          # shellcheck disable=SC2002,SC2129
           echo "=== CI FAILURE ==="
           cat /tmp/ci-failure.txt 2>&1 || echo "no ci-failure.txt"
           echo "=== DEBUG HEADERS ==="

@@ -135,9 +135,11 @@ jobs:
         #       run: python "testing area/twitter_v3.py"                <- V3 (card, buttons nested)
         # ───────────────────────────────────────────────────────────────────
         run: |
-          echo "TWITTER_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
-          echo "REPORT_PATH=${{ runner.temp }}/twitter_report.json" >> "$GITHUB_ENV"
-          echo "PERSISTENCE_PATH=${{ runner.temp }}/twitter_persistence.json" >> "$GITHUB_ENV"
+          {
+            echo "TWITTER_START_EPOCH=$(date +%s)"
+            echo "REPORT_PATH=${{ runner.temp }}/twitter_report.json"
+            echo "PERSISTENCE_PATH=${{ runner.temp }}/twitter_persistence.json"
+          } >> "$GITHUB_ENV"
           set -o pipefail
           set +e
           python "testing area/twitter_v3.py" 2>&1 | tee twitter_monitor.log   # ← V3
