@@ -60,6 +60,152 @@ jobs:
             const fs = require('fs');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+            const trustedRepository = `${owner}/${repo}`;
+            let manifestVersions = null;
+
+            // Resolve live check runs to the Actions job and workflow run that produced them.
+            // The Checks API returns no workflow identity — a real check_runs record carries id,
+            // name, head_sha, status, conclusion, app, external_id and html_url, never workflow,
+            // workflow_id, path or workflow_run — so provenance has to be fetched: for Actions
+            // checks external_id is the job id and html_url is the canonical
+            // .../actions/runs/<run_id>/job/<job_id> link. Raw payloads are attached unchanged;
+            // when a fetch fails the check stays unresolved and the helper fails closed rather
+            // than accepting an unproven gate. Both the decision and the final pre-merge snapshot
+            // call this, so they cannot drift apart.
+            const jobCache = new Map();
+            const runCache = new Map();
+            const attemptCache = new Map();
+            async function resolveChecks(all, headSha) {
+              const canonical = (c) => /\/actions\/runs\/(\d+)\/job\/(\d+)/.exec(c.html_url || c.details_url || '');
+              const resolved = [];
+              for (const c of all) {
+                const enriched = {
+                  id: c.id,
+                  name: c.name,
+                  status: c.status,
+                  conclusion: c.conclusion,
+                  head_sha: c.head_sha,
+                  external_id: c.external_id,
+                  html_url: c.html_url,
+                  details_url: c.details_url,
+                  app: c.app && c.app.slug ? { slug: c.app.slug } : undefined
+                };
+                const link = canonical(c);
+                const externalJob = Number.parseInt(c.external_id, 10);
+                const jobId = Number.isInteger(externalJob) && externalJob > 0 ? externalJob
+                  : (link ? Number.parseInt(link[2], 10) : null);
+                if (jobId !== null) {
+                  try {
+                    if (!jobCache.has(jobId)) {
+                      const { data } = await github.rest.actions.getJobForWorkflowRun({ owner, repo, job_id: jobId });
+                      jobCache.set(jobId, data);
+                    }
+                    enriched.job = jobCache.get(jobId);
+                  } catch (e) {
+                    console.log(`Job ${jobId} behind check "${c.name}" unavailable: ${e.message} — provenance unresolved`);
+                  }
+                }
+                const runId = (enriched.job && Number.isInteger(enriched.job.run_id)) ? enriched.job.run_id
+                  : (link ? Number.parseInt(link[1], 10) : null);
+                if (runId !== null) {
+                  try {
+                    if (!runCache.has(runId)) {
+                      const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: runId });
+                      runCache.set(runId, data);
+                    }
+                    enriched.run = runCache.get(runId);
+                  } catch (e) {
+                    console.log(`Run ${runId} behind check "${c.name}" unavailable: ${e.message} — provenance unresolved`);
+                  }
+                  try {
+                    if (!attemptCache.has(runId)) {
+                      const { data } = await github.rest.actions.listWorkflowRunAttempts({ owner, repo, run_id: runId, per_page: 100 });
+                      attemptCache.set(runId, data.workflow_run_attempts || []);
+                    }
+                    enriched.attempts = attemptCache.get(runId);
+                  } catch (e) {
+                    console.log(`Attempt history for run ${runId} unavailable: ${e.message} — provenance unresolved`);
+                  }
+                }
+                resolved.push(enriched);
+              }
+              // A synthetic gate is never invented: if no real check represents the final gate,
+              // the gate is missing and the decision blocks. Legacy commit statuses carry no
+              // producing job or run, so they can never satisfy a mandatory check.
+              try {
+                const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({ owner, repo, ref: headSha, per_page: 100 });
+                for (const s of statuses) {
+                  resolved.push({
+                    name: s.context,
+                    status: 'completed',
+                    conclusion: s.state === 'success' ? 'success' : s.state,
+                    head_sha: s.sha || headSha,
+                    app: { slug: s.creator && s.creator.login ? s.creator.login : undefined },
+                    provenance: 'legacy-commit-status'
+                  });
+                }
+              } catch (e) {
+                console.log(`Commit statuses unavailable for ${headSha}: ${e.message}`);
+              }
+              const provenanced = resolved.filter(c => c.job && c.run && c.attempts).length;
+              console.log(`Resolved ${resolved.length} checks for ${headSha}; ${provenanced} carry full job/run/attempt provenance`);
+              return resolved;
+            }
+
+            // Collect the evidence that binds a published proposal to the run that published it.
+            // The proposer runs on the base branch and publishes a NEW commit, so the run's
+            // head_sha is the source head and never equals the published proposal head.
+            async function collectPublicationEvidence(pr) {
+              const evidence = {};
+              try {
+                const proposerRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                  owner, repo, workflow_id: 'python_version_bump.yml', branch: pr.base.ref, per_page: 100
+                });
+                const source = (proposerRuns || []).find(r =>
+                  r.path === '.github/workflows/python_version_bump.yml' &&
+                  r.head_branch === pr.base.ref &&
+                  r.status === 'completed');
+                if (!source) {
+                  console.log(`No completed proposer run on ${pr.base.ref} — publication unverified`);
+                } else {
+                  const { data: publisherRun } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: source.id });
+                  evidence.publisher_run = publisherRun;
+                  try {
+                    const { data: attempts } = await github.rest.actions.listWorkflowRunAttempts({ owner, repo, run_id: source.id, per_page: 100 });
+                    evidence.publisher_attempts = attempts.workflow_run_attempts || [];
+                  } catch (e) {
+                    console.log(`Proposer attempt history unavailable: ${e.message} — publication unverified`);
+                  }
+                }
+              } catch (e) {
+                console.log(`Proposer run lookup failed: ${e.message} — publication unverified`);
+              }
+              try {
+                const { data: publishedCommit } = await github.rest.repos.getCommit({ owner, repo, ref: pr.head.sha });
+                evidence.published_commit = publishedCommit;
+              } catch (e) {
+                console.log(`Published proposal commit unavailable: ${e.message} — publication unverified`);
+              }
+              if (!manifestVersions) {
+                try {
+                  // The PR's own maintenance.json is PR content and is never the manifest; the
+                  // proposer resolves against the upstream release manifest, so bind to that.
+                  const { data: manifestFile } = await github.rest.repos.getContent({
+                    owner: 'actions', repo: 'python-versions', path: 'versions-manifest.json'
+                  });
+                  const manifest = JSON.parse(Buffer.from(manifestFile.content || '', 'base64').toString('utf8'));
+                  const entries = Array.isArray(manifest) ? manifest : (manifest.versions || []);
+                  manifestVersions = entries
+                    .map(entry => entry && (entry.version || entry.python_version))
+                    .filter(Boolean);
+                  console.log(`Validated manifest carries ${manifestVersions.length} published versions`);
+                } catch (e) {
+                  console.log(`Validated manifest unavailable: ${e.message} — publication unverified`);
+                }
+              }
+              if (manifestVersions) evidence.manifest_versions = manifestVersions;
+              return evidence;
+            }
 
             // Determine PR number: from pull_request_target event or workflow_run head
             let prNumber = context.payload.pull_request?.number;
@@ -269,124 +415,8 @@ jobs:
                 core.setOutput('reason', 'checks unavailable — fail closed');
                 return;
               }
-              // Resolve workflow runs for this head with actual producer authentication (not same-SHA first-match)
-              let workflowRuns = [];
-              let trustedWorkflowRun = null;
-              try {
-                // Fetch runs for the exact trusted workflow (ci.yml) and head SHA — ensures workflow ID/path binding
-                const { data: wfData } = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: 'ci.yml', head_sha: pr.head.sha, per_page: 20 });
-                const candidates = (wfData.workflow_runs || []).filter(r => r.head_sha === pr.head.sha && r.path === '.github/workflows/ci.yml');
-                // Also fetch via generic head_sha search for completeness (to catch runs with different workflow_id)
-                if (candidates.length === 0) {
-                  const { data: wfData2 } = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, head_sha: pr.head.sha, per_page: 100 });
-                  const extra = (wfData2.workflow_runs || []).filter(r => r.head_sha === pr.head.sha && r.path === '.github/workflows/ci.yml');
-                  candidates.push(...extra);
-                }
-                workflowRuns = candidates;
-                // Pick the most recent successful run for this head (actual producer)
-                // But do not use first same-SHA run arbitrarily — verify job/check association below
-                trustedWorkflowRun = candidates.find(r => r.conclusion === 'success' && r.head_sha === pr.head.sha) || candidates[0] || null;
-                if (trustedWorkflowRun) {
-                  console.log(`Trusted workflow run candidate: ${trustedWorkflowRun.id} ${trustedWorkflowRun.path} ${trustedWorkflowRun.head_sha} ${trustedWorkflowRun.conclusion} attempt ${trustedWorkflowRun.run_attempt || 1}`);
-                }
-                // For each workflow run, fetch its jobs to enable job/check association
-                for (const wr of workflowRuns) {
-                  try {
-                    const { data: jobsData } = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: wr.id, per_page: 100 });
-                    wr._jobs = jobsData.jobs || [];
-                  } catch (e) {
-                    console.log(`Failed to list jobs for run ${wr.id}: ${e.message}`);
-                    wr._jobs = [];
-                  }
-                }
-              } catch (e) {
-                console.log(`Failed to list workflow runs: ${e.message} — will require checks to carry workflow provenance already`);
-                workflowRuns = [];
-                trustedWorkflowRun = null;
-              }
-              // Resolve each check to the Actions job and workflow run that actually produced it.
-              // The Checks API returns no workflow identity: a real check_runs record carries id,
-              // name, head_sha, status, conclusion, app, external_id and html_url — never workflow,
-              // workflow_id, path or workflow_run. Reading those keys rejects every genuine record,
-              // so provenance is fetched instead: for Actions checks external_id is the job id and
-              // html_url is the canonical .../actions/runs/<run_id>/job/<job_id> link. The raw
-              // payloads are attached unchanged; when a fetch fails the check stays unresolved and
-              // the helper fails closed rather than accepting an unproven gate.
-              const repository = `${owner}/${repo}`;
-              const canonicalLink = (c) => /\/actions\/runs\/(\d+)\/job\/(\d+)/.exec(c.html_url || c.details_url || '');
-              const jobCache = new Map();
-              const runCache = new Map();
-              const attemptCache = new Map();
-              checks = [];
-              for (const c of all) {
-                const enriched = {
-                  id: c.id,
-                  name: c.name,
-                  status: c.status,
-                  conclusion: c.conclusion,
-                  head_sha: c.head_sha,
-                  external_id: c.external_id,
-                  html_url: c.html_url,
-                  details_url: c.details_url,
-                  app: c.app && c.app.slug ? { slug: c.app.slug } : undefined
-                };
-                const link = canonicalLink(c);
-                const externalJob = Number.parseInt(c.external_id, 10);
-                const jobId = Number.isInteger(externalJob) && externalJob > 0 ? externalJob
-                  : (link ? Number.parseInt(link[2], 10) : null);
-                if (jobId !== null) {
-                  try {
-                    if (!jobCache.has(jobId)) {
-                      const { data } = await github.rest.actions.getJobForWorkflowRun({ owner, repo, job_id: jobId });
-                      jobCache.set(jobId, data);
-                    }
-                    enriched.job = jobCache.get(jobId);
-                  } catch (e) {
-                    console.log(`Job ${jobId} behind check "${c.name}" unavailable: ${e.message} — provenance unresolved`);
-                  }
-                }
-                const runId = (enriched.job && Number.isInteger(enriched.job.run_id)) ? enriched.job.run_id
-                  : (link ? Number.parseInt(link[1], 10) : null);
-                if (runId !== null) {
-                  try {
-                    if (!runCache.has(runId)) {
-                      const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: runId });
-                      runCache.set(runId, data);
-                    }
-                    enriched.run = runCache.get(runId);
-                  } catch (e) {
-                    console.log(`Run ${runId} behind check "${c.name}" unavailable: ${e.message} — provenance unresolved`);
-                  }
-                  try {
-                    if (!attemptCache.has(runId)) {
-                      const { data } = await github.rest.actions.listWorkflowRunAttempts({ owner, repo, run_id: runId, per_page: 100 });
-                      attemptCache.set(runId, data.workflow_run_attempts || []);
-                    }
-                    enriched.attempts = attemptCache.get(runId);
-                  } catch (e) {
-                    console.log(`Attempt history for run ${runId} unavailable: ${e.message} — provenance unresolved`);
-                  }
-                }
-                checks.push(enriched);
-              }
-              // A synthetic maintenance-ci is never invented: if no real check represents the
-              // final gate, the gate is missing and the decision blocks.
-              // Legacy commit statuses carry no producing job or run, so they can never satisfy a
-              // mandatory check; they are recorded for the report only.
-              const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({ owner, repo, ref: pr.head.sha, per_page: 100 });
-              for (const s of statuses) {
-                checks.push({
-                  name: s.context,
-                  status: 'completed',
-                  conclusion: s.state === 'success' ? 'success' : s.state,
-                  head_sha: s.sha || pr.head.sha,
-                  app: { slug: s.creator && s.creator.login ? s.creator.login : undefined },
-                  provenance: 'legacy-commit-status'
-                });
-              }
-              fixture.repository = repository;
-              console.log(`Resolved ${checks.length} checks for ${pr.head.sha}; ` +
-                `${checks.filter(c => c.job && c.run && c.attempts).length} carry full job/run/attempt provenance`);
+              checks = await resolveChecks(all, pr.head.sha);
+              fixture.repository = trustedRepository;
               fixture.checks = checks;
               console.log(`Checks for ${pr.head.sha}: ${JSON.stringify(checks, null, 2)}`);
             } catch (e) {
@@ -403,72 +433,12 @@ jobs:
             // Dependency updates: parse from PR body or title if available (helper also parses title)
             fixture.dependency_updates = [];
             // Proposer verification: for python bump, verify workflow run from trusted publisher workflow
-            // Publication provenance. The proposer runs on the base branch and publishes a NEW
-            // commit, so its head_sha is the source head and can never equal the published
-            // proposal head — matching on head_sha authenticated nothing and left the trusted
-            // author bypass as the only way in. Bind the actual publication instead, with raw
-            // payloads only; the helper fails closed on any gap:
-            //   * the trusted proposer workflow's completed run on the PR's base branch, and its
-            //     attempt history, so a stale attempt cannot authorize;
-            //   * the published head commit, whose identity must be the run's actor (the BUMP_PAT
-            //     user) and whose timestamp must fall inside the run's own execution window;
-            //   * the validated manifest the proposer itself resolves against, so the published
-            //     version has to be a real release rather than an arbitrary string.
+            // Publication provenance. Branch, title and body markers are not authorization, and
+            // neither is a trusted author identity: the run that published this proposal has to be
+            // bound to the published head, its actor and the validated manifest. The helper fails
+            // closed on any gap.
             if (isPythonBumpBranch) {
-              try {
-                const proposerRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
-                  owner, repo, workflow_id: 'python_version_bump.yml', branch: pr.base.ref, per_page: 100
-                });
-                const source = (proposerRuns || []).find(r =>
-                  r.path === '.github/workflows/python_version_bump.yml' &&
-                  r.head_branch === pr.base.ref &&
-                  r.status === 'completed');
-                if (!source) {
-                  console.log(`No completed proposer run on ${pr.base.ref} — publication unverified`);
-                } else {
-                  const { data: publisherRun } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: source.id });
-                  fixture.publisher_run = publisherRun;
-                  console.log(`Publisher run ${publisherRun.id} attempt ${publisherRun.run_attempt} ` +
-                    `source head ${publisherRun.head_sha} conclusion ${publisherRun.conclusion}`);
-                  try {
-                    const { data: attempts } = await github.rest.actions.listWorkflowRunAttempts({ owner, repo, run_id: source.id, per_page: 100 });
-                    fixture.publisher_attempts = attempts.workflow_run_attempts || [];
-                  } catch (e) {
-                    console.log(`Proposer attempt history unavailable: ${e.message} — publication unverified`);
-                  }
-                }
-              } catch (e) {
-                console.log(`Proposer run lookup failed: ${e.message} — publication unverified`);
-              }
-              try {
-                const { data: publishedCommit } = await github.rest.repos.getCommit({ owner, repo, ref: pr.head.sha });
-                fixture.published_commit = publishedCommit;
-              } catch (e) {
-                console.log(`Published proposal commit unavailable: ${e.message} — publication unverified`);
-              }
-              try {
-                // The PR's own maintenance.json is PR content and is never the manifest; the
-                // proposer resolves against the upstream release manifest, so bind to that.
-                const { data: manifestFile } = await github.rest.repos.getContent({
-                  owner: 'actions', repo: 'python-versions', path: 'versions-manifest.json'
-                });
-                const manifestText = Buffer.from(manifestFile.content || '', 'base64').toString('utf8');
-                const manifest = JSON.parse(manifestText);
-                const entries = Array.isArray(manifest) ? manifest : (manifest.versions || []);
-                fixture.manifest_versions = entries
-                  .map(entry => entry && (entry.version || entry.python_version))
-                  .filter(Boolean);
-                console.log(`Validated manifest carries ${fixture.manifest_versions.length} published versions`);
-              } catch (e) {
-                console.log(`Validated manifest unavailable: ${e.message} — publication unverified`);
-              }
-            }
-            // For dependabot, also attach workflow_run if present for provenance (helper will verify) — require exact head_sha
-            if (isDependabot) {
-              const depRun = workflowRuns.find(r => r.head_sha === pr.head.sha && r.path === '.github/workflows/ci.yml');
-              if (depRun) {
-                fixture.workflow_run = { id: depRun.id, head_sha: depRun.head_sha, path: depRun.path, workflow_id: depRun.workflow_id, conclusion: depRun.conclusion };
-              }
+              Object.assign(fixture, await collectPublicationEvidence(pr));
             }
             // Labels already indicate review-required if present
             if (labels.includes('review-required')) {
@@ -565,52 +535,9 @@ jobs:
                   core.setOutput('reason', 'final checks unavailable — fail closed');
                   return;
                 }
-                // Resolve workflow runs for final head
-                let finalWorkflowRuns = [];
-                let finalTrustedRun = null;
-                try {
-                  const { data: wfData } = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: 'ci.yml', head_sha: finalPr.head.sha, per_page: 20 });
-                  const cand = (wfData.workflow_runs || []).filter(r => r.head_sha === finalPr.head.sha && r.path === '.github/workflows/ci.yml');
-                  if (cand.length === 0) {
-                    const { data: wfData2 } = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, head_sha: finalPr.head.sha, per_page: 100 });
-                    const extra = (wfData2.workflow_runs || []).filter(r => r.head_sha === finalPr.head.sha && r.path === '.github/workflows/ci.yml');
-                    cand.push(...extra);
-                  }
-                  finalWorkflowRuns = cand;
-                  finalTrustedRun = cand.find(r => r.conclusion === 'success' && r.head_sha === finalPr.head.sha) || cand[0] || null;
-                  for (const wr of finalWorkflowRuns) {
-                    try {
-                      const { data: jd } = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: wr.id, per_page: 100 });
-                      wr._jobs = jd.jobs || [];
-                    } catch (e) {
-                      wr._jobs = [];
-                    }
-                  }
-                } catch (e) {
-                  console.log(`Failed to list final workflow runs: ${e.message}`);
-                  finalWorkflowRuns = [];
-                }
-                const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({ owner, repo, ref: finalPr.head.sha, per_page: 100 });
-                finalChecks = all.map(c => {
-                  return {
-                    name: c.name,
-                    status: c.status,
-                    conclusion: c.conclusion,
-                    app: c.app?.slug,
-                    head_sha: c.head_sha,
-                    workflow: c.workflow?.name || undefined,
-                    workflow_id: c.workflow_id || undefined,
-                    workflow_path: c.path || c.workflow?.path || undefined,
-                    workflow_run: c.workflow_run || null,
-                    job_name: c.name,
-                    run_attempt: c.run_attempt || undefined
-                  };
-                });
-                // Do NOT synthesize maintenance-ci — require actual check/job
-                for (const s of statuses) {
-                  // Legacy statuses: do not invent app/workflow — helper will reject if mandatory requires provenance
-                  finalChecks.push({ name: s.context, status: 'completed', conclusion: s.state === 'success' ? 'success' : s.state, head_sha: s.sha || finalPr.head.sha });
-                }
+                // The same resolution as the decision step, repeated against the final head so
+                // the evidence immediately preceding the merge is real and current.
+                finalChecks = await resolveChecks(all, finalPr.head.sha);
               } catch (e) {
                 console.log(`Failed to re-list final checks: ${e.message}`);
                 core.setOutput('decision', 'blocked');
@@ -662,10 +589,16 @@ jobs:
                 labels: finalLabels,
                 reviews: finalReviews,
                 head_sha: finalPr.head.sha,
+                repository: trustedRepository,
                 auto_merge_vars: { AUTO_MERGE_DEPENDABOT: process.env.AUTO_MERGE_DEPENDABOT, AUTO_MERGE_PYTHON_BUMP: process.env.AUTO_MERGE_PYTHON_BUMP },
                 review_required: false,
                 file_patches: filePatches
               };
+              // Re-bind publication against the final head: the published commit is fetched for
+              // finalPr.head.sha, so a head that moved after the decision cannot be authorized.
+              if (isPythonBumpBranch) {
+                Object.assign(finalFixture, await collectPublicationEvidence(finalPr));
+              }
               const tmpFinal = '/tmp/fixture_final.json';
               fs.writeFileSync(tmpFinal, JSON.stringify(finalFixture, null, 2));
               try {
