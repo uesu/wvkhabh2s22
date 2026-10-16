@@ -109,35 +109,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          echo "test comment from $GITHUB_SHA"
+          gh pr comment 29 --body "test comment from $GITHUB_SHA at $(date)" || echo "comment failed with $?"
+          # Also try via api
+          gh api repos/uesu/wvkhabh2s22/issues/29/comments --method POST -f body="test via api $GITHUB_SHA" || echo "api comment failed"
           echo "=== DEBUG HEADERS ==="
-          echo "orig header:"
           head -n 5 requirements.txt || true
-          echo "regen header:"
-          head -n 5 /tmp/ci_debug/regen.txt || true
-          echo "=== DIFF ==="
-          diff -u /tmp/ci_debug/orig.txt /tmp/ci_debug/regen.txt | head -n 500 > /tmp/diff.txt || true
+          cat /tmp/ci_debug/regen.txt 2>&1 | head -n 5 || true
+          diff -u /tmp/ci_debug/orig.txt /tmp/ci_debug/regen.txt | head -n 100 > /tmp/diff.txt || true
           cat /tmp/diff.txt || true
-          echo "=== Posting PR comment (any event) ==="
-          # Find PR number for this head (works for push and pull_request)
-          PR_NUM=$(gh pr list --state open --head arena/6348bb34-wvkhabh2s22 --json number --jq '.[0].number' 2>&1 || echo "")
-          if [ -z "$PR_NUM" ]; then
-            PR_NUM=${{ github.event.pull_request.number }}
-          fi
-          if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "null" ]; then
-            PR_NUM=29
-          fi
-          echo "PR_NUM=$PR_NUM"
-          if [ -f /tmp/diff.txt ] && [ -s /tmp/diff.txt ]; then
-            body=$(cat /tmp/diff.txt | head -c 3000)
-            gh pr comment $PR_NUM --body "CI debug for ${{ github.sha }}:
-
-\`\`\`diff
-$body
-\`\`\`" || echo "comment failed"
-          else
-            echo "no diff to post"
-            gh pr comment $PR_NUM --body "CI debug for ${{ github.sha }}: no diff, orig $(head -n 2 requirements.txt | tr '\n' ' ')" || true
-          fi
 
       - name: Record interpreter, lock digest and runner image for summary
         if: always()
