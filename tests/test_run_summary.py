@@ -5,6 +5,7 @@ Validates .github/scripts/render_run_summary.py
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import sys
@@ -139,8 +140,60 @@ def test_load_and_cli():
     finally:
         os.unlink(fname)
 
+def test_actual_engine_report_count_precedes_classification():
+    """Execute each engine's real final report-construction block, without I/O.
+
+    This tests source order and the actual report dict, not a duplicate classifier.
+    It does not dispatch main, call a source, post to Discord or save caches.
+    """
+    from types import SimpleNamespace
+
+    for filename, current, initial in (
+        ("reddit_main_v3.py", "posted", "posted_at_start"),
+        ("twitter_v3.py", "posted_urls", "posted_urls_at_start"),
+    ):
+        tree = ast.parse((ROOT / "testing area" / filename).read_text())
+        main = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "main")
+        # The final outer try assigns the real report dict before serializing it.
+        block = next(
+            n for n in reversed(main.body)
+            if isinstance(n, ast.Try)
+            and any(isinstance(stmt, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "report" for t in stmt.targets)
+                    for stmt in n.body)
+        )
+        report_index = next(
+            i for i, stmt in enumerate(block.body)
+            if isinstance(stmt, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "report" for t in stmt.targets)
+        )
+        code = compile(ast.Module(body=block.body[:report_index + 1], type_ignores=[]), filename, "exec")
+        for delivered, errors, warnings, started, expected in (
+            (1, ["source failed"], [], 20.0, "degraded"),
+            (0, ["source failed"], [], 20.0, "failed"),
+            (0, [], ["source warning"], 20.0, "degraded"),
+            (0, [], [], 20.0, "success"),
+            (0, [], [], None, "not-run"),
+        ):
+            ns = {
+                "os": os, "_time": SimpleNamespace(time=lambda: 30.0),
+                "_setup_start": 10.0, "_monitor_start": started,
+                "_attempted_accounts": 1 if started else 0, "_usable_accounts": 0,
+                "_errors": errors, "_warnings": warnings, "_execution_result": "success",
+                "_http_requests": 0, "_feeds_parsed": 0, "_successful_responses": 0,
+                "_skipped": 0, "_held": 0, "_reason_counters": {},
+                "_hosts_attempted": [], "_hosts_selected": [],
+                "SUBREDDITS": [], "ACCOUNTS": [], "pending": {},
+                current: {"old", *(["new"] if delivered else [])}, initial: {"old"},
+            }
+            exec(code, ns)
+            report = ns["report"]
+            assert report["posted"] == delivered, (filename, report)
+            assert report["execution_result"] == expected, (filename, report)
+
+
 def main():
-    tests = [test_redaction, test_redaction_keeps_both_catch_all_branches, test_render_minimal, test_render_missing_file, test_load_and_cli]
+    tests = [test_actual_engine_report_count_precedes_classification, test_redaction, test_redaction_keeps_both_catch_all_branches, test_render_minimal, test_render_missing_file, test_load_and_cli]
     failed = []
     for fn in tests:
         try:

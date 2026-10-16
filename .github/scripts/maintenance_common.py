@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Portable maintenance helpers shared across News-family proposal heads.
 
 This module is the News-local common-helper *candidate*. It is not approved
@@ -19,9 +18,10 @@ import re
 import tempfile
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 SCHEMA_VERSION = 1
 
@@ -831,8 +831,7 @@ def parse_notice(message: str, kind: str) -> dict[str, Any] | None:
     if not isinstance(message, str):
         return None
     text = message.strip()
-    if text.startswith("::notice::"):
-        text = text[len("::notice::"):]
+    text = text.removeprefix("::notice::")
     prefix = f"{kind} "
     if not text.startswith(prefix):
         return None
@@ -1038,8 +1037,8 @@ def parse_iso_date(value: str | None) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _read_release_date_cache(path: Path, now: datetime) -> dict[str, str] | None:
@@ -1071,7 +1070,7 @@ def fetch_release_dates(
     state is ``cache`` or ``ok`` when dates were obtained, and ``unavailable``
     when the authority could not be reached or returned nothing usable.
     """
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     cache_path = cache_path or _default_release_date_cache()
     cached = _read_release_date_cache(cache_path, now)
     if cached:
@@ -1085,7 +1084,7 @@ def fetch_release_dates(
         try:
             with request(url, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-        except Exception as exc:  # network, timeout, JSON or HTTP error
+        except Exception as exc:  # noqa: BLE001 - injected opener boundary must fail closed
             if not dates:
                 return {}, "unavailable", f"{type(exc).__name__}: {exc}"
             break
@@ -1138,9 +1137,8 @@ def apply_release_dates(
         version = str(item.get("version") or "").strip()
         trusted = str(item.get("release_date_source") or "") == RELEASE_DATE_SOURCE
         if not trusted:
-            if item.get("published_at") or item.get("release_date"):
-                if version:
-                    stripped.append(version)
+            if (item.get("published_at") or item.get("release_date")) and version:
+                stripped.append(version)
             item.pop("published_at", None)
             item.pop("release_date", None)
         authoritative = dates.get(version)

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Round 61 (2026-10-04): semantic cache merge for the monitor workflows.
 
 WHY THIS EXISTS — the 2026-10-03 double post (prod run #4014 vs cache
@@ -82,8 +81,7 @@ def _entry_ts(value) -> float:
                 ts = float(raw)
             except (TypeError, ValueError):
                 continue
-            if ts > best:
-                best = ts
+            best = max(best, ts)
     return best
 
 
@@ -168,6 +166,6 @@ def main(argv: list[str]) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv))
-    except Exception as exc:  # loud by design — never push a half-merge
+    except Exception as exc:  # noqa: BLE001 - CLI boundary must never push a half-merge
         print(f"SEMANTIC MERGE FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
         sys.exit(1)

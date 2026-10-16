@@ -1964,17 +1964,16 @@ async def main():
         _commit = "unavailable"  # commit is handled by workflow, not engine
         _push = "unavailable"
         # Determine execution_result based on whether we had errors
+        posted_count = len(posted_urls - posted_urls_at_start)
         if _errors:
-            _execution_result = "degraded" if max(0, posted_count if 'posted_count' in locals() else 0) > 0 else "failed"
-        elif _warnings and not _errors:
+            _execution_result = "degraded" if posted_count > 0 else "failed"
+        elif _warnings:
             _execution_result = "degraded"
         else:
             _execution_result = "success"
         # Distinguish zero activity from missing evidence: if no feeds attempted, it's not-run or zero
-        if _attempted_accounts == 0 and _execution_result == "success":
-            # Check if we actually ran monitor or early exited
-            if 'posted_count' not in locals():
-                _execution_result = "not-run"
+        if _monitor_start is None and _execution_result == "success":
+            _execution_result = "not-run"
         import sys as _sys3
         report_path = os.getenv("REPORT_PATH") or os.getenv("REPORT_JSON") or (os.getenv("RUNNER_TEMP", "/tmp") + "/twitter_report.json")
         code_sha = os.getenv("CODE_SHA") or os.getenv("GITHUB_SHA") or "unknown"
@@ -1985,10 +1984,6 @@ async def main():
             configured = len(ACCOUNTS)
         except Exception:
             configured = "unavailable"
-        try:
-            posted_count = len(posted_urls) - len(posted_urls_at_start) if 'posted_urls' in locals() and 'posted_urls_at_start' in locals() else 0
-        except Exception:
-            posted_count = 0
         _monitor_dur = (_persistence_start - _setup_start) if _setup_start else "unavailable"
         _setup_dur = (_monitor_start - _setup_start) if '_monitor_start' in locals() and _monitor_start else "unavailable"
         # Use measured counters where available, else unavailable (not zero)

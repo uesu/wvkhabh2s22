@@ -37,13 +37,13 @@
   "shared_files": [
     {
       "path": ".github/scripts/maintenance_common.py",
-      "sha256": "67e5b379c5de0a4a86fa78a3af4a8389a39155c88d6f08679eb963ffe2ae1d2a",
+      "sha256": "9e04a5150c407d75e62bfb83cdbab2b386e49f6b1ef4c42710da679d3b1593f3",
       "executable": false,
       "shared_with": ["uesu/News-Express", "uesu/Game-Express", "uesu/7jkxmy9nvbc"]
     },
     {
       "path": ".github/scripts/merge_monitor_caches.py",
-      "sha256": "0e53a8c1a450531003e4490ed6706055911e2c85eef883252808c87ca286491b",
+      "sha256": "7b116a7c6fcc720f900510bde42809950137f0dadd143d4a417e8c018761b6b3",
       "executable": false,
       "shared_with": ["uesu/News-Express"]
     }

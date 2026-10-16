@@ -5287,6 +5287,7 @@ async def main():
     use_oauth = bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET)
 
     async with aiohttp.ClientSession() as session:
+        _monitor_start = _time.time()
         # ---- round 13: proxy warm-up (writes proxy_health.json) ----------
         global _proxy_health
         if PROXY_MEDIA and reddit_proxy is not None:
@@ -5821,15 +5822,15 @@ async def main():
         _local_save = "success"
         _commit = "unavailable"
         _push = "unavailable"
+        posted_count = len(posted - posted_at_start)
         if _errors:
-            _execution_result = "degraded" if max(0, posted_count if 'posted_count' in locals() else 0) > 0 else "failed"
-        elif _warnings and not _errors:
+            _execution_result = "degraded" if posted_count > 0 else "failed"
+        elif _warnings:
             _execution_result = "degraded"
         else:
             _execution_result = "success"
-        if _attempted_accounts == 0 and _execution_result == "success":
-            if 'posted_count' not in locals():
-                _execution_result = "not-run"
+        if _monitor_start is None and _execution_result == "success":
+            _execution_result = "not-run"
         import sys as _sys3
         report_path = os.getenv("REPORT_PATH") or os.getenv("REPORT_JSON") or (os.getenv("RUNNER_TEMP", "/tmp") + "/reddit_report.json")
         code_sha = os.getenv("CODE_SHA") or os.getenv("GITHUB_SHA") or "unknown"
@@ -5844,10 +5845,6 @@ async def main():
             attempted = len(pending) if 'pending' in locals() else _attempted_accounts
         except Exception:
             attempted = _attempted_accounts
-        try:
-            posted_count = len(posted) - len(posted_at_start) if 'posted' in locals() and 'posted_at_start' in locals() else 0
-        except Exception:
-            posted_count = 0
         _monitor_dur = (_persistence_start - _setup_start) if '_setup_start' in locals() and _setup_start else "unavailable"
         _setup_dur = (_monitor_start - _setup_start) if '_monitor_start' in locals() and _monitor_start else "unavailable"
         report = {
