@@ -440,6 +440,33 @@ def test_clean_install_targets_venv_with_frozen_flags():
         fixture.cleanup()
 
 
+def test_lock_evidence_notice_published_only_in_ci():
+    """Auditable evidence must survive a green run, without changing any outcome."""
+    ci = load_ci()
+    fixture = Fixture()
+    try:
+        code, out, _ = run_registry(ci, fixture, env={"GITHUB_ACTIONS": "true"})
+        assert code == 0, f"evidence publication must not fail the gate, got {code}"
+        notices = [line for line in out.splitlines() if line.startswith("::notice::")]
+        assert len(notices) == 2, f"one bounded notice per lock graph, got {notices}"
+        joined = "\n".join(notices)
+        assert "byte-stable" in joined and "idempotent" in joined, joined
+        assert "clean-venv" in joined, joined
+        assert "typing-extensions markers" in joined, joined
+        assert all(len(line) <= 1600 for line in notices), "notice must stay bounded"
+        assert "%" not in joined.replace("%25", ""), "notice must escape percent for annotations"
+    finally:
+        fixture.cleanup()
+
+    fixture_local = Fixture()
+    try:
+        code, out, _ = run_registry(ci, fixture_local, env={})
+        assert code == 0, f"local run must still pass, got {code}"
+        assert "::notice::" not in out, "notices are a CI-only channel"
+    finally:
+        fixture_local.cleanup()
+
+
 def test_non_idempotent_regeneration_blocks():
     """A lock that only reproduces once is not frozen (master spec item 1)."""
     ci = load_ci()
@@ -642,6 +669,7 @@ def main() -> None:
         test_wrong_pip_tools_version_blocks,
         test_hash_verified_install_failure_blocks,
         test_lock_without_hashes_blocks,
+        test_lock_evidence_notice_published_only_in_ci,
         test_clean_install_targets_venv_with_frozen_flags,
         test_non_idempotent_regeneration_blocks,
         test_clean_environment_install_failure_blocks,

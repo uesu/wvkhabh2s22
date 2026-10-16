@@ -219,6 +219,39 @@ def _difference_summary(committed: list[str], regenerated: list[str], limit: int
     return " | ".join(parts)
 
 
+def _notice(text: str) -> None:
+    """Publish bounded, sanitized evidence as a notice annotation when running in CI.
+
+    Job step summaries are not retrievable through the API, so evidence that must be
+    auditable after a green run is emitted as a notice annotation instead. This is
+    read-only, credential-free and bounded; it never changes a check outcome.
+    """
+    if not in_ci():
+        return
+    safe = text.replace("%", "%25").replace("\r", " ").replace("\n", " ")[:1500]
+    print(f"::notice::{safe}")
+
+
+def _marker_evidence(packages: tuple[str, ...], needle: str) -> str:
+    """Report the real Requires-Dist markers of installed distributions.
+
+    Used to explain why a package is or is not part of the graph under the pinned
+    interpreter, from metadata rather than from assumption.
+    """
+    from importlib.metadata import PackageNotFoundError, requires
+
+    parts = []
+    for package in packages:
+        try:
+            entries = requires(package) or []
+        except PackageNotFoundError:
+            parts.append(f"{package}=not installed")
+            continue
+        hits = [entry for entry in entries if needle in entry.lower()]
+        parts.append(f"{package}={hits[0] if hits else 'no ' + needle + ' requirement'}")
+    return "; ".join(parts)
+
+
 def _verify_clean_install(label: str, target: Path, gate: Gate, name: str) -> None:
     """Install one frozen graph into a fresh virtual environment with the pinned pip.
 
@@ -384,6 +417,14 @@ def _verify_lock_graph(label: str, src_name: str, gate: Gate, name: str) -> None
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     _verify_clean_install(label, target, gate, name)
+    if not gate.failures and not gate.not_validated:
+        _notice(
+            f"lock-consistency {label}: Python {running_python()} (pin {pinned_python()}) / "
+            f"pip {PINNED_PIP} / pip-tools {PINNED_PIP_TOOLS}; byte-stable, idempotent across two "
+            f"seeded regenerations, dry run and clean-venv hash-verified wheels-only install OK; "
+            f"typing-extensions markers: "
+            f"{_marker_evidence(('aiohttp', 'aiosignal', 'multidict', 'propcache', 'yarl'), 'typing')}"
+        )
 
 
 def check_lock_consistency(gate: Gate, name: str) -> None:
