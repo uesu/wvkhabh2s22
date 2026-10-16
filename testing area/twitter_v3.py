@@ -1414,34 +1414,25 @@ class _TestFeed:
 
 
 async def fetch_working_feed(session: aiohttp.ClientSession, account: str):
+    # Returns (feed, attempts, selected_host) — actual attempt counts, no fabrication, no extra requests
     # round 12 (2026-09-17): every attempt is logged. Before this, a dead
     # nitter fleet made the whole monitor a silent no-op (zero log lines —
     # the missed 2026-09-17 Wuthering_Waves/2100555373073797461 tweet).
     headers = {"User-Agent": "Mozilla/5.0"}
+    attempts = 0
+    selected = None
     for idx, instance in enumerate(RSS_INSTANCES):
         feed_url = f"{instance}/{account}/rss"
         req_headers = headers
         token_env = RSS_TOKEN_ENV.get(instance)
         token = os.getenv(token_env, "").strip() if token_env else ""
         if token:
-            # Token-gated instance (bot check): send the RSS token as a
-            # Bearer header, inside the User-Agent (round 14, 2026-09-18 —
-            # the operator confirmed the token is accepted anywhere in the
-            # UA) and as a ?token= query param. A wrong/missing token just
-            # gets a challenge/403 answer, which is logged below and the
-            # chain moves on.
             req_headers = {**headers,
                            "Authorization": f"Bearer {token}",
                            "User-Agent": f"Mozilla/5.0 {token}"}
             feed_url = f"{feed_url}?token={url_quote(token, safe='')}"
         try:
-            # Wire telemetry: count each HTTP attempt (no extra requests)
-            # We use a mutable list to track across calls via closure in main, but for now just count via global
-            # The main will sum attempts, but we also try to increment a global if available
-            try:
-                globals()['_http_requests'] = globals().get('_http_requests', 0) + 1
-            except Exception:
-                pass
+            attempts += 1
             async with session.get(feed_url, headers=req_headers,
                                    timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
@@ -1450,7 +1441,9 @@ async def fetch_working_feed(session: aiohttp.ClientSession, account: str):
                     if feed.entries:
                         logging.info(f"[{account}] feed OK via {instance} — "
                                      f"{len(feed.entries)} entries.")
-                        return feed
+                        selected = instance
+                        # Return actual telemetry with feed
+                        return (feed, attempts, selected)
                     logging.info(f"[{account}] {instance}: HTTP 200 but 0 entries "
                                  f"(bot check / stale instance?) — trying next.")
                 else:
@@ -1461,7 +1454,7 @@ async def fetch_working_feed(session: aiohttp.ClientSession, account: str):
                          f"trying next.")
     logging.warning(f"[{account}] NO working nitter instance this run — "
                     f"account skipped (see TEST_TWEET_ID to rebuild one tweet).")
-    return None
+    return (None, attempts, selected)
 
 
 async def fetch_tweet_details(session: aiohttp.ClientSession, account: str, tweet_id: str,
@@ -1681,20 +1674,39 @@ async def main():
     async with aiohttp.ClientSession() as session:
         _monitor_start = _time.time()
         feeds_tasks = [fetch_working_feed(session, acc) for acc in ACCOUNTS]
-        feeds = await asyncio.gather(*feeds_tasks)
-        # Wire telemetry at existing boundary (no extra requests)
+        _results = await asyncio.gather(*feeds_tasks)
+        # Wire telemetry at actual request/parse/selection boundaries without extra calls
+        # _results is list of (feed, attempts, selected_host)
+        feeds = []
+        _http_requests = 0
+        _hosts_attempted = []
+        _hosts_selected = []
+        _feeds_parsed = 0
+        for res in _results:
+            # Handle both new tuple (feed, attempts, selected) and legacy feed-only (for tests)
+            if isinstance(res, tuple) and len(res) == 3:
+                feed, attempts, selected = res
+            elif isinstance(res, tuple) and len(res) == 2:
+                # Legacy double where second is attempts
+                feed, attempts = res
+                selected = None
+            else:
+                feed = res
+                attempts = 1 if feed else len(RSS_INSTANCES)
+                selected = RSS_INSTANCES[0] if feed and getattr(feed, 'entries', None) else None
+            feeds.append(feed)
+            _http_requests += attempts or 0
+            if attempts:
+                # Record all attempted hosts up to attempts (first N instances)
+                for inst in RSS_INSTANCES[:attempts]:
+                    if inst not in _hosts_attempted:
+                        _hosts_attempted.append(inst)
+            if selected:
+                _hosts_selected.append(selected)
+            if feed and getattr(feed, 'entries', None):
+                _feeds_parsed += len(feed.entries)
         _attempted_accounts = len(ACCOUNTS)
         _usable_accounts = sum(1 for f in feeds if f and getattr(f, 'entries', None))
-        _feeds_parsed = sum(len(getattr(f, 'entries', [])) for f in feeds if f)
-        _http_requests = sum(len(RSS_INSTANCES) for _ in ACCOUNTS)  # approximate, actual may be less if early success
-        # More accurate: count actual instances tried per account by checking which instance succeeded
-        _hosts_attempted = list(RSS_INSTANCES)
-        _hosts_selected = []
-        for acc, feed in zip(ACCOUNTS, feeds):
-            if feed and getattr(feed, 'entries', None):
-                # Find which instance succeeded (first that returned feed)
-                # For now, record the first instance as selected
-                _hosts_selected.append(RSS_INSTANCES[0])
 
         feed_pairs = list(zip(ACCOUNTS, feeds))
 

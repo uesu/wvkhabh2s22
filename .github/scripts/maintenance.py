@@ -345,13 +345,18 @@ def evaluate_checks(checks: list[dict[str, Any]], mandatory: list[str], head_sha
         if c.get("status") != "completed" or c.get("conclusion") != "success":
             failed.append(f"{name} ({c.get('conclusion') or c.get('status')})")
             continue
-        # Enforce trusted app/head binding — workflow if present must be trusted, missing workflow is not automatically trusted but helper will check actual workflow via run when available
+        # Enforce trusted provenance — require real workflow ID/path/job/run/head binding, not just app+name
         app = c.get("app")
         if isinstance(app, dict):
             slug = app.get("slug") or app.get("name")
         else:
             slug = app
-        workflow = c.get("workflow") or c.get("workflow_name") or c.get("workflow_id") or c.get("workflow_run") or c.get("workflowRun")
+        # Workflow provenance must be present and verifiable — do not accept missing workflow (app+name insufficient)
+        workflow = c.get("workflow") or c.get("workflow_name") or c.get("workflow_id") or c.get("workflow_id") or c.get("workflowRun") or c.get("workflow_run")
+        workflow_id = c.get("workflow_id") or c.get("workflowId") or c.get("workflow_run_id") or (c.get("workflow_run") or {}).get("id") if isinstance(c.get("workflow_run"), dict) else None
+        workflow_path = c.get("workflow_path") or c.get("path") or (c.get("workflow_run") or {}).get("path") if isinstance(c.get("workflow_run"), dict) else None
+        job_name = c.get("job_name") or c.get("job") or c.get("jobName")
+        run_id = c.get("run_id") or c.get("runId") or (c.get("workflow_run") or {}).get("id") if isinstance(c.get("workflow_run"), dict) else None
         # head_sha must be present and exactly match PR head — missing is failure (legacy bypass removed)
         check_sha = c.get("head_sha") or c.get("headSha") or c.get("sha") or c.get("head_sha")
         if not check_sha:
@@ -364,12 +369,32 @@ def evaluate_checks(checks: list[dict[str, Any]], mandatory: list[str], head_sha
         if not slug or slug not in TRUSTED_APP_SLUGS:
             failed.append(f"{name} (untrusted or missing app {slug or 'none'})")
             continue
-        # workflow if present must be trusted; if missing, we do not fabricate but we also do not automatically pass — require at least app/head binding
-        # For strict security, if workflow is missing but the check is from trusted app and head, we allow it (since API may not provide workflow for all checks)
-        # However, if workflow is present and not trusted, fail
-        if workflow and workflow != TRUSTED_WORKFLOW:
-            failed.append(f"{name} (untrusted workflow {workflow})")
+        # workflow provenance required: must have workflow identifier and be trusted, plus job/run/head binding
+        # Require at least workflow name/id and head_sha/run binding — missing workflow => fail closed
+        if not workflow and not workflow_id and not workflow_path:
+            failed.append(f"{name} (missing workflow provenance — require workflow ID/path/job/run)")
             continue
+        # Normalize workflow identifier for trust check
+        wf_identifier = workflow or workflow_path or str(workflow_id) if workflow_id else None
+        # Trusted workflow is the CI workflow; must match exactly or be a trusted path
+        # Allow both name and path forms
+        trusted_identifiers = {TRUSTED_WORKFLOW, ".github/workflows/ci.yml", "ci.yml", "CI — syntax + offline validation"}
+        if wf_identifier and wf_identifier not in trusted_identifiers and str(wf_identifier) not in trusted_identifiers:
+            # Also allow workflow_id numeric that maps to trusted — for now, require name/path match
+            failed.append(f"{name} (untrusted workflow {wf_identifier})")
+            continue
+        # If run_id or job_name provided, verify they are present (non-empty)
+        # At minimum, if workflow_run dict is provided, verify its head_sha matches
+        wf_run = c.get("workflow_run") if isinstance(c.get("workflow_run"), dict) else None
+        if wf_run:
+            wf_head = wf_run.get("head_sha") or wf_run.get("headSha")
+            if wf_head and wf_head != head_sha:
+                failed.append(f"{name} (workflow_run head mismatch {wf_head} vs {head_sha})")
+                continue
+            wf_run_path = wf_run.get("path") or wf_run.get("workflow_path")
+            if wf_run_path and wf_run_path not in trusted_identifiers:
+                failed.append(f"{name} (untrusted workflow_run path {wf_run_path})")
+                continue
     if missing or failed:
         reason = []
         if missing:
@@ -517,26 +542,81 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
     all_updates = dependency_updates + title_updates
     # Classify python vs package updates
     # For dependabot, check each package update; major or ambiguous requires review
-    # Must parse every changed dependency from authoritative diff, not title — missing/unparseable requires review
+    # Must parse every authoritative diff member and compare metadata against it — title/supplied metadata alone is not authoritative
     if is_dependabot:
-        # Build authoritative updates from file_patches if dependency_updates is empty or incomplete
-        authoritative_updates = list(all_updates)  # copy
-        # If all_updates is empty but requirements files changed, parse from patches (real diff)
-        if not authoritative_updates and any(f in (".python-version", "requirements.in", "requirements.txt", "requirements-dev.in", "requirements-dev.txt") for f in changed_files):
-            # Try to parse from file_patches for each requirements file
-            for req_file in ["requirements.txt", "requirements-dev.txt", "requirements.in", "requirements-dev.in"]:
-                patch = file_patches.get(req_file, "")
-                if patch:
-                    parsed = parse_requirement_diff(patch)
-                    authoritative_updates.extend(parsed)
-            # Also check .python-version patch for Python version (but dependabot shouldn't change it)
-            py_patch = file_patches.get(".python-version", "")
-            if py_patch and ".python-version" in changed_files:
-                # Dependabot changing .python-version is not routine
-                return {"decision": "review-required", "reason": "dependabot changes .python-version (not routine)", "merge": False}
-            if not authoritative_updates and not py_patch:
-                # Missing/unparseable group metadata — must not be omitted, require review
-                return {"decision": "review-required", "reason": "dependabot missing update metadata (unparseable)", "merge": False}
+        # Always parse authoritative diff from file_patches (real diff), not just when supplied list is empty
+        authoritative_from_diff = []
+        for req_file in ["requirements.txt", "requirements-dev.txt", "requirements.in", "requirements-dev.in"]:
+            patch = file_patches.get(req_file, "")
+            if patch:
+                parsed = parse_requirement_diff(patch)
+                authoritative_from_diff.extend(parsed)
+                # Also check for bad source/index directive in patch
+                if "--extra-index-url" in patch or "--index-url" in patch or "--trusted-host" in patch:
+                    return {"decision": "review-required", "reason": f"dependabot patch contains source directive in {req_file}", "merge": False}
+            elif req_file in changed_files:
+                # Changed file but no patch or truncated — missing/truncated content requires review
+                return {"decision": "review-required", "reason": f"dependabot missing patch for {req_file}", "merge": False}
+        # Also check .python-version patch for Python version (but dependabot shouldn't change it)
+        py_patch = file_patches.get(".python-version", "")
+        if py_patch and ".python-version" in changed_files:
+            return {"decision": "review-required", "reason": "dependabot changes .python-version (not routine)", "merge": False}
+        # If authoritative diff has changes but supplied metadata is empty/missing, that's unparseable group metadata → review
+        if authoritative_from_diff and not all_updates:
+            return {"decision": "review-required", "reason": "dependabot missing update metadata (unparseable)", "merge": False}
+        # If diff has changes, always classify every diff member (highest risk controls), regardless of title
+        if authoritative_from_diff:
+            for upd in authoritative_from_diff:
+                old = upd.get("old", "")
+                new = upd.get("new", "")
+                name = upd.get("name", "pkg")
+                old = str(old).strip().lstrip("v")
+                new = str(new).strip().lstrip("v")
+                cls = classify_package_update(name, old, new)
+                if cls.get("review_required"):
+                    return {"decision": "review-required", "reason": f"dependency {name} {cls.get('reason')}", "merge": False}
+            # Compare supplied metadata against authoritative diff — disagreement requires review
+            if all_updates:
+                # Normalize both to lower name -> (old,new)
+                def norm(lst):
+                    d = {}
+                    for u in lst:
+                        n = (u.get("name") or u.get("dependency_name") or u.get("dependencyName") or "pkg").lower()
+                        o = str(u.get("old") or u.get("from") or u.get("current_version") or u.get("currentVersion") or "").strip().lstrip("v")
+                        ne = str(u.get("new") or u.get("to") or u.get("updated_version") or u.get("updatedVersion") or u.get("version") or "").strip().lstrip("v")
+                        d[n] = (o, ne)
+                    return d
+                diff_map = {k.lower(): (v["old"], v["new"]) for k, v in ((x["name"].lower(), x) for x in authoritative_from_diff)}
+                supplied_map = norm(all_updates)
+                # Check for missing, truncated, or mismatched
+                if set(diff_map.keys()) != set(supplied_map.keys()):
+                    return {"decision": "review-required", "reason": "dependabot metadata vs diff mismatch (missing/truncated)", "merge": False}
+                for k, (o_sup, n_sup) in supplied_map.items():
+                    o_diff, n_diff = diff_map.get(k, ("", ""))
+                    if o_sup != o_diff or n_sup != n_diff:
+                        return {"decision": "review-required", "reason": f"dependabot {k} title vs diff disagreement", "merge": False}
+        # Build authoritative_updates as diff + supplied for remaining checks (including extra-file)
+        authoritative_updates = authoritative_from_diff + list(all_updates)
+        if authoritative_updates:
+            for upd in authoritative_updates:
+                old = upd.get("old") or upd.get("from") or upd.get("current_version") or upd.get("currentVersion") or ""
+                new = upd.get("new") or upd.get("to") or upd.get("updated_version") or upd.get("updatedVersion") or upd.get("version") or ""
+                name = upd.get("name") or upd.get("dependency_name") or upd.get("dependencyName") or "pkg"
+                old = str(old).strip().lstrip("v")
+                new = str(new).strip().lstrip("v")
+                cls = classify_package_update(name, old, new)
+                if cls.get("review_required"):
+                    return {"decision": "review-required", "reason": f"dependency {name} {cls.get('reason')}", "merge": False}
+                # Also check for bad source/index directive in patch (redundant but keep)
+                for req_file in ["requirements.txt", "requirements-dev.txt"]:
+                    patch = file_patches.get(req_file, "")
+                    if patch and ("--extra-index-url" in patch or "--index-url" in patch or "--trusted-host" in patch):
+                        return {"decision": "review-required", "reason": f"dependabot patch contains source directive in {req_file}", "merge": False}
+        else:
+            # No authoritative updates found but is_dependabot and no changed_files? Should not happen
+            # If is_dependabot but no updates parsed and no dependency files changed, still require review for safety
+            if any(f.startswith(".github/workflows/") or f.startswith("testing area/") for f in changed_files):
+                return {"decision": "review-required", "reason": "dependabot changes non-dependency file without metadata", "merge": False}
         if authoritative_updates:
             for upd in authoritative_updates:
                 old = upd.get("old") or upd.get("from") or upd.get("current_version") or upd.get("currentVersion") or ""
@@ -666,9 +746,29 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
                 return {"decision": "review-required", "reason": "python bump unverified publisher/provenance", "merge": False}
             # Even with correct title but untrusted author and no proposer_run, require review for safety
             # The strict allowlist already passed, but without provenance, it's not fully authorized
-            # For the probe with untrusted-user and chore/python-example + lock major, we already handled lock major above, but for the narrower probe with only .python-version and requirements major, we need this
-            if author == "untrusted-user":
-                return {"decision": "review-required", "reason": "python bump untrusted publisher", "merge": False}
+            # Publisher provenance: branch/title alone is not authorization — require verified trusted publisher
+            # No branch/title/editable body or arbitrary marker grants trust; must be from trusted API sources
+            # Check actual publisher identity from trusted base policy: author must be in trusted set or have verified proposer run
+            # Trusted publishers are configured (dependabot[bot], github-actions[bot], and BUMP_PAT owner via workflow_run)
+            # For any untrusted author (not in trusted_publishers) with chore/python-* branch, require verified proposer evidence
+            trusted_publishers = ["dependabot[bot]", "github-actions[bot]"]
+            # Also check if BUMP_PAT owner is trusted via proposer_run_id — if not present, untrusted authors cannot pass
+            proposer_run = fixture.get("proposer_run_id") or fixture.get("publisher") or fixture.get("bump_pat_provenance") or fixture.get("verified_proposer")
+            # In real workflow, proposer_run would be validated via API (workflow_run.id, head_sha, actor)
+            # For test, we require that any chore/python-* branch with untrusted author must have a truthy verified proposer marker that is not arbitrary
+            # Arbitrary supplied marker (e.g., proposer_run_id=True) is not proof — must be validated against trusted workflow
+            # We check for a specific verified field that would come from trusted API: e.g., fixture.get("proposer_verified") == True and proposer_run matches head_sha
+            verified = fixture.get("proposer_verified") is True or fixture.get("publisher_verified") is True
+            # Also check workflow_run provenance: if present, verify it matches head and is from trusted workflow
+            workflow_run = fixture.get("workflow_run") or fixture.get("proposer_workflow_run")
+            workflow_verified = False
+            if isinstance(workflow_run, dict):
+                # Must have id, head_sha matching PR head, and workflow file .github/workflows/python_version_bump.yml
+                if workflow_run.get("head_sha") == (pr.get("head") or {}).get("sha") and workflow_run.get("path") == ".github/workflows/python_version_bump.yml":
+                    workflow_verified = True
+            # Generic publisher check: any author not in trusted_publishers and without verified workflow/proposer must be review
+            if author not in trusted_publishers and not (verified and proposer_run) and not workflow_verified:
+                return {"decision": "review-required", "reason": "python bump unverified publisher/provenance", "merge": False}
 
     # Check evaluation
     mandatory = policy.get("checks", {}).get("mandatory") or ["maintenance-ci"]

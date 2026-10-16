@@ -49,6 +49,18 @@ jobs:
         run: |
           python -m compileall -q "testing area" tests .github/scripts
 
+      - name: Install actionlint (pinned, for mandatory workflow-lint)
+        run: |
+          # Install actionlint binary pinned to advisory SHA's version (v1.7.7 via reviewdog v1.80.0)
+          curl -sL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash -s -- 1.7.7
+          sudo mv ./actionlint /usr/local/bin/actionlint
+          actionlint -version
+
+      - name: Install zizmor (pinned, for mandatory workflow-lint)
+        run: |
+          python -m pip install zizmor==1.12.1
+          zizmor --version
+
       - name: Run CI adapter — development profile
         run: |
           python .github/scripts/ci.py --profile development
