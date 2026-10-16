@@ -2281,6 +2281,11 @@ def test_adapter_never_parses_external_id_or_trusts_a_foreign_link():
     assert provenance is None and "no canonical Actions job link" in problem, problem
 
 
+def _raising_opener(*args, **kwargs):
+    """Stand-in for an unreachable release-date authority."""
+    raise OSError("authority unreachable")
+
+
 def test_proposer_cli_soaks_against_the_release_date_authority():
     """The real proposer entry point must not derive soak age from a mirror timestamp.
 
@@ -2325,17 +2330,38 @@ def test_proposer_cli_soaks_against_the_release_date_authority():
         assert "Deferred:" in combined and "soak" in combined, combined
         assert "bump=no" in output.read_text(encoding="utf-8"), output.read_text(encoding="utf-8")
 
-        # 2. Authority unreachable -> defer rather than fall back to the manifest's own timestamp.
-        missing = work / "no-such-cache.json"
-        env["RELEASE_DATE_CACHE"] = str(missing)
+        # 2. The authority knows nothing about this version -> still defer. Seeded through the
+        # cache so the case is deterministic and offline: whether the live authority is reachable
+        # must not change the outcome, because the invariant is that a mirror timestamp can never
+        # produce a proposal.
+        output.write_text("", encoding="utf-8")
+        cache.write_text(json.dumps({"fetched_at": datetime.now(timezone.utc).isoformat(),
+                                     "dates": {"3.14.8": "2025-12-01"}}), encoding="utf-8")
+        env["RELEASE_DATE_CACHE"] = str(cache)
         result = subprocess.run(cmd, cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=300)
         combined = result.stdout + result.stderr
         assert result.returncode == 0, combined
         assert "Traceback" not in combined, combined
-        assert "release-date-authority-unavailable" in combined, combined
+        assert "Deferred:" in combined, combined
+        assert "release-date-unavailable" in combined or "soak" in combined, combined
         assert "bump=no" in output.read_text(encoding="utf-8")
+        assert "Candidate: 3.15.0" not in combined, combined
 
-        # 3. The untrusted GitHub-releases enrichment that used to define soak age is gone. The
+        # 3. An authority that cannot be reached reports itself unavailable rather than empty, so
+        # the selector defers on release-date-authority-unavailable instead of guessing an age.
+        dates, state, detail = maintenance.common.fetch_release_dates(
+            opener=_raising_opener, cache_path=work / "never-written.json")
+        assert_eq(dates, {})
+        assert_eq(state, "unavailable")
+        assert detail, "the failure must be reported, not swallowed"
+        assert not (work / "never-written.json").exists(), "an unavailable authority must not be cached"
+        unreachable = maintenance.select_candidate(
+            "3.14.8", json.loads(manifest.read_text(encoding="utf-8")), soak_days=30,
+            release_dates=dates, release_date_state=state)
+        assert unreachable["deferred"] is True, unreachable
+        assert_eq(unreachable["reason"], "deferred: release-date-authority-unavailable")
+
+        # 4. The untrusted GitHub-releases enrichment that used to define soak age is gone. The
         # comment explaining why may mention it; the request it made may not.
         adapter = (ROOT / ".github" / "scripts" / "python_version_bump.py").read_text(encoding="utf-8")
         assert "releases/tags/v" not in adapter, "mirror enrichment call must stay removed"
