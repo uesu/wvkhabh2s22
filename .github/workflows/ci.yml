@@ -74,24 +74,47 @@ jobs:
           python -m pip install zizmor==1.12.1
           zizmor --version
 
-      - name: Run CI adapter — development profile
+      - name: Run CI adapter — both mandatory profiles
         run: |
           set +e
-          # tee, not redirection: the registry publishes its own annotations as workflow
-          # commands on stdout, which the runner only sees when stdout is not captured.
-          # -u keeps stdout unbuffered so merged output stays in real order.
-          python -u .github/scripts/ci.py --profile development 2>&1 | tee /tmp/ci-adapter.log
-          rc=${PIPESTATUS[0]}
-          if [ "$rc" -ne 0 ] && ! grep -q "^::error::" /tmp/ci-adapter.log; then
-            # Fallback only for a crash before the registry could report: never grep the log
-            # for ERROR strings, because the registered suites emit those as fixtures.
-            tail -c 2400 /tmp/ci-adapter.log | tr '\n' '~' | sed 's/%/%25/g' > /tmp/ci-tail.txt
+          # Both profiles run the same mandatory registry; each is executed here so the
+          # production profile is demonstrated in the pinned environment too, not assumed
+          # from the development result. tee, not redirection: the registry publishes its
+          # own annotations as workflow commands on stdout, which the runner only sees when
+          # stdout is not captured. -u keeps stdout unbuffered so merged output stays in order.
+          failed=0
+          unvalidated=0
+          for profile in development production; do
+            echo "::group::CI adapter — ${profile} profile"
+            python -u .github/scripts/ci.py --profile "${profile}" 2>&1 | tee "/tmp/ci-adapter-${profile}.log"
+            rc=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            if [ "${rc}" -eq 1 ]; then
+              failed=1
+            elif [ "${rc}" -eq 2 ]; then
+              unvalidated=1
+            elif [ "${rc}" -ne 0 ]; then
+              failed=1
+            fi
+          done
+          if [ "${failed}" -eq 1 ]; then
+            outcome=1
+          elif [ "${unvalidated}" -eq 1 ]; then
+            outcome=2
+          else
+            outcome=0
+          fi
+          if [ "${outcome}" -ne 0 ] && \
+             ! grep -qh "^::error::" /tmp/ci-adapter-development.log /tmp/ci-adapter-production.log; then
+            # Fallback only for a crash before the registry could report: never grep the logs for
+            # ERROR strings, because the registered suites emit those as fixtures.
+            tail -c 2400 /tmp/ci-adapter-production.log | tr '\n' '~' | sed 's/%/%25/g' > /tmp/ci-tail.txt
             split -b 800 /tmp/ci-tail.txt /tmp/ci-chunk-
             for _f in /tmp/ci-chunk-*; do
-              echo "::error::ci-adapter crashed without reporting (rc=$rc): $(cat "$_f")"
+              echo "::error::ci-adapter crashed without reporting (rc=${outcome}): $(cat "$_f")"
             done
           fi
-          exit "$rc"
+          exit "${outcome}"
 
       - name: Debug lock on failure
         if: failure()
@@ -146,7 +169,7 @@ jobs:
             echo "Adapter failure lines (bounded):"
             echo ""
             echo '```'
-            grep -E "^(FAIL|NOT VALIDATED)" /tmp/ci-adapter.log 2>/dev/null | head -n 20
+            grep -hE "^(FAIL|NOT VALIDATED)" /tmp/ci-adapter-development.log /tmp/ci-adapter-production.log 2>/dev/null | head -n 20
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
