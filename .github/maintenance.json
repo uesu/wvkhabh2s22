@@ -11,6 +11,11 @@
     "policy_file": ".github/maintenance.json",
     "commit_identity": "github-actions[bot]"
   },
+  "security_evidence": {
+    "mode": "disabled",
+    "required": [],
+    "reason": "Deliberate declaration, not an omission: Dependabot security alerts are disabled for this repository and it configures no code-scanning workflow, so there is no scan evidence to collect. Dependency updates still run through .github/dependabot.yml under the review-required update policy. If code-scanning or secret-scanning is ever enabled, set mode to required and list the kinds; deleting this block is treated as unconfigured and blocks the merge rather than passing it."
+  },
   "checks": {
     "mandatory": [
       "maintenance-ci"

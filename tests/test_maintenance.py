@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -100,25 +101,72 @@ def test_select_candidate():
         {"version": "3.14.9", "stable": True, "published_at": "2026-10-01T00:00:00Z", "files": [{"platform":"linux","arch":"x64"}], "release_url": "https://example.com/3.14.9"},
         {"version": "3.15.0", "stable": True, "published_at": "2026-10-10T00:00:00Z", "files": [{"platform":"linux","arch":"x64"}], "release_url": "https://example.com/3.15.0"},
     ]
-    # current 3.14.8 -> should pick patch 3.14.9 (newest patch)
+    # current 3.14.8 -> should pick patch 3.14.9 (newest patch). A patch never soaks, so it does
+    # not depend on the release-date authority.
     r = maintenance.select_candidate("3.14.8", manifest, soak_days=30, now_ts=now, ignore_soak=False)
     assert_eq(r["candidate"], "3.14.9")
     assert_eq(r["kind"], "patch")
-    # if no patch, should pick minor after soak
+    # if no patch, should pick minor after soak — soaked against the python.org date
     manifest2 = [
         {"version": "3.14.8", "stable": True, "published_at": "2026-09-01T00:00:00Z", "files": [{"platform":"linux","arch":"x64"}], "release_url": ""},
         {"version": "3.15.0", "stable": True, "published_at": "2026-10-10T00:00:00Z", "files": [{"platform":"linux","arch":"x64"}], "release_url": ""},
     ]
-    # now is 2026-10-15 (5 days after 3.15.0) -> should defer
+    dates = {"3.15.0": "2026-10-10"}
+    # now is 2026-10-12 (2 days after the authoritative 3.15.0 release) -> should defer
     now_soon = int(time.mktime(time.strptime("2026-10-12T00:00:00", "%Y-%m-%dT%H:%M:%S")))
-    r = maintenance.select_candidate("3.14.8", manifest2, soak_days=30, now_ts=now_soon)
+    r = maintenance.select_candidate("3.14.8", manifest2, soak_days=30, now_ts=now_soon,
+                                     release_dates=dates, release_date_state="ok")
     assert r.get("deferred") is True
+    assert "soak" in r["reason"], r["reason"]
     # after soak, should return candidate
     now_late = int(time.mktime(time.strptime("2026-11-20T00:00:00", "%Y-%m-%dT%H:%M:%S")))
-    r = maintenance.select_candidate("3.14.8", manifest2, soak_days=30, now_ts=now_late)
+    r = maintenance.select_candidate("3.14.8", manifest2, soak_days=30, now_ts=now_late,
+                                     release_dates=dates, release_date_state="ok")
     assert_eq(r["candidate"], "3.15.0")
     assert_eq(r["kind"], "minor")
     assert r.get("deferred") is False
+
+
+def test_soak_age_comes_from_python_org_not_from_the_setup_python_manifest():
+    """A setup-python timestamp is a mirror artefact and must never define soak age.
+
+    These are the three ways the manifest's own ``published_at`` used to satisfy the soak window:
+    the authority was never consulted, the authority does not know the version, or the archive was
+    rebuilt long after the release so its timestamp claims an age the release does not have.
+    """
+    now_late = int(time.mktime(time.strptime("2026-11-20T00:00:00", "%Y-%m-%dT%H:%M:%S")))
+    # published_at claims the release is over a year old; python.org says it is two days old.
+    rebuilt = [
+        {"version": "3.14.8", "stable": True, "files": [{"platform": "linux", "arch": "x64"}]},
+        {"version": "3.15.0", "stable": True, "published_at": "2025-01-01T00:00:00Z",
+         "files": [{"platform": "linux", "arch": "x64"}], "release_url": "u"},
+    ]
+    r = maintenance.select_candidate("3.14.8", rebuilt, soak_days=30, now_ts=now_late,
+                                     release_dates={"3.15.0": "2026-11-18"}, release_date_state="ok")
+    assert r.get("deferred") is True, r
+    assert "soak" in r["reason"], r["reason"]
+    assert "3.15.0" in r["release_dates"]["stripped_untrusted_dates"], r["release_dates"]
+
+    # Authority never reached: an old-looking manifest timestamp cannot be read as "soaked".
+    for state in ("", "unavailable"):
+        r = maintenance.select_candidate("3.14.8", rebuilt, soak_days=30, now_ts=now_late,
+                                         release_dates={}, release_date_state=state)
+        assert r.get("deferred") is True, (state, r)
+        assert_eq(r["reason"], "deferred: release-date-authority-unavailable")
+
+    # Authority reached but silent about this version: unknown stays dateless and defers.
+    r = maintenance.select_candidate("3.14.8", rebuilt, soak_days=30, now_ts=now_late,
+                                     release_dates={"3.14.8": "2025-01-01"}, release_date_state="ok")
+    assert r.get("deferred") is True, r
+    assert_eq(r["reason"], "deferred: release-date-unavailable")
+    assert "3.15.0" in r["release_dates"]["unknown"], r["release_dates"]
+
+    # A cached authority reading is still authoritative.
+    r = maintenance.select_candidate("3.14.8", rebuilt, soak_days=30, now_ts=now_late,
+                                     release_dates={"3.15.0": "2026-01-05"}, release_date_state="cache")
+    assert r.get("deferred") is False, r
+    assert_eq(r["candidate"], "3.15.0")
+
 
 # ---------------------------------------------------------------------------
 # Fixtures shaped exactly like the live REST responses. The Checks API returns no
@@ -127,6 +175,15 @@ def test_select_candidate():
 # ---------------------------------------------------------------------------
 
 REPO = "uesu/wvkhabh2s22"
+
+
+def repo_side(full_name=REPO):
+    """The repo association a real GET /pulls/{n} payload carries on both base and head.
+
+    Branch name and base ref alone are not provenance, so fixtures that omit this are modelling
+    a payload the API never returns.
+    """
+    return {"id": 1, "name": full_name.split("/")[-1], "full_name": full_name, "private": False}
 HEAD = "abc123def456"
 RUN_ID = 38848439019
 JOB_ID = 116801413454
@@ -499,7 +556,9 @@ def _decision(checks, repository=REPO, labels=(), auto_merge="yes"):
     fixture = {
         "pr": {
             "number": 30, "state": "open", "draft": False, "mergeable": True,
-            "mergeable_state": "clean", "base": {"ref": "main"}, "head": {"sha": HEAD},
+            "mergeable_state": "clean",
+            "base": {"ref": "main", "repo": repo_side()},
+            "head": {"sha": HEAD, "repo": repo_side()},
             "title": "build(deps): bump aiohttp from 3.14.3 to 3.14.5",
             "user": {"login": "dependabot[bot]"},
         },
@@ -535,10 +594,12 @@ def test_decision_from_fixture():
     assert blocked["merge"] is False
     assert "provenance unresolved" in blocked["reason"], blocked["reason"]
 
-    # provenance must be verifiable against an exact repository
+    # provenance must be verifiable against an exact repository. The association gate now binds
+    # both sides of the PR to the repository the controller was invoked for, so a missing
+    # repository is rejected before check provenance is even consulted.
     no_repo = _decision([resolved_check("maintenance-ci")], repository=None)
     assert_eq(no_repo["decision"], "blocked")
-    assert "repository not supplied" in no_repo["reason"], no_repo["reason"]
+    assert "missing-expected-repository" in no_repo["reason"], no_repo["reason"]
 
     # a superseded attempt cannot authorize a merge
     stale = _decision([resolved_check("maintenance-ci", job=api_job(attempt=1),
@@ -593,6 +654,9 @@ PROPOSER_RUN_ID = 38849000001
 RUN_ACTOR = "release-engineer"          # authorized the run (manual dispatch)
 PAT_PUBLISHER = "bump-pat-owner"        # owns BUMP_PAT, authors the PR
 COMMIT_BOT = "github-actions[bot]"      # configured commit identity in trusted policy
+#: The git identity the publisher actually commits with (its own documented defaults), which is
+#: also what configured_commit_identity derives from the bot login in trusted policy.
+COMMIT_BOT_EMAIL = "41898282+github-actions[bot]@users.noreply.github.com"
 CANDIDATE = "3.14.9"
 PYTHON_PATCH = "@@ -1 +1 @@\n-3.14.8\n+3.14.9\n"
 
@@ -652,18 +716,34 @@ def api_proposer_attempt(*, run_id=PROPOSER_RUN_ID, attempt=1, head_sha=SOURCE_H
     }
 
 
-def api_published_commit(*, sha=PUBLISHED_HEAD):
-    """Shaped like GET /repos/{owner}/{repo}/commits/{ref} for the published proposal head."""
-    return {
-        "sha": sha,
-        "author": {"id": 8, "login": PAT_PUBLISHER, "type": "User"},
-        "committer": {"id": 8, "login": PAT_PUBLISHER, "type": "User"},
-        "commit": {
-            "author": {"name": COMMIT_BOT, "date": "2026-10-16T02:03:00Z"},
-            "committer": {"name": COMMIT_BOT, "date": "2026-10-16T02:03:00Z"},
-            "message": f"chore: bump CPython pin 3.14.8 -> {CANDIDATE}",
+def api_published_commit(*, sha=PUBLISHED_HEAD, author_login=COMMIT_BOT, committer_login=COMMIT_BOT,
+                         git_name=COMMIT_BOT, git_email=COMMIT_BOT_EMAIL,
+                         committer_name=None, committer_email=None, include_git_identity=True):
+    """Shaped like GET /repos/{owner}/{repo}/commits/{ref} for the published proposal head.
+
+    This models what the publisher really produces: the PAT holder pushes, but the commit object
+    is signed with the configured bot identity, so GitHub resolves both the top-level author and
+    committer *login* and the inner git name/email to that bot. The PR author (PAT publisher) and
+    the run actor stay different identities and are verified separately.
+    """
+    inner = {
+        "author": {"name": git_name, "email": git_email, "date": "2026-10-16T02:03:00Z"},
+        "committer": {
+            "name": git_name if committer_name is None else committer_name,
+            "email": git_email if committer_email is None else committer_email,
+            "date": "2026-10-16T02:03:00Z",
         },
+        "message": f"chore: bump CPython pin 3.14.8 -> {CANDIDATE}",
     }
+    commit = {
+        "sha": sha,
+        "author": {"id": 8, "login": author_login, "type": "Bot" if author_login == COMMIT_BOT else "User"},
+        "committer": {"id": 8, "login": committer_login,
+                      "type": "Bot" if committer_login == COMMIT_BOT else "User"},
+    }
+    if include_git_identity:
+        commit["commit"] = inner
+    return commit
 
 
 def api_validation_record(*, run_id=PROPOSER_RUN_ID, attempt=1, source_head=SOURCE_HEAD,
@@ -706,8 +786,9 @@ def _proposer_fixture(**overrides):
     fixture = {
         "pr": {
             "number": 31, "state": "open", "draft": False, "mergeable": True,
-            "mergeable_state": "clean", "base": {"ref": "main"},
-            "head": {"sha": PUBLISHED_HEAD, "ref": f"chore/python-{CANDIDATE}"},
+            "mergeable_state": "clean",
+            "base": {"ref": "main", "repo": repo_side()},
+            "head": {"sha": PUBLISHED_HEAD, "ref": f"chore/python-{CANDIDATE}", "repo": repo_side()},
             "title": f"chore: bump CPython pin 3.14.8 -> {CANDIDATE}",
             "user": {"login": PAT_PUBLISHER},
         },
@@ -728,16 +809,29 @@ def _proposer_fixture(**overrides):
     return fixture
 
 
-def _proposer_decision(**overrides):
-    """Run the real decision path over an API-shaped python-bump proposal."""
+def _proposer_decision(policy_text=None, **overrides):
+    """Run the real decision path over an API-shaped python-bump proposal.
+
+    ``policy_text`` substitutes the trusted base policy, so a test can exercise a policy that
+    declares different security-evidence requirements without touching the shipped profile.
+    """
     fixture = _proposer_fixture(**overrides)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
         json.dump(fixture, fh)
         fname = fh.name
+    policy_path = str(ROOT / ".github" / "maintenance.json")
+    tmp_policy = None
     try:
-        return maintenance.decision_from_fixture(fname, str(ROOT / ".github" / "maintenance.json"))
+        if policy_text is not None:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as ph:
+                ph.write(policy_text)
+                tmp_policy = ph.name
+            policy_path = tmp_policy
+        return maintenance.decision_from_fixture(fname, policy_path)
     finally:
         os.unlink(fname)
+        if tmp_policy:
+            os.unlink(tmp_policy)
 
 
 def test_proposer_publication_bound_to_the_real_run():
@@ -802,7 +896,6 @@ def test_proposer_publication_rejects_incomplete_evidence():
         "publication record carries no digests": {"publication_record": {**api_publication_record(), "digests": None}},
         "published commit is not the PR head": {"published_commit": api_published_commit(sha="deadbeef")},
         "published commit unavailable": {"published_commit": None},
-        "repository not supplied": {"repository": None},
     }
     for label, overrides in cases.items():
         decision = _proposer_decision(**overrides)
@@ -810,14 +903,115 @@ def test_proposer_publication_rejects_incomplete_evidence():
         assert_eq(decision["decision"], "review-required")
         assert "publication unverified" in decision["reason"], f"{label}: {decision['reason']}"
 
+    # A fixture that names no repository cannot be associated with this repository at all, so the
+    # association gate blocks it before publication provenance is consulted.
+    no_repo = _proposer_decision(repository=None)
+    assert no_repo["merge"] is False
+    assert_eq(no_repo["decision"], "blocked")
+    assert "missing-expected-repository" in no_repo["reason"], no_repo["reason"]
+
+
+def test_repository_association_binds_both_sides_of_the_pr():
+    """Branch name and base ref are not provenance: a fork head or a missing association blocks."""
+    assert _proposer_decision()["merge"] is True, "the same-repository proposal must still merge"
+
+    def pr_with(**kwargs):
+        pr = {
+            "number": 31, "state": "open", "draft": False, "mergeable": True,
+            "mergeable_state": "clean",
+            "base": {"ref": "main", "repo": repo_side()},
+            "head": {"sha": PUBLISHED_HEAD, "ref": f"chore/python-{CANDIDATE}", "repo": repo_side()},
+            "title": f"chore: bump CPython pin 3.14.8 -> {CANDIDATE}",
+            "user": {"login": PAT_PUBLISHER},
+        }
+        pr.update(kwargs)
+        return pr
+
+    cases = {
+        "head comes from a fork": pr_with(
+            head={"sha": PUBLISHED_HEAD, "ref": f"chore/python-{CANDIDATE}",
+                  "repo": repo_side("attacker/wvkhabh2s22")}),
+        "base names a foreign repository": pr_with(base={"ref": "main", "repo": repo_side("uesu/News-Express")}),
+        "head carries no repository association": pr_with(head={"sha": PUBLISHED_HEAD, "ref": "x"}),
+        "base carries no repository association": pr_with(base={"ref": "main"}),
+    }
+    for label, pr in cases.items():
+        decision = _proposer_decision(pr=pr)
+        assert decision["merge"] is False, f"{label} must not authorize a merge"
+        assert_eq(decision["decision"], "blocked")
+        assert ("repository association" in decision["reason"] or "fork PR" in decision["reason"]), \
+            f"{label}: {decision['reason']}"
+
+
+def test_security_evidence_is_a_declared_policy_not_an_absence():
+    """Scan evidence is resolved from trusted policy; unconfigured blocks and unavailable defers.
+
+    A repository either requires named scan evidence or has deliberately declared that it requires
+    none. Those are different statements, and only the second one may skip the gate.
+    """
+    shipped = (ROOT / ".github" / "maintenance.json").read_text(encoding="utf-8")
+    profile = json.loads(shipped)
+    mode, required = maintenance.common.security_policy(profile)
+    assert_eq(mode, "disabled")
+    assert_eq(required, [])
+    assert (profile.get("security_evidence") or {}).get("reason"), "a disabled gate must record why"
+    assert _proposer_decision()["merge"] is True, "the shipped declaration must not block"
+
+    def policy_with(block):
+        variant = json.loads(shipped)
+        if block is None:
+            variant.pop("security_evidence", None)
+        else:
+            variant["security_evidence"] = block
+        return json.dumps(variant, indent=2)
+
+    # Deleting the declaration is a configuration gap, not a pass.
+    gap = _proposer_decision(policy_text=policy_with(None))
+    assert gap["merge"] is False
+    assert_eq(gap["decision"], "blocked")
+    assert "security-evidence-unconfigured" in gap["reason"], gap["reason"]
+
+    required_policy = policy_with({"mode": "required", "required": ["code-scanning"]})
+    scan = {"state": "ok", "open": 0, "analysed": True}
+
+    # Required and satisfied by a clean scan.
+    clean = _proposer_decision(policy_text=required_policy, security_evidence={"code-scanning": scan})
+    assert clean["merge"] is True, clean["reason"]
+
+    # Required with unresolved findings blocks.
+    dirty = _proposer_decision(policy_text=required_policy,
+                               security_evidence={"code-scanning": {"state": "ok", "open": 3}})
+    assert dirty["merge"] is False
+    assert_eq(dirty["decision"], "blocked")
+    assert "unresolved-code-scanning-alerts:3" in dirty["reason"], dirty["reason"]
+
+    # Required but never collected, or collected and unavailable, defers to a human. An empty
+    # requirement list is not a pass and an unavailable scan is not clean.
+    for label, evidence in (("absent", None),
+                            ("unavailable", {"code-scanning": {"state": "unavailable", "open": None}}),
+                            ("malformed open count", {"code-scanning": {"state": "ok", "open": "none"}})):
+        deferred = _proposer_decision(policy_text=required_policy, security_evidence=evidence)
+        assert deferred["merge"] is False, f"{label} must not authorize a merge"
+        assert_eq(deferred["decision"], "review-required")
+        assert "security evidence unavailable" in deferred["reason"], f"{label}: {deferred['reason']}"
+
+    # Evidence supplied by PR content cannot satisfy a policy that declares none required, and a
+    # policy that requires a kind the evidence does not cover still defers.
+    partial = _proposer_decision(policy_text=policy_with(
+        {"mode": "required", "required": ["code-scanning", "secret-scanning"]}),
+        security_evidence={"code-scanning": scan})
+    assert partial["merge"] is False
+    assert "security-evidence-missing:secret-scanning" in partial["reason"], partial["reason"]
+
 
 def test_trusted_author_does_not_bypass_publication_provenance():
     """Whichever trusted identity authored the proposal, absent records authorize nothing."""
     for login in ("github-actions[bot]", "dependabot[bot]", PAT_PUBLISHER, RUN_ACTOR):
         pr = {
             "number": 31, "state": "open", "draft": False, "mergeable": True,
-            "mergeable_state": "clean", "base": {"ref": "main"},
-            "head": {"sha": PUBLISHED_HEAD, "ref": f"chore/python-{CANDIDATE}"},
+            "mergeable_state": "clean",
+            "base": {"ref": "main", "repo": repo_side()},
+            "head": {"sha": PUBLISHED_HEAD, "ref": f"chore/python-{CANDIDATE}", "repo": repo_side()},
             "title": f"chore: bump CPython pin 3.14.8 -> {CANDIDATE}",
             "user": {"login": login},
         }
@@ -827,6 +1021,37 @@ def test_trusted_author_does_not_bypass_publication_provenance():
         # a complete chain authored by the same identity is still bound to the records
         bound = _proposer_decision(pr=pr, publication_record=api_publication_record(pr_author=login))
         assert bound["merge"] is True, f"{login}: {bound['reason']}"
+
+
+def test_publication_verifies_the_fetched_commit_not_the_notice_claim():
+    """A notice may copy the expected bot string; that is not verification of the commit object.
+
+    Before this repository adopted the shared verifier, the commit identity was checked only
+    against the string the publication notice reported about itself, so a publisher that claimed
+    the configured bot while committing as anyone else passed. The independently fetched commit
+    is now the authority for both the GitHub login and the git name/email of author and committer.
+    """
+    # The real shape still verifies: PAT publishes the PR, the actor authorized the run, and the
+    # commit object is signed by the configured bot. Three identities, each bound to its own source.
+    bound = _proposer_decision()
+    assert bound["merge"] is True, bound["reason"]
+
+    cases = {
+        "commit pushed under the PAT owner's GitHub login": api_published_commit(author_login=PAT_PUBLISHER),
+        "committed under the PAT owner's GitHub login": api_published_commit(committer_login=PAT_PUBLISHER),
+        "git author name is not the configured bot": api_published_commit(git_name="Someone Else"),
+        "git author email is not the configured bot": api_published_commit(git_email="attacker@example.com"),
+        "git committer name is not the configured bot": api_published_commit(committer_name="Someone Else"),
+        "git committer email is not the configured bot": api_published_commit(committer_email="attacker@example.com"),
+        "commit object carries no git identity at all": api_published_commit(include_git_identity=False),
+        "fetched commit is not the PR head": api_published_commit(sha="deadbeef" * 5),
+        "fetched commit unavailable": None,
+    }
+    for label, commit in cases.items():
+        decision = _proposer_decision(published_commit=commit)
+        assert decision["merge"] is False, f"{label} must not authorize a merge"
+        assert_eq(decision["decision"], "review-required")
+        assert "publication unverified" in decision["reason"], f"{label}: {decision['reason']}"
 
 
 def test_notice_records_survive_the_annotation_round_trip():
@@ -1467,7 +1692,10 @@ def cold_candidate_source(interpreter, *, bootstrap=True):
     """A minimal repository whose registry is a stand-in, for the candidate block to consume."""
     source = pathlib.Path(tempfile.mkdtemp(prefix="cold-source-"))
     (source / ".github" / "scripts").mkdir(parents=True)
-    for helper in ("maintenance.py", "python_version_bump.py"):
+    # maintenance.py imports the shared cross-repository authority, so a tree that ships
+    # maintenance.py alone is no longer runnable. Copying the common module here keeps the
+    # cold-candidate harness honest about the real deployment unit.
+    for helper in ("maintenance.py", "maintenance_common.py", "python_version_bump.py"):
         shutil.copy2(ROOT / ".github" / "scripts" / helper, source / ".github" / "scripts" / helper)
     _write(source / ".github" / "scripts" / "ci.py",
            "import os, sys\nsys.exit(int(os.environ.get('FAKE_REGISTRY_RC', '0')))\n")
@@ -2053,8 +2281,76 @@ def test_adapter_never_parses_external_id_or_trusts_a_foreign_link():
     assert provenance is None and "no canonical Actions job link" in problem, problem
 
 
+def test_proposer_cli_soaks_against_the_release_date_authority():
+    """The real proposer entry point must not derive soak age from a mirror timestamp.
+
+    Executed through ``python_version_bump.py --check`` in a subprocess, so a broken caller cannot
+    hide behind a helper-only fixture. The release-date authority is seeded through its own cache
+    file, which is the supported offline path — no network is involved in the positive case.
+    """
+    work = pathlib.Path(tempfile.mkdtemp(prefix="proposer-cli-"))
+    cache = work / "release-dates.json"
+    manifest = work / "manifest.json"
+    output = work / "github_output"
+    # A rebuilt archive: the manifest claims 3.15.0 shipped over a year ago, python.org says it
+    # shipped two days ago.
+    released_two_days_ago = (datetime.now(timezone.utc) - timedelta(days=2)).date().isoformat()
+    manifest.write_text(json.dumps([
+        {"version": "3.14.8", "stable": True, "release_url": "https://example.com/3.14.8",
+         "files": [{"filename": "python-3.14.8-linux-x64.tar.gz", "arch": "x64", "platform": "linux"}]},
+        {"version": "3.15.0", "stable": True, "published_at": "2025-01-01T00:00:00Z",
+         "release_url": "https://example.com/3.15.0",
+         "files": [{"filename": "python-3.15.0-linux-x64.tar.gz", "arch": "x64", "platform": "linux"}]},
+    ]), encoding="utf-8")
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ROOT / ".github" / "scripts") + os.pathsep + env.get("PYTHONPATH", "")
+    env["GITHUB_OUTPUT"] = str(output)
+    env["SOAK_DAYS"] = "30"
+    env.pop("IGNORE_SOAK", None)
+    env.pop("FORCE_VERSION", None)
+    cmd = [sys.executable, str(ROOT / ".github" / "scripts" / "python_version_bump.py"),
+           "--manifest", str(manifest), "--current", "3.14.8", "--check"]
+
+    try:
+        # 1. Authority reachable (seeded cache) and the release is two days old -> defer on soak.
+        cache.write_text(json.dumps({"fetched_at": datetime.now(timezone.utc).isoformat(),
+                                     "dates": {"3.15.0": released_two_days_ago}}), encoding="utf-8")
+        env["RELEASE_DATE_CACHE"] = str(cache)
+        result = subprocess.run(cmd, cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=300)
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        assert "Traceback" not in combined, combined
+        assert "release-date authority cache" in combined, combined
+        assert "Deferred:" in combined and "soak" in combined, combined
+        assert "bump=no" in output.read_text(encoding="utf-8"), output.read_text(encoding="utf-8")
+
+        # 2. Authority unreachable -> defer rather than fall back to the manifest's own timestamp.
+        missing = work / "no-such-cache.json"
+        env["RELEASE_DATE_CACHE"] = str(missing)
+        result = subprocess.run(cmd, cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=300)
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        assert "Traceback" not in combined, combined
+        assert "release-date-authority-unavailable" in combined, combined
+        assert "bump=no" in output.read_text(encoding="utf-8")
+
+        # 3. The untrusted GitHub-releases enrichment that used to define soak age is gone. The
+        # comment explaining why may mention it; the request it made may not.
+        adapter = (ROOT / ".github" / "scripts" / "python_version_bump.py").read_text(encoding="utf-8")
+        assert "releases/tags/v" not in adapter, "mirror enrichment call must stay removed"
+        assert 'entry["published_at"]' not in adapter, "the adapter must no longer write a mirror timestamp"
+        assert "fetch_release_dates" in adapter, "the authority must be consulted by the caller"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+
 def main():
-    tests = [test_parse_version, test_compare_versions, test_classify_python, test_classify_package, test_classify_group, test_validate_changed_files, test_select_candidate, test_evaluate_checks, test_provenance_requires_the_exact_producer, test_provenance_accepts_the_current_attempt_only, test_opaque_external_id_is_never_parsed_as_a_job_id, test_canonical_link_must_name_this_repository_and_check, test_decision_from_fixture, test_proposer_publication_bound_to_the_real_run, test_proposer_publication_rejects_incomplete_evidence, test_trusted_author_does_not_bypass_publication_provenance, test_adapter_resolves_real_payloads_and_refetches_after_a_rerun, test_adapter_never_parses_external_id_or_trusts_a_foreign_link, test_publisher_step_publishes_only_the_validated_bytes, test_publisher_step_rejects_every_way_the_artifact_can_be_wrong, test_publisher_step_rejects_a_commit_signed_by_another_identity, test_publisher_step_reports_an_unchanged_proposal_without_publishing, test_missing_pat_is_an_explicit_configuration_error, test_candidate_step_validates_the_exact_proposal_under_the_candidate, test_candidate_step_executes_and_emits_bounded_evidence, test_notice_records_survive_the_annotation_round_trip, test_policy_reconciliation_is_narrow, test_staged_artifact_survives_a_real_archive_round_trip, test_unstaged_upload_layout_is_rejected_by_the_publisher, test_artifact_with_tampered_bytes_or_extra_paths_is_rejected, test_staging_refuses_to_package_an_incomplete_proposal, test_cold_candidate_bootstraps_the_compiler_before_the_first_compile, test_cold_candidate_without_the_bootstrap_fails_closed, test_publication_evidence_reads_the_real_jobs_envelope, test_publication_evidence_finds_notices_on_the_second_page, test_publication_evidence_fails_closed_on_malformed_lists, test_publication_evidence_ignores_a_run_that_published_a_different_proposal]
+    tests = [test_parse_version, test_compare_versions, test_classify_python, test_classify_package, test_classify_group, test_validate_changed_files, test_select_candidate, test_soak_age_comes_from_python_org_not_from_the_setup_python_manifest,
+           test_evaluate_checks, test_provenance_requires_the_exact_producer, test_provenance_accepts_the_current_attempt_only, test_opaque_external_id_is_never_parsed_as_a_job_id, test_canonical_link_must_name_this_repository_and_check, test_decision_from_fixture, test_proposer_publication_bound_to_the_real_run, test_proposer_publication_rejects_incomplete_evidence, test_repository_association_binds_both_sides_of_the_pr,
+           test_security_evidence_is_a_declared_policy_not_an_absence,
+           test_trusted_author_does_not_bypass_publication_provenance, test_publication_verifies_the_fetched_commit_not_the_notice_claim, test_proposer_cli_soaks_against_the_release_date_authority, test_adapter_resolves_real_payloads_and_refetches_after_a_rerun, test_adapter_never_parses_external_id_or_trusts_a_foreign_link, test_publisher_step_publishes_only_the_validated_bytes, test_publisher_step_rejects_every_way_the_artifact_can_be_wrong, test_publisher_step_rejects_a_commit_signed_by_another_identity, test_publisher_step_reports_an_unchanged_proposal_without_publishing, test_missing_pat_is_an_explicit_configuration_error, test_candidate_step_validates_the_exact_proposal_under_the_candidate, test_candidate_step_executes_and_emits_bounded_evidence, test_notice_records_survive_the_annotation_round_trip, test_policy_reconciliation_is_narrow, test_staged_artifact_survives_a_real_archive_round_trip, test_unstaged_upload_layout_is_rejected_by_the_publisher, test_artifact_with_tampered_bytes_or_extra_paths_is_rejected, test_staging_refuses_to_package_an_incomplete_proposal, test_cold_candidate_bootstraps_the_compiler_before_the_first_compile, test_cold_candidate_without_the_bootstrap_fails_closed, test_publication_evidence_reads_the_real_jobs_envelope, test_publication_evidence_finds_notices_on_the_second_page, test_publication_evidence_fails_closed_on_malformed_lists, test_publication_evidence_ignores_a_run_that_published_a_different_proposal]
     failed = []
     for fn in tests:
         try:

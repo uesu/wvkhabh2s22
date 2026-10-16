@@ -18,13 +18,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# Pinned build toolchain. These live here, not in the registry, so the merge controller and the
-# CI registry can never drift apart about which pip/pip-tools produced a validated lock graph:
-# publication evidence records the versions it actually used and is compared against these.
-PINNED_PIP = "26.1.1"
-PINNED_PIP_TOOLS = "7.5.3"
+# Shared cross-repository maintenance authority. This module is byte-identical in every
+# repository that adopts it: the verification *semantics* (publication provenance, release-date
+# authority, security evidence, notice envelopes, producer identity) live there, while everything
+# repository-specific stays here and in .github/maintenance.json — proposal scope, trusted
+# workflow/check names, allowed runtime paths, the JS merge controller and the lock-regenerating
+# proposer. Adoption means delegating, not forking: a semantic fix lands once and applies
+# everywhere, and no repository is hidden behind a repository-name conditional.
+import maintenance_common as common  # noqa: E402
+
+SCHEMA_VERSION = common.SCHEMA_VERSION
+
+# Pinned build toolchain. These live in the shared module, not in the registry, so the merge
+# controller, the CI registry and the proposer can never drift apart about which pip/pip-tools
+# produced a validated lock graph: publication evidence records the versions it actually used and
+# is compared against these. A repository may override them from its own profile via
+# compiler_pins(); the module constants are the shared default.
+PINNED_PIP = common.PINNED_PIP
+PINNED_PIP_TOOLS = common.PINNED_PIP_TOOLS
 
 # Allowed runtime files that may change in a valid maintenance PR.
 # Production without docs must work; docs/history are never runtime.
@@ -36,6 +49,7 @@ ALLOWED_RUNTIME_PATTERNS = [
     r"^requirements-dev\.txt$",
     r"^\.github/maintenance\.json$",
     r"^\.github/scripts/maintenance\.py$",
+    r"^\.github/scripts/maintenance_common\.py$",
     r"^\.github/scripts/python_version_bump\.py$",
     r"^\.github/scripts/ci\.py$",
     r"^\.github/scripts/render_run_summary\.py$",
@@ -266,11 +280,26 @@ def validate_changed_files(
     return {"ok": True, "reason": "allowed", "disallowed": []}
 
 
-def select_candidate(current: str, manifest: list[dict[str, Any]], soak_days: int = 30, now_ts: int | None = None, ignore_soak: bool = False) -> dict[str, Any]:
+def select_candidate(
+    current: str,
+    manifest: list[dict[str, Any]],
+    soak_days: int = 30,
+    now_ts: int | None = None,
+    ignore_soak: bool = False,
+    release_dates: dict[str, str] | None = None,
+    release_date_state: str = "",
+) -> dict[str, Any]:
     """
     Runtime proposer: select newest patch of current series, else newest patch
     of next minor after soak. Returns dict with candidate, kind, release_url, reason.
     Implements full algorithm from spec.
+
+    Soak age comes from the python.org downloads API, never from a setup-python manifest
+    timestamp. ``apply_release_dates`` strips any ``published_at``/``release_date`` the manifest
+    carries itself, because a rebuilt archive's publication timestamp is an artefact of the
+    mirror and would silently redefine the age of an old release. A minor candidate therefore
+    soaks only against an authoritative date: when the authority was not reached, or does not
+    know that version, the selector defers instead of guessing an age.
     """
     import time
     cur = parse_version(current)
@@ -280,10 +309,13 @@ def select_candidate(current: str, manifest: list[dict[str, Any]], soak_days: in
     series_next = (cur[0], cur[1] + 1)
     now = now_ts if now_ts is not None else int(time.time())
 
+    enriched, date_summary = common.apply_release_dates(manifest, release_dates or {}, release_date_state)
+    authority_ok = str(release_date_state) in ("ok", "cache")
+
     def newest(series):
         best = None
         best_entry = None
-        for entry in manifest:
+        for entry in enriched:
             raw = entry.get("version", "")
             if not entry.get("stable"):
                 continue
@@ -309,22 +341,28 @@ def select_candidate(current: str, manifest: list[dict[str, Any]], soak_days: in
             release_url = entry.get("release_url", "") if entry else ""
             # Soak check for minor
             if kind == "minor" and not ignore_soak:
-                published = entry.get("published_at") if entry else None
-                if not published:
+                if not authority_ok:
+                    # The release-date authority was not consulted successfully. Its absence
+                    # cannot be read as "old enough" — that is how a rebuilt archive would
+                    # bypass the soak window.
+                    return {"candidate": candidate, "kind": kind, "reason": "deferred: release-date-authority-unavailable", "release_url": release_url, "deferred": True, "release_dates": date_summary}
+                published = entry.get("release_date") if entry else None
+                trusted = bool(published) and str(entry.get("release_date_source") or "") == common.RELEASE_DATE_SOURCE
+                if not trusted:
                     # Missing release date cannot bypass soak
-                    return {"candidate": candidate, "kind": kind, "reason": "deferred: release-date-unavailable", "release_url": release_url, "deferred": True}
-                # Parse published_at ISO
+                    return {"candidate": candidate, "kind": kind, "reason": "deferred: release-date-unavailable", "release_url": release_url, "deferred": True, "release_dates": date_summary}
+                # Parse the authoritative ISO date
                 try:
-                    from datetime import datetime, timezone
-                    # Handle both with and without tz
-                    pub = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                    pub = common.parse_iso_date(str(published))
+                    if pub is None:
+                        raise ValueError(f"unparseable release date {published!r}")
                     age_days = (now - int(pub.timestamp())) / 86400
                     if age_days < soak_days:
-                        return {"candidate": candidate, "kind": kind, "reason": f"deferred: soak {age_days:.1f}/{soak_days} days", "release_url": release_url, "deferred": True}
+                        return {"candidate": candidate, "kind": kind, "reason": f"deferred: soak {age_days:.1f}/{soak_days} days", "release_url": release_url, "deferred": True, "release_dates": date_summary}
                 except Exception:
-                    return {"candidate": candidate, "kind": kind, "reason": "deferred: release-date-unavailable", "release_url": release_url, "deferred": True}
-            return {"candidate": candidate, "kind": kind, "reason": "available", "release_url": release_url, "deferred": False}
-    return {"candidate": None, "kind": "none", "reason": "up-to-date", "release_url": None, "deferred": False}
+                    return {"candidate": candidate, "kind": kind, "reason": "deferred: release-date-unavailable", "release_url": release_url, "deferred": True, "release_dates": date_summary}
+            return {"candidate": candidate, "kind": kind, "reason": "available", "release_url": release_url, "deferred": False, "release_dates": date_summary}
+    return {"candidate": None, "kind": "none", "reason": "up-to-date", "release_url": None, "deferred": False, "release_dates": date_summary}
 
 
 def is_successful_check(check: dict[str, Any]) -> bool:
@@ -534,6 +572,11 @@ def verify_publication_record(
     fixture: dict[str, Any],
     pr: dict[str, Any],
     candidate_version: str | None,
+    *,
+    pinned_pip: str | None = None,
+    pinned_pip_tools: str | None = None,
+    trusted_proposer_path: str | None = None,
+    proposal_files: tuple[str, ...] | None = None,
 ) -> tuple[bool, str]:
     """Bind a published proposal to the run and attempt that actually validated and published it.
 
@@ -544,162 +587,47 @@ def verify_publication_record(
     bytes and one for the publication — and this verifier requires both, from the same attempt of
     the same successful run of the trusted proposer workflow in this exact repository.
 
-    Three identities stay distinct and are never required to be one login: the run actor who
+    Three identities stay distinct and are never collapsed into one login: the run actor who
     authorized the run, the PAT publisher who authored the PR, and the configured commit bot who
     signed the commit. Each is bound through the actual publication record and the actual PR,
     not assumed equal. The proposal digests compared here are computed by the caller from the
     published file contents, so a proposal cannot vouch for itself.
+
+    The verification semantics are the shared cross-repository implementation in
+    ``maintenance_common``; this adapter supplies what is repository-specific — the trusted
+    proposer workflow path, this repository's proposal scope (pin plus both regenerated lock
+    graphs), and the pinned compiler versions. Those pins are taken from the trusted profile and
+    never from the evidence: letting the record declare the pins it happened to use would let a
+    proposal vouch for its own toolchain. The commit identity is likewise verified against the
+    independently fetched commit object, not against the string the notice reports about itself.
     """
-    if not isinstance(fixture, dict):
-        return False, "publication evidence unavailable"
-    repository = str(fixture.get("repository") or "").strip()
-    if not repository:
-        return False, "publication evidence carries no repository"
+    evidence = fixture if isinstance(fixture, dict) else {}
+    repository = str(evidence.get("repository") or "").strip()
+    proposer_path = trusted_proposer_path or TRUSTED_PROPOSER_PATH
+    verdict = common.verify_publication_record(
+        evidence,
+        pr if isinstance(pr, dict) else {},
+        candidate_version=candidate_version,
+        trusted_proposer_path=proposer_path,
+        proposal_files=PROPOSAL_FILES if proposal_files is None else tuple(proposal_files),
+        pinned_pip=pinned_pip or PINNED_PIP,
+        pinned_pip_tools=pinned_pip_tools or PINNED_PIP_TOOLS,
+        repository=repository,
+    )
+    reason = str(verdict.get("reason") or "publication-unverified")
+    if verdict.get("state") != "ready":
+        return False, reason
 
-    run = fixture.get("proposer_run")
-    if not isinstance(run, dict) or not run:
-        return False, "no proposer run record was supplied"
-    if run.get("path") != TRUSTED_PROPOSER_PATH:
-        return False, f"proposer run workflow {run.get('path')!r} is not {TRUSTED_PROPOSER_PATH}"
-    if not isinstance(run.get("id"), int) or run["id"] <= 0:
-        return False, "proposer run carries no numeric id"
-    if not isinstance(run.get("workflow_id"), int) or run["workflow_id"] <= 0:
-        return False, "proposer run carries no numeric workflow id"
-    if run.get("status") != "completed" or run.get("conclusion") != "success":
-        return False, f"proposer run is {run.get('status')}/{run.get('conclusion')}"
-    for key in ("repository", "head_repository"):
-        record = run.get(key)
-        if not isinstance(record, dict) or record.get("full_name") != repository:
-            return False, f"proposer run {key} {record} is not {repository}"
-    if not isinstance(run.get("run_attempt"), int) or run["run_attempt"] <= 0:
-        return False, "proposer run carries no numeric current attempt"
-
-    attempt = fixture.get("proposer_attempt")
-    if not isinstance(attempt, dict) or not attempt:
-        return False, "attempt-specific proposer record unavailable — currency unproven"
-    if attempt.get("id") != run["id"] or attempt.get("run_attempt") != run["run_attempt"]:
-        return False, (
-            f"proposer attempt record {attempt.get('id')}/{attempt.get('run_attempt')} is not "
-            f"run {run['id']} attempt {run['run_attempt']}"
-        )
-    if attempt.get("status") != "completed" or attempt.get("conclusion") != "success":
-        return False, f"proposer attempt is {attempt.get('status')}/{attempt.get('conclusion')}"
-    if attempt.get("head_sha") != run.get("head_sha"):
-        return False, (
-            f"proposer attempt record is for source head {attempt.get('head_sha')}, "
-            f"not this run's {run.get('head_sha')}"
-        )
-
-    validation = fixture.get("validation_record")
-    publication = fixture.get("publication_record")
-    if not isinstance(validation, dict) or not validation:
-        return False, "no proposal-validation record was published by that run"
-    if not isinstance(publication, dict) or not publication:
-        return False, "no proposal-publication record was published by that run"
-    for label, record in (("validation", validation), ("publication", publication)):
-        if record.get("run_id") != run["id"] or record.get("run_attempt") != run["run_attempt"]:
-            return False, (
-                f"{label} record names run {record.get('run_id')} attempt "
-                f"{record.get('run_attempt')}, not this run {run['id']}/{run['run_attempt']}"
-            )
-
-    head = str((pr.get("head") or {}).get("sha") or "")
-    branch = str((pr.get("head") or {}).get("ref") or "")
-    number = pr.get("number")
-    if not head:
-        return False, "proposal head sha unavailable"
-    if publication.get("pull_number") != number:
-        return False, f"publication record names PR {publication.get('pull_number')}, not #{number}"
-    if publication.get("published_head") != head:
-        return False, f"publication record names head {publication.get('published_head')}, not {head}"
-    if branch and publication.get("branch") != branch:
-        return False, f"publication record names branch {publication.get('branch')}, not {branch}"
-
-    # The record's claimed identities must match the real ones, each in its own role.
-    actual_author = ((pr.get("user") or {}).get("login")) or None
-    if not publication.get("pr_author"):
-        return False, "publication record carries no PR author"
-    if actual_author and publication["pr_author"] != actual_author:
-        return False, (
-            f"publication record names author {publication['pr_author']}, "
-            f"but the PR author is {actual_author}"
-        )
-    actor = ((run.get("actor") or {}).get("login")) or None
-    if not publication.get("run_actor"):
-        return False, "publication record carries no run actor"
-    if actor and publication["run_actor"] != actor:
-        return False, (
-            f"publication record names run actor {publication['run_actor']}, "
-            f"but the run actor is {actor}"
-        )
-    expected_commit = fixture.get("expected_commit_identity")
-    if not publication.get("commit_identity"):
-        return False, "publication record carries no commit identity"
-    if expected_commit and publication["commit_identity"] != expected_commit:
-        return False, (
-            f"commit identity {publication['commit_identity']} is not the configured "
-            f"{expected_commit}"
-        )
-
-    # The validated source head is the proposer run's own head — a real binding, not a window.
-    if not validation.get("source_head"):
-        return False, "validation record carries no source head"
-    if validation["source_head"] != run.get("head_sha"):
-        return False, (
-            f"validation record was produced from {validation['source_head']}, "
-            f"not this run's source head {run.get('head_sha')}"
-        )
-    if not candidate_version:
-        return False, "authoritative candidate version could not be parsed from the proposal"
-    if validation.get("candidate_version") != candidate_version:
-        return False, (
-            f"validation record validated {validation.get('candidate_version')}, "
-            f"not the proposed {candidate_version}"
-        )
-    if validation.get("interpreter") != candidate_version:
-        return False, (
-            f"validation was not performed by the candidate interpreter "
-            f"({validation.get('interpreter')} != {candidate_version})"
-        )
-    pinned_pip = fixture.get("pinned_pip") or PINNED_PIP
-    pinned_tools = fixture.get("pinned_pip_tools") or PINNED_PIP_TOOLS
-    if validation.get("pip") != pinned_pip or validation.get("pip_tools") != pinned_tools:
-        return False, (
-            f"validation used pip {validation.get('pip')} / pip-tools "
-            f"{validation.get('pip_tools')}, not the pinned {pinned_pip} / {pinned_tools}"
-        )
-
-    recorded = validation.get("digests")
-    if not isinstance(recorded, dict) or not recorded:
-        return False, "validation record carries no digests"
-    actual = fixture.get("proposal_digests")
-    if not isinstance(actual, dict) or not actual:
-        return False, "published proposal digests were not computed"
-    for name in PROPOSAL_FILES:
-        if name not in recorded:
-            return False, f"validation record has no digest for {name}"
-        if recorded[name] != actual.get(name):
-            return False, (
-                f"{name} digest {recorded[name]} does not match the published bytes "
-                f"{actual.get(name)}"
-            )
-
-    commit = fixture.get("published_commit")
-    if not isinstance(commit, dict) or commit.get("sha") != head:
-        return False, f"published head {head[:12] if head else head} is not a real commit"
-    published = publication.get("digests")
-    if not isinstance(published, dict) or not published:
-        return False, "publication record carries no digests"
-    for name in PROPOSAL_FILES:
-        if published.get(name) != actual.get(name):
-            return False, (
-                f"publication record digest for {name} does not match the published bytes"
-            )
+    run = evidence.get("proposer_run") or {}
+    validation = evidence.get("validation_record") or {}
+    publication = evidence.get("publication_record") or {}
+    head = str(((pr or {}).get("head") or {}).get("sha") or "")
+    source_head = str(validation.get("source_head") or "")
     return True, (
-        f"proposal bound to {TRUSTED_PROPOSER_PATH} run {run['id']} attempt {run['run_attempt']}: "
-        f"source {validation['source_head'][:12]}, published PR #{number} head {head[:12]}, "
-        f"actor {publication['run_actor']}, author {publication['pr_author']}, "
-        f"commit {publication['commit_identity']}"
+        f"proposal bound to {proposer_path} run {run.get('id')} attempt {run.get('run_attempt')}: "
+        f"source {source_head[:12]}, published PR #{(pr or {}).get('number')} head {head[:12]}, "
+        f"actor {publication.get('run_actor')}, author {publication.get('pr_author')}, "
+        f"commit {publication.get('commit_identity')}"
     )
 
 
@@ -821,6 +749,30 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
     head_repo = (pr.get("head") or {}).get("repo", {}).get("full_name") or base_repo
     if base_repo and head_repo and base_repo != head_repo:
         return {"decision": "blocked", "reason": f"fork PR: head {head_repo} != base {base_repo}", "merge": False}
+    # Branch name and base ref alone are not provenance. Both sides of the PR are bound to the
+    # repository the controller was invoked for, which only the trusted caller can supply: a
+    # missing association, a foreign base or a cross-fork head must never reach the merge call.
+    expected_repo = str(fixture.get("repository") or "").strip()
+    association_failure = common.repo_association_failure(pr, expected_repo)
+    if association_failure:
+        return {"decision": "blocked", "reason": f"repository association: {association_failure}", "merge": False}
+
+    # Security evidence is resolved from trusted policy, never from PR content. A repository
+    # either requires named scan evidence or has deliberately declared that it requires none;
+    # an unconfigured profile is a configuration gap and blocks, and unavailable evidence defers
+    # to a human instead of reading as clean.
+    security_mode, security_required = common.security_policy(policy)
+    security = common.verify_security_evidence(
+        fixture.get("security_evidence"), security_required, mode=security_mode
+    )
+    if security.get("state") == "failed":
+        return {"decision": "blocked", "reason": f"security evidence: {security.get('reason')}", "merge": False}
+    if security.get("state") != "ready":
+        return {
+            "decision": "review-required",
+            "reason": f"security evidence unavailable: {security.get('reason')}",
+            "merge": False,
+        }
 
     # Hold labels / changes requested — latest per user, pagination fail-closed
     # If reviews are paginated, fixture may indicate truncated; fail closed if so

@@ -17,6 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 # Import shared helpers
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import maintenance  # type: ignore
+import maintenance_common as common  # type: ignore  # noqa: E402
 
 
 def read_current_pin() -> str | None:
@@ -413,42 +414,39 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:
         print(f"::error::Failed to read manifest: {e}", file=sys.stderr)
         return 1
-    # Enrich manifest entries with published_at via CPython releases API if missing (soak requires release date)
-    # The versions-manifest.json lacks published_at; fetch from api.github.com/repos/python/cpython/releases/tags/vX.Y.Z
-    try:
-        import urllib.request
-        token = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
-        headers = {"Accept": "application/vnd.github+json", "User-Agent": "python-version-bump"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        # data is typically list of {version, files} or dict; handle both
-        entries = data if isinstance(data, list) else data.get("versions", [])
-        for entry in entries:
-            ver = entry.get("version") or entry.get("tag_name", "")
-            if not ver:
-                continue
-            # Normalize to X.Y.Z without v prefix
-            v = ver.lstrip("v")
-            if entry.get("published_at") or entry.get("release_date"):
-                continue
-            url = f"https://api.github.com/repos/python/cpython/releases/tags/v{v}"
-            try:
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    rel = json.load(resp)
-                    pub = rel.get("published_at") or rel.get("created_at")
-                    if pub:
-                        entry["published_at"] = pub
-            except Exception as e:
-                # If not found, try without v prefix or skip (defer without date)
-                pass
-    except Exception as e:
-        print(f"WARN: could not enrich manifest with published_at: {e}", file=sys.stderr)
+    # Soak age authority: the python.org downloads API, never a mirror timestamp.
+    #
+    # The setup-python versions-manifest carries no release date, and a GitHub release's
+    # published_at describes when a mirror artefact was (re)published, not when CPython shipped.
+    # Enriching from api.github.com/repos/python/cpython/releases therefore let a rebuilt archive
+    # silently redefine the age of an old release and walk it through the soak window, and its
+    # failures were swallowed as a warning. apply_release_dates strips any date the manifest
+    # claims for itself and attaches only authoritative ones; versions the authority does not know
+    # stay dateless so the selector defers instead of guessing an age.
+    entries = data if isinstance(data, list) else (data.get("versions") or [])
+    cache_override = os.getenv("RELEASE_DATE_CACHE")
+    fetch_kwargs = {"cache_path": pathlib.Path(cache_override)} if cache_override else {}
+    release_dates, release_date_state, release_date_detail = common.fetch_release_dates(**fetch_kwargs)
+    if release_date_state == "unavailable":
+        print(
+            f"WARN: release-date authority unavailable ({release_date_detail}) — minor candidates "
+            "defer rather than soak against a mirror timestamp",
+            file=sys.stderr,
+        )
+    else:
+        print(f"release-date authority {release_date_state}: {release_date_detail}")
 
     soak_days = int(os.getenv("SOAK_DAYS", "30") or "30")
     ignore_soak = os.getenv("IGNORE_SOAK", "").lower() == "true"
 
-    result = maintenance.select_candidate(current, data, soak_days=soak_days, ignore_soak=ignore_soak)
+    result = maintenance.select_candidate(
+        current,
+        entries,
+        soak_days=soak_days,
+        ignore_soak=ignore_soak,
+        release_dates=release_dates,
+        release_date_state=release_date_state,
+    )
     cand = result.get("candidate")
     if not cand:
         print(result.get("reason", "up-to-date"))
