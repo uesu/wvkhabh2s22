@@ -64,6 +64,12 @@ jobs:
 
 
 def load_ci():
+    # ci.py imports its sibling maintenance helper. Loading by file path bypasses sys.path, so
+    # this loader puts the scripts directory there exactly like every other importer does; that
+    # is what lets ci.py keep its sibling import at the top of the file with no suppression.
+    scripts_dir = str(CI_PATH.resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
     spec = importlib.util.spec_from_file_location("ci_registry_under_test", CI_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

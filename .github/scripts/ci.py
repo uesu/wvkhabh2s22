@@ -26,12 +26,14 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-
 # The pinned build toolchain is defined once, in the shared maintenance helper, so the registry
-# and the merge controller validate against the same versions.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from maintenance import PINNED_PIP, PINNED_PIP_TOOLS  # noqa: E402  (single source of truth)
+# and the merge controller validate against the same versions. Sibling modules resolve with no
+# sys.path manipulation: running this file as a script puts its own directory on sys.path, and
+# every importer inserts .github/scripts first — including load_ci() in tests/test_ci_registry.py,
+# which loads this module by path and so has to supply what script mode would have supplied.
+from maintenance import PINNED_PIP, PINNED_PIP_TOOLS  # single source of truth
+
+ROOT = Path(__file__).resolve().parents[2]
 
 WORKFLOW_DIR = ROOT / ".github" / "workflows"
 
@@ -164,12 +166,12 @@ def _structural_lock_failures(target: Path, label: str) -> list[str]:
 
 def _compiler_versions() -> tuple[str, str]:
     pip_run = subprocess.run(
-        [sys.executable, "-m", "pip", "--version"], capture_output=True, text=True, timeout=60
+        [sys.executable, "-m", "pip", "--version"], check=False, capture_output=True, text=True, timeout=60
     )
     pip_out = f"{pip_run.stdout or ''}{pip_run.stderr or ''}".strip()
     try:
         tools_run = subprocess.run(
-            ["pip-compile", "--version"], capture_output=True, text=True, timeout=60
+            ["pip-compile", "--version"], check=False, capture_output=True, text=True, timeout=60
         )
         tools_out = f"{tools_run.stdout or ''}{tools_run.stderr or ''}".strip()
     except FileNotFoundError:
@@ -191,7 +193,7 @@ def _regenerate_lock(label: str, src_name: str, tmpdir: Path) -> subprocess.Comp
             "--generate-hashes", "--allow-unsafe", "--resolver=backtracking",
             "--strip-extras", f"--output-file={label}", src_name,
         ],
-        capture_output=True,
+        check=False, capture_output=True,
         text=True,
         timeout=240,
         cwd=tmpdir,
@@ -297,7 +299,7 @@ def _verify_clean_install(label: str, target: Path, gate: Gate, name: str) -> No
     venv_dir = parent / "venv"
     try:
         create = subprocess.run(
-            [sys.executable, "-m", "venv", str(venv_dir)], capture_output=True, text=True, timeout=180
+            [sys.executable, "-m", "venv", str(venv_dir)], check=False, capture_output=True, text=True, timeout=180
         )
         if create.returncode != 0:
             gate.fail(
@@ -315,7 +317,7 @@ def _verify_clean_install(label: str, target: Path, gate: Gate, name: str) -> No
                 sys.executable, "-m", "pip", "--python", str(venv_python), "install",
                 "--require-hashes", "--only-binary=:all:", "-r", str(target),
             ],
-            capture_output=True, text=True, timeout=900,
+            check=False, capture_output=True, text=True, timeout=900,
         )
         if install.returncode != 0:
             gate.fail(
@@ -325,7 +327,7 @@ def _verify_clean_install(label: str, target: Path, gate: Gate, name: str) -> No
             )
             return
         check = subprocess.run(
-            [str(venv_python), "-m", "pip", "check"], capture_output=True, text=True, timeout=180
+            [str(venv_python), "-m", "pip", "check"], check=False, capture_output=True, text=True, timeout=180
         )
         if check.returncode != 0:
             gate.fail(
@@ -431,11 +433,11 @@ def _verify_lock_graph(label: str, src_name: str, gate: Gate, name: str) -> None
             "--require-hashes", "--only-binary=:all:", "-r", str(target),
         ]
         try:
-            inst = subprocess.run(install_cmd, capture_output=True, text=True, timeout=180)
+            inst = subprocess.run(install_cmd, check=False, capture_output=True, text=True, timeout=180)
             if inst.returncode != 0 and "externally-managed-environment" in (inst.stderr or ""):
                 inst = subprocess.run(
                     install_cmd + ["--break-system-packages"],
-                    capture_output=True, text=True, timeout=180,
+                    check=False, capture_output=True, text=True, timeout=180,
                 )
         except subprocess.TimeoutExpired:
             gate.fail(name, f"{label} hash-verified install --dry-run timed out (180s)")
@@ -568,7 +570,7 @@ def _run_external_linter(
 ) -> None:
     """Execute a mandatory external linter. Availability alone is never a pass."""
     try:
-        probe = subprocess.run(version_args, capture_output=True, text=True, timeout=60)
+        probe = subprocess.run(version_args, check=False, capture_output=True, text=True, timeout=60)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         if in_ci():
             gate.fail(name, f"{tool} is mandatory in CI but could not be executed: {exc}")
@@ -586,7 +588,7 @@ def _run_external_linter(
             gate.unvalidated(name, f"{tool} unusable locally — {tool} checks not validated here")
         return
     try:
-        run = subprocess.run(lint_args, capture_output=True, text=True, timeout=300, cwd=ROOT)
+        run = subprocess.run(lint_args, check=False, capture_output=True, text=True, timeout=300, cwd=ROOT)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         if in_ci():
             gate.fail(name, f"{tool} invocation failed: {exc}")
@@ -602,7 +604,7 @@ def _run_external_linter(
 
 def run_command(gate: Gate, name: str, cmd: list[str]) -> None:
     try:
-        result = subprocess.run(cmd, cwd=ROOT)
+        result = subprocess.run(cmd, check=False, cwd=ROOT)
     except FileNotFoundError as exc:
         if in_ci() and cmd and cmd[0] in EXTERNAL_LINTERS:
             gate.fail(name, f"{cmd[0]} binary not found (mandatory in CI) — {exc}")
