@@ -163,6 +163,75 @@ def policy_change_is_narrow(before: str, after: str, candidate: str) -> bool:
     return new_current == candidate and new_supported == [candidate]
 
 
+#: Name of the evidence record inside the proposal artifact, beside the proposal files.
+ARTIFACT_RECORD_NAME = "proposal-validation.json"
+
+
+def artifact_paths() -> tuple[str, ...]:
+    """The exact relative paths a proposal artifact must contain, in the publisher's tree layout.
+
+    The artifact is a flat staging directory that mirrors the repository-relative proposal paths
+    and carries the evidence record beside them. That layout matters: uploading several separate
+    search paths makes the action use their least common ancestor as the artifact root, so files
+    arrive nested under a directory the publisher does not look inside, and hidden files such as
+    ``.python-version`` are excluded unless inclusion is requested explicitly.
+    """
+    return tuple(PROPOSAL_FILES) + (ARTIFACT_RECORD_NAME,)
+
+
+def stage_proposal_artifact(
+    workspace: pathlib.Path,
+    record: dict[str, Any],
+    destination: pathlib.Path,
+) -> dict[str, str]:
+    """Copy exactly the proposal files plus the evidence record into a dedicated staging tree.
+
+    Only allowlisted paths are copied: never the whole checkout, ``.git``, secrets, caches or
+    arbitrary hidden files. Returns the digests of what was staged so the caller can log them.
+    """
+    import hashlib
+    import shutil
+
+    if destination.exists():
+        shutil.rmtree(destination)
+    staged: dict[str, str] = {}
+    for name in PROPOSAL_FILES:
+        source = workspace / name
+        if not source.is_file():
+            raise FileNotFoundError(f"validated proposal is missing {name}")
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+        staged[name] = hashlib.sha256(target.read_bytes()).hexdigest()
+    payload = json.dumps(record, sort_keys=True, indent=2) + "\n"
+    (destination / ARTIFACT_RECORD_NAME).write_text(payload, encoding="utf-8")
+    staged[ARTIFACT_RECORD_NAME] = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return staged
+
+
+def verify_artifact_layout(
+    root: pathlib.Path,
+) -> tuple[bool, str, list[str]]:
+    """Validate the FULL expected path set after download, before anything is published.
+
+    A layout that silently lost the dotfiles or nested everything under an extra directory has to
+    fail closed here rather than publish a partial proposal.
+    """
+    missing = [name for name in artifact_paths() if not (root / name).is_file()]
+    if missing:
+        return False, f"proposal artifact is missing {', '.join(missing)}", missing
+    extra = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if relative not in artifact_paths():
+            extra.append(relative)
+    if extra:
+        return False, f"proposal artifact carries unexpected paths: {', '.join(extra[:10])}", extra
+    return True, "proposal artifact layout complete", []
+
+
 def build_validation_evidence(
     *,
     source_head: str,

@@ -192,25 +192,62 @@ jobs:
               }
             }
 
-            // Every notice record published by one proposer run, across all of its jobs' check
-            // runs and every annotation level. Read-only.
+            // The Actions list endpoints return an ENVELOPE — {total_count, jobs: [...]} or
+            // {total_count, workflow_runs: [...]} — not a bare array. Octokit's paginate flattens
+            // the envelope's list key across every page, but destructuring `data` as the list and
+            // iterating it throws a TypeError on the real shape, and the caller's catch would then
+            // silently lose every publication record: a fail-open disguised as an error. Both
+            // shapes are normalized explicitly and anything malformed stays fail-closed.
+            const LIST_KEYS = ['jobs', 'workflow_runs', 'annotations', 'check_runs', 'workflow_run_attempts'];
+
+            function normalizeList(payload) {
+              if (Array.isArray(payload)) return payload;
+              if (payload && typeof payload === 'object') {
+                for (const key of LIST_KEYS) {
+                  if (Array.isArray(payload[key])) return payload[key];
+                }
+              }
+              return null;
+            }
+
+            // Every notice record published by one proposer run, across ALL pages of its jobs and
+            // every annotation of each job's check run. Read-only, and never partial-by-accident:
+            // a malformed or unavailable list yields no records, so publication stays unverified.
             async function recordsForRun(runId) {
-              const found = { validation: null, publication: null };
-              const { data: jobs } = await github.rest.actions.listJobsForWorkflowRun({
-                owner, repo, run_id: runId, per_page: 100
-              });
-              for (const job of (jobs || [])) {
-                if (!Number.isInteger(job.id)) continue;
-                let annotations = [];
+              const found = { validation: null, publication: null, jobsSeen: 0, listUsable: false };
+              let payload;
+              try {
+                payload = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                  owner, repo, run_id: runId, per_page: 100
+                });
+              } catch (e) {
+                console.log(`Proposer run ${runId} job list unavailable: ${e.message} — publication unverified`);
+                return found;
+              }
+              const jobs = normalizeList(payload);
+              if (!jobs) {
+                console.log(`Proposer run ${runId} returned a malformed job list (${payload === null ? 'null' : typeof payload}) — publication unverified`);
+                return found;
+              }
+              found.jobsSeen = jobs.length;
+              found.listUsable = true;
+              for (const job of jobs) {
+                if (!job || !Number.isInteger(job.id)) continue;
+                let annotationsPayload;
                 try {
-                  annotations = await github.paginate(github.rest.checks.listAnnotations, {
+                  annotationsPayload = await github.paginate(github.rest.checks.listAnnotations, {
                     owner, repo, check_run_id: job.id, per_page: 100
                   });
                 } catch (e) {
                   console.log(`Annotations unavailable for job ${job.id}: ${e.message}`);
                   continue;
                 }
-                for (const annotation of (annotations || [])) {
+                const annotations = normalizeList(annotationsPayload);
+                if (!annotations) {
+                  console.log(`Annotations for job ${job.id} were malformed — skipping that job`);
+                  continue;
+                }
+                for (const annotation of annotations) {
                   const message = annotation && annotation.message;
                   if (!found.publication) found.publication = parseNotice(message, 'proposal-publication');
                   if (!found.validation) found.validation = parseNotice(message, 'proposal-validation');
@@ -249,7 +286,12 @@ jobs:
                 const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
                   owner, repo, workflow_id: PROPOSER_WORKFLOW_PATH, branch: pr.base.ref, per_page: 100
                 });
-                const candidates = (runs || []).filter(r =>
+                const runList = normalizeList(runs);
+                if (!runList) {
+                  console.log(`Proposer run list was malformed (${runs === null ? 'null' : typeof runs}) — publication unverified`);
+                  return evidence;
+                }
+                const candidates = runList.filter(r =>
                   r && r.path === PROPOSER_WORKFLOW_PATH && r.head_branch === pr.base.ref);
                 console.log(`Inspecting ${candidates.length} proposer run(s) on ${pr.base.ref} for a publication record naming PR #${pr.number}`);
                 let selected = null;

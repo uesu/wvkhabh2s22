@@ -146,6 +146,7 @@ jobs:
           import os, pathlib, shutil, subprocess, sys
 
           sys.path.insert(0, ".github/scripts")
+          import maintenance
           import python_version_bump as proposer
 
           candidate = os.environ["CANDIDATE"].strip()
@@ -160,6 +161,43 @@ jobs:
           if actual != candidate:
               print(f"::error::candidate interpreter is {actual}, expected {candidate}")
               raise SystemExit(1)
+
+          # Bootstrap the pinned compiler INSIDE the freshly selected interpreter BEFORE the first
+          # compile call. A new interpreter does not inherit the previous one's site-packages, so
+          # the toolchain installed under the current pin is not available here, and the previous
+          # interpreter's pip-compile executable must not be used either: the resolution and the
+          # lock header have to come from the candidate itself.
+          subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade",
+                          f"pip=={maintenance.PINNED_PIP}"], check=True)
+          subprocess.run([sys.executable, "-m", "pip", "install",
+                          f"pip-tools=={maintenance.PINNED_PIP_TOOLS}"], check=True)
+
+          # Verify the bootstrap interpreter-bound: the versions have to be the pinned ones and
+          # the compiler module has to live inside this interpreter's own prefix, not an inherited
+          # site-packages directory.
+          probe = subprocess.run(
+              [sys.executable, "-c",
+               "import importlib.metadata as md, pathlib, sys, piptools;"
+               "print(md.version('pip'));"
+               "print(md.version('pip-tools'));"
+               "print(pathlib.Path(piptools.__file__).resolve());"
+               "print(pathlib.Path(sys.prefix).resolve())"],
+              capture_output=True, text=True, timeout=120,
+          )
+          if probe.returncode != 0:
+              print(f"::error::the candidate interpreter has no working pinned compiler: "
+                    f"{(probe.stderr or probe.stdout or '').strip()[-800:]}")
+              raise SystemExit(1)
+          boot_pip, boot_tools, module_path, prefix = probe.stdout.split()
+          if boot_pip != maintenance.PINNED_PIP or boot_tools != maintenance.PINNED_PIP_TOOLS:
+              print(f"::error::candidate bootstrap produced pip {boot_pip} / pip-tools {boot_tools}, "
+                    f"expected {maintenance.PINNED_PIP} / {maintenance.PINNED_PIP_TOOLS}")
+              raise SystemExit(1)
+          if not module_path.startswith(prefix):
+              print(f"::error::candidate compiler at {module_path} is inherited from outside "
+                    f"the candidate prefix {prefix}")
+              raise SystemExit(1)
+          print(f"bootstrapped pip {boot_pip} / pip-tools {boot_tools} inside {prefix}")
 
           if work.exists():
               shutil.rmtree(work)
@@ -209,16 +247,15 @@ jobs:
               print(f"::error::the candidate proposal failed the registry (exit {registry.returncode})")
               raise SystemExit(1)
 
-          pip_version = subprocess.run([sys.executable, "-m", "pip", "--version"],
-                                       capture_output=True, text=True, check=True).stdout.strip()
-          tools_version = subprocess.run(["pip-compile", "--version"],
-                                         capture_output=True, text=True, check=True).stdout.strip()
+          # The recorded toolchain versions are the ones verified inside the candidate above.
+          # Reading `pip-compile --version` from PATH would report the PREVIOUS interpreter's
+          # compiler, which is precisely the confusion the bootstrap exists to prevent.
           record = proposer.build_validation_evidence(
               source_head=os.environ.get("GITHUB_SHA", ""),
               candidate=candidate,
               interpreter=actual,
-              pip_version=pip_version.split()[1] if len(pip_version.split()) > 1 else pip_version,
-              pip_tools_version=tools_version.split()[-1] if tools_version.split() else tools_version,
+              pip_version=boot_pip,
+              pip_tools_version=boot_tools,
               digests=proposer.digest_files(work),
               run_id=int(os.environ["GITHUB_RUN_ID"]),
               run_attempt=int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")),
@@ -228,9 +265,21 @@ jobs:
               print("::error::validation evidence exceeds the bounded notice size")
               raise SystemExit(1)
           print(line)
-          pathlib.Path("/tmp/proposal-validation.json").write_text(
-              __import__("json").dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-          print("candidate proposal validated; evidence recorded")
+
+          # Stage exactly the allowlisted proposal files plus the evidence record in the flat tree
+          # the publisher expects. Uploading several separate absolute paths would make the action
+          # use their least common ancestor (/tmp) as the artifact root, nesting every file under
+          # candidate-proposal/, and hidden files are excluded unless inclusion is requested.
+          staged = proposer.stage_proposal_artifact(
+              work, record, pathlib.Path("/tmp/proposal-artifact"))
+          ok, reason, problems = proposer.verify_artifact_layout(
+              pathlib.Path("/tmp/proposal-artifact"))
+          if not ok:
+              print(f"::error::staged proposal artifact is incomplete: {reason}")
+              raise SystemExit(1)
+          for name in sorted(staged):
+              print(f"staged {name} sha256={staged[name][:16]}")
+          print(f"candidate proposal validated; {reason}")
           PY
 
       - name: Upload the exact validated proposal bytes
@@ -238,12 +287,12 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v4 — SHA-pinned
         with:
           name: python-bump-proposal-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            /tmp/candidate-proposal/.python-version
-            /tmp/candidate-proposal/requirements.txt
-            /tmp/candidate-proposal/requirements-dev.txt
-            /tmp/candidate-proposal/.github/maintenance.json
-            /tmp/proposal-validation.json
+          # One staged tree, so the artifact root is that directory's contents and the publisher
+          # finds every file at the relative path it expects. Hidden inclusion is required because
+          # .python-version and .github/maintenance.json are dotfiles, which the action ignores by
+          # default. Only the allowlisted staged tree is uploaded — never the checkout or .git.
+          path: /tmp/proposal-artifact
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 30
 
@@ -311,6 +360,11 @@ jobs:
           latest = os.environ["LATEST"].strip()
           current = os.environ["CURRENT"].strip()
           validated = pathlib.Path("/tmp/validated-proposal")
+          layout_ok, layout_reason, _missing = proposer.verify_artifact_layout(validated)
+          if not layout_ok:
+              print(f"::error::{layout_reason} — refusing to publish a partial proposal")
+              raise SystemExit(1)
+          print(f"downloaded proposal artifact: {layout_reason}")
           record = json.loads((validated / "proposal-validation.json").read_text(encoding="utf-8"))
 
           if record.get("candidate_version") != latest:

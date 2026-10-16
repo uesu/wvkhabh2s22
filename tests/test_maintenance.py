@@ -1057,7 +1057,7 @@ def test_publisher_step_rejects_every_way_the_artifact_can_be_wrong():
         "artifact validated a stale source head": "is not the current checkout",
         "artifact validated unpinned pip": "do not match the validated proposal",
         "artifact digests do not match its own bytes": "do not match the validated proposal",
-        "artifact is missing a proposal file": "validated proposal is missing",
+        "artifact is missing a proposal file": "proposal artifact is missing requirements-dev.txt",
         "artifact rewrites policy beyond the derived versions": "beyond the two derived version fields",
     }
     for label, kwargs in cases.items():
@@ -1227,6 +1227,644 @@ sys.exit(0)
         assert f"expected {CANDIDATE}" in result.stdout + result.stderr
     else:
         assert "::notice::proposal-validation" in result.stdout, result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Proposal artifact packaging. Uploading several separate absolute paths makes
+# the action use their least common ancestor as the artifact root and excludes
+# hidden files by default, so the publisher would find neither .python-version
+# nor .github/maintenance.json, and the visible files would be nested one
+# directory deeper than it looks. These tests round-trip a real archive.
+# ---------------------------------------------------------------------------
+
+def _zip_tree(root, archive, *, prefix="", skip_hidden=False):
+    """Zip a tree the way the upload action would, honouring its documented defaults."""
+    import zipfile
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix()
+            if skip_hidden and any(part.startswith(".") for part in relative.split("/")):
+                continue
+            zf.write(path, prefix + relative)
+
+
+def _unzip(archive, destination):
+    import zipfile
+    with zipfile.ZipFile(archive) as zf:
+        zf.extractall(destination)
+    return destination
+
+
+def proposal_checkout():
+    """A base checkout whose proposal files already carry the validated candidate bytes."""
+    workspace = publisher_workspace()
+    for name in maintenance.PROPOSAL_FILES:
+        (workspace / name).write_bytes((PROPOSAL_ROOT / name).read_bytes())
+    return workspace
+
+
+def test_staged_artifact_survives_a_real_archive_round_trip():
+    """Stage, archive, extract: the publisher's expected tree arrives intact, dotfiles included."""
+    workspace = proposal_checkout()
+    record = api_validation_record()
+    staged = pathlib.Path(tempfile.mkdtemp(prefix="staged-")) / "proposal-artifact"
+    digests = python_version_bump.stage_proposal_artifact(workspace, record, staged)
+
+    # every allowlisted path is present, including both dotfiles, and nothing else
+    for name in python_version_bump.artifact_paths():
+        assert (staged / name).is_file(), f"{name} was not staged"
+    assert (staged / ".python-version").is_file(), "the pin is a hidden file and must be staged"
+    assert (staged / ".github" / "maintenance.json").is_file()
+    ok, reason, problems = python_version_bump.verify_artifact_layout(staged)
+    assert ok, reason
+    assert_eq(len(digests), len(python_version_bump.artifact_paths()))
+
+    archive = pathlib.Path(tempfile.mkdtemp(prefix="archive-")) / "artifact.zip"
+    _zip_tree(staged, archive)
+    downloaded = _unzip(archive, pathlib.Path(tempfile.mkdtemp(prefix="download-")))
+    ok, reason, _ = python_version_bump.verify_artifact_layout(downloaded)
+    assert ok, f"the round trip lost something: {reason}"
+    for name in maintenance.PROPOSAL_FILES:
+        assert (downloaded / name).read_bytes() == (workspace / name).read_bytes(), name
+    recovered = json.loads((downloaded / "proposal-validation.json").read_text(encoding="utf-8"))
+    assert_eq(recovered, record)
+
+    # and the real publisher consumes that extracted tree
+    shutil.rmtree(VALIDATED_ARTIFACT_PATH, ignore_errors=True)
+    shutil.copytree(downloaded, VALIDATED_ARTIFACT_PATH)
+    try:
+        target = proposal_checkout()
+        bin_dir = mock_git(target, diff_names=list(maintenance.PROPOSAL_FILES),
+                           head_policy=(ROOT / ".github" / "maintenance.json").read_text(encoding="utf-8"),
+                           commit_author=COMMIT_BOT)
+        result = run_publisher(workspace=target, validated=downloaded, env={}, path_prepend=bin_dir)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "downloaded proposal artifact: proposal artifact layout complete" in result.stdout
+    finally:
+        shutil.rmtree(VALIDATED_ARTIFACT_PATH, ignore_errors=True)
+
+
+def test_unstaged_upload_layout_is_rejected_by_the_publisher():
+    """The layout the previous upload produced must fail closed, not publish a partial proposal.
+
+    Several absolute search paths share /tmp as their least common ancestor, so visible files
+    arrive nested under candidate-proposal/, and the hidden files are excluded entirely.
+    """
+    workspace = proposal_checkout()
+    record = api_validation_record()
+    staged = pathlib.Path(tempfile.mkdtemp(prefix="staged-")) / "proposal-artifact"
+    python_version_bump.stage_proposal_artifact(workspace, record, staged)
+
+    # reproduce the old multi-path upload: /tmp as root, hidden files dropped
+    tmp_root = pathlib.Path(tempfile.mkdtemp(prefix="lca-"))
+    shutil.copytree(staged, tmp_root / "candidate-proposal")
+    shutil.copy2(staged / "proposal-validation.json", tmp_root / "proposal-validation.json")
+    archive = pathlib.Path(tempfile.mkdtemp(prefix="archive-")) / "artifact.zip"
+    _zip_tree(tmp_root, archive, skip_hidden=True)
+    downloaded = _unzip(archive, pathlib.Path(tempfile.mkdtemp(prefix="download-")))
+
+    ok, reason, missing = python_version_bump.verify_artifact_layout(downloaded)
+    assert not ok, "the nested, dotfile-free layout must not pass as complete"
+    assert ".python-version" in missing, missing
+    assert ".github/maintenance.json" in missing, missing
+
+    shutil.rmtree(VALIDATED_ARTIFACT_PATH, ignore_errors=True)
+    shutil.copytree(downloaded, VALIDATED_ARTIFACT_PATH)
+    try:
+        bin_dir = mock_git(workspace, diff_names=[], head_policy="", commit_author=COMMIT_BOT)
+        result = run_publisher(workspace=workspace, validated=downloaded, env={}, path_prepend=bin_dir)
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, "a partial artifact must not publish"
+        assert "refusing to publish a partial proposal" in combined, combined
+        assert "Traceback" not in combined, combined
+    finally:
+        shutil.rmtree(VALIDATED_ARTIFACT_PATH, ignore_errors=True)
+
+
+def test_artifact_with_tampered_bytes_or_extra_paths_is_rejected():
+    """Tampered content and unexpected extra paths both fail closed."""
+    workspace = proposal_checkout()
+    record = api_validation_record()
+
+    tampered = pathlib.Path(tempfile.mkdtemp(prefix="tampered-"))
+    python_version_bump.stage_proposal_artifact(workspace, record, tampered)
+    lock = tampered / "requirements.txt"
+    lock.write_text(lock.read_text(encoding="utf-8") + "\nmalicious-package==1.0\n", encoding="utf-8")
+    ok, reason, _ = python_version_bump.verify_artifact_layout(tampered)
+    assert ok, reason  # layout is complete; the digests are what catch this
+    shutil.rmtree(VALIDATED_ARTIFACT_PATH, ignore_errors=True)
+    shutil.copytree(tampered, VALIDATED_ARTIFACT_PATH)
+    try:
+        bin_dir = mock_git(workspace, diff_names=list(maintenance.PROPOSAL_FILES),
+                           head_policy=(ROOT / ".github" / "maintenance.json").read_text(encoding="utf-8"),
+                           commit_author=COMMIT_BOT)
+        result = run_publisher(workspace=workspace, validated=tampered, env={}, path_prepend=bin_dir)
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, "tampered bytes must not publish"
+        assert "do not match the validated proposal" in combined, combined
+    finally:
+        shutil.rmtree(VALIDATED_ARTIFACT_PATH, ignore_errors=True)
+
+    extra = pathlib.Path(tempfile.mkdtemp(prefix="extra-"))
+    python_version_bump.stage_proposal_artifact(workspace, record, extra)
+    _write(extra / ".git" / "config", "[core]\n")
+    _write(extra / "unexpected.txt", "not part of a proposal\n")
+    ok, reason, problems = python_version_bump.verify_artifact_layout(extra)
+    assert not ok, "an artifact carrying extra paths must not be accepted"
+    assert "unexpected paths" in reason, reason
+    assert any(".git" in item for item in problems), problems
+
+
+def test_staging_refuses_to_package_an_incomplete_proposal():
+    """Staging fails closed rather than uploading a proposal missing a file."""
+    workspace = publisher_workspace()
+    (workspace / "requirements-dev.txt").unlink()
+    destination = pathlib.Path(tempfile.mkdtemp(prefix="staged-")) / "out"
+    try:
+        python_version_bump.stage_proposal_artifact(workspace, api_validation_record(), destination)
+    except FileNotFoundError as exc:
+        assert "requirements-dev.txt" in str(exc), exc
+    else:
+        raise AssertionError("staging an incomplete proposal must raise")
+
+
+# ---------------------------------------------------------------------------
+# Cold-candidate bootstrap. A freshly selected interpreter does not inherit the
+# previous one's site-packages, so the pinned compiler has to be bootstrapped
+# inside it before the first compile call. Injecting a fake piptools through
+# PYTHONPATH hides that ordering requirement, which is what the previous fixture
+# did; this one starts from an interpreter that genuinely has no compiler.
+# ---------------------------------------------------------------------------
+
+COLD_VENV = pathlib.Path("/tmp/cold-candidate-venv")
+
+FAKE_PIP = r"""
+import os, pathlib, sys
+
+LOG = pathlib.Path(os.environ["BOOTSTRAP_LOG"])
+SITE = pathlib.Path(sys.prefix) / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+META = pathlib.Path(os.environ["FAKE_META_DIR"])
+argv = sys.argv[1:]
+
+
+def record(text):
+    with LOG.open("a", encoding="utf-8") as handle:
+        handle.write(text + "\n")
+
+
+def write_metadata(directory, name, version):
+    info = directory / f"{name.replace('-', '_')}-{version}.dist-info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n", encoding="utf-8")
+
+
+if "--version" in argv:
+    print("pip 26.1.1 from /fake (python 3.11)")
+    sys.exit(0)
+
+joined = " ".join(argv)
+record("pip " + joined)
+
+if "pip==" in joined:
+    write_metadata(META, "pip", joined.split("pip==")[1].split()[0])
+elif "pip-tools==" in joined:
+    version = joined.split("pip-tools==")[1].split()[0]
+    write_metadata(META, "pip-tools", version)
+    # a real install puts the package inside this interpreter's own prefix
+    package = SITE / "piptools"
+    package.mkdir(parents=True, exist_ok=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__main__.py").write_text(
+        "import os, pathlib, sys\n"
+        "argv = sys.argv[1:]\n"
+        "with open(os.environ['BOOTSTRAP_LOG'], 'a', encoding='utf-8') as h:\n"
+        "    h.write('piptools ' + ' '.join(argv) + chr(10))\n"
+        "if argv[:1] == ['compile']:\n"
+        "    out = [a.split('=', 1)[1] for a in argv if a.startswith('--output-file=')][0]\n"
+        "    pathlib.Path(out).write_text('# regenerated by the bootstrapped compiler\\n')\n"
+        "sys.exit(0)\n", encoding="utf-8")
+sys.exit(0)
+"""
+
+
+def cold_interpreter():
+    """An interpreter with no compiler and no inherited site-packages."""
+    if not (COLD_VENV / "bin" / "python").exists():
+        subprocess.run([sys.executable, "-m", "venv", str(COLD_VENV)], check=True,
+                       capture_output=True, timeout=300)
+    site = next(p for p in (COLD_VENV / "lib").glob("python*/site-packages"))
+    for stale in list(site.glob("piptools")) + list(site.glob("pip_tools-*.dist-info")):
+        shutil.rmtree(stale, ignore_errors=True)
+        if stale.is_file():
+            stale.unlink()
+    return COLD_VENV / "bin" / "python", site
+
+
+def cold_candidate_source(interpreter, *, bootstrap=True):
+    """A minimal repository whose registry is a stand-in, for the candidate block to consume."""
+    source = pathlib.Path(tempfile.mkdtemp(prefix="cold-source-"))
+    (source / ".github" / "scripts").mkdir(parents=True)
+    for helper in ("maintenance.py", "python_version_bump.py"):
+        shutil.copy2(ROOT / ".github" / "scripts" / helper, source / ".github" / "scripts" / helper)
+    _write(source / ".github" / "scripts" / "ci.py",
+           "import os, sys\nsys.exit(int(os.environ.get('FAKE_REGISTRY_RC', '0')))\n")
+    _write(source / ".python-version", "3.14.8\n")
+    _write(source / "requirements.in", "aiohttp\n")
+    _write(source / "requirements.txt", "# base graph\n")
+    _write(source / "requirements-dev.in", "pip-tools\n")
+    _write(source / "requirements-dev.txt", "# base dev graph\n")
+    _write(source / ".github" / "maintenance.json",
+           (ROOT / ".github" / "maintenance.json").read_text(encoding="utf-8"))
+    block = CANDIDATE_BLOCK
+    if not bootstrap:
+        # remove exactly the bootstrap calls, leaving everything else identical
+        start = block.index('subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade",')
+        end = block.index("if work.exists():")
+        block = block[:start] + block[end:]
+    script = source / "candidate.py"
+    script.write_text(block, encoding="utf-8")
+    return source
+
+
+def run_cold_candidate(*, bootstrap=True):
+    interpreter, site = cold_interpreter()
+    source = cold_candidate_source(interpreter, bootstrap=bootstrap)
+    fake_dir = pathlib.Path(tempfile.mkdtemp(prefix="fake-pip-"))
+    _write(fake_dir / "pip" / "__init__.py", "")
+    _write(fake_dir / "pip" / "__main__.py", FAKE_PIP)
+    log = pathlib.Path(tempfile.mkdtemp(prefix="bootstrap-log-")) / "order.log"
+    log.write_text("", encoding="utf-8")
+    actual = subprocess.run([str(interpreter), "-c",
+                             "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')"],
+                            capture_output=True, text=True, check=True).stdout.strip()
+    env = {
+        "PATH": os.environ["PATH"],
+        "PYTHONPATH": str(fake_dir),
+        "BOOTSTRAP_LOG": str(log),
+        "FAKE_META_DIR": str(fake_dir),
+        "CANDIDATE": actual,          # the running interpreter IS the candidate here
+        "GITHUB_SHA": SOURCE_HEAD,
+        "GITHUB_RUN_ID": str(PROPOSER_RUN_ID),
+        "GITHUB_RUN_ATTEMPT": "1",
+        "FAKE_REGISTRY_RC": "0",
+    }
+    result = subprocess.run([str(interpreter), str(source / "candidate.py")], cwd=source,
+                            env=env, capture_output=True, text=True, timeout=600)
+    order = [line for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return result, order, site
+
+
+def test_cold_candidate_bootstraps_the_compiler_before_the_first_compile():
+    """A compiler-free interpreter must be bootstrapped before, and only then, regenerate locks."""
+    interpreter, site = cold_interpreter()
+    # the fixture really is cold: no compiler, no inherited site-packages
+    cold_env = {**os.environ, "PYTHONPATH": ""}
+    probe = subprocess.run(
+        [str(interpreter), "-c", "import importlib.util; print(importlib.util.find_spec('piptools'))"],
+        capture_output=True, text=True, check=True, env=cold_env).stdout.strip()
+    assert_eq(probe, "None")
+
+    result, order, site = run_cold_candidate()
+    assert result.returncode == 0, result.stdout + result.stderr
+    compiles = [i for i, line in enumerate(order) if line.startswith("piptools compile")]
+    boot_tools = [i for i, line in enumerate(order) if "pip-tools==" in line]
+    boot_pip = [i for i, line in enumerate(order) if "pip==" in line and "pip-tools" not in line]
+    installs = [i for i, line in enumerate(order) if "--require-hashes" in line]
+    assert boot_pip and boot_tools and compiles and installs, order
+    # the BOOTSTRAP pip install is the first one; a later `pip install --upgrade` belongs to the
+    # graph-installation step and must not be confused with it
+    assert_eq(boot_pip[0], 0)
+    assert min(boot_pip) < min(boot_tools), f"pip must be pinned before the compiler: {order}"
+    assert min(boot_tools) < min(compiles), f"the compiler must exist before compiling: {order}"
+    assert max(compiles) < min(installs), f"both graphs are generated before they are installed: {order}"
+    assert compiles == sorted(compiles), order
+    assert_eq(len(compiles), 2)
+    # the compiler landed inside the candidate's own prefix, not an inherited site-packages
+    assert (site / "piptools" / "__main__.py").is_file(), "bootstrap did not install into the candidate"
+    # and the evidence records the bootstrapped versions, not a PATH executable's
+    assert "::notice::proposal-validation" in result.stdout, result.stdout
+    notice_line = [l for l in result.stdout.splitlines() if l.startswith("::notice::proposal-validation")][0]
+    record = python_version_bump.parse_notice(notice_line, python_version_bump.VALIDATION_NOTICE)
+    assert_eq(record["pip"], maintenance.PINNED_PIP)
+    assert_eq(record["pip_tools"], maintenance.PINNED_PIP_TOOLS)
+    ok, reason, _ = python_version_bump.verify_artifact_layout(pathlib.Path("/tmp/proposal-artifact"))
+    assert ok, reason
+
+
+def test_cold_candidate_without_the_bootstrap_fails_closed():
+    """Removing the bootstrap must break the run — otherwise the test above proves nothing."""
+    result, order, _site = run_cold_candidate(bootstrap=False)
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, "a compiler-free candidate must not regenerate locks"
+    assert not [line for line in order if line.startswith("piptools")], order
+    assert "no working pinned compiler" in combined or "No module named piptools" in combined, combined
+
+
+# ---------------------------------------------------------------------------
+# Publication-evidence adapter integration: execute the ACTUAL JavaScript from
+# maintenance_merge.yml against the real GitHub list ENVELOPES. The jobs endpoint
+# returns {total_count, jobs: [...]}; destructuring `data` as the array throws a
+# TypeError, and the caller's catch then silently loses every publication record.
+# ---------------------------------------------------------------------------
+
+EVIDENCE_START = "            const PROPOSER_WORKFLOW_PATH = "
+EVIDENCE_END = "\n            // Determine PR number:"
+
+
+def evidence_source():
+    """Extract the real publication-evidence collector from the workflow, dedented."""
+    text = (ROOT / ".github" / "workflows" / "maintenance_merge.yml").read_text(encoding="utf-8")
+    start = text.index(EVIDENCE_START)
+    end = text.index(EVIDENCE_END, start)
+    lines = text[start:end].splitlines()
+    return "\n".join(line[12:] if line.startswith(" " * 12) else line for line in lines)
+
+
+EVIDENCE_HARNESS = r"""
+const fs = require('fs');
+const fixture = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const calls = [];
+const logs = [];
+const owner = 'uesu', repo = 'wvkhabh2s22';
+const trustedRepository = `${owner}/${repo}`;
+const console = { log: (m) => logs.push(String(m)) };
+
+// Real Octokit paginate flattens the envelope's list key across every page.
+const LIST_KEYS = ['jobs', 'workflow_runs', 'annotations', 'check_runs'];
+function listOf(data) {
+  if (Array.isArray(data)) return data;
+  if (data && typeof data === 'object') {
+    for (const key of LIST_KEYS) if (Array.isArray(data[key])) return data[key];
+  }
+  return null;
+}
+
+function endpoint(kind) {
+  return async (params) => {
+    calls.push({ kind, params });
+    const served = fixture[kind];
+    if (served && served.throw) throw new Error(served.throw);
+    const page = (params && params.page) || 1;
+    const pages = served && served.pages;
+    if (pages) return { data: pages[page - 1] !== undefined ? pages[page - 1] : (served.empty || []) };
+    return { data: served !== undefined ? served : null };
+  };
+}
+
+const github = {
+  rest: {
+    actions: {
+      listWorkflowRuns: endpoint('listWorkflowRuns'),
+      listJobsForWorkflowRun: endpoint('listJobsForWorkflowRun'),
+      getWorkflowRun: endpoint('getWorkflowRun'),
+      getWorkflowRunAttempt: endpoint('getWorkflowRunAttempt')
+    },
+    checks: { listAnnotations: endpoint('listAnnotations') },
+    repos: { getCommit: endpoint('getCommit'), getContent: endpoint('getContent') }
+  },
+  paginate: async (method, params) => {
+    const perPage = (params && params.per_page) || 100;
+    const out = [];
+    for (let page = 1; page <= 10; page++) {
+      const response = await method(Object.assign({}, params, { page }));
+      const list = listOf(response.data);
+      if (!list) return response.data;   // let the caller's own normalization decide
+      out.push(...list);
+      if (list.length < perPage) break;
+    }
+    return out;
+  }
+};
+
+(async () => {
+  const result = { error: null, evidence: null };
+  try {
+""" + "PLACEHOLDER_BODY" + r"""
+    result.evidence = await collectPublicationEvidence(fixture.pr);
+  } catch (e) {
+    result.error = `${e.constructor.name}: ${e.message}`;
+  }
+  result.calls = calls.map(c => c.kind);
+  result.logs = logs;
+  process.stdout.write(JSON.stringify(result));
+})();
+"""
+
+
+def _run_evidence(fixture):
+    """Execute the real collector in node against a recorded API-shaped fixture."""
+    fixture_path = pathlib.Path(tempfile.mkdtemp(prefix="evidence-")) / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    script = pathlib.Path(tempfile.mkdtemp(prefix="evidence-js-")) / "adapter.js"
+    body = EVIDENCE_HARNESS.replace("PLACEHOLDER_BODY", evidence_source())
+    script.write_text(body, encoding="utf-8")
+    result = subprocess.run(["node", str(script), str(fixture_path)],
+                            capture_output=True, text=True, timeout=180)
+    assert result.returncode == 0, f"node failed: {result.stderr[:1200]}"
+    return json.loads(result.stdout)
+
+
+def _annotation(message, level="notice"):
+    return {"annotation_level": level, "message": message}
+
+
+def _notice_annotation(record, kind):
+    """The annotation GitHub stores for a notice: the command prefix is stripped from the message."""
+    line = python_version_bump.notice(kind, record)
+    assert line is not None, "evidence must fit in a bounded notice"
+    prefix = "::notice::"
+    assert line.startswith(prefix), line
+    return _annotation(line[len(prefix):])
+
+
+def _evidence_fixture(*, jobs_pages=None, annotations=None, runs=None, jobs=None,
+                      validation=None, publication=None):
+    """A recorded API-shaped fixture using the REAL envelopes, not bare arrays."""
+    validation_record = api_validation_record() if validation is None else validation
+    publication_record = api_publication_record() if publication is None else publication
+    jobs_list = [{"id": 555001, "name": "select-and-validate"},
+                 {"id": 555002, "name": "publish"}] if jobs is None else jobs
+    annotation_list = ([
+        _notice_annotation(validation_record, python_version_bump.VALIDATION_NOTICE),
+        _notice_annotation(publication_record, python_version_bump.PUBLICATION_NOTICE),
+    ] if annotations is None else annotations) if validation_record or publication_record else []
+    run_record = {"id": PROPOSER_RUN_ID, "path": PROPOSER_PATH, "head_branch": "main",
+                  "status": "completed", "conclusion": "success", "run_attempt": 1,
+                  "head_sha": SOURCE_HEAD, "workflow_id": 88,
+                  "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
+                  "actor": {"login": RUN_ACTOR}}
+    runs_list = [run_record] if runs is None else runs
+    fixture = {
+        "pr": {"number": 31, "base": {"ref": "main"},
+               "head": {"sha": PUBLISHED_HEAD, "ref": f"chore/python-{CANDIDATE}"},
+               "user": {"login": PAT_PUBLISHER}},
+        "listWorkflowRuns": {"pages": [runs_list]},
+        "listJobsForWorkflowRun": ({"pages": jobs_pages} if jobs_pages is not None
+                                   else {"pages": [jobs_list]}),
+        "listAnnotations": {"pages": [annotation_list]},
+        "getWorkflowRun": run_record,
+        "getWorkflowRunAttempt": {**run_record, "run_attempt": 1},
+        "getCommit": api_published_commit(),
+        "getContent": None,
+    }
+    return fixture
+
+
+def _content_fixture():
+    """Serve the actual proposal bytes so the JS digests can be compared with Python's."""
+    import base64
+    payload = {}
+    for name in maintenance.PROPOSAL_FILES:
+        raw = (PROPOSAL_ROOT / name).read_bytes()
+        payload[name] = base64.b64encode(raw).decode("ascii")
+    return payload
+
+
+def test_publication_evidence_reads_the_real_jobs_envelope():
+    """The real {total_count, jobs: [...]} envelope must yield both records, not a TypeError."""
+    fixture = _evidence_fixture()
+    content = _content_fixture()
+    result = _run_evidence_with_content(fixture, content)
+    assert result["error"] is None, f"the real envelope crashed the collector: {result['error']}"
+    evidence = result["evidence"]
+    assert evidence is not None, result["logs"]
+    assert_eq(evidence["repository"], REPO)
+    assert_eq(evidence["proposer_run"]["id"], PROPOSER_RUN_ID)
+    assert_eq(evidence["proposer_attempt"]["run_attempt"], 1)
+    assert evidence["validation_record"], result["logs"]
+    assert evidence["publication_record"], result["logs"]
+    assert_eq(evidence["validation_record"], api_validation_record())
+    assert_eq(evidence["publication_record"], api_publication_record())
+    assert_eq(evidence["published_commit"]["sha"], PUBLISHED_HEAD)
+    # the JS sha256 over base64-decoded content must equal Python's digest of the same bytes
+    assert_eq(evidence["proposal_digests"], dict(PROPOSAL_DIGESTS))
+    assert "listJobsForWorkflowRun" in result["calls"], result["calls"]
+
+
+def _run_evidence_with_content(fixture, content):
+    """Variant harness that serves repos.getContent per requested path."""
+    body = EVIDENCE_HARNESS.replace("PLACEHOLDER_BODY", evidence_source())
+    body = body.replace(
+        "    repos: { getCommit: endpoint('getCommit'), getContent: endpoint('getContent') }",
+        """    repos: {
+      getCommit: endpoint('getCommit'),
+      getContent: async (params) => {
+        calls.push({ kind: 'getContent', params });
+        const encoded = FIXTURE_CONTENT[params.path];
+        if (encoded === undefined) { const e = new Error('Not Found'); e.status = 404; throw e; }
+        return { data: { content: encoded, encoding: 'base64' } };
+      }
+    }""")
+    body = body.replace("const fixture = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));",
+                        "const fixture = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));\n"
+                        "const FIXTURE_CONTENT = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));")
+    fixture_path = pathlib.Path(tempfile.mkdtemp(prefix="evidence-")) / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    content_path = fixture_path.parent / "content.json"
+    content_path.write_text(json.dumps(content), encoding="utf-8")
+    script = pathlib.Path(tempfile.mkdtemp(prefix="evidence-js-")) / "adapter.js"
+    script.write_text(body, encoding="utf-8")
+    result = subprocess.run(["node", str(script), str(fixture_path), str(content_path)],
+                            capture_output=True, text=True, timeout=180)
+    assert result.returncode == 0, f"node failed: {result.stderr[:1500]}"
+    return json.loads(result.stdout)
+
+
+def test_publication_evidence_finds_notices_on_the_second_page():
+    """Records published by a job on page 2 must still be found; one page is not enough."""
+    content = _content_fixture()
+    page1 = [{"id": 555001, "name": "select-and-validate"}] * 100   # a full page, so paging continues
+    page2 = [{"id": 555002, "name": "publish"}]
+    fixture = _evidence_fixture(jobs_pages=[page1, page2])
+    annotations_by_job = {
+        555001: [],   # the first job publishes nothing
+        555002: [
+            _notice_annotation(api_validation_record(), python_version_bump.VALIDATION_NOTICE),
+            _notice_annotation(api_publication_record(), python_version_bump.PUBLICATION_NOTICE),
+        ],
+    }
+    body = EVIDENCE_HARNESS.replace("PLACEHOLDER_BODY", evidence_source())
+    body = body.replace(
+        "    repos: { getCommit: endpoint('getCommit'), getContent: endpoint('getContent') }",
+        """    repos: {
+      getCommit: endpoint('getCommit'),
+      getContent: async (params) => {
+        calls.push({ kind: 'getContent', params });
+        const encoded = FIXTURE_CONTENT[params.path];
+        if (encoded === undefined) { const e = new Error('Not Found'); e.status = 404; throw e; }
+        return { data: { content: encoded, encoding: 'base64' } };
+      }
+    }""")
+    body = body.replace(
+        "    checks: { listAnnotations: endpoint('listAnnotations') },",
+        """    checks: { listAnnotations: async (params) => {
+        calls.push({ kind: 'listAnnotations', params });
+        return { data: FIXTURE_ANNOTATIONS[String(params.check_run_id)] || [] };
+      } },""")
+    body = body.replace("const fixture = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));",
+                        "const fixture = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));\n"
+                        "const FIXTURE_CONTENT = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));\n"
+                        "const FIXTURE_ANNOTATIONS = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'));")
+    directory = pathlib.Path(tempfile.mkdtemp(prefix="page2-"))
+    (directory / "fixture.json").write_text(json.dumps(fixture), encoding="utf-8")
+    (directory / "content.json").write_text(json.dumps(content), encoding="utf-8")
+    (directory / "annotations.json").write_text(
+        json.dumps({str(k): v for k, v in annotations_by_job.items()}), encoding="utf-8")
+    script = directory / "adapter.js"
+    script.write_text(body, encoding="utf-8")
+    result = subprocess.run(
+        ["node", str(script), str(directory / "fixture.json"), str(directory / "content.json"),
+         str(directory / "annotations.json")], capture_output=True, text=True, timeout=180)
+    assert result.returncode == 0, result.stderr[:1500]
+    out = json.loads(result.stdout)
+    assert out["error"] is None, out["error"]
+    evidence = out["evidence"]
+    assert evidence["validation_record"], out["logs"]
+    assert evidence["publication_record"], "a page-2 notice must still be found"
+    assert_eq(evidence["publication_record"]["pull_number"], 31)
+    # both pages were really requested
+    assert out["calls"].count("listJobsForWorkflowRun") >= 2, out["calls"]
+
+
+def test_publication_evidence_fails_closed_on_malformed_lists():
+    """A malformed or unavailable list yields no records, so publication stays unverified."""
+    content = _content_fixture()
+    cases = {
+        "jobs envelope without a jobs array": {"listJobsForWorkflowRun": {"pages": [{"total_count": 2}]}},
+        "jobs endpoint unavailable": {"listJobsForWorkflowRun": {"throw": "502 Bad Gateway"}},
+        "runs envelope without a workflow_runs array": {"listWorkflowRuns": {"pages": [{"total_count": 1}]}},
+        "runs endpoint unavailable": {"listWorkflowRuns": {"throw": "502 Bad Gateway"}},
+        "annotations malformed": {"listAnnotations": {"pages": [{"message": "not a list"}]}},
+        "notices absent": {"listAnnotations": {"pages": [[_annotation("an ordinary notice")]]}},
+        "notice payload is not json": {"listAnnotations": {"pages": [[
+            _annotation("proposal-publication {not json")]]}},
+    }
+    for label, overrides in cases.items():
+        fixture = _evidence_fixture()
+        fixture.update(overrides)
+        result = _run_evidence_with_content(fixture, content)
+        # the collector must never throw on a malformed envelope
+        assert result["error"] is None, f"{label} crashed the collector: {result['error']}"
+        evidence = result["evidence"]
+        has_records = bool(evidence.get("validation_record")) and bool(evidence.get("publication_record"))
+        assert not has_records, f"{label} must not produce publication records"
+        assert not evidence.get("proposer_run"), f"{label} must not select a proposer run"
+
+
+def test_publication_evidence_ignores_a_run_that_published_a_different_proposal():
+    """Selection is by the record's PR number and head, not by first completed run."""
+    content = _content_fixture()
+    other = api_publication_record(pull_number=99, published_head="f" * 40)
+    fixture = _evidence_fixture(
+        annotations=[_notice_annotation(other, python_version_bump.PUBLICATION_NOTICE)])
+    result = _run_evidence_with_content(fixture, content)
+    assert result["error"] is None, result["error"]
+    evidence = result["evidence"]
+    assert not evidence.get("proposer_run"), "a run that published another PR must not be selected"
+    assert any("not this proposal" in line for line in result["logs"]), result["logs"]
 
 
 # ---------------------------------------------------------------------------
@@ -1416,7 +2054,7 @@ def test_adapter_never_parses_external_id_or_trusts_a_foreign_link():
 
 
 def main():
-    tests = [test_parse_version, test_compare_versions, test_classify_python, test_classify_package, test_classify_group, test_validate_changed_files, test_select_candidate, test_evaluate_checks, test_provenance_requires_the_exact_producer, test_provenance_accepts_the_current_attempt_only, test_opaque_external_id_is_never_parsed_as_a_job_id, test_canonical_link_must_name_this_repository_and_check, test_decision_from_fixture, test_proposer_publication_bound_to_the_real_run, test_proposer_publication_rejects_incomplete_evidence, test_trusted_author_does_not_bypass_publication_provenance, test_adapter_resolves_real_payloads_and_refetches_after_a_rerun, test_adapter_never_parses_external_id_or_trusts_a_foreign_link, test_publisher_step_publishes_only_the_validated_bytes, test_publisher_step_rejects_every_way_the_artifact_can_be_wrong, test_publisher_step_rejects_a_commit_signed_by_another_identity, test_publisher_step_reports_an_unchanged_proposal_without_publishing, test_missing_pat_is_an_explicit_configuration_error, test_candidate_step_validates_the_exact_proposal_under_the_candidate, test_candidate_step_executes_and_emits_bounded_evidence, test_notice_records_survive_the_annotation_round_trip, test_policy_reconciliation_is_narrow]
+    tests = [test_parse_version, test_compare_versions, test_classify_python, test_classify_package, test_classify_group, test_validate_changed_files, test_select_candidate, test_evaluate_checks, test_provenance_requires_the_exact_producer, test_provenance_accepts_the_current_attempt_only, test_opaque_external_id_is_never_parsed_as_a_job_id, test_canonical_link_must_name_this_repository_and_check, test_decision_from_fixture, test_proposer_publication_bound_to_the_real_run, test_proposer_publication_rejects_incomplete_evidence, test_trusted_author_does_not_bypass_publication_provenance, test_adapter_resolves_real_payloads_and_refetches_after_a_rerun, test_adapter_never_parses_external_id_or_trusts_a_foreign_link, test_publisher_step_publishes_only_the_validated_bytes, test_publisher_step_rejects_every_way_the_artifact_can_be_wrong, test_publisher_step_rejects_a_commit_signed_by_another_identity, test_publisher_step_reports_an_unchanged_proposal_without_publishing, test_missing_pat_is_an_explicit_configuration_error, test_candidate_step_validates_the_exact_proposal_under_the_candidate, test_candidate_step_executes_and_emits_bounded_evidence, test_notice_records_survive_the_annotation_round_trip, test_policy_reconciliation_is_narrow, test_staged_artifact_survives_a_real_archive_round_trip, test_unstaged_upload_layout_is_rejected_by_the_publisher, test_artifact_with_tampered_bytes_or_extra_paths_is_rejected, test_staging_refuses_to_package_an_incomplete_proposal, test_cold_candidate_bootstraps_the_compiler_before_the_first_compile, test_cold_candidate_without_the_bootstrap_fails_closed, test_publication_evidence_reads_the_real_jobs_envelope, test_publication_evidence_finds_notices_on_the_second_page, test_publication_evidence_fails_closed_on_malformed_lists, test_publication_evidence_ignores_a_run_that_published_a_different_proposal]
     failed = []
     for fn in tests:
         try:
