@@ -61,22 +61,39 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const trustedRepository = `${owner}/${repo}`;
-            let manifestVersions = null;
+            // Canonical Actions job link for THIS repository: exact host, exact owner/repo and
+            // numeric run/job ids. Anything else is rejected rather than guessed at.
+            const canonicalJobLink = (url) => {
+              if (typeof url !== 'string') return null;
+              const expected = `https://github.com/${trustedRepository}/actions/runs/`;
+              const trimmed = url.trim();
+              if (!trimmed.startsWith(expected)) return null;
+              const match = /^(\d+)\/job\/(\d+)\/?$/.exec(trimmed.slice(expected.length));
+              if (!match) return null;
+              return { runId: Number.parseInt(match[1], 10), jobId: Number.parseInt(match[2], 10) };
+            };
 
             // Resolve live check runs to the Actions job and workflow run that produced them.
             // The Checks API returns no workflow identity — a real check_runs record carries id,
             // name, head_sha, status, conclusion, app, external_id and html_url, never workflow,
-            // workflow_id, path or workflow_run — so provenance has to be fetched: for Actions
-            // checks external_id is the job id and html_url is the canonical
-            // .../actions/runs/<run_id>/job/<job_id> link. Raw payloads are attached unchanged;
-            // when a fetch fails the check stays unresolved and the helper fails closed rather
-            // than accepting an unproven gate. Both the decision and the final pre-merge snapshot
-            // call this, so they cannot drift apart.
-            const jobCache = new Map();
-            const runCache = new Map();
-            const attemptCache = new Map();
+            // workflow_id, path or workflow_run — so provenance has to be fetched and bound.
+            //
+            // external_id is OPAQUE: for a real Actions check it is a UUID such as
+            // 0fb0ae38-2e89-5fc7-8093-e2d0d0cf857d, not the job id, and parseInt on its leading
+            // digits would invent a job (83e46dd2-... -> 83). It is passed through as metadata
+            // only. The canonical html_url link supplies the run and job ids, and the fetched
+            // job's own check_run_url must point back at this exact check in this repository.
+            //
+            // There is no listWorkflowRunAttempts endpoint. getWorkflowRun reports the run's
+            // current attempt and getWorkflowRunAttempt returns that attempt's record, so
+            // currency is the agreement of two supported calls.
+            //
+            // Caches are created per call on purpose: the decision step and the final pre-merge
+            // snapshot must each fetch current records, never reuse the earlier snapshot's.
             async function resolveChecks(all, headSha) {
-              const canonical = (c) => /\/actions\/runs\/(\d+)\/job\/(\d+)/.exec(c.html_url || c.details_url || '');
+              const jobCache = new Map();
+              const runCache = new Map();
+              const attemptCache = new Map();
               const resolved = [];
               for (const c of all) {
                 const enriched = {
@@ -90,41 +107,42 @@ jobs:
                   details_url: c.details_url,
                   app: c.app && c.app.slug ? { slug: c.app.slug } : undefined
                 };
-                const link = canonical(c);
-                const externalJob = Number.parseInt(c.external_id, 10);
-                const jobId = Number.isInteger(externalJob) && externalJob > 0 ? externalJob
-                  : (link ? Number.parseInt(link[2], 10) : null);
-                if (jobId !== null) {
-                  try {
-                    if (!jobCache.has(jobId)) {
-                      const { data } = await github.rest.actions.getJobForWorkflowRun({ owner, repo, job_id: jobId });
-                      jobCache.set(jobId, data);
-                    }
-                    enriched.job = jobCache.get(jobId);
-                  } catch (e) {
-                    console.log(`Job ${jobId} behind check "${c.name}" unavailable: ${e.message} — provenance unresolved`);
-                  }
+                const link = canonicalJobLink(c.html_url) || canonicalJobLink(c.details_url);
+                if (!link) {
+                  console.log(`Check "${c.name}" has no canonical ${trustedRepository} job link — provenance unresolved`);
+                  resolved.push(enriched);
+                  continue;
                 }
-                const runId = (enriched.job && Number.isInteger(enriched.job.run_id)) ? enriched.job.run_id
-                  : (link ? Number.parseInt(link[1], 10) : null);
-                if (runId !== null) {
-                  try {
-                    if (!runCache.has(runId)) {
-                      const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: runId });
-                      runCache.set(runId, data);
-                    }
-                    enriched.run = runCache.get(runId);
-                  } catch (e) {
-                    console.log(`Run ${runId} behind check "${c.name}" unavailable: ${e.message} — provenance unresolved`);
+                try {
+                  if (!jobCache.has(link.jobId)) {
+                    const { data } = await github.rest.actions.getJobForWorkflowRun({ owner, repo, job_id: link.jobId });
+                    jobCache.set(link.jobId, data);
                   }
+                  enriched.job = jobCache.get(link.jobId);
+                } catch (e) {
+                  console.log(`Job ${link.jobId} behind check "${c.name}" unavailable: ${e.message} — provenance unresolved`);
+                }
+                try {
+                  if (!runCache.has(link.runId)) {
+                    const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: link.runId });
+                    runCache.set(link.runId, data);
+                  }
+                  enriched.run = runCache.get(link.runId);
+                } catch (e) {
+                  console.log(`Run ${link.runId} behind check "${c.name}" unavailable: ${e.message} — provenance unresolved`);
+                }
+                if (enriched.run && Number.isInteger(enriched.run.run_attempt)) {
+                  const key = `${link.runId}:${enriched.run.run_attempt}`;
                   try {
-                    if (!attemptCache.has(runId)) {
-                      const { data } = await github.rest.actions.listWorkflowRunAttempts({ owner, repo, run_id: runId, per_page: 100 });
-                      attemptCache.set(runId, data.workflow_run_attempts || []);
+                    if (!attemptCache.has(key)) {
+                      const { data } = await github.rest.actions.getWorkflowRunAttempt({
+                        owner, repo, run_id: link.runId, attempt_number: enriched.run.run_attempt
+                      });
+                      attemptCache.set(key, data);
                     }
-                    enriched.attempts = attemptCache.get(runId);
+                    enriched.attempt = attemptCache.get(key);
                   } catch (e) {
-                    console.log(`Attempt history for run ${runId} unavailable: ${e.message} — provenance unresolved`);
+                    console.log(`Attempt ${enriched.run.run_attempt} of run ${link.runId} unavailable: ${e.message} — currency unproven`);
                   }
                 }
                 resolved.push(enriched);
@@ -147,7 +165,7 @@ jobs:
               } catch (e) {
                 console.log(`Commit statuses unavailable for ${headSha}: ${e.message}`);
               }
-              const provenanced = resolved.filter(c => c.job && c.run && c.attempts).length;
+              const provenanced = resolved.filter(c => c.job && c.run && c.attempt).length;
               console.log(`Resolved ${resolved.length} checks for ${headSha}; ${provenanced} carry full job/run/attempt provenance`);
               return resolved;
             }
@@ -170,11 +188,15 @@ jobs:
                 } else {
                   const { data: publisherRun } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: source.id });
                   evidence.publisher_run = publisherRun;
-                  try {
-                    const { data: attempts } = await github.rest.actions.listWorkflowRunAttempts({ owner, repo, run_id: source.id, per_page: 100 });
-                    evidence.publisher_attempts = attempts.workflow_run_attempts || [];
-                  } catch (e) {
-                    console.log(`Proposer attempt history unavailable: ${e.message} — publication unverified`);
+                  if (Number.isInteger(publisherRun.run_attempt)) {
+                    try {
+                      const { data: attempt } = await github.rest.actions.getWorkflowRunAttempt({
+                        owner, repo, run_id: publisherRun.id, attempt_number: publisherRun.run_attempt
+                      });
+                      evidence.publisher_attempt = attempt;
+                    } catch (e) {
+                      console.log(`Proposer attempt record unavailable: ${e.message} — publication unverified`);
+                    }
                   }
                 }
               } catch (e) {
@@ -186,24 +208,22 @@ jobs:
               } catch (e) {
                 console.log(`Published proposal commit unavailable: ${e.message} — publication unverified`);
               }
-              if (!manifestVersions) {
-                try {
-                  // The PR's own maintenance.json is PR content and is never the manifest; the
-                  // proposer resolves against the upstream release manifest, so bind to that.
-                  const { data: manifestFile } = await github.rest.repos.getContent({
-                    owner: 'actions', repo: 'python-versions', path: 'versions-manifest.json'
-                  });
-                  const manifest = JSON.parse(Buffer.from(manifestFile.content || '', 'base64').toString('utf8'));
-                  const entries = Array.isArray(manifest) ? manifest : (manifest.versions || []);
-                  manifestVersions = entries
-                    .map(entry => entry && (entry.version || entry.python_version))
-                    .filter(Boolean);
-                  console.log(`Validated manifest carries ${manifestVersions.length} published versions`);
-                } catch (e) {
-                  console.log(`Validated manifest unavailable: ${e.message} — publication unverified`);
-                }
+              try {
+                // The PR's own maintenance.json is PR content and is never the manifest; the
+                // proposer resolves against the upstream release manifest, so bind to that.
+                // Fetched per call so the final snapshot cannot reuse a stale copy.
+                const { data: manifestFile } = await github.rest.repos.getContent({
+                  owner: 'actions', repo: 'python-versions', path: 'versions-manifest.json'
+                });
+                const manifest = JSON.parse(Buffer.from(manifestFile.content || '', 'base64').toString('utf8'));
+                const entries = Array.isArray(manifest) ? manifest : (manifest.versions || []);
+                evidence.manifest_versions = entries
+                  .map(entry => entry && (entry.version || entry.python_version))
+                  .filter(Boolean);
+                console.log(`Validated manifest carries ${evidence.manifest_versions.length} published versions`);
+              } catch (e) {
+                console.log(`Validated manifest unavailable: ${e.message} — publication unverified`);
               }
-              if (manifestVersions) evidence.manifest_versions = manifestVersions;
               return evidence;
             }
 

@@ -324,6 +324,27 @@ def is_successful_check(check: dict[str, Any]) -> bool:
 TRUSTED_WORKFLOW_PATHS = {".github/workflows/ci.yml"}
 
 
+_CANONICAL_JOB_LINK = re.compile(
+    r"^https://github\.com/(?P<repository>[^/]+/[^/]+)/actions/runs/(?P<run_id>\d+)/job/(?P<job_id>\d+)/?$"
+)
+
+
+def parse_canonical_job_link(url: Any, repository: str | None) -> tuple[int, int] | None:
+    """Extract (run_id, job_id) from a canonical Actions job link for THIS repository.
+
+    The link is the only reliable route from a check run to its producer, so it is matched
+    exactly: https scheme, the github.com host, this owner/repo, and numeric run and job ids.
+    A foreign host, a foreign repository, a scheme-relative URL or a non-numeric id yields
+    None rather than a guess.
+    """
+    if not isinstance(url, str) or not repository:
+        return None
+    match = _CANONICAL_JOB_LINK.match(url.strip())
+    if not match or match.group("repository") != repository:
+        return None
+    return int(match.group("run_id")), int(match.group("job_id"))
+
+
 def resolve_check_provenance(
     check: dict[str, Any],
     *,
@@ -332,20 +353,33 @@ def resolve_check_provenance(
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Resolve one check run to the Actions job and workflow run that actually produced it.
 
-    The Checks API does not return workflow identity: a real ``check_runs`` record carries
-    ``id``, ``name``, ``head_sha``, ``status``, ``conclusion``, ``app``, ``external_id`` and
-    ``html_url`` — but no ``workflow``, ``workflow_id``, ``path`` or ``workflow_run``. Reading
-    those keys off the check therefore rejects every genuine record. Provenance has to be
-    *resolved*: for Actions checks ``external_id`` is the job id, and the check's ``html_url``
-    is the canonical ``.../actions/runs/<run_id>/job/<job_id>`` link. The caller fetches those
-    records and attaches the raw payloads as ``job``, ``run`` and ``attempts``; nothing here
-    invents a field, and any gap fails closed.
+    The Checks API returns no workflow identity: a real ``check_runs`` record carries ``id``,
+    ``name``, ``head_sha``, ``status``, ``conclusion``, ``app``, ``external_id`` and
+    ``html_url`` — never ``workflow``, ``workflow_id``, ``path`` or ``workflow_run``. Reading
+    those keys off the check therefore rejects every genuine record, so provenance has to be
+    resolved and then bound.
+
+    ``external_id`` is opaque: for a real Actions check it is a UUID such as
+    ``0fb0ae38-2e89-5fc7-8093-e2d0d0cf857d``, not the numeric job id, and parsing its leading
+    digits would silently invent a job (``83e46dd2-...`` -> 83). It is recorded as metadata and
+    never used for identity. The canonical ``html_url`` link supplies the run and job ids, and
+    the fetched job's own ``check_run_url`` has to point back at this exact check in this exact
+    repository — that mutual reference, not a name match, is the proof of production.
+
+    The caller attaches three raw fetched payloads: ``job`` (actions.getJobForWorkflowRun),
+    ``run`` (actions.getWorkflowRun, which reports the current attempt) and ``attempt``
+    (actions.getWorkflowRunAttempt for the job's own attempt number). There is no
+    listWorkflowRunAttempts endpoint, so currency is established by comparing the job's attempt
+    against the run's current attempt and against the fetched attempt-specific record. Any gap
+    fails closed; nothing here invents a field.
     """
     name = check.get("name")
     job = check.get("job") if isinstance(check.get("job"), dict) else None
     run = check.get("run") if isinstance(check.get("run"), dict) else None
-    attempts = check.get("attempts") if isinstance(check.get("attempts"), list) else None
+    attempt = check.get("attempt") if isinstance(check.get("attempt"), dict) else None
 
+    if not repository:
+        return None, f"{name} (repository not supplied — cannot verify provenance)"
     if not isinstance(check.get("id"), int) or check.get("id") <= 0:
         return None, f"{name} (no check run id — cannot bind provenance)"
     if check.get("head_sha") != head_sha:
@@ -356,35 +390,47 @@ def resolve_check_provenance(
     slug = (app.get("slug") or app.get("name")) if isinstance(app, dict) else app
     if slug not in TRUSTED_APP_SLUGS:
         return None, f"{name} (untrusted or missing app {slug or 'none'})"
-    if slug and name not in TRUSTED_CHECKS:
+    if name not in TRUSTED_CHECKS:
         return None, f"{name} (untrusted check identity)"
+
+    link = parse_canonical_job_link(check.get("html_url"), repository) or \
+        parse_canonical_job_link(check.get("details_url"), repository)
+    if link is None:
+        return None, (
+            f"{name} (no canonical Actions job link for {repository} in "
+            f"{check.get('html_url') or check.get('details_url') or 'either url'})"
+        )
+    link_run_id, link_job_id = link
 
     if job is None:
         return None, f"{name} (producing job unavailable — provenance unresolved)"
-    external_id = check.get("external_id")
-    try:
-        job_id = int(external_id) if external_id is not None else None
-    except (TypeError, ValueError):
-        job_id = None
-    if job_id is None or job.get("id") != job_id:
-        return None, f"{name} (job {job.get('id')} is not the check's job {external_id})"
+    if job.get("id") != link_job_id:
+        return None, f"{name} (fetched job {job.get('id')} is not the linked job {link_job_id})"
+    expected_check_url = f"https://api.github.com/repos/{repository}/check-runs/{check.get('id')}"
+    if job.get("check_run_url") != expected_check_url:
+        return None, (
+            f"{name} (job {job.get('id')} does not point back at this check: "
+            f"{job.get('check_run_url')} != {expected_check_url})"
+        )
     if job.get("name") != name:
         return None, f"{name} (job name {job.get('name')} does not match the required check)"
     if job.get("head_sha") != head_sha:
         return None, f"{name} (job head mismatch {job.get('head_sha')} vs {head_sha})"
     if job.get("status") != "completed" or job.get("conclusion") != "success":
         return None, f"{name} (job {job.get('conclusion') or job.get('status')})"
-    if not isinstance(job.get("run_id"), int) or not isinstance(job.get("run_attempt"), int):
-        return None, f"{name} (job carries no run id/attempt)"
+    if job.get("run_id") != link_run_id:
+        return None, f"{name} (job belongs to run {job.get('run_id')}, not the linked run {link_run_id})"
+    if not isinstance(job.get("run_attempt"), int) or job.get("run_attempt") <= 0:
+        return None, f"{name} (job carries no attempt number)"
 
     if run is None:
         return None, f"{name} (producing workflow run unavailable — provenance unresolved)"
-    if run.get("id") != job.get("run_id"):
-        return None, f"{name} (run {run.get('id')} is not the job's run {job.get('run_id')})"
+    if run.get("id") != link_run_id:
+        return None, f"{name} (fetched run {run.get('id')} is not the linked run {link_run_id})"
     if run.get("run_attempt") != job.get("run_attempt"):
         return None, (
-            f"{name} (run attempt {run.get('run_attempt')} is not the job's attempt "
-            f"{job.get('run_attempt')})"
+            f"{name} (stale attempt {job.get('run_attempt')} — "
+            f"the run's current attempt is {run.get('run_attempt')})"
         )
     if run.get("head_sha") != head_sha:
         return None, f"{name} (run head mismatch {run.get('head_sha')} vs {head_sha})"
@@ -394,26 +440,31 @@ def resolve_check_provenance(
         return None, f"{name} (untrusted workflow path {run.get('path')})"
     if not isinstance(run.get("workflow_id"), int) or run.get("workflow_id") <= 0:
         return None, f"{name} (run carries no workflow id)"
-    if not repository:
-        return None, f"{name} (repository not supplied — cannot verify provenance)"
     for key in ("repository", "head_repository"):
-        owner_repo = run.get(key)
-        full_name = owner_repo.get("full_name") if isinstance(owner_repo, dict) else owner_repo
+        record = run.get(key)
+        full_name = record.get("full_name") if isinstance(record, dict) else record
         if full_name != repository:
             return None, f"{name} (run {key} {full_name} is not {repository})"
 
-    if not attempts:
-        return None, f"{name} (attempt history unavailable — cannot confirm the current attempt)"
-    latest = max((a.get("run_attempt") or 0) for a in attempts if isinstance(a, dict))
-    if job.get("run_attempt") != latest:
+    if attempt is None:
+        return None, f"{name} (attempt-specific run record unavailable — currency unproven)"
+    if attempt.get("id") != link_run_id or attempt.get("run_attempt") != job.get("run_attempt"):
         return None, (
-            f"{name} (stale attempt {job.get('run_attempt')} — the current attempt is {latest})"
+            f"{name} (attempt record {attempt.get('id')}/{attempt.get('run_attempt')} is not "
+            f"run {link_run_id} attempt {job.get('run_attempt')})"
         )
+    if attempt.get("head_sha") != head_sha:
+        return None, f"{name} (attempt head mismatch {attempt.get('head_sha')} vs {head_sha})"
+    if attempt.get("status") != "completed" or attempt.get("conclusion") != "success":
+        return None, f"{name} (attempt {attempt.get('conclusion') or attempt.get('status')})"
+    if attempt.get("path") not in TRUSTED_WORKFLOW_PATHS:
+        return None, f"{name} (untrusted attempt workflow path {attempt.get('path')})"
 
     return (
         {
             "name": name,
             "check_id": check.get("id"),
+            "check_run_url": job.get("check_run_url"),
             "job_id": job.get("id"),
             "job_name": job.get("name"),
             "run_id": run.get("id"),
@@ -424,6 +475,8 @@ def resolve_check_provenance(
             "head_sha": head_sha,
             "repository": repository,
             "app": slug,
+            # opaque metadata only — never an identity
+            "external_id": check.get("external_id"),
         },
         None,
     )
@@ -459,7 +512,7 @@ def verify_proposer_publication(
     published PR head:
 
     * the run is the trusted proposer workflow, completed successfully, in this exact
-      repository, and is the current attempt of that run;
+      repository, and its attempt-specific record agrees with the run's current attempt;
     * the published PR head commit exists, equals ``pr.head.sha``, was authored or committed by
       the identity that ran the proposer (the run's actor — the BUMP_PAT user or the bot), and
       was created inside the run's own execution window;
@@ -494,12 +547,31 @@ def verify_proposer_publication(
         if full_name != repository:
             return False, f"publisher run {key} {full_name} is not {repository}"
 
-    attempts = fixture.get("publisher_attempts")
-    if not isinstance(attempts, list) or not attempts:
-        return False, "publisher attempt history unavailable"
-    latest = max((a.get("run_attempt") or 0) for a in attempts if isinstance(a, dict))
-    if run.get("run_attempt") != latest:
-        return False, f"publisher run attempt {run.get('run_attempt')} is stale (current {latest})"
+    # There is no listWorkflowRunAttempts endpoint: getWorkflowRun reports the run's current
+    # attempt, and getWorkflowRunAttempt returns that exact attempt's record. Currency is the
+    # agreement of those two supported calls, not a fabricated history array.
+    if not isinstance(run.get("run_attempt"), int) or run.get("run_attempt") <= 0:
+        return False, "publisher run carries no attempt number"
+    attempt = fixture.get("publisher_attempt")
+    if not isinstance(attempt, dict):
+        return False, "publisher attempt record unavailable"
+    if attempt.get("id") != run.get("id"):
+        return False, f"publisher attempt record is for run {attempt.get('id')}, not {run.get('id')}"
+    if attempt.get("run_attempt") != run.get("run_attempt"):
+        return False, (
+            f"publisher attempt record {attempt.get('run_attempt')} is not the run's current "
+            f"attempt {run.get('run_attempt')} — the publication was superseded by a rerun"
+        )
+    if attempt.get("status") != "completed" or attempt.get("conclusion") != "success":
+        return False, (
+            f"publisher attempt {attempt.get('conclusion') or attempt.get('status')} is not a "
+            "completed success"
+        )
+    if attempt.get("head_sha") != run.get("head_sha"):
+        return False, (
+            f"publisher attempt head {attempt.get('head_sha')} is not the run source head "
+            f"{run.get('head_sha')}"
+        )
 
     commit = fixture.get("published_commit")
     if not isinstance(commit, dict):
