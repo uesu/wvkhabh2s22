@@ -476,9 +476,13 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                             print(f"WARN check_run post {_auth2[:6]} failed: {_e3}", file=sys.stderr)
                             continue
                 try:
-                    _sp_gh.run(["gh", "api", "repos/uesu/wvkhabh2s22/issues/29/comments", "-f", f"body={body}"], capture_output=True, text=True, timeout=10)
-                except Exception:
-                    pass
+                    import os as _os_gh
+                    _env = _os_gh.environ.copy()
+                    _env["GH_TOKEN"] = token
+                    _env["GITHUB_TOKEN"] = token
+                    _sp_gh.run(["gh", "api", "repos/uesu/wvkhabh2s22/issues/29/comments", "-f", f"body={body}"], capture_output=True, text=True, timeout=10, env=_env)
+                except Exception as _e_gh:
+                    print(f"WARN gh api via gh failed: {_e_gh}", file=sys.stderr)
                 # Also try to create a new issue for visibility
                 try:
                     import json as _js4
