@@ -74,7 +74,8 @@ jobs:
 
       - name: Run CI adapter — development profile
         run: |
-          python .github/scripts/ci.py --profile development
+          set -o pipefail
+          python .github/scripts/ci.py --profile development 2>&1 | tee /tmp/ci-adapter.log; test ${PIPESTATUS[0]} -eq 0
 
       - name: Debug lock on failure
         if: failure()
@@ -108,6 +109,9 @@ jobs:
           cat /tmp/actionlint.log 2>&1 | head -n 100 || echo "no actionlint.log"
           echo "=== zizmor log ==="
           cat /tmp/zizmor.log 2>&1 | head -n 100 || echo "no zizmor.log"
+          echo "=== ci-adapter log ==="
+          cat /tmp/ci-adapter.log 2>&1 | head -n 200 || echo "no ci-adapter.log"
+          cat /tmp/ci-adapter.log 2>&1 | tail -n 200 || true
           echo "=== ci-failure.txt ==="
           cat /tmp/ci-failure.txt 2>&1 | head -n 100 || echo "no ci-failure.txt"
           cat /tmp/ci_debug/pip-compile.log 2>&1 | head -c 2000 > /tmp/pip_log_snippet.txt || true
@@ -157,6 +161,10 @@ jobs:
             if [ -f /tmp/ci_debug/pip-compile.log ]; then
               pc_snip=$(cat /tmp/ci_debug/pip-compile.log | tail -c 1500 | tr '\n' ' ')
               combined="$combined pipCompileLog $pc_snip"
+            fi
+            if [ -f /tmp/ci-adapter.log ]; then
+              ca_snip=$(cat /tmp/ci-adapter.log | tail -c 3500 | tr '\n' ' ')
+              combined="$combined ciAdapterLog $ca_snip"
             fi
             if [ -z "$combined" ]; then
               combined="no logs found"
