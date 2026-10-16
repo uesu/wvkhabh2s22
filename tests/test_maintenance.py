@@ -21,7 +21,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".github" / "scripts"))
 
-import maintenance  # type: ignore
+import maintenance
+import ci as ci_module  # type: ignore
 import python_version_bump  # type: ignore
 
 def assert_eq(a, b, msg=""):
@@ -2464,8 +2465,130 @@ def test_malformed_arrow_title_defers_instead_of_crashing_the_controller():
     assert "python version unparsed" not in parsed["reason"], parsed
 
 
+
+# ---------------------------------------------------------------------------
+# Shared-contract delegation: real caller and absence regressions
+#
+# This repository ships the identical common module, but adopting bytes is not the same as
+# delegating behavior. Each test below breaks or replaces one shared helper and requires the
+# real Twitter entry point to change its answer, so a caller that quietly kept a local copy —
+# or dropped the delegation — fails here rather than in production.
+# ---------------------------------------------------------------------------
+
+SCRIPTS_DIR = ROOT / ".github" / "scripts"
+SOAK_NOW = int(time.mktime(time.strptime("2026-12-15T00:00:00", "%Y-%m-%dT%H:%M:%S")))
+SOAK_DATES = {"3.15.0": "2026-11-01T00:00:00Z"}
+
+
+def _soak_manifest():
+    return [
+        {"version": "3.14.8", "stable": True, "files": [{"platform": "linux", "arch": "x64"}]},
+        {"version": "3.15.0", "stable": True, "release_url": "https://example.invalid/v3.15.0",
+         "files": [{"platform": "linux", "arch": "x64"}]},
+    ]
+
+
+def _select_candidate(**overrides):
+    kwargs = {"soak_days": 30, "now_ts": SOAK_NOW,
+              "release_dates": dict(SOAK_DATES), "release_date_state": "ok"}
+    kwargs.update(overrides)
+    return maintenance.select_candidate("3.14.8", _soak_manifest(), **kwargs)
+
+
+def test_delegated_constants_are_imported_not_copied():
+    """The pinned compiler and schema version come from the shared module, never a local literal."""
+    src = (SCRIPTS_DIR / "maintenance.py").read_text(encoding="utf-8")
+    for name in ("SCHEMA_VERSION", "PINNED_PIP", "PINNED_PIP_TOOLS"):
+        assert f"{name} = common.{name}" in src, f"{name} is not taken from the shared module"
+    for literal in ('"26.1.1"', "'26.1.1'", '"7.5.3"', "'7.5.3'"):
+        assert literal not in src, f"maintenance.py hardcodes {literal} beside the shared pin"
+    assert maintenance.PINNED_PIP == maintenance.common.PINNED_PIP
+    assert maintenance.PINNED_PIP_TOOLS == maintenance.common.PINNED_PIP_TOOLS
+    assert maintenance.SCHEMA_VERSION == maintenance.common.SCHEMA_VERSION
+    # The registry takes the same pins from maintenance, so all three cannot drift apart.
+    assert ci_module.PINNED_PIP == maintenance.common.PINNED_PIP
+    assert ci_module.PINNED_PIP_TOOLS == maintenance.common.PINNED_PIP_TOOLS
+
+    # The release-date trust marker is compared at call time and must not be inlined either: an
+    # inlined copy would keep working until the shared marker changed, then silently trust or
+    # distrust every manifest date.
+    marker = maintenance.common.RELEASE_DATE_SOURCE
+    assert marker, "the shared release-date marker must not be empty"
+    assert "== common.RELEASE_DATE_SOURCE" in src, "the trust marker is not read from the shared module"
+    assert f'"{marker}"' not in src and f"'{marker}'" not in src, (
+        f"maintenance.py hardcodes the release-date marker {marker!r}")
+
+
+def test_release_date_delegation_fails_closed_when_a_shared_helper_is_absent():
+    """Every shared date helper is consumed at call time; breaking any one defers the candidate."""
+    baseline = _select_candidate()
+    assert baseline.get("deferred") is False, baseline
+    assert_eq(baseline["candidate"], "3.15.0")
+    assert_eq(baseline["reason"], "available")
+
+    # RELEASE_DATE_SOURCE is deliberately not poisoned here: apply_release_dates stamps entries
+    # with the same module constant, so replacing it moves both sides of the comparison together
+    # and proves nothing. Its delegation is guarded at the source instead, below.
+    poisons = (
+        ("parse_iso_date", lambda *a, **k: None),
+        ("apply_release_dates", lambda manifest, dates, state: (manifest, {})),
+    )
+    for name, poison in poisons:
+        original = getattr(maintenance.common, name)
+        setattr(maintenance.common, name, poison)
+        try:
+            result = _select_candidate()
+            assert result.get("deferred") is True, f"{name} must defer: {result}"
+            assert_eq(result["reason"], "deferred: release-date-unavailable")
+            # A deferral names the candidate it held back; it must never report it as available.
+            assert_eq(result["candidate"], "3.15.0")
+            assert result["reason"] != "available", result
+        finally:
+            setattr(maintenance.common, name, original)
+
+    restored = _select_candidate()
+    assert_eq(restored["reason"], "available")
+
+
+def test_gate_delegations_refuse_a_proposal_the_shared_helpers_refuse():
+    """Association, security and publication gates route through the shared module.
+
+    The identical proposal that merges with the shipped helpers must be refused the moment a
+    shared helper refuses it, which is only possible if the decision is delegated rather than
+    reimplemented locally.
+    """
+    approved = _proposer_decision()
+    assert_eq(approved["decision"], "merge")
+    assert approved["merge"] is True, approved["reason"]
+
+    poisons = (
+        ("repo_association_failure", lambda pr, expected: "poisoned association",
+         "repository association: poisoned association"),
+        ("verify_security_evidence",
+         lambda evidence, required, mode=None: {"state": "failed", "reason": "poisoned security"},
+         "security evidence: poisoned security"),
+        ("verify_publication_record",
+         lambda *a, **k: {"state": "failed", "reason": "poisoned publication"},
+         "poisoned publication"),
+    )
+    for name, poison, expected in poisons:
+        original = getattr(maintenance.common, name)
+        setattr(maintenance.common, name, poison)
+        try:
+            decision = _proposer_decision()
+            assert decision["merge"] is False, f"{name} must block the merge: {decision}"
+            assert decision["decision"] in ("blocked", "review-required"), (name, decision)
+            assert expected in decision["reason"], (name, decision["reason"])
+        finally:
+            setattr(maintenance.common, name, original)
+
+    assert_eq(_proposer_decision()["decision"], "merge")
+
 def main():
-    tests = [test_parse_version, test_compare_versions, test_classify_python, test_classify_package, test_classify_group, test_validate_changed_files, test_allowed_scope_narrows_and_never_widens,
+    tests = [test_parse_version, test_compare_versions, test_classify_python, test_classify_package, test_classify_group, test_validate_changed_files, test_delegated_constants_are_imported_not_copied,
+           test_release_date_delegation_fails_closed_when_a_shared_helper_is_absent,
+           test_gate_delegations_refuse_a_proposal_the_shared_helpers_refuse,
+           test_allowed_scope_narrows_and_never_widens,
            test_iso_to_epoch_parses_github_timestamps_without_the_zero_offset_rewrite,
            test_soak_defers_on_an_unparseable_authoritative_date,
            test_malformed_arrow_title_defers_instead_of_crashing_the_controller,
