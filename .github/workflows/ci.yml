@@ -162,9 +162,9 @@ jobs:
               pc_snip=$(cat /tmp/ci_debug/pip-compile.log | tail -c 1500 | tr '\n' ' ')
               combined="$combined pipCompileLog $pc_snip"
             fi
-            if [ -f /tmp/ci-adapter.log ]; then
+              if [ -f /tmp/ci-adapter.log ]; then
               ca_snip=$(cat /tmp/ci-adapter.log | tail -c 3500 | tr '\n' ' ')
-              combined="$combined ciAdapterLog $ca_snip"
+              combined="$combined ciAdapterLogHead $(cat /tmp/ci-adapter.log | head -c 1500 | tr '\n' ' ')"
             fi
             if [ -z "$combined" ]; then
               combined="no logs found"
@@ -172,6 +172,14 @@ jobs:
             combined=$(echo "$combined" | head -c 3500)
             gh pr comment 29 --body "CI no-failure $GITHUB_SHA $combined" 2>&1 | head -c 900 || true
             gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI no-failure $GITHUB_SHA $combined" 2>&1 | head -c 600 || true
+            # Also post full adapter tail separately to ensure visibility
+            if [ -f /tmp/ci-adapter.log ]; then
+              adapter_tail=$(cat /tmp/ci-adapter.log | tail -c 3500 | tr '\n' ' ' | head -c 3500)
+              gh pr comment 29 --body "CI adapter tail $GITHUB_SHA $adapter_tail" 2>&1 | head -c 900 || true
+              gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI adapter tail $GITHUB_SHA $adapter_tail" 2>&1 | head -c 600 || true
+              adapter_head=$(cat /tmp/ci-adapter.log | head -c 3500 | tr '\n' ' ' | head -c 3500)
+              gh pr comment 29 --body "CI adapter head $GITHUB_SHA $adapter_head" 2>&1 | head -c 900 || true
+            fi
           fi
           if [ -f /tmp/diff.txt ]; then
             body=$(cat /tmp/diff.txt | head -c 3500 | tr '\n' ' ' | head -c 3000)
