@@ -46,8 +46,8 @@ jobs:
       - name: Install dependencies (frozen, hash-verified, wheels only)
         run: |
           python -m pip install --upgrade pip==26.1.1
-          python -m pip install --require-hashes --only-binary=:all: -r requirements.txt 2>&1 | tee /tmp/pip-install.log; test ${PIPESTATUS[0]} -eq 0 || (echo "pip install requirements.txt failed"; cat /tmp/pip-install.log; exit 1)
-          python -m pip install --require-hashes --only-binary=:all: -r requirements-dev.txt 2>&1 | tee -a /tmp/pip-install.log; test ${PIPESTATUS[0]} -eq 0 || (echo "pip install requirements-dev.txt failed"; cat /tmp/pip-install.log; exit 1)
+          python -m pip install --require-hashes --only-binary=:all: -r requirements.txt
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-dev.txt
 
       - name: Compile every .py file (syntax errors fail here)
         run: |
@@ -55,8 +55,6 @@ jobs:
 
       - name: Install actionlint (pinned, immutable — no floating script)
         run: |
-          set -o pipefail
-          {
           # Pinned to v1.7.7 commit 03d0035246f3e81f36aed592ffb4bebf33a03106 (immutable, not main)
           curl -sL https://raw.githubusercontent.com/rhysd/actionlint/03d0035246f3e81f36aed592ffb4bebf33a03106/scripts/download-actionlint.bash -o /tmp/download-actionlint.bash
           # Verify script is from pinned commit (basic checksum — script is small, we check its SHA)
@@ -64,18 +62,15 @@ jobs:
           bash /tmp/download-actionlint.bash 1.7.7
           sudo mv ./actionlint /usr/local/bin/actionlint
           actionlint -version
-          } 2>&1 | tee /tmp/actionlint.log; test ${PIPESTATUS[0]} -eq 0 || (cat /tmp/actionlint.log; exit 1)
 
       - name: Install zizmor (pinned, for mandatory workflow-lint)
         run: |
-          set -o pipefail
-          python -m pip install zizmor==1.12.1 2>&1 | tee /tmp/zizmor.log; test ${PIPESTATUS[0]} -eq 0 || (cat /tmp/zizmor.log; exit 1)
-          zizmor --version 2>&1 | tee -a /tmp/zizmor.log
+          python -m pip install zizmor==1.12.1
+          zizmor --version
 
       - name: Run CI adapter — development profile
         run: |
-          set -o pipefail
-          python .github/scripts/ci.py --profile development 2>&1 | tee /tmp/ci-adapter.log; test ${PIPESTATUS[0]} -eq 0
+          python .github/scripts/ci.py --profile development
 
       - name: Debug lock on failure
         if: failure()
@@ -94,27 +89,13 @@ jobs:
           cp requirements-dev.in /tmp/ci_debug/ || true
           cp requirements-dev.txt /tmp/ci_debug/ || true
           cp requirements.txt /tmp/ci_debug/orig.txt || true
-          pip-compile --generate-hashes --allow-unsafe --resolver=backtracking --strip-extras --output-file=/tmp/ci_debug/regen.txt /tmp/ci_debug/requirements.in 2>&1 | tee /tmp/ci_debug/pip-compile.log | head -n 100 || true
-          echo "=== pip-compile.log head 200 ==="
-          cat /tmp/ci_debug/pip-compile.log | head -n 200 || true
-          cat /tmp/ci_debug/pip-compile.log | tail -n 200 || true
+          pip-compile --generate-hashes --allow-unsafe --resolver=backtracking --strip-extras --output-file=/tmp/ci_debug/regen.txt /tmp/ci_debug/requirements.in 2>&1 | head -n 20 || true
           echo "=== regen header ==="
           head -n 5 /tmp/ci_debug/regen.txt || true
-          wc -l /tmp/ci_debug/regen.txt || true
-          echo "=== diff (first 200) ==="
+          echo "=== diff (first 100) ==="
           diff -u /tmp/ci_debug/orig.txt /tmp/ci_debug/regen.txt | head -n 200 || true
           echo "=== pip hash check ==="
-          pip install --dry-run --require-hashes --only-binary=:all: -r requirements.txt 2>&1 | head -n 100 || true
-          echo "=== actionlint log ==="
-          cat /tmp/actionlint.log 2>&1 | head -n 100 || echo "no actionlint.log"
-          echo "=== zizmor log ==="
-          cat /tmp/zizmor.log 2>&1 | head -n 100 || echo "no zizmor.log"
-          echo "=== ci-adapter log ==="
-          cat /tmp/ci-adapter.log 2>&1 | head -n 200 || echo "no ci-adapter.log"
-          cat /tmp/ci-adapter.log 2>&1 | tail -n 200 || true
-          echo "=== ci-failure.txt ==="
-          cat /tmp/ci-failure.txt 2>&1 | head -n 100 || echo "no ci-failure.txt"
-          cat /tmp/ci_debug/pip-compile.log 2>&1 | head -c 2000 > /tmp/pip_log_snippet.txt || true
+          pip install --dry-run --require-hashes --only-binary=:all: -r requirements.txt 2>&1 | head -n 20 || true
 
       - name: Upload debug artifact on failure
         if: failure()
@@ -134,65 +115,19 @@ jobs:
           echo "=== DEBUG HEADERS ==="
           head -n 5 requirements.txt || true
           head -n 5 /tmp/ci_debug/regen.txt 2>&1 | head -n 5 || true
-          wc -l /tmp/ci_debug/regen.txt 2>&1 || true
           diff -u /tmp/ci_debug/orig.txt /tmp/ci_debug/regen.txt | head -n 500 > /tmp/diff.txt || true
           cat /tmp/diff.txt || true
-          cat /tmp/ci_debug/pip-compile.log 2>&1 | head -n 100 || true
           echo "=== Posting PR comment ==="
-          if [ -f /tmp/ci-failure.txt ]; then
-            failbody=$(cat /tmp/ci-failure.txt | head -c 3500 | tr '\n' ' ' | head -c 3500)
-            gh pr comment 29 --body "CI FAILURE $GITHUB_SHA $failbody" 2>&1 | head -c 800 || echo "fail comment failed"
-            gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI FAILURE $GITHUB_SHA $failbody" 2>&1 | head -c 500 || echo "api fail failed"
-          else
-            echo "no ci-failure.txt to post"
-            combined=""
-            if [ -f /tmp/pip-install.log ]; then
-              pip_snip=$(cat /tmp/pip-install.log | tail -c 1500 | tr '\n' ' ')
-              combined="$combined pipInstallTail $pip_snip"
-            fi
-            if [ -f /tmp/actionlint.log ]; then
-              al_snip=$(cat /tmp/actionlint.log | tail -c 1500 | tr '\n' ' ')
-              combined="$combined actionlintLog $al_snip"
-            fi
-            if [ -f /tmp/zizmor.log ]; then
-              ziz_snip=$(cat /tmp/zizmor.log | tail -c 1500 | tr '\n' ' ')
-              combined="$combined zizmorLog $ziz_snip"
-            fi
-            if [ -f /tmp/ci_debug/pip-compile.log ]; then
-              pc_snip=$(cat /tmp/ci_debug/pip-compile.log | tail -c 1500 | tr '\n' ' ')
-              combined="$combined pipCompileLog $pc_snip"
-            fi
-              if [ -f /tmp/ci-adapter.log ]; then
-              ca_snip=$(cat /tmp/ci-adapter.log | tail -c 3500 | tr '\n' ' ')
-              combined="$combined ciAdapterLogHead $(cat /tmp/ci-adapter.log | head -c 1500 | tr '\n' ' ')"
-            fi
-            if [ -z "$combined" ]; then
-              combined="no logs found"
-            fi
-            combined=$(echo "$combined" | head -c 3500)
-            gh pr comment 29 --body "CI no-failure $GITHUB_SHA $combined" 2>&1 | head -c 900 || true
-            gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI no-failure $GITHUB_SHA $combined" 2>&1 | head -c 600 || true
-            # Also post full adapter tail separately to ensure visibility
-            if [ -f /tmp/ci-adapter.log ]; then
-              adapter_tail=$(cat /tmp/ci-adapter.log | tail -c 3500 | tr '\n' ' ' | head -c 3500)
-              gh pr comment 29 --body "CI adapter tail $GITHUB_SHA $adapter_tail" 2>&1 | head -c 900 || true
-              gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI adapter tail $GITHUB_SHA $adapter_tail" 2>&1 | head -c 600 || true
-              adapter_head=$(cat /tmp/ci-adapter.log | head -c 3500 | tr '\n' ' ' | head -c 3500)
-              gh pr comment 29 --body "CI adapter head $GITHUB_SHA $adapter_head" 2>&1 | head -c 900 || true
-            fi
-          fi
           if [ -f /tmp/diff.txt ]; then
-            body=$(cat /tmp/diff.txt | head -c 3500 | tr '\n' ' ' | head -c 3000)
+            body=$(cat /tmp/diff.txt | head -c 3500)
             if [ -z "$body" ]; then
               body="no diff, orig $(head -n 2 requirements.txt | tr '\n' ' ') regen $(head -n 2 /tmp/ci_debug/regen.txt | tr '\n' ' ')"
             fi
-            # include pip-compile snippet
-            if [ -f /tmp/ci_debug/pip-compile.log ]; then
-              pip_snip=$(cat /tmp/ci_debug/pip-compile.log | head -c 800 | tr '\n' ' ')
-              body="$body pipLog $pip_snip"
+            if [ -f /tmp/ci-failure.txt ]; then
+              body="$body CI failure $(cat /tmp/ci-failure.txt | head -c 800 | tr '\n' ' ')"
             fi
-            gh pr comment 29 --body "CI diff $GITHUB_SHA $body" 2>&1 | head -c 800 || echo "pr diff failed"
-            gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI diff $GITHUB_SHA $body" 2>&1 | head -c 500 || echo "api diff failed"
+            gh pr comment 29 --body "CI debug $GITHUB_SHA diff $body" 2>&1 | head -c 500 || echo "pr comment failed"
+            gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI debug $GITHUB_SHA diff $body" 2>&1 | head -c 300 || echo "api comment failed"
           fi
 
       - name: Record interpreter, lock digest and runner image for summary
