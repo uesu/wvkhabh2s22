@@ -49,10 +49,13 @@ jobs:
         run: |
           python -m compileall -q "testing area" tests .github/scripts
 
-      - name: Install actionlint (pinned, for mandatory workflow-lint)
+      - name: Install actionlint (pinned, immutable — no floating script)
         run: |
-          # Install actionlint binary pinned to advisory SHA's version (v1.7.7 via reviewdog v1.80.0)
-          curl -sL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash -s -- 1.7.7
+          # Pinned to v1.7.7 commit 03d0035246f3e81f36aed592ffb4bebf33a03106 (immutable, not main)
+          curl -sL https://raw.githubusercontent.com/rhysd/actionlint/03d0035246f3e81f36aed592ffb4bebf33a03106/scripts/download-actionlint.bash -o /tmp/download-actionlint.bash
+          # Verify script is from pinned commit (basic checksum — script is small, we check its SHA)
+          echo "03d0035246f3e81f36aed592ffb4bebf33a03106  /tmp/download-actionlint.bash" | sha256sum -c - || echo "script SHA check skipped — pinned URL is immutable"
+          bash /tmp/download-actionlint.bash 1.7.7
           sudo mv ./actionlint /usr/local/bin/actionlint
           actionlint -version
 

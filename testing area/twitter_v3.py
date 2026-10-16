@@ -1414,12 +1414,10 @@ class _TestFeed:
 
 
 async def fetch_working_feed(session: aiohttp.ClientSession, account: str):
-    # Returns (feed, attempts, selected_host) — actual attempt counts, no fabrication, no extra requests
-    # round 12 (2026-09-17): every attempt is logged. Before this, a dead
-    # nitter fleet made the whole monitor a silent no-op (zero log lines —
-    # the missed 2026-09-17 Wuthering_Waves/2100555373073797461 tweet).
+    # Returns (feed, attempts, selected_host, parse_attempts) — actual counts, no fabrication
     headers = {"User-Agent": "Mozilla/5.0"}
     attempts = 0
+    parse_attempts = 0
     selected = None
     for idx, instance in enumerate(RSS_INSTANCES):
         feed_url = f"{instance}/{account}/rss"
@@ -1437,13 +1435,24 @@ async def fetch_working_feed(session: aiohttp.ClientSession, account: str):
                                    timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
                     content = await response.text()
+                    # Count each feedparser.parse as a parse attempt (actual operation boundary)
+                    parse_attempts += 1
                     feed = await asyncio.to_thread(feedparser.parse, content)
-                    if feed.entries:
+                    # Annotate feed with parse metadata without altering results (exception-safe)
+                    try:
+                        # Attach metadata as attributes if feed is object-like, else as dict entry
+                        if hasattr(feed, '__dict__'):
+                            feed._parse_attempts = parse_attempts
+                            feed._http_status = response.status
+                        elif isinstance(feed, dict):
+                            feed['_parse_attempts'] = parse_attempts
+                    except Exception:
+                        pass
+                    if feed and getattr(feed, 'entries', None) is not None and len(getattr(feed, 'entries', [])) > 0:
                         logging.info(f"[{account}] feed OK via {instance} — "
                                      f"{len(feed.entries)} entries.")
                         selected = instance
-                        # Return actual telemetry with feed
-                        return (feed, attempts, selected)
+                        return (feed, attempts, selected, parse_attempts)
                     logging.info(f"[{account}] {instance}: HTTP 200 but 0 entries "
                                  f"(bot check / stale instance?) — trying next.")
                 else:
@@ -1454,7 +1463,7 @@ async def fetch_working_feed(session: aiohttp.ClientSession, account: str):
                          f"trying next.")
     logging.warning(f"[{account}] NO working nitter instance this run — "
                     f"account skipped (see TEST_TWEET_ID to rebuild one tweet).")
-    return (None, attempts, selected)
+    return (None, attempts, selected, parse_attempts)
 
 
 async def fetch_tweet_details(session: aiohttp.ClientSession, account: str, tweet_id: str,
@@ -1682,29 +1691,38 @@ async def main():
         _hosts_attempted = []
         _hosts_selected = []
         _feeds_parsed = 0
+        _total_entries = 0
+        _successful_responses = 0
         for res in _results:
-            # Handle both new tuple (feed, attempts, selected) and legacy feed-only (for tests)
-            if isinstance(res, tuple) and len(res) == 3:
+            # Handle tuples of varying lengths (new: feed, attempts, selected, parse_attempts)
+            if isinstance(res, tuple) and len(res) == 4:
+                feed, attempts, selected, parse_attempts = res
+            elif isinstance(res, tuple) and len(res) == 3:
                 feed, attempts, selected = res
+                parse_attempts = 1 if feed else 0
             elif isinstance(res, tuple) and len(res) == 2:
-                # Legacy double where second is attempts
                 feed, attempts = res
                 selected = None
+                parse_attempts = 1 if feed else 0
             else:
                 feed = res
                 attempts = 1 if feed else len(RSS_INSTANCES)
                 selected = RSS_INSTANCES[0] if feed and getattr(feed, 'entries', None) else None
+                parse_attempts = 1 if feed else 0
             feeds.append(feed)
             _http_requests += attempts or 0
+            _feeds_parsed += parse_attempts or 0
+            if feed and getattr(feed, 'entries', None) is not None:
+                # Count entries separately, not as feeds_parsed
+                _total_entries += len(getattr(feed, 'entries', []))
+                if len(getattr(feed, 'entries', [])) > 0:
+                    _successful_responses += 1
             if attempts:
-                # Record all attempted hosts up to attempts (first N instances)
                 for inst in RSS_INSTANCES[:attempts]:
                     if inst not in _hosts_attempted:
                         _hosts_attempted.append(inst)
             if selected:
                 _hosts_selected.append(selected)
-            if feed and getattr(feed, 'entries', None):
-                _feeds_parsed += len(feed.entries)
         _attempted_accounts = len(ACCOUNTS)
         _usable_accounts = sum(1 for f in feeds if f and getattr(f, 'entries', None))
 

@@ -268,57 +268,87 @@ jobs:
                 core.setOutput('reason', 'checks unavailable — fail closed');
                 return;
               }
-              // Resolve workflow runs for this head to attach real workflow ID/path/job/run/head provenance
+              // Resolve workflow runs for this head with actual producer authentication (not same-SHA first-match)
               let workflowRuns = [];
+              let trustedWorkflowRun = null;
               try {
-                const { data: wfData } = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, head_sha: pr.head.sha, per_page: 100 });
-                workflowRuns = wfData.workflow_runs || [];
-                // Also fetch by workflow file name to ensure we have ci.yml runs
-                // The trusted workflow is .github/workflows/ci.yml
-                // Already covered by head_sha filter, but we enrich with path verification
+                // Fetch runs for the exact trusted workflow (ci.yml) and head SHA — ensures workflow ID/path binding
+                const { data: wfData } = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: 'ci.yml', head_sha: pr.head.sha, per_page: 20 });
+                const candidates = (wfData.workflow_runs || []).filter(r => r.head_sha === pr.head.sha && r.path === '.github/workflows/ci.yml');
+                // Also fetch via generic head_sha search for completeness (to catch runs with different workflow_id)
+                if (candidates.length === 0) {
+                  const { data: wfData2 } = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, head_sha: pr.head.sha, per_page: 100 });
+                  const extra = (wfData2.workflow_runs || []).filter(r => r.head_sha === pr.head.sha && r.path === '.github/workflows/ci.yml');
+                  candidates.push(...extra);
+                }
+                workflowRuns = candidates;
+                // Pick the most recent successful run for this head (actual producer)
+                // But do not use first same-SHA run arbitrarily — verify job/check association below
+                trustedWorkflowRun = candidates.find(r => r.conclusion === 'success' && r.head_sha === pr.head.sha) || candidates[0] || null;
+                if (trustedWorkflowRun) {
+                  console.log(`Trusted workflow run candidate: ${trustedWorkflowRun.id} ${trustedWorkflowRun.path} ${trustedWorkflowRun.head_sha} ${trustedWorkflowRun.conclusion} attempt ${trustedWorkflowRun.run_attempt || 1}`);
+                }
+                // For each workflow run, fetch its jobs to enable job/check association
+                for (const wr of workflowRuns) {
+                  try {
+                    const { data: jobsData } = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: wr.id, per_page: 100 });
+                    wr._jobs = jobsData.jobs || [];
+                  } catch (e) {
+                    console.log(`Failed to list jobs for run ${wr.id}: ${e.message}`);
+                    wr._jobs = [];
+                  }
+                }
               } catch (e) {
                 console.log(`Failed to list workflow runs: ${e.message} — will require checks to carry workflow provenance already`);
                 workflowRuns = [];
+                trustedWorkflowRun = null;
               }
               // Also consider commit statuses (legacy)
               const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({ owner, repo, ref: pr.head.sha, per_page: 100 });
-              // Enrich checks with real workflow provenance from API — no fabrication
+              // Enrich checks with real workflow provenance via job/run association — no same-SHA first-match, no synthetic gate
               checks = all.map(c => {
-                let matchedRun = workflowRuns.find(wr => wr.head_sha === c.head_sha);
-                const wfInfo = matchedRun ? { id: matchedRun.id, name: matchedRun.name, path: matchedRun.path, head_sha: matchedRun.head_sha, conclusion: matchedRun.conclusion } : null;
+                // Find the workflow run whose job actually produced this check (via jobs list)
+                let matchedRun = null;
+                let matchedJob = null;
+                for (const wr of workflowRuns) {
+                  const job = (wr._jobs || []).find(j => j.name === c.name || j.name === c.name.replace(/-/g, ' '));
+                  if (job) {
+                    matchedRun = wr;
+                    matchedJob = job;
+                    break;
+                  }
+                  // Fallback: if check name is maintenance-ci, it corresponds to the workflow's final gate job
+                  if (c.name === 'maintenance-ci' && wr.path === '.github/workflows/ci.yml') {
+                    // Require that the workflow run actually has a job named maintenance-ci
+                    const jc = (wr._jobs || []).find(j => j.name === 'maintenance-ci' || j.name === 'validate' || j.name.includes('maintenance'));
+                    if (jc) {
+                      matchedRun = wr;
+                      matchedJob = jc;
+                      break;
+                    }
+                  }
+                }
+                // If no job match, do not fabricate workflow — leave provenance missing (helper will fail closed)
+                // This prevents same-SHA first-match from authenticating unrelated runs
+                const wfInfo = matchedRun ? { id: matchedRun.id, name: matchedRun.name, path: matchedRun.path, head_sha: matchedRun.head_sha, conclusion: matchedRun.conclusion, run_attempt: matchedRun.run_attempt || 1, workflow_id: matchedRun.workflow_id } : null;
+                // Also verify security scan findings if this check is workflow-lint or zizmor: require actual job conclusion
+                // (Helper will verify, but we can attach attempt)
                 return {
                   name: c.name,
-                  status: c.status,
-                  conclusion: c.conclusion,
+                  status: matchedJob ? matchedJob.conclusion === 'success' ? 'completed' : matchedJob.status : c.status,
+                  conclusion: matchedJob ? matchedJob.conclusion : c.conclusion,
                   app: c.app?.slug,
                   head_sha: c.head_sha,
                   workflow: matchedRun ? matchedRun.name : undefined,
                   workflow_id: matchedRun ? matchedRun.workflow_id : undefined,
                   workflow_path: matchedRun ? matchedRun.path : undefined,
                   workflow_run: wfInfo,
-                  job_name: c.name
+                  job_name: matchedJob ? matchedJob.name : c.name,
+                  run_attempt: matchedRun ? matchedRun.run_attempt || 1 : undefined
                 };
               });
-              // Add workflow runs as synthetic checks for trusted workflow if not already represented
-              for (const wr of workflowRuns) {
-                if (wr.head_sha !== pr.head.sha) continue;
-                if (wr.path !== '.github/workflows/ci.yml' && wr.name !== 'CI — syntax + offline validation') continue;
-                const already = checks.some(ch => ch.workflow_run && ch.workflow_run.id === wr.id);
-                if (!already && wr.conclusion === 'success') {
-                  checks.push({
-                    name: 'maintenance-ci',
-                    status: 'completed',
-                    conclusion: wr.conclusion,
-                    app: 'github-actions',
-                    head_sha: wr.head_sha,
-                    workflow: wr.name,
-                    workflow_id: wr.workflow_id,
-                    workflow_path: wr.path,
-                    workflow_run: { id: wr.id, name: wr.name, path: wr.path, head_sha: wr.head_sha, conclusion: wr.conclusion },
-                    job_name: 'maintenance-ci'
-                  });
-                }
-              }
+              // Do NOT create synthetic maintenance-ci from workflow run if no check represents it — require actual gate
+              // The final gate must be present as a real check/job; inventing it hides missing evidence
               // Add statuses as checks
               for (const s of statuses) {
                 // Legacy statuses: creator/context distinct from check-run provenance — do not invent app/workflow, include actual sha and context
@@ -475,50 +505,57 @@ jobs:
                 }
                 // Resolve workflow runs for final head
                 let finalWorkflowRuns = [];
+                let finalTrustedRun = null;
                 try {
-                  const { data: wfData } = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, head_sha: finalPr.head.sha, per_page: 100 });
-                  finalWorkflowRuns = wfData.workflow_runs || [];
+                  const { data: wfData } = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: 'ci.yml', head_sha: finalPr.head.sha, per_page: 20 });
+                  const cand = (wfData.workflow_runs || []).filter(r => r.head_sha === finalPr.head.sha && r.path === '.github/workflows/ci.yml');
+                  if (cand.length === 0) {
+                    const { data: wfData2 } = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, head_sha: finalPr.head.sha, per_page: 100 });
+                    const extra = (wfData2.workflow_runs || []).filter(r => r.head_sha === finalPr.head.sha && r.path === '.github/workflows/ci.yml');
+                    cand.push(...extra);
+                  }
+                  finalWorkflowRuns = cand;
+                  finalTrustedRun = cand.find(r => r.conclusion === 'success' && r.head_sha === finalPr.head.sha) || cand[0] || null;
+                  for (const wr of finalWorkflowRuns) {
+                    try {
+                      const { data: jd } = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: wr.id, per_page: 100 });
+                      wr._jobs = jd.jobs || [];
+                    } catch (e) {
+                      wr._jobs = [];
+                    }
+                  }
                 } catch (e) {
                   console.log(`Failed to list final workflow runs: ${e.message}`);
                   finalWorkflowRuns = [];
                 }
                 const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({ owner, repo, ref: finalPr.head.sha, per_page: 100 });
                 finalChecks = all.map(c => {
-                  let matchedRun = finalWorkflowRuns.find(wr => wr.head_sha === c.head_sha);
-                  const wfInfo = matchedRun ? { id: matchedRun.id, name: matchedRun.name, path: matchedRun.path, head_sha: matchedRun.head_sha, conclusion: matchedRun.conclusion } : null;
+                  let matchedRun = null;
+                  let matchedJob = null;
+                  for (const wr of finalWorkflowRuns) {
+                    const job = (wr._jobs || []).find(j => j.name === c.name);
+                    if (job) { matchedRun = wr; matchedJob = job; break; }
+                    if (c.name === 'maintenance-ci' && wr.path === '.github/workflows/ci.yml') {
+                      const jc = (wr._jobs || []).find(j => j.name === 'maintenance-ci' || j.name === 'validate');
+                      if (jc) { matchedRun = wr; matchedJob = jc; break; }
+                    }
+                  }
+                  const wfInfo = matchedRun ? { id: matchedRun.id, name: matchedRun.name, path: matchedRun.path, head_sha: matchedRun.head_sha, conclusion: matchedRun.conclusion, run_attempt: matchedRun.run_attempt || 1, workflow_id: matchedRun.workflow_id } : null;
                   return {
                     name: c.name,
-                    status: c.status,
-                    conclusion: c.conclusion,
+                    status: matchedJob ? (matchedJob.conclusion === 'success' ? 'completed' : matchedJob.status) : c.status,
+                    conclusion: matchedJob ? matchedJob.conclusion : c.conclusion,
                     app: c.app?.slug,
                     head_sha: c.head_sha,
                     workflow: matchedRun ? matchedRun.name : undefined,
                     workflow_id: matchedRun ? matchedRun.workflow_id : undefined,
                     workflow_path: matchedRun ? matchedRun.path : undefined,
                     workflow_run: wfInfo,
-                    job_name: c.name
+                    job_name: matchedJob ? matchedJob.name : c.name,
+                    run_attempt: matchedRun ? matchedRun.run_attempt || 1 : undefined
                   };
                 });
-                // Enrich with workflow runs if needed
-                for (const wr of finalWorkflowRuns) {
-                  if (wr.head_sha !== finalPr.head.sha) continue;
-                  if (wr.path !== '.github/workflows/ci.yml' && wr.name !== 'CI — syntax + offline validation') continue;
-                  const already = finalChecks.some(ch => ch.workflow_run && ch.workflow_run.id === wr.id);
-                  if (!already && wr.conclusion === 'success') {
-                    finalChecks.push({
-                      name: 'maintenance-ci',
-                      status: 'completed',
-                      conclusion: wr.conclusion,
-                      app: 'github-actions',
-                      head_sha: wr.head_sha,
-                      workflow: wr.name,
-                      workflow_id: wr.workflow_id,
-                      workflow_path: wr.path,
-                      workflow_run: { id: wr.id, name: wr.name, path: wr.path, head_sha: wr.head_sha, conclusion: wr.conclusion },
-                      job_name: 'maintenance-ci'
-                    });
-                  }
-                }
+                // Do NOT synthesize maintenance-ci — require actual check/job
                 for (const s of statuses) {
                   // Legacy statuses: do not invent app/workflow — helper will reject if mandatory requires provenance
                   finalChecks.push({ name: s.context, status: 'completed', conclusion: s.state === 'success' ? 'success' : s.state, head_sha: s.sha || finalPr.head.sha });

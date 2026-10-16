@@ -733,42 +733,67 @@ def decision_from_fixture(fixture_path: str | os.PathLike, trusted_policy_path: 
         if fixture.get("deferred"):
             return {"decision": "review-required", "reason": "python soak not satisfied", "merge": False}
         # Verify actual publisher/run/head provenance — branch/title alone is not authorization
-        # Require configured trusted publisher/proposal run: check proposer_run or BUMP_PAT provenance
-        # If fixture indicates proposer_run_id or publisher, validate it; otherwise, if author is untrusted and branch is chore/python-*, require review
-        trusted_publishers = ["github-actions[bot]", "dependabot[bot]"]
-        # BUMP_PAT owner is not known here, but we can check if the PR was created via the publisher workflow by checking for a proposer marker
-        proposer_run = fixture.get("proposer_run_id") or fixture.get("publisher") or fixture.get("bump_pat_provenance")
-        # If author is untrusted and no proposer_run, it's not a verified proposal — require review (no branch/body authority)
-        if author not in trusted_publishers and not proposer_run:
-            # Also check if the PR body or title contains proposer run reference — if not, it's unrelated successful proposer run or no run
-            body = pr.get("body") or ""
-            if "Automated Python bump" not in body and "chore: bump CPython pin" not in title:
-                return {"decision": "review-required", "reason": "python bump unverified publisher/provenance", "merge": False}
-            # Even with correct title but untrusted author and no proposer_run, require review for safety
-            # The strict allowlist already passed, but without provenance, it's not fully authorized
-            # Publisher provenance: branch/title alone is not authorization — require verified trusted publisher
-            # No branch/title/editable body or arbitrary marker grants trust; must be from trusted API sources
-            # Check actual publisher identity from trusted base policy: author must be in trusted set or have verified proposer run
-            # Trusted publishers are configured (dependabot[bot], github-actions[bot], and BUMP_PAT owner via workflow_run)
-            # For any untrusted author (not in trusted_publishers) with chore/python-* branch, require verified proposer evidence
-            trusted_publishers = ["dependabot[bot]", "github-actions[bot]"]
-            # Also check if BUMP_PAT owner is trusted via proposer_run_id — if not present, untrusted authors cannot pass
+        # Unconditional gate for Python lane: a supplied marker is never proof, even if truthy/numeric
+        if is_python_bump:
+            trusted_publishers = ["github-actions[bot]", "dependabot[bot]"]
+            # Gather proposer evidence from fixture (must be validated via trusted API, not just truthy)
             proposer_run = fixture.get("proposer_run_id") or fixture.get("publisher") or fixture.get("bump_pat_provenance") or fixture.get("verified_proposer")
-            # In real workflow, proposer_run would be validated via API (workflow_run.id, head_sha, actor)
-            # For test, we require that any chore/python-* branch with untrusted author must have a truthy verified proposer marker that is not arbitrary
-            # Arbitrary supplied marker (e.g., proposer_run_id=True) is not proof — must be validated against trusted workflow
-            # We check for a specific verified field that would come from trusted API: e.g., fixture.get("proposer_verified") == True and proposer_run matches head_sha
+            # Verified flag must be explicitly True from trusted API verification, not just presence of marker
             verified = fixture.get("proposer_verified") is True or fixture.get("publisher_verified") is True
-            # Also check workflow_run provenance: if present, verify it matches head and is from trusted workflow
+            # Workflow run must be from trusted workflow file and match exact head SHA
             workflow_run = fixture.get("workflow_run") or fixture.get("proposer_workflow_run")
             workflow_verified = False
             if isinstance(workflow_run, dict):
-                # Must have id, head_sha matching PR head, and workflow file .github/workflows/python_version_bump.yml
-                if workflow_run.get("head_sha") == (pr.get("head") or {}).get("sha") and workflow_run.get("path") == ".github/workflows/python_version_bump.yml":
-                    workflow_verified = True
-            # Generic publisher check: any author not in trusted_publishers and without verified workflow/proposer must be review
-            if author not in trusted_publishers and not (verified and proposer_run) and not workflow_verified:
+                # Must have id, head_sha matching PR head, path == python_version_bump.yml, and successful conclusion
+                if (workflow_run.get("head_sha") == (pr.get("head") or {}).get("sha")
+                    and workflow_run.get("path") == ".github/workflows/python_version_bump.yml"
+                    and workflow_run.get("conclusion") in (None, "success")):  # None for in-progress, but we check success elsewhere
+                    # Also require that proposer_run is numeric and matches workflow_run id if both present
+                    if proposer_run is not None:
+                        # proposer_run should be numeric and equal to workflow_run id, not boolean True
+                        try:
+                            if int(proposer_run) != int(workflow_run.get("id", -1)):
+                                workflow_verified = False
+                            else:
+                                workflow_verified = True
+                        except Exception:
+                            # Non-numeric or boolean True fails verification
+                            workflow_verified = False
+                    else:
+                        workflow_verified = True
+                # Also allow verification via separate proposer_run_id + workflow_run id match
+                if not workflow_verified and workflow_run.get("path") == ".github/workflows/python_version_bump.yml":
+                    # If workflow_run is present but proposer_run is boolean/arbitrary, it must not pass
+                    pass
+            # Additional checks: proposer_run must be numeric (not boolean), and if verified flag is set, proposer_run must be valid
+            # Boolean True is truthy but not proof — must be numeric and match workflow_run
+            if proposer_run is True or proposer_run == "true":
+                # Explicitly reject boolean true as marker
+                proposer_run_valid = False
+            elif isinstance(proposer_run, bool):
+                proposer_run_valid = False
+            elif proposer_run is not None:
+                try:
+                    # Must be int-like and not boolean
+                    if isinstance(proposer_run, str) and not proposer_run.isdigit():
+                        proposer_run_valid = False
+                    else:
+                        _id = int(proposer_run)
+                        proposer_run_valid = _id > 0 and verified
+                    # Also need workflow_verified to be True for full authorization
+                    if not workflow_verified:
+                        proposer_run_valid = False
+                except Exception:
+                    proposer_run_valid = False
+            else:
+                proposer_run_valid = False
+            # For Python bump, require either trusted author or fully verified proposer (numeric id + verified flag + workflow_verified)
+            # No branch/title/body marker alone grants trust
+            if author not in trusted_publishers and not (proposer_run_valid and workflow_verified):
+                # Also check body/title markers are not trusted — they are not proof
                 return {"decision": "review-required", "reason": "python bump unverified publisher/provenance", "merge": False}
+            # If author is untrusted but has valid proposer, also require that workflow_run head matches PR head and version matches manifest
+            # (Additional manifest validation elsewhere)
 
     # Check evaluation
     mandatory = policy.get("checks", {}).get("mandatory") or ["maintenance-ci"]
