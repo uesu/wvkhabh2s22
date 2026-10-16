@@ -201,10 +201,17 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                         def normalize(lines):
                             out = []
                             for line in lines:
+                                # Normalize all occurrences of tmpdir and absolute input path, not just header
+                                if str(tmpdir) in line:
+                                    line = line.replace(str(tmpdir) + "/", "")
+                                    line = line.replace(str(tmpdir), "")
+                                if str(Path(tmpdir) / src) in line:
+                                    line = line.replace(str(Path(tmpdir) / src), src)
                                 if "--output-file=" in line:
                                     import re as _re2
                                     line = _re2.sub(r"--output-file=\S+", "--output-file=requirements.txt" if label == "requirements.txt" else "--output-file=requirements-dev.txt", line)
-                                    line = line.replace(str(tmpdir) + "/", "")
+                                # Normalize via comments that contain absolute path
+                                if "# via" in line and "/" in line:
                                     line = line.replace(str(Path(tmpdir) / src), src)
                                     line = line.replace(str(tmpdir) + "/", "")
                                 out.append(line)
