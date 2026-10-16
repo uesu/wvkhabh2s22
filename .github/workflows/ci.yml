@@ -89,13 +89,20 @@ jobs:
           cp requirements-dev.in /tmp/ci_debug/ || true
           cp requirements-dev.txt /tmp/ci_debug/ || true
           cp requirements.txt /tmp/ci_debug/orig.txt || true
-          pip-compile --generate-hashes --allow-unsafe --resolver=backtracking --strip-extras --output-file=/tmp/ci_debug/regen.txt /tmp/ci_debug/requirements.in 2>&1 | head -n 20 || true
+          pip-compile --generate-hashes --allow-unsafe --resolver=backtracking --strip-extras --output-file=/tmp/ci_debug/regen.txt /tmp/ci_debug/requirements.in 2>&1 | tee /tmp/ci_debug/pip-compile.log | head -n 100 || true
+          echo "=== pip-compile.log head 200 ==="
+          cat /tmp/ci_debug/pip-compile.log | head -n 200 || true
+          cat /tmp/ci_debug/pip-compile.log | tail -n 200 || true
           echo "=== regen header ==="
           head -n 5 /tmp/ci_debug/regen.txt || true
-          echo "=== diff (first 100) ==="
+          wc -l /tmp/ci_debug/regen.txt || true
+          echo "=== diff (first 200) ==="
           diff -u /tmp/ci_debug/orig.txt /tmp/ci_debug/regen.txt | head -n 200 || true
           echo "=== pip hash check ==="
-          pip install --dry-run --require-hashes --only-binary=:all: -r requirements.txt 2>&1 | head -n 20 || true
+          pip install --dry-run --require-hashes --only-binary=:all: -r requirements.txt 2>&1 | head -n 100 || true
+          echo "=== ci-failure.txt ==="
+          cat /tmp/ci-failure.txt 2>&1 | head -n 100 || echo "no ci-failure.txt"
+          cat /tmp/ci_debug/pip-compile.log 2>&1 | head -c 2000 > /tmp/pip_log_snippet.txt || true
 
       - name: Upload debug artifact on failure
         if: failure()
@@ -115,19 +122,31 @@ jobs:
           echo "=== DEBUG HEADERS ==="
           head -n 5 requirements.txt || true
           head -n 5 /tmp/ci_debug/regen.txt 2>&1 | head -n 5 || true
+          wc -l /tmp/ci_debug/regen.txt 2>&1 || true
           diff -u /tmp/ci_debug/orig.txt /tmp/ci_debug/regen.txt | head -n 500 > /tmp/diff.txt || true
           cat /tmp/diff.txt || true
+          cat /tmp/ci_debug/pip-compile.log 2>&1 | head -n 100 || true
           echo "=== Posting PR comment ==="
+          if [ -f /tmp/ci-failure.txt ]; then
+            failbody=$(cat /tmp/ci-failure.txt | head -c 3500 | tr '\n' ' ' | head -c 3500)
+            gh pr comment 29 --body "CI FAILURE $GITHUB_SHA $failbody" 2>&1 | head -c 800 || echo "fail comment failed"
+            gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI FAILURE $GITHUB_SHA $failbody" 2>&1 | head -c 500 || echo "api fail failed"
+          else
+            echo "no ci-failure.txt to post"
+            gh pr comment 29 --body "CI debug $GITHUB_SHA no ci-failure.txt but validate failed" 2>&1 | head -c 500 || true
+          fi
           if [ -f /tmp/diff.txt ]; then
-            body=$(cat /tmp/diff.txt | head -c 3500)
+            body=$(cat /tmp/diff.txt | head -c 3500 | tr '\n' ' ' | head -c 3000)
             if [ -z "$body" ]; then
               body="no diff, orig $(head -n 2 requirements.txt | tr '\n' ' ') regen $(head -n 2 /tmp/ci_debug/regen.txt | tr '\n' ' ')"
             fi
-            if [ -f /tmp/ci-failure.txt ]; then
-              body="$body CI failure $(cat /tmp/ci-failure.txt | head -c 800 | tr '\n' ' ')"
+            # include pip-compile snippet
+            if [ -f /tmp/ci_debug/pip-compile.log ]; then
+              pip_snip=$(cat /tmp/ci_debug/pip-compile.log | head -c 800 | tr '\n' ' ')
+              body="$body pipLog $pip_snip"
             fi
-            gh pr comment 29 --body "CI debug $GITHUB_SHA diff $body" 2>&1 | head -c 500 || echo "pr comment failed"
-            gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI debug $GITHUB_SHA diff $body" 2>&1 | head -c 300 || echo "api comment failed"
+            gh pr comment 29 --body "CI diff $GITHUB_SHA $body" 2>&1 | head -c 800 || echo "pr diff failed"
+            gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI diff $GITHUB_SHA $body" 2>&1 | head -c 500 || echo "api diff failed"
           fi
 
       - name: Record interpreter, lock digest and runner image for summary
