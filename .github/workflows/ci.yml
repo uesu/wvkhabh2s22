@@ -28,6 +28,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      issues: write
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7 — SHA-pinned
@@ -122,19 +123,11 @@ jobs:
             if [ -z "$body" ]; then
               body="no diff, orig $(head -n 2 requirements.txt | tr '\n' ' ') regen $(head -n 2 /tmp/ci_debug/regen.txt | tr '\n' ' ')"
             fi
-            # Include ci-failure in body
             if [ -f /tmp/ci-failure.txt ]; then
-              body="$body
-
-CI failure: $(cat /tmp/ci-failure.txt | head -c 1000)"
+              body="$body CI failure $(cat /tmp/ci-failure.txt | head -c 800 | tr '\n' ' ')"
             fi
-            gh pr comment 29 --body "CI debug for $GITHUB_SHA:
-
-\`\`\`diff
-$body
-\`\`\`" || echo "pr comment failed"
-            # Also create a check run with diff for api.github.com visibility
-            gh api repos/uesu/wvkhabh2s22/check-runs --method POST -f name="ci-debug-$GITHUB_SHA" -f head_sha="$GITHUB_SHA" -f status="completed" -f conclusion="neutral" -f "output[title]=CI debug diff" -f "output[summary]=$body" 2>&1 | head -c 200 || echo "check run failed"
+            gh pr comment 29 --body "CI debug $GITHUB_SHA diff $body" 2>&1 | head -c 500 || echo "pr comment failed"
+            gh api repos/uesu/wvkhabh2s22/issues/29/comments -f body="CI debug $GITHUB_SHA diff $body" 2>&1 | head -c 300 || echo "api comment failed"
           fi
 
       - name: Record interpreter, lock digest and runner image for summary
