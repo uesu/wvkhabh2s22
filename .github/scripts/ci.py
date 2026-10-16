@@ -225,11 +225,11 @@ def run_profile(profile: str, verbose: bool = False) -> int:
                         if orig_norm != new_norm:
                             for i, (a, b) in enumerate(zip(orig_norm, new_norm)):
                                 if a != b:
-                                    print(f"FAIL: {label} not byte-stable at line {i+1}: orig={a!r} new={b!r}", file=sys.stderr)
+                                    print(f"WARN: {label} not byte-stable at line {i+1}: orig={a!r} new={b!r}", file=sys.stderr)
                                     break
                             else:
                                 if len(orig_norm) != len(new_norm):
-                                    print(f"FAIL: {label} not byte-stable: line count orig {len(orig_norm)} vs new {len(new_norm)}", file=sys.stderr)
+                                    print(f"WARN: {label} not byte-stable: line count orig {len(orig_norm)} vs new {len(new_norm)}", file=sys.stderr)
                             print(f"FAIL: {label} regeneration not byte-stable (only agreed header normalization allowed)", file=sys.stderr)
                             failures.append(name)
                             _failed = True
