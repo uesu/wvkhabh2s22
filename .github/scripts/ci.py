@@ -198,8 +198,116 @@ def _first_difference(orig: list[str], new: list[str]) -> str:
     return f"line count differs: committed {len(orig)} vs regenerated {len(new)}"
 
 
+def _difference_summary(committed: list[str], regenerated: list[str], limit: int = 12) -> str:
+    """A bounded, single-line summary of every differing line (diagnostics must stay readable)."""
+    import difflib
+
+    added: list[str] = []
+    removed: list[str] = []
+    for line in difflib.unified_diff(committed, regenerated, lineterm="", n=0):
+        if line.startswith(("---", "+++", "@@")):
+            continue
+        if line.startswith("-"):
+            removed.append(line[1:].strip())
+        elif line.startswith("+"):
+            added.append(line[1:].strip())
+    parts = [f"{len(removed)} committed-only line(s), {len(added)} regenerated-only line(s)"]
+    for item in removed[:limit]:
+        parts.append(f"committed-only: {item[:120]!r}")
+    for item in added[:limit]:
+        parts.append(f"regenerated-only: {item[:120]!r}")
+    return " | ".join(parts)
+
+
+def _verify_lock_graph(label: str, src_name: str, gate: Gate, name: str) -> None:
+    """Verify one lock graph: structure, pinned compiler, byte-stable regeneration, hashed install."""
+    target = ROOT / label
+    structural = _structural_lock_failures(target, label)
+    if structural:
+        for problem in structural:
+            gate.fail(name, problem)
+        return
+
+    pip_out, tools_out = _compiler_versions()
+    if PINNED_PIP not in pip_out:
+        gate.fail(name, f"{label} requires pip=={PINNED_PIP} (got: {pip_out or 'unavailable'})")
+        return
+    if PINNED_PIP_TOOLS not in tools_out:
+        gate.fail(
+            name, f"{label} requires pip-tools=={PINNED_PIP_TOOLS} (got: {tools_out or 'unavailable'})"
+        )
+        return
+
+    src = ROOT / src_name
+    if not src.exists():
+        gate.fail(name, f"{src_name} missing — cannot regenerate {label}")
+        return
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="ci-lock-"))
+    try:
+        # Seed the isolated copy so the documented command reproduces the locked resolution.
+        shutil.copy2(src, tmpdir / src_name)
+        shutil.copy2(target, tmpdir / label)
+        try:
+            regen = _regenerate_lock(label, src_name, tmpdir)
+        except subprocess.TimeoutExpired:
+            gate.fail(name, f"{label} regeneration timed out (240s)")
+            return
+        if regen.returncode != 0:
+            gate.fail(
+                name,
+                f"{label} regeneration with the documented command failed "
+                f"(exit {regen.returncode}): {(regen.stderr or regen.stdout or '').strip()[:2000]}",
+            )
+            return
+        produced = tmpdir / label
+        if not produced.exists():
+            gate.fail(name, f"{label} regeneration produced no output file")
+            return
+        committed = _read_lock(target).splitlines()
+        regenerated = _read_lock(produced).splitlines()
+        if committed != regenerated:
+            # Full-byte comparison: no path/header rewriting, no tolerated drift.
+            gate.fail(
+                name,
+                f"{label} is not byte-stable under Python {running_python()} / pip {PINNED_PIP} / "
+                f"pip-tools {PINNED_PIP_TOOLS} — {_first_difference(committed, regenerated)}",
+            )
+            gate.fail(name, f"{label} regeneration differences: {_difference_summary(committed, regenerated)}")
+            return
+        print(f"OK lock-consistency: {label} byte-stable under pinned interpreter and compiler")
+
+        install_cmd = [
+            sys.executable, "-m", "pip", "install", "--dry-run",
+            "--require-hashes", "--only-binary=:all:", "-r", str(target),
+        ]
+        try:
+            inst = subprocess.run(install_cmd, capture_output=True, text=True, timeout=180)
+            if inst.returncode != 0 and "externally-managed-environment" in (inst.stderr or ""):
+                inst = subprocess.run(
+                    install_cmd + ["--break-system-packages"],
+                    capture_output=True, text=True, timeout=180,
+                )
+        except subprocess.TimeoutExpired:
+            gate.fail(name, f"{label} hash-verified install --dry-run timed out (180s)")
+            return
+        if inst.returncode != 0:
+            gate.fail(
+                name,
+                f"{label} hash-verified install --dry-run failed: "
+                f"{(inst.stderr or inst.stdout or '').strip()[:2000]}",
+            )
+            return
+        print(f"OK lock-consistency: {label} installs hash-verified, wheels only")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def check_lock_consistency(gate: Gate, name: str) -> None:
-    """Hashed locks verified under the exact pinned interpreter and pinned compiler."""
+    """Hashed locks verified under the exact pinned interpreter and pinned compiler.
+
+    Both graphs are always verified so one run reports every difference.
+    """
     pin = pinned_python()
     running = running_python()
     if not pin:
@@ -214,87 +322,14 @@ def check_lock_consistency(gate: Gate, name: str) -> None:
         )
         return
 
-    labels = (("requirements.txt", "requirements.in"), ("requirements-dev.txt", "requirements-dev.in"))
-    for label, src_name in labels:
-        target = ROOT / label
-        for problem in _structural_lock_failures(target, label):
-            gate.fail(name, problem)
-        if name in gate.failures:
-            return
-
-        pip_out, tools_out = _compiler_versions()
-        if PINNED_PIP not in pip_out:
-            gate.fail(name, f"{label} requires pip=={PINNED_PIP} (got: {pip_out or 'unavailable'})")
-            return
-        if PINNED_PIP_TOOLS not in tools_out:
-            gate.fail(
-                name, f"{label} requires pip-tools=={PINNED_PIP_TOOLS} (got: {tools_out or 'unavailable'})"
-            )
-            return
-
-        src = ROOT / src_name
-        if not src.exists():
-            gate.fail(name, f"{src_name} missing — cannot regenerate {label}")
-            return
-
-        tmpdir = Path(tempfile.mkdtemp(prefix="ci-lock-"))
-        try:
-            # Seed the isolated copy so the documented command reproduces the locked resolution.
-            shutil.copy2(src, tmpdir / src_name)
-            shutil.copy2(target, tmpdir / label)
-            try:
-                regen = _regenerate_lock(label, src_name, tmpdir)
-            except subprocess.TimeoutExpired:
-                gate.fail(name, f"{label} regeneration timed out (240s)")
-                return
-            if regen.returncode != 0:
-                gate.fail(
-                    name,
-                    f"{label} regeneration with the documented command failed "
-                    f"(exit {regen.returncode}): {(regen.stderr or regen.stdout or '').strip()[:2000]}",
-                )
-                return
-            produced = tmpdir / label
-            if not produced.exists():
-                gate.fail(name, f"{label} regeneration produced no output file")
-                return
-            committed = _read_lock(target).splitlines()
-            regenerated = _read_lock(produced).splitlines()
-            if committed != regenerated:
-                # Full-byte comparison: no path/header rewriting, no tolerated drift.
-                gate.fail(
-                    name,
-                    f"{label} is not byte-stable under Python {running} / pip {PINNED_PIP} / "
-                    f"pip-tools {PINNED_PIP_TOOLS} — {_first_difference(committed, regenerated)}",
-                )
-                return
-            print(f"OK lock-consistency: {label} byte-stable under pinned interpreter and compiler")
-
-            install_cmd = [
-                sys.executable, "-m", "pip", "install", "--dry-run",
-                "--require-hashes", "--only-binary=:all:", "-r", str(target),
-            ]
-            try:
-                inst = subprocess.run(install_cmd, capture_output=True, text=True, timeout=180)
-                if inst.returncode != 0 and "externally-managed-environment" in (inst.stderr or ""):
-                    inst = subprocess.run(
-                        install_cmd + ["--break-system-packages"],
-                        capture_output=True, text=True, timeout=180,
-                    )
-            except subprocess.TimeoutExpired:
-                gate.fail(name, f"{label} hash-verified install --dry-run timed out (180s)")
-                return
-            if inst.returncode != 0:
-                gate.fail(
-                    name,
-                    f"{label} hash-verified install --dry-run failed: "
-                    f"{(inst.stderr or inst.stdout or '').strip()[:2000]}",
-                )
-                return
-            print(f"OK lock-consistency: {label} installs hash-verified, wheels only")
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-    print("PASS lock-consistency: both graphs genuine, frozen and reproducible")
+    before = len(gate.failures)
+    for label, src_name in (
+        ("requirements.txt", "requirements.in"),
+        ("requirements-dev.txt", "requirements-dev.in"),
+    ):
+        _verify_lock_graph(label, src_name, gate, name)
+    if len(gate.failures) == before:
+        print("PASS lock-consistency: both graphs genuine, frozen and reproducible")
 
 
 def _strict_yaml_loader():

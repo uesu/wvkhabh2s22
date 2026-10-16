@@ -309,7 +309,7 @@ jobs:
         if: always()
         run: |
           [ -f "${{ runner.temp }}/reddit_report.json" ] || echo '{"schema_version":1,"workflow_mode":"reddit","code_sha":"'"$CODE_SHA"'","python_version":"'"$(python -V 2>&1 | cut -d" " -f2)"'","lock_digest":"'"$(sha256sum requirements.txt | cut -d" " -f1)"'","runner_image":"${{ runner.os }}","execution_result":"failed","warnings":["report missing — early failure"]}' > "${{ runner.temp }}/reddit_report.json"
-          cat "${{ runner.temp }}/reddit_report.json" | python -m json.tool | head -n 50 || true
+          python -m json.tool "${{ runner.temp }}/reddit_report.json" | head -n 50 || true
 
       - name: Render run summary (versioned JSON → Markdown)
         if: always()
