@@ -62,6 +62,7 @@ jobs:
           SOAK_DAYS: ${{ vars.PYTHON_BUMP_SOAK_DAYS }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # shellcheck disable=SC2002,SC2129
           set -euo pipefail
           CURRENT="$(tr -d ' \r\n' < .python-version)"
           if [ -z "$CURRENT" ]; then
