@@ -25,7 +25,7 @@ jobs:
   # ---------------------------------------------------------------------------
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       contents: read
     steps:
@@ -115,6 +115,177 @@ jobs:
             done
           fi
           exit "${outcome}"
+
+      # ---------------------------------------------------------------------
+      # TEMPORARY PR-only compiler bridge — removed in the final alignment commit.
+      # Regenerates the aligned dev lock under the pinned interpreter using the
+      # repository's own seeded compiler command, then publishes reviewable
+      # evidence. Artifact blobs and job logs are not retrievable from the review
+      # sandbox, so the genuine generated difference is also emitted as bounded
+      # annotations. Read-only: it never writes the checkout, never pushes, and
+      # dispatches no monitor, proposer or publisher.
+      # ---------------------------------------------------------------------
+      - name: Generate aligned lint lock candidate (temporary bridge)
+        if: github.event_name == 'pull_request'
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python - <<'PY'
+          import base64
+          import difflib
+          import gzip
+          import hashlib
+          import importlib.metadata
+          import json
+          import os
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          # BRIDGE_LOCAL_PREFLIGHT is never set on a runner: it exists only so the identical
+          # shipped script can be rehearsed on a non-pinned interpreter, where the version
+          # assertions and the byte-identity control are reported instead of enforced.
+          preflight = os.getenv("BRIDGE_LOCAL_PREFLIGHT") == "1"
+          root = Path.cwd()
+          if not preflight:
+              assert sys.version_info[:3] == (3, 14, 8), sys.version
+              assert importlib.metadata.version("pip") == "26.1.1", importlib.metadata.version("pip")
+              assert importlib.metadata.version("pip-tools") == "7.5.3", importlib.metadata.version("pip-tools")
+              assert (root / ".python-version").read_text(encoding="utf-8").strip() == "3.14.8"
+          policy = json.loads((root / ".github/maintenance.json").read_text(encoding="utf-8"))
+          target_ruff = policy["lint_toolchain"]["version"]
+          assert target_ruff == "0.17.1", policy["lint_toolchain"]
+          committed_in = (root / "requirements-dev.in").read_text(encoding="utf-8")
+          assert committed_in.splitlines().count("ruff==0.14.3") == 1, "expected exactly one 0.14.3 pin"
+          committed_lock = (root / "requirements-dev.txt").read_bytes()
+
+          sys.path.insert(0, str(root / ".github/scripts"))
+          import ci
+
+
+          def compile_once(workdir: Path) -> bytes:
+              """One seeded regeneration through the repository's own compiler command."""
+              run = ci._regenerate_lock("requirements-dev.txt", "requirements-dev.in", workdir)
+              if run.returncode:
+                  print(run.stdout)
+                  print(run.stderr, file=sys.stderr)
+                  raise SystemExit(f"dev lock regeneration failed (exit {run.returncode})")
+              return (workdir / "requirements-dev.txt").read_bytes()
+
+
+          def seeded() -> Path:
+              workdir = Path(tempfile.mkdtemp(prefix="bridge-"))
+              for name in ("requirements-dev.in", "requirements-dev.txt"):
+                  shutil.copy2(root / name, workdir / name)
+              return workdir
+
+
+          # CONTROL: the unchanged input must reproduce the committed lock byte-for-byte here,
+          # which proves this step sees the same interpreter, compiler and seeds as the gate.
+          control_dir = seeded()
+          control_identical = compile_once(control_dir) == committed_lock
+          shutil.rmtree(control_dir, ignore_errors=True)
+          if not preflight:
+              assert control_identical, "control regeneration is not byte-identical to the committed lock"
+
+          # CANDIDATE: the aligned input, compiled twice so idempotence is proven, not assumed.
+          out = Path(os.environ["RUNNER_TEMP"]) / "lint-lock-candidate"
+          shutil.rmtree(out, ignore_errors=True)
+          out.mkdir(parents=True)
+          for name in ("requirements-dev.in", "requirements-dev.txt"):
+              shutil.copy2(root / name, out / name)
+          (out / "requirements-dev.in").write_text(
+              committed_in.replace("ruff==0.14.3", f"ruff=={target_ruff}"), encoding="utf-8"
+          )
+          regenerated = compile_once(out)
+          idempotent = compile_once(out) == regenerated
+          assert idempotent, "non-idempotent lock"
+          (out / "requirements-dev.txt").write_bytes(regenerated)
+
+          dirty = subprocess.run(
+              ["git", "status", "--porcelain", "--",
+               "requirements.in", "requirements.txt", "requirements-dev.in", "requirements-dev.txt"],
+              check=True, capture_output=True, text=True, cwd=root,
+          ).stdout.strip()
+          checkout_clean = dirty == ""
+          assert checkout_clean, f"the bridge must never write the checkout: {dirty!r}"
+
+          diff = list(difflib.unified_diff(
+              committed_lock.decode(encoding="utf-8").splitlines(),
+              regenerated.decode(encoding="utf-8").splitlines(),
+              fromfile="committed/requirements-dev.txt",
+              tofile="regenerated/requirements-dev.txt",
+              lineterm="", n=1,
+          ))
+          removed = sum(1 for line in diff if line.startswith("-") and not line.startswith("---"))
+          added = sum(1 for line in diff if line.startswith("+") and not line.startswith("+++"))
+          digest = hashlib.sha256(regenerated).hexdigest()
+          proof = {
+              "purpose": "temporary PR-only compiler bridge; removed in the final alignment commit",
+              "repository": os.environ.get("GITHUB_REPOSITORY", "local"),
+              "pr_head_sha": os.environ.get("PR_HEAD_SHA", "local"),
+              "checkout_sha": subprocess.run(["git", "rev-parse", "HEAD"], check=True,
+                                             capture_output=True, text=True, cwd=root).stdout.strip(),
+              "run_id": os.environ.get("GITHUB_RUN_ID", "local"),
+              "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "local"),
+              "python": sys.version,
+              "pip": importlib.metadata.version("pip"),
+              "pip_tools": importlib.metadata.version("pip-tools"),
+              "control_regeneration_byte_identical": control_identical,
+              "compilations": 2,
+              "idempotent": idempotent,
+              "checkout_unmodified": checkout_clean,
+              "committed_sha256": hashlib.sha256(committed_lock).hexdigest(),
+              "regenerated_sha256": digest,
+              "committed_lines": len(committed_lock.decode(encoding="utf-8").splitlines()),
+              "regenerated_lines": len(regenerated.decode(encoding="utf-8").splitlines()),
+              "diff_removed_lines": removed,
+              "diff_added_lines": added,
+              "runtime_input_sha256": hashlib.sha256((root / "requirements.in").read_bytes()).hexdigest(),
+              "runtime_lock_sha256": hashlib.sha256((root / "requirements.txt").read_bytes()).hexdigest(),
+          }
+          (out / "proof.json").write_text(json.dumps(proof, indent=2) + "\n", encoding="utf-8")
+
+
+          def notice(text: str) -> None:
+              print("::notice::" + text.replace("%", "%25"))
+
+
+          notice(
+              "LINT-BRIDGE-PROOF "
+              f"python={sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro} "
+              f"pip={proof['pip']} pip-tools={proof['pip_tools']} "
+              f"control_byte_identical={control_identical} compilations=2 idempotent={idempotent} "
+              f"checkout_unmodified={checkout_clean} committed_sha256={proof['committed_sha256']} "
+              f"regenerated_sha256={digest} committed_lines={proof['committed_lines']} "
+              f"regenerated_lines={proof['regenerated_lines']} diff_removed={removed} diff_added={added} "
+              f"runtime_in_sha256={proof['runtime_input_sha256'][:16]} "
+              f"runtime_lock_sha256={proof['runtime_lock_sha256'][:16]} "
+              f"pr_head_sha={proof['pr_head_sha']} checkout_sha={proof['checkout_sha']} "
+              f"run={proof['run_id']}/{proof['run_attempt']}"
+          )
+
+          # The review sandbox cannot reach artifact blobs or job logs, so the genuine generated
+          # difference is also published as bounded single-line annotations. gzip+base64 keeps it
+          # to a few notices; the whole-file digest above proves any reconstruction is byte-exact.
+          blob = base64.b64encode(gzip.compress("\n".join(diff).encode(encoding="utf-8"), 9)).decode()
+          chunks = [blob[i:i + 700] for i in range(0, len(blob), 700)] or [""]
+          assert len(chunks) <= 8, f"generated diff too large to publish: {len(chunks)} chunks"
+          for index, chunk in enumerate(chunks, 1):
+              notice(f"LINT-BRIDGE-DIFF {index}/{len(chunks)} sha256={digest[:16]} {chunk}")
+          print(f"bridge complete: {len(chunks)} diff notice(s), regenerated {digest}")
+          PY
+
+      - name: Upload aligned lint lock artifact (temporary bridge)
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7 — SHA-pinned
+        with:
+          name: lint-lock-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/lint-lock-candidate/
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Debug lock on failure
         if: failure()
