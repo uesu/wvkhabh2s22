@@ -39,18 +39,20 @@
 # change the workflow run line to: python "testing area/reddit_main_v2_embedez.py" or
 # "testing area/reddit_main_v3.py" (Does not require API)
 # ---------------------------------------------------------------------------
+import asyncio
+import json
+import logging
 import os
 import re
-import json
 import time
-import asyncio
-import logging
+
 import aiohttp
 import feedparser
 from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # ■ SUBREDDITS TO TRACK
@@ -159,7 +161,7 @@ def get_webhook_for_subreddit(subreddit: str) -> str | None:
     if webhook:
         return webhook
     if DEFAULT_WEBHOOK_URL:
-        logging.warning(f"No dedicated webhook for r/{subreddit} (expected {env_key}). Using fallback.")
+        logger.warning(f"No dedicated webhook for r/{subreddit} (expected {env_key}). Using fallback.")
         return DEFAULT_WEBHOOK_URL
     return None
 
@@ -170,7 +172,7 @@ def load_posted() -> set:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 return set(json.load(f))
         except Exception as e:
-            logging.error(f"Error reading cache: {e}")
+            logger.error(f"Error reading cache: {e}", exc_info=True)
     return set()
 
 
@@ -179,7 +181,7 @@ def save_posted(posted: set):
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(list(posted)[-MAX_CACHE_SIZE:], f, indent=2)
     except Exception as e:
-        logging.error(f"Error saving cache: {e}")
+        logger.error(f"Error saving cache: {e}", exc_info=True)
 
 
 def normalize_reddit_path(link: str) -> str | None:
@@ -244,25 +246,25 @@ async def _fetch_feed(session: aiohttp.ClientSession, feed_url: str, label: str)
                 if response.status == 429:
                     if attempt - 1 < len(retry_delays):
                         delay = retry_delays[attempt - 1]
-                        logging.info(f"[{label}] HTTP 429 (rate limited) — retry {attempt} in {delay}s.")
+                        logger.info(f"[{label}] HTTP 429 (rate limited) — retry {attempt} in {delay}s.")
                         await asyncio.sleep(delay)
                         continue
-                    logging.info(f"[{label}] still HTTP 429 after {attempt - 1} retries — giving up.")
+                    logger.info(f"[{label}] still HTTP 429 after {attempt - 1} retries — giving up.")
                     return None
                 if response.status != 200:
-                    logging.info(f"[{label}] HTTP {response.status} — rejected.")
+                    logger.info(f"[{label}] HTTP {response.status} — rejected.")
                     return None
                 content = await response.text()
                 feed = await asyncio.to_thread(feedparser.parse, content)
                 if not feed.entries:
-                    logging.info(f"[{label}] no RSS entries (bot-check/interstitial/HTML page?) — rejected.")
+                    logger.info(f"[{label}] no RSS entries (bot-check/interstitial/HTML page?) — rejected.")
                     return None
                 if not any("/comments/" in str(getattr(e, "link", "")) for e in feed.entries[:5]):
-                    logging.info(f"[{label}] entries contain no reddit /comments/ links — rejected.")
+                    logger.info(f"[{label}] entries contain no reddit /comments/ links — rejected.")
                     return None
                 return feed
         except Exception as e:
-            logging.info(f"[{label}] error: {e}")
+            logger.info(f"[{label}] error: {e}")
             return None
 
 
@@ -275,7 +277,7 @@ def _combined_feed_url() -> str:
 
 
 async def fetch_combined_feed(session: aiohttp.ClientSession):
-    logging.info(f"Fetching combined feed for {len(SUBREDDITS)} subreddits in 1 request...")
+    logger.info(f"Fetching combined feed for {len(SUBREDDITS)} subreddits in 1 request...")
     feed = await _fetch_feed(session, _combined_feed_url(), "combined")
     if feed:
         covered = set()
@@ -284,7 +286,7 @@ async def fetch_combined_feed(session: aiohttp.ClientSession):
             sub = _subreddit_by_name(extract_subreddit(path)) if path else None
             if sub:
                 covered.add(sub)
-        logging.info(f"Combined feed OK: {len(feed.entries)} entries covering {len(covered)} subreddit(s).")
+        logger.info(f"Combined feed OK: {len(feed.entries)} entries covering {len(covered)} subreddit(s).")
     return feed
 
 
@@ -297,9 +299,9 @@ async def fetch_working_reddit_feed(session: aiohttp.ClientSession, subreddit: s
             feed_url += f"?feed={REDDIT_FEED_TOKEN}"
         feed = await _fetch_feed(session, feed_url, instance)
         if feed:
-            logging.info(f"Successfully fetched r/{subreddit} from {instance}")
+            logger.info(f"Successfully fetched r/{subreddit} from {instance}")
             return feed
-    logging.warning(f"Could not fetch valid RSS feed for r/{subreddit} from any instance.")
+    logger.warning(f"Could not fetch valid RSS feed for r/{subreddit} from any instance.")
     return None
 
 
@@ -379,22 +381,22 @@ async def send_discord_webhook(session: aiohttp.ClientSession, webhook_url: str,
         async with session.post(request_url, json=payload,
                                 timeout=aiohttp.ClientTimeout(total=10)) as response:
             if response.status in (200, 204):
-                logging.info("Successfully posted to Discord Webhook.")
+                logger.info("Successfully posted to Discord Webhook.")
                 return True
             body = await response.text()
-            logging.error(f"Discord Webhook returned status {response.status}: {body}")
+            logger.error(f"Discord Webhook returned status {response.status}: {body}")
             return False
     except Exception as e:
-        logging.error(f"Error posting to Discord Webhook: {e}")
+        logger.error(f"Error posting to Discord Webhook: {e}")
         return False
 
 
 async def main():
     if not SUBREDDITS:
-        logging.error("No subreddits configured in SUBREDDITS environment variable.")
+        logger.error("No subreddits configured in SUBREDDITS environment variable.")
         return
     if not REDDIT_FEED_TOKEN:
-        logging.warning("REDDIT_FEED_TOKEN not set — running anonymously. The combined feed "
+        logger.warning("REDDIT_FEED_TOKEN not set — running anonymously. The combined feed "
                         "(1 request/run) usually fits the ~1 req/min limit, but add your feed "
                         "token (old.reddit.com -> Preferences -> Feeds) as REDDIT_FEED_TOKEN "
                         "to be bulletproof.")
@@ -413,7 +415,7 @@ async def main():
                                       known_subreddit=None)
         else:
             # ---- FALLBACK: per-subreddit feeds (staggered) --------------
-            logging.info("Combined feed unavailable — falling back to per-subreddit feeds...")
+            logger.info("Combined feed unavailable — falling back to per-subreddit feeds...")
 
             async def _staggered_fetch(sub: str, index: int):
                 await asyncio.sleep(index * FEED_FETCH_STAGGER)
@@ -434,18 +436,18 @@ async def main():
         subreddit_posts = {sub: found.get(sub, []) for sub in SUBREDDITS}
         total_found = sum(len(v) for v in subreddit_posts.values())
         if total_found == 0:
-            logging.info("No new Reddit posts to post.")
+            logger.info("No new Reddit posts to post.")
             save_posted(posted)
             return
 
-        logging.info(f"Found {total_found} new Reddit posts. Posting per-channel...")
+        logger.info(f"Found {total_found} new Reddit posts. Posting per-channel...")
 
         for subreddit, posts in subreddit_posts.items():
             if not posts:
                 continue
             webhook_url = get_webhook_for_subreddit(subreddit)
             if not webhook_url:
-                logging.error(f"No webhook configured for r/{subreddit}. Skipping.")
+                logger.error(f"No webhook configured for r/{subreddit}. Skipping.")
                 continue
             posts.sort(key=lambda p: p["published_ts"])
             for post in posts:
@@ -469,7 +471,7 @@ async def main():
                     await asyncio.sleep(1.5)
 
     save_posted(posted)
-    logging.info("Reddit RSS Monitor execution finished successfully.")
+    logger.info("Reddit RSS Monitor execution finished successfully.")
 
 
 if __name__ == "__main__":

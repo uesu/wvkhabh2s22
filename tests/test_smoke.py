@@ -6417,6 +6417,244 @@ check("r77: the runtime modules inspected for special cases were actually found"
       and len(_r77_runtime) >= 10, str(_r77_runtime))
 
 
+# ---- r78 (N-FINAL-2): the legacy V1 engine's cache behaviour and its module
+# logger. These execute the REAL load_posted/save_posted from
+# "testing area/reddit_main.py" against temporary files with a stub logger:
+# no webhook, no HTTP, and the tracked cache file is never written.
+import ast as _r78_ast
+import hashlib as _r78_hashlib
+import logging as _r78_logging
+import traceback as _r78_tb
+
+_r78_engine = os.path.join(ROOT, "testing area", "reddit_main.py")
+with open(_r78_engine, encoding="utf-8") as _r78_fh:
+    _r78_src = _r78_fh.read()
+_r78_tree = _r78_ast.parse(_r78_src)
+
+
+class _R78StubLogger:
+    """Records calls the way logging.Logger does, resolving exc_info=True live."""
+
+    def __init__(self):
+        self.records = []
+
+    def _emit(self, level, msg, kwargs):
+        exc = kwargs.get("exc_info")
+        if exc is True:
+            exc = sys.exc_info()
+        self.records.append((level, msg, kwargs, exc))
+
+    def error(self, msg, *args, **kwargs):
+        self._emit("error", msg, kwargs)
+
+    def warning(self, msg, *args, **kwargs):
+        self._emit("warning", msg, kwargs)
+
+    def info(self, msg, *args, **kwargs):
+        self._emit("info", msg, kwargs)
+
+
+def _r78_rendered(exc_info):
+    if not exc_info:
+        return ""
+    return "".join(_r78_tb.format_exception(*exc_info))
+
+
+def _r78_func(name):
+    return next(n for n in _r78_tree.body
+                if isinstance(n, _r78_ast.FunctionDef) and n.name == name)
+
+
+_r78_state = os.path.join(ROOT, "posted_reddit.json")
+with open(_r78_state, "rb") as _r78_fh:
+    _r78_state_before = _r78_hashlib.sha256(_r78_fh.read()).hexdigest()
+
+_r78_mod = load_module("smoke_reddit_main_r78", "testing area/reddit_main.py")
+_r78_saved = (_r78_mod.CACHE_FILE, _r78_mod.MAX_CACHE_SIZE, getattr(_r78_mod, "logger", None))
+_r78_tmp = tempfile.mkdtemp(prefix="r78-cache-")
+_r78_token = "1xR78_DO_NOT_LOG"
+os.environ["DISCORD_WEBHOOK_R78"] = f"https://discord.com/api/webhooks/999/{_r78_token}"
+try:
+    check("r78: the engine exposes a module-level logger attribute",
+          isinstance(_r78_saved[2], _r78_logging.Logger), repr(_r78_saved[2]))
+    _r78_stub = _R78StubLogger()
+    _r78_mod.logger = _r78_stub
+
+    _r78_mod.CACHE_FILE = os.path.join(_r78_tmp, "absent.json")
+    _r78_got = _r78_mod.load_posted()
+    check("r78: an absent cache file yields an empty set and logs nothing",
+          _r78_got == set() and _r78_stub.records == [],
+          f"got={_r78_got!r} records={_r78_stub.records}")
+
+    _r78_valid = os.path.join(_r78_tmp, "valid.json")
+    with open(_r78_valid, "w", encoding="utf-8") as _r78_fh:
+        json.dump(["sub_1xaaa", "sub_1xbbb", "sub_1xccc"], _r78_fh)
+    _r78_mod.CACHE_FILE = _r78_valid
+    _r78_got = _r78_mod.load_posted()
+    check("r78: a valid cache returns exactly the stored IDs",
+          _r78_got == {"sub_1xaaa", "sub_1xbbb", "sub_1xccc"} and _r78_stub.records == [],
+          str(sorted(_r78_got)))
+
+    _r78_bad = os.path.join(_r78_tmp, "malformed.json")
+    with open(_r78_bad, "w", encoding="utf-8") as _r78_fh:
+        _r78_fh.write('{"truncated": not json]')
+    _r78_mod.CACHE_FILE = _r78_bad
+    _r78_got = _r78_mod.load_posted()
+    _r78_err = [r for r in _r78_stub.records if r[0] == "error"]
+    _r78_first = next(iter(_r78_err), None)
+    check("r78: a malformed cache logs one failure and still returns an empty set",
+          _r78_got == set() and len(_r78_err) == 1 and _r78_first is not None
+          and "Error reading cache" in _r78_first[1],
+          f"got={_r78_got!r} records={_r78_stub.records}")
+    check("r78: the malformed-cache failure now reports exception context",
+          _r78_first is not None and _r78_first[2].get("exc_info") is True
+          and bool(_r78_first[3]),
+          str(_r78_err))
+    _r78_text = _r78_rendered(_r78_first[3]) if _r78_first else ""
+    check("r78: that traceback names the real cause and the failing engine frame",
+          "JSONDecodeError" in _r78_text and "load_posted" in _r78_text
+          and "reddit_main.py" in _r78_text,
+          _r78_text[-300:])
+    _r78_leak = [_r78_token, "discord.com/api/webhooks"]
+    check("r78: the added traceback and message leak no webhook token",
+          _r78_first is not None
+          and not any(t in _r78_text for t in _r78_leak)
+          and not any(t in _r78_first[1] for t in _r78_leak),
+          _r78_text[-200:])
+
+    _r78_stub.records.clear()
+    _r78_dir = os.path.join(_r78_tmp, "a-directory")
+    os.makedirs(_r78_dir, exist_ok=True)
+    _r78_mod.CACHE_FILE = _r78_dir
+    _r78_raised = None
+    try:
+        _r78_mod.save_posted({"sub_1xddd"})
+    except OSError as exc:
+        _r78_raised = exc
+    _r78_err = [r for r in _r78_stub.records if r[0] == "error"]
+    _r78_first = next(iter(_r78_err), None)
+    check("r78: a failed cache write is logged and never raised at the caller",
+          _r78_raised is None and len(_r78_err) == 1 and _r78_first is not None
+          and "Error saving cache" in _r78_first[1],
+          f"raised={_r78_raised!r} records={_r78_stub.records}")
+    _r78_wtext = _r78_rendered(_r78_first[3]) if _r78_first else ""
+    check("r78: the failed-write failure reports exception context too",
+          _r78_first is not None and _r78_first[2].get("exc_info") is True
+          and "IsADirectoryError" in _r78_wtext,
+          str(_r78_err))
+    check("r78: that traceback identifies the unwritable cache path",
+          _r78_first is not None and _r78_dir in _r78_wtext,
+          _r78_wtext[-200:])
+
+    _r78_stub.records.clear()
+    _r78_mod.CACHE_FILE = os.path.join(_r78_tmp, "no-such-dir", "cache.json")
+    _r78_raised = None
+    try:
+        _r78_mod.save_posted({"sub_1xeee"})
+    except OSError as exc:
+        _r78_raised = exc
+    _r78_err = [r for r in _r78_stub.records if r[0] == "error"]
+    _r78_first = next(iter(_r78_err), None)
+    check("r78: an unwritable cache location also logs and does not raise",
+          _r78_raised is None and len(_r78_err) == 1 and _r78_first is not None
+          and "FileNotFoundError" in _r78_rendered(_r78_first[3]),
+          f"raised={_r78_raised!r} records={_r78_stub.records}")
+
+    _r78_stub.records.clear()
+    _r78_out = os.path.join(_r78_tmp, "out.json")
+    _r78_mod.CACHE_FILE = _r78_out
+    _r78_mod.MAX_CACHE_SIZE = 500
+    _r78_posted = {"sub_1xfff", "sub_1xggg"}
+    _r78_expected = list(_r78_posted)
+    _r78_mod.save_posted(_r78_posted)
+    with open(_r78_out, encoding="utf-8") as _r78_fh:
+        _r78_raw = _r78_fh.read()
+    check("r78: a normal save writes the same IDs, logs nothing and reloads identically",
+          json.loads(_r78_raw) == _r78_expected and _r78_stub.records == []
+          and _r78_mod.load_posted() == _r78_posted,
+          _r78_raw)
+    check("r78: the written cache keeps its indent-2 JSON list shape",
+          _r78_raw.startswith('[\n  "') and _r78_raw.endswith('"\n]'), _r78_raw)
+
+    _r78_lim = os.path.join(_r78_tmp, "limit.json")
+    _r78_mod.CACHE_FILE = _r78_lim
+    _r78_mod.MAX_CACHE_SIZE = 3
+    _r78_many = {f"sub_1x{i:03d}" for i in range(6)}
+    _r78_tail = list(_r78_many)[-3:]
+    _r78_mod.save_posted(_r78_many)
+    with open(_r78_lim, encoding="utf-8") as _r78_fh:
+        _r78_written = json.load(_r78_fh)
+    check("r78: MAX_CACHE_SIZE still truncates the cache to the same tail slice",
+          _r78_written == _r78_tail and len(_r78_written) == 3
+          and set(_r78_written) <= _r78_many,
+          str(_r78_written))
+
+    _r78_live = _r78_saved[2]
+    check("r78: the engine logger is a named module logger that still propagates",
+          _r78_live is not None and _r78_live is not _r78_logging.getLogger()
+          and _r78_live.name == _r78_mod.__name__
+          and _r78_live.propagate is True and not _r78_live.handlers,
+          repr(_r78_live))
+
+    _r78_defs = [n for n in _r78_tree.body if isinstance(n, _r78_ast.Assign)
+                 and any(getattr(t, "id", "") == "logger" for t in n.targets)]
+    _r78_def = next(iter(_r78_defs), None)
+    check("r78: exactly one module-level logger is defined via logging.getLogger(__name__)",
+          len(_r78_defs) == 1 and _r78_def is not None
+          and isinstance(_r78_def.value, _r78_ast.Call)
+          and getattr(next(iter(_r78_def.value.args), None), "id", "") == "__name__",
+          f"count={len(_r78_defs)}")
+
+    _r78_addh = [n for n in _r78_ast.walk(_r78_tree)
+                 if isinstance(n, _r78_ast.Attribute) and n.attr == "addHandler"]
+    _r78_prop = [n for n in _r78_ast.walk(_r78_tree)
+                 if isinstance(n, _r78_ast.Attribute) and n.attr == "propagate"]
+    _r78_basic = [n for n in _r78_ast.walk(_r78_tree) if isinstance(n, _r78_ast.Call)
+                  and isinstance(n.func, _r78_ast.Attribute)
+                  and n.func.attr == "basicConfig"]
+    check("r78: the cleanup adds no handler, never disables propagation, keeps one basicConfig",
+          not _r78_addh and not _r78_prop and len(_r78_basic) == 1,
+          f"addHandler={len(_r78_addh)} propagate={len(_r78_prop)} basicConfig={len(_r78_basic)}")
+
+    _r78_root = [n for n in _r78_ast.walk(_r78_tree) if isinstance(n, _r78_ast.Call)
+                 and isinstance(n.func, _r78_ast.Attribute)
+                 and getattr(n.func.value, "id", "") == "logging"
+                 and n.func.attr in ("info", "warning", "error", "debug", "critical", "exception")]
+    check("r78: no root-logger call remains anywhere in the legacy engine",
+          not _r78_root, str([n.lineno for n in _r78_root]))
+
+    for _r78_name in ("load_posted", "save_posted"):
+        _r78_fn = _r78_func(_r78_name)
+        _r78_blind = [h for t in _r78_ast.walk(_r78_fn) if isinstance(t, _r78_ast.Try)
+                      for h in t.handlers if getattr(h.type, "id", "") == "Exception"]
+        _r78_raise = [n for n in _r78_ast.walk(_r78_fn) if isinstance(n, _r78_ast.Raise)]
+        check(f"r78: {_r78_name} keeps its fail-soft except Exception and never re-raises",
+              len(_r78_blind) == 1 and not _r78_raise,
+              f"handlers={len(_r78_blind)} raises={len(_r78_raise)}")
+
+    _r78_probes = ("retry_delays", "await asyncio.sleep(delay)",
+                   "session.post(request_url, json=payload",
+                   "aiohttp.ClientTimeout(total=10)", "await asyncio.sleep(1.5)",
+                   "return DEFAULT_WEBHOOK_URL", "if response.status in (200, 204):",
+                   "json.dump(list(posted)[-MAX_CACHE_SIZE:], f, indent=2)",
+                   'CACHE_FILE = "posted_reddit.json"', "MAX_CACHE_SIZE = 500")
+    _r78_missing = [probe for probe in _r78_probes if probe not in _r78_src]
+    check("r78: retry delays, payload, timeout, webhook fallback and cache schema are unchanged",
+          not _r78_missing, str(_r78_missing))
+finally:
+    _r78_mod.CACHE_FILE = _r78_saved[0]
+    _r78_mod.MAX_CACHE_SIZE = _r78_saved[1]
+    if _r78_saved[2] is not None:
+        _r78_mod.logger = _r78_saved[2]
+    os.environ.pop("DISCORD_WEBHOOK_R78", None)
+    shutil.rmtree(_r78_tmp, ignore_errors=True)
+
+with open(_r78_state, "rb") as _r78_fh:
+    _r78_state_after = _r78_hashlib.sha256(_r78_fh.read()).hexdigest()
+check("r78: the tracked posted_reddit.json cache was never written by these tests",
+      _r78_state_before == _r78_state_after, _r78_state_after)
+
+
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
     sys.exit(1)
