@@ -21,18 +21,7 @@
     "version": "0.17.1",
     "rule_set": "the pinned version's own defaults: no repository ruff config and no per-rule suppression",
     "declared_in": ".github/workflows/ci.yml",
-    "pending_alignment": [
-      {
-        "declaration": "requirements-dev.in",
-        "pinned": "0.14.3",
-        "reason": "regenerating the hashed dev graph requires the pinned 3.14.8 interpreter; lock-consistency compares full lock bytes with no header tolerance, so the lock cannot be produced on a 3.11 host"
-      },
-      {
-        "declaration": "requirements-dev.txt",
-        "pinned": "0.14.3",
-        "reason": "same regeneration constraint as requirements-dev.in; the advisory lane no longer pip-installs ruff, so this pin affects local development only"
-      }
-    ]
+    "pending_alignment": []
   },
   "shared_files": [
     {

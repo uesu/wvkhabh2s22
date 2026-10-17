@@ -685,6 +685,9 @@ def check_lint_toolchain(gate: Gate, name: str) -> None:
     if not isinstance(pending, list):
         gate.fail(name, "lint_toolchain.pending_alignment must be a list")
         return
+    if pending:
+        gate.fail(name, "lint toolchain alignment is incomplete: pending_alignment must be empty")
+        return
     recorded_pending: dict[str, str] = {}
     for entry in pending:
         if not isinstance(entry, dict) or not entry.get("declaration") or not str(entry.get("reason") or "").strip():

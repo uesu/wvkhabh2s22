@@ -115,7 +115,7 @@ def make_lock(label: str, pins: list[tuple[str, str]], src: str, interpreter: st
 
 
 RUNTIME_PINS = [("aiohttp", "3.14.5"), ("feedparser", "6.0.14"), ("yarl", "1.25.1")]
-DEV_PINS = RUNTIME_PINS + [("pip-tools", "7.5.3"), ("pip", "26.1.1"), ("ruff", "0.14.3")]
+DEV_PINS = RUNTIME_PINS + [("pip-tools", "7.5.3"), ("pip", "26.1.1"), ("ruff", "0.17.1")]
 
 
 class Fixture:
@@ -128,7 +128,7 @@ class Fixture:
         (self.tmp / "testing area").mkdir()
         (self.tmp / ".python-version").write_text(pin + "\n", encoding="utf-8")
         (self.tmp / "requirements.in").write_text("aiohttp>=3.14.3,<4\n", encoding="utf-8")
-        (self.tmp / "requirements-dev.in").write_text("-r requirements.in\nruff==0.14.3\n", encoding="utf-8")
+        (self.tmp / "requirements-dev.in").write_text("-r requirements.in\nruff==0.17.1\n", encoding="utf-8")
         self.runtime_lock = make_lock("requirements.txt", RUNTIME_PINS, "requirements.in")
         self.dev_lock = make_lock("requirements-dev.txt", DEV_PINS, "requirements-dev.in")
         (self.tmp / "requirements.txt").write_text(self.runtime_lock, encoding="utf-8")
@@ -915,10 +915,9 @@ def test_shipped_lint_policy_matches_the_shipped_workflow():
     enforced, problem = ci.pinned_ruff_action_version(ci.ROOT)
     assert problem == "", problem
     assert enforced == record["version"], f"workflow runs {enforced}, policy records {record['version']}"
-    pending = {e["declaration"]: e["pinned"] for e in record["pending_alignment"]}
+    assert record.get("pending_alignment") == [], record
     for declaration, pin in ci.declared_ruff_pins(ci.ROOT).items():
-        if pin != record["version"]:
-            assert pending.get(declaration) == pin, (declaration, pin, pending)
+        assert pin == record["version"], (declaration, pin, record["version"])
 
 
 def test_aligned_lint_toolchain_passes_the_gate():
@@ -987,6 +986,28 @@ def test_unrecorded_dependency_pin_divergence_blocks():
         fixture.cleanup()
 
 
+
+def test_recorded_dependency_pin_divergence_still_blocks():
+    """Recording a divergence is bookkeeping, not alignment: both profiles must fail."""
+    for profile_name in ("development", "production"):
+        ci = load_ci()
+        fixture = Fixture()
+        try:
+            (fixture.tmp / "requirements-dev.in").write_text("-r requirements.in\nruff==0.14.3\n", encoding="utf-8")
+            path = fixture.tmp / ".github" / "maintenance.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["lint_toolchain"]["pending_alignment"] = [{
+                "declaration": "requirements-dev.in", "pinned": "0.14.3",
+                "reason": "recording pending work must not make final alignment pass",
+            }]
+            path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            code, _, err = run_registry(ci, fixture, profile=profile_name)
+            assert code == 1, (profile_name, code, err)
+            assert "pending_alignment must be empty" in err, err
+        finally:
+            fixture.cleanup()
+
+
 def test_stale_pending_alignment_blocks():
     """Once the declarations agree, keeping the excuse on record must fail too."""
     ci = load_ci()
@@ -1002,7 +1023,7 @@ def test_stale_pending_alignment_blocks():
             json.dumps(profile, indent=2) + "\n", encoding="utf-8")
         code, _, err = run_registry(ci, fixture)
         assert code == 1, f"a stale pending_alignment entry must fail closed, got {code}"
-        assert "stale pending_alignment entry" in err, err
+        assert "pending_alignment must be empty" in err, err
     finally:
         fixture.cleanup()
 
@@ -1089,6 +1110,7 @@ def main() -> None:
         test_unpinned_ruff_action_blocks,
         test_unrecorded_ruff_config_blocks,
         test_unrecorded_dependency_pin_divergence_blocks,
+        test_recorded_dependency_pin_divergence_still_blocks,
         test_stale_pending_alignment_blocks,
         test_absent_lint_policy_blocks,
         test_malformed_policy_version_blocks,
