@@ -192,8 +192,105 @@ def test_actual_engine_report_count_precedes_classification():
             assert report["execution_result"] == expected, (filename, report)
 
 
+def _early_exit_report_block(filename):
+    """Locate an engine's early-exit report block: a try whose next sibling is a bare return."""
+    tree = ast.parse((ROOT / "testing area" / filename).read_text())
+    main = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "main")
+    for parent in ast.walk(main):
+        body = getattr(parent, "body", None)
+        if not isinstance(body, list):
+            continue
+        for index, stmt in enumerate(body):
+            if not isinstance(stmt, ast.Try):
+                continue
+            writes_report = any(
+                isinstance(sub, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "report" for t in sub.targets)
+                for sub in stmt.body
+            )
+            following = body[index + 1] if index + 1 < len(body) else None
+            if writes_report and isinstance(following, ast.Return) and following.value is None:
+                return compile(ast.Module(body=stmt.body, type_ignores=[]), filename, "exec")
+    raise AssertionError(f"no early-exit report block found in {filename}")
+
+
+def _make_tracking_open(handles):
+    """Return an open() wrapper that retains every handle it hands back.
+
+    A retained handle stays open unless the source closes it explicitly, which
+    is what makes the unclosed-write regression observable.
+    """
+    real_open = open
+
+    def tracking_open(*args, **kwargs):
+        handle = real_open(*args, **kwargs)
+        handles.append(handle)
+        return handle
+
+    return tracking_open
+
+
+def test_early_exit_report_write_closes_its_file():
+    """The no-target early exit must emit a complete report and close the handle.
+
+    Executed from each engine's real early-exit block with no I/O beyond the
+    report file itself. A handle retained by this test stays open unless the
+    source closes it explicitly, so the pre-fix ``json.dump(report, open(...))``
+    form fails here while the context-manager form passes.
+    """
+    import time as _time_mod
+
+    saved = {name: os.environ.get(name) for name in ("REPORT_PATH", "REPORT_JSON")}
+    try:
+        for filename, mode, warning in (
+            ("reddit_main_v3.py", "reddit", "no subreddits configured"),
+            ("twitter_v3.py", "twitter", "no accounts configured"),
+        ):
+            code = _early_exit_report_block(filename)
+            path = os.path.join(tempfile.mkdtemp(), "report.json")
+            os.environ["REPORT_PATH"] = path
+            os.environ.pop("REPORT_JSON", None)
+            handles = []
+            ns = {
+                "open": _make_tracking_open(handles), "_time": _time_mod, "_setup_start": 1.0,
+                "ACCOUNTS": [], "SUBREDDITS": [],
+            }
+            exec(code, ns)
+            assert handles, (filename, "the early-exit block never opened the report file")
+            assert all(h.closed for h in handles), (
+                filename, "report file left open: json.dump(report, open(...)) must use a context manager"
+            )
+            with open(path, encoding="utf-8") as fh:
+                report = json.load(fh)
+            assert report["workflow_mode"] == mode, (filename, report)
+            assert report["execution_result"] == "not-run", (filename, report)
+            assert report["posted"] == 0 and report["warnings"] == [warning], (filename, report)
+            assert report["persistence"] == {"local_save": "not-run", "commit": "not-run", "push": "not-run"}
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def test_no_engine_passes_an_unclosed_open_to_a_writer():
+    """Structural ban: open() must never be handed straight to another call."""
+    for filename in ("reddit_main_v3.py", "twitter_v3.py"):
+        tree = ast.parse((ROOT / "testing area" / filename).read_text())
+        leaks = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            passed = list(node.args) + [kw.value for kw in node.keywords]
+            for arg in passed:
+                if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name) and arg.func.id == "open":
+                    leaks.append(node.lineno)
+        assert not leaks, (filename, "unclosed open() passed as an argument at lines", sorted(leaks))
+
+
 def main():
-    tests = [test_actual_engine_report_count_precedes_classification, test_redaction, test_redaction_keeps_both_catch_all_branches, test_render_minimal, test_render_missing_file, test_load_and_cli]
+    tests = [test_early_exit_report_write_closes_its_file, test_no_engine_passes_an_unclosed_open_to_a_writer, test_actual_engine_report_count_precedes_classification, test_redaction, test_redaction_keeps_both_catch_all_branches, test_render_minimal, test_render_missing_file, test_load_and_cli]
     failed = []
     for fn in tests:
         try:

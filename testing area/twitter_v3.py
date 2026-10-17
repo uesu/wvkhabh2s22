@@ -1650,7 +1650,8 @@ async def main():
                 "persistence": {"local_save": "not-run", "commit": "not-run", "push": "not-run"}
             }
             __import__("os").makedirs(__import__("os").path.dirname(report_path) or ".", exist_ok=True)
-            __import__("json").dump(report, open(report_path, "w", encoding="utf-8"), indent=2)
+            with open(report_path, "w", encoding="utf-8") as _f:
+                __import__("json").dump(report, _f, indent=2)
         except Exception:
             pass
         return

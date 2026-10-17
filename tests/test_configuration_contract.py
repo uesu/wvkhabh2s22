@@ -11,7 +11,6 @@ Validates that runtime configuration files meet production contract:
 """
 from __future__ import annotations
 
-import os
 import re
 import sys
 from pathlib import Path
