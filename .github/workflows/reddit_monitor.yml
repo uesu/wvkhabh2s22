@@ -279,28 +279,34 @@ jobs:
         run: |
           [ -f monitor.log ] || : > monitor.log
           count_matches() { local pattern="$1"; grep -Ec "$pattern" monitor.log 2>/dev/null || true; }
-          extract_number() { local value; value=$(grep -Eo "$1" monitor.log 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || true); printf '%s\n' "${value:-0}"; }
-          runtime=$(( ${MONITOR_END_EPOCH:-$(date +%s)} - ${MONITOR_START_EPOCH:-$(date +%s)} ))
+          extract_number() { local value; value=$(grep -Eo "$1" monitor.log 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || true); printf '%s\n' "${value:-unavailable}"; }
+          runtime=unavailable
+          if [ -n "${MONITOR_START_EPOCH:-}" ] && [ -n "${MONITOR_END_EPOCH:-}" ]; then
+            runtime="$(( MONITOR_END_EPOCH - MONITOR_START_EPOCH ))s"
+          fi
           ok=$(count_matches 'proxy warm-up.*OK')
           failed=$(count_matches 'proxy warm-up.*(DOWN|FAILED|unavailable|error)')
           new_candidates=$(extract_number 'Found [0-9]+ new Reddit posts')
+          if grep -q 'No new Reddit posts to post\.' monitor.log; then new_candidates=0; fi
           {
             echo "## Reddit Feed Monitor — run summary"
             echo
             if [ "${{ job.status }}" = "success" ]; then echo "**Result:** success"; else echo "**Result:** failure"; fi
-            echo "**Runtime:** ${runtime}s"
+            echo "**Runtime:** ${runtime}"
             echo
             echo "### Feed"
+            echo "- counts describe matching local log records, not an independent delivery/source-health audit"
             echo "- entries read: $(extract_number 'Combined feed OK: [0-9]+ entries')"
             echo "- new candidates: ${new_candidates}"
             echo "- posts delivered: $(count_matches 'Reddit V3 Posted:')"
             echo "- listing/retry-related log lines: $(count_matches 'skipped.*next tick|retried next tick')"
             echo
             echo "### Providers and videos"
+            echo "- provider/quality counts below are observed log matches, not exhaustive request or health totals"
             echo "- proxy warmups: ${ok} OK, ${failed} failed"
             echo "- accepted 1080p upgrades: $(count_matches 'EmbedEZ 1080p candidate accepted')"
             echo "- quality fallback notices: $(count_matches 'retaining validated base')"
-            echo "- final video provider labels: $(grep -Eo 'card media via [^ ]+' monitor.log 2>/dev/null | sort -u | tr '\n' ' ' || true)"
+            echo "- observed card-media provider labels: $(grep -Eo 'card media via [^ ]+' monitor.log 2>/dev/null | sort -u | tr '\n' ' ' || true)"
             echo
             echo "### State"
             echo "- cache commit/push: ${CACHE_RESULT:-failed}"

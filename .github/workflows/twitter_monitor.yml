@@ -214,8 +214,12 @@ jobs:
           [ -f twitter_monitor.log ] || : > twitter_monitor.log
           count_matches() { local pattern="$1"; grep -Ec "$pattern" twitter_monitor.log 2>/dev/null || true; }
           total_feed_entries() { local total; total=$(grep 'feed OK via' twitter_monitor.log 2>/dev/null | grep -Eo '[0-9]+ entries' | grep -Eo '[0-9]+' | awk '{ total += $1 } END { print total + 0 }' || true); printf '%s\n' "${total:-0}"; }
-          feed_failures() { awk '/^\[[^]]+\] NO working nitter instance this run/ { n++ } END { print n + 0 }' twitter_monitor.log 2>/dev/null || true; }
-          runtime=$(( ${TWITTER_END_EPOCH:-$(date +%s)} - ${TWITTER_START_EPOCH:-$(date +%s)} ))
+          feed_lines() { sed -E 's/^.*\[(DEBUG|INFO|WARNING|ERROR|CRITICAL)\][[:space:]]*//' twitter_monitor.log; }
+          feed_failures() { feed_lines | awk '/^\[[^]]+\] NO working nitter instance this run/ { n++ } END { print n + 0 }' 2>/dev/null || true; }
+          runtime=unavailable
+          if [ -n "${TWITTER_START_EPOCH:-}" ] && [ -n "${TWITTER_END_EPOCH:-}" ]; then
+            runtime="$(( TWITTER_END_EPOCH - TWITTER_START_EPOCH ))s"
+          fi
           feeds_ok=$(count_matches 'feed OK via')
           feeds_failed=$(feed_failures)
           feeds_empty=$(count_matches 'skipping — no feed / 0 entries')
@@ -224,18 +228,22 @@ jobs:
             echo "## Twitter Feed Monitor — run summary"
             echo
             if [ "${{ job.status }}" = "success" ]; then echo "**Result:** success"; else echo "**Result:** failure"; fi
-            echo "**Runtime:** ${runtime}s"
+            echo "**Runtime:** ${runtime}"
             echo
             echo "### Feeds"
-            accounts_checked=$(awk '/^\[[^]]+\] feed OK via/ || /^\[[^]]+\] NO working nitter instance this run/ || /^\[[^]]+\] skipping — no feed \/ 0 entries/ { account=$0; sub(/^\[/, "", account); sub(/\].*$/, "", account); print account }' twitter_monitor.log 2>/dev/null | sort -u | wc -l | tr -d ' ' || true)
-            echo "- accounts checked: ${accounts_checked}"
+            echo "- counts describe matching local log records, not an independent delivery/source-health audit"
+            if [ "$feeds_ok" -eq 0 ] && [ "$feeds_failed" -eq 0 ] && [ "$feeds_empty" -eq 0 ]; then
+              echo "- observation coverage: unavailable (no matching feed records)"
+            fi
+            accounts_checked=$(feed_lines | awk '/^\[[^]]+\] feed OK via/ || /^\[[^]]+\] NO working nitter instance this run/ || /^\[[^]]+\] skipping — no feed \/ 0 entries/ { account=$0; sub(/^\[/, "", account); sub(/\].*$/, "", account); print account }' 2>/dev/null | sort -u | wc -l | tr -d ' ' || true)
+            echo "- accounts observed in feed logs: ${accounts_checked}"
             echo "- entries read: ${entries_read}"
             echo "- successful feeds: ${feeds_ok}"
             echo "- failed feeds: ${feeds_failed}"
             echo "- empty feeds: ${feeds_empty}"
             echo
             echo "### Posts"
-            echo "- new posts found: $(count_matches 'new posts|new tweet')"
+            echo "- new candidates: not separately measured by this log format"
             echo "- posts delivered: $(count_matches 'V3 Posted:')"
             echo "- skip log lines: $(count_matches 'skipping')"
             echo "- retry/fallback log lines: $(count_matches 'trying next|retry')"

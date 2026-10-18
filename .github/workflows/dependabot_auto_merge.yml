@@ -142,6 +142,17 @@ jobs:
               }
 
               const number = eventPr.number;
+              const requiresWorkflowReview = files => files.some(file =>
+                [file.filename, file.previous_filename].some(path =>
+                  typeof path === 'string' && path.startsWith('.github/workflows/')));
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number: number, per_page: 100,
+              });
+              if (requiresWorkflowReview(files)) {
+                core.info('Workflow files changed: review and merge this update while available, then check the next live run.');
+                return;
+              }
+
               const expectedHeadSha = eventPr.head.sha;
               let waitingFor = 'checks';
 

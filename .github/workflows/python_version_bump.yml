@@ -44,15 +44,14 @@
 #  Patch releases have no soak: a patch usually keeps the same series ABI and
 #  may contain security fixes.
 #
-#  AUTO-MERGE (repository Variable AUTO_MERGE_PYTHON_BUMP)
-#    unset / anything else -> never merges, just opens the PR
-#    'yes'                 -> merges green PATCH bumps only
-#  There is intentionally no `all` mode. A MINOR bump such as Python 3.15
-#  always waits for manual review even when every validation gate passes.
+#  MERGE POLICY
+#  All verified Python update PRs wait for attended review and merge. The legacy
+#  AUTO_MERGE_PYTHON_BUMP variable is ignored, including yes/all. Validation and
+#  PR publication stay automatic; no workflow here approves GitHub security holds.
 #
 #  AUTHENTICATION AND PUBLICATION
-#  This workflow uses secrets.BUMP_PAT for checkout, PR creation, and the
-#  optional patch auto-merge. BUMP_PAT must remain a GitHub Actions secret
+#  This workflow uses secrets.BUMP_PAT for checkout and PR publication.
+#  BUMP_PAT must remain a GitHub Actions secret
 #  reference only; no token value belongs in this repository. If the token is
 #  missing or invalid, the job fails safely. There is no direct-to-main
 #  fallback.
@@ -395,6 +394,10 @@ jobs:
           suites were run AGAIN on the rewritten tree.
 
           All of them passed — the PR is only created when they do.
+          This PR waits for attended review/merge regardless of the legacy
+          AUTO_MERGE_PYTHON_BUMP variable. After updating a live workflow,
+          confirm the next real monitor run executes; GitHub may require human
+          security review. This workflow does not approve or bypass that hold.
           ${NOTE}
           > The commands above are the same offline gates CI runs, executed
           > under the candidate interpreter before this PR was opened. Any
@@ -404,20 +407,6 @@ jobs:
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "Opened $URL"
-
-      # AUTO_MERGE_PYTHON_BUMP: 'yes' = eligible patch bumps only.
-      - name: Merge it (only when AUTO_MERGE_PYTHON_BUMP allows this kind)
-        if: >-
-          steps.pr.outputs.url != '' &&
-          vars.AUTO_MERGE_PYTHON_BUMP == 'yes' &&
-          steps.resolve.outputs.kind == 'patch'
-        env:
-          GH_TOKEN: ${{ secrets.BUMP_PAT }}
-          URL: ${{ steps.pr.outputs.url }}
-        run: |
-          set -euo pipefail
-          gh pr merge "$URL" --squash --delete-branch
-          echo "Merged $URL"
 
       - name: Summary
         if: always()
