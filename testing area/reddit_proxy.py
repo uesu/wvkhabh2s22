@@ -402,10 +402,19 @@ def status_id_decode(encoded: str) -> str:
 # ---------------------------------------------------------------------------
 # ■ Parsing helpers (pure — unit-testable offline)
 # ---------------------------------------------------------------------------
+_MULTI_OG_KEYS = frozenset({
+    "og:image",
+    "og:video",
+    "og:video:url",
+    "og:video:secure_url",
+    "twitter:player:stream",
+})
+
+
 def _og_meta(page_html: str) -> dict:
-    """og:/twitter: meta tags -> dict. og:image collects ALL occurrences in
-    order (galleries emit one tag per photo); every other key keeps the
-    first value. HTML entities are unescaped."""
+    """og:/twitter: meta tags -> dict. Image and video keys collect ALL
+    occurrences in document order (audio-cover stills can precede motion);
+    every other key keeps the first value. HTML entities are unescaped."""
     meta = {}
     for m in re.finditer(r"<meta[^>]+>", page_html, re.I):
         tag = m.group(0)
@@ -420,8 +429,8 @@ def _og_meta(page_html: str) -> dict:
             if (k2, v2) == (key, val):
                 break
             key, val = k2, v2
-        if key == "og:image":
-            meta.setdefault("og:image", []).append(val)
+        if key in _MULTI_OG_KEYS:
+            meta.setdefault(key, []).append(val)
         else:
             meta.setdefault(key, val)
     return meta
@@ -996,17 +1005,65 @@ def parse_embeddit_component_page(page_html: str):
     }
 
 
+def is_audio_cover_url(url: str | None) -> bool:
+    """EmbedEZ ``render/audio?...&cover=...`` is an audio-cover still, not motion video."""
+    return "/render/audio" in (url or "").lower()
+
+
+def is_motion_video_item(item: dict | None) -> bool:
+    if not isinstance(item, dict):
+        return False
+    url = str(item.get("url") or "")
+    if is_audio_cover_url(url):
+        return False
+    return item.get("kind") == "video"
+
+
+def filter_proxy_media(media: list | None) -> list:
+    """Drop audio-cover renderers so they cannot become a second video tile."""
+    out = []
+    for item in media or []:
+        if not isinstance(item, dict):
+            continue
+        if is_audio_cover_url(item.get("url")):
+            continue
+        out.append(item)
+    return out
+
+
+def _og_values(meta: dict, *keys: str) -> list:
+    """Preserve document order when keys are lists; accept a bare string too."""
+    out = []
+    for key in keys:
+        value = meta.get(key)
+        if isinstance(value, list):
+            out.extend(value)
+        elif value:
+            out.append(value)
+    return out
+
+
 def _media_from_og(meta: dict) -> list:
-    """og: tags -> media list. og:video (muxed mp4 with audio) first, then
-    every og:image in order (galleries emit one per photo)."""
+    """og: tags -> media list. First motion og:video (skipping audio-cover
+    stills), then every og:image in order (galleries emit one per photo)."""
     media = []
-    video_url = meta.get("og:video:secure_url") or meta.get("og:video")
-    if video_url:
+    seen = set()
+    for video_url in _og_values(
+        meta, "og:video:secure_url", "og:video", "og:video:url", "twitter:player:stream",
+    ):
+        if not video_url or video_url in seen:
+            continue
+        seen.add(video_url)
+        if is_audio_cover_url(video_url):
+            continue
         media.append({"kind": "video", "url": video_url})
-    for img in meta.get("og:image", []):
-        kind = "gif" if img.split("?")[0].lower().endswith(".gif") else "image"
+        break
+    for img in _og_values(meta, "og:image"):
+        if is_audio_cover_url(img):
+            continue
+        kind = "gif" if str(img).split("?")[0].lower().endswith(".gif") else "image"
         media.append({"kind": kind, "url": img})
-    return media
+    return filter_proxy_media(media)
 
 
 # ---------------------------------------------------------------------------
@@ -1417,7 +1474,7 @@ async def fetch_proxy_post(session, path: str, label: str = "",
                     # the same attempt (the text-only branch fell through).
                     logging.info(f"[{label}] {service} had no usable data.")
                     continue
-                if need_video and not any(m["kind"] == "video" for m in result["media"]):
+                if need_video and not any(is_motion_video_item(m) for m in result["media"]):
                     if r < fallback_rank:
                         fallback_result, fallback_rank = result, r
                     logging.info(f"[{label}] {service} result has no video - "
@@ -1466,7 +1523,7 @@ async def fetch_proxy_post(session, path: str, label: str = "",
                 # as an incomplete gallery, so a higher-priority video (if
                 # one arrives) replaces it via the normal _better_media
                 # tie-break before the chain gives up.
-                if need_video and any(m["kind"] == "video"
+                if need_video and any(is_motion_video_item(m)
                                       for m in best_media_result["media"]):
                     if any(rank[tasks[t]] < r for t in pending):
                         logging.info(f"[{label}] video via {service} but a "
@@ -1500,10 +1557,16 @@ async def fetch_proxy_post(session, path: str, label: str = "",
     if best_media_result is not None:
         # Cap a copy: never mutate the service's original result/list.
         best_media_result = dict(best_media_result)
-        best_media_result["media"] = best_media_result["media"][:MEDIA_CAP_ITEMS]
+        best_media_result["media"] = filter_proxy_media(
+            best_media_result["media"])[:MEDIA_CAP_ITEMS]
         logging.info(f"[{label}] proxy media winner - "
                      f"{len(best_media_result['media'])} item(s).")
         return best_media_result
+    if isinstance(fallback_result, dict) and fallback_result.get("media"):
+        if any(is_audio_cover_url(m.get("url"))
+               for m in fallback_result["media"] if isinstance(m, dict)):
+            fallback_result = dict(fallback_result)
+            fallback_result["media"] = filter_proxy_media(fallback_result["media"])
     return fallback_result
 
 
