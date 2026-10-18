@@ -281,7 +281,7 @@ check("proxy: og:image collects all in order",
       str(meta.get("og:image")))
 check("proxy: og values unescaped", meta.get("og:title") == "Heist mode & more", str(meta.get("og:title")))
 check("proxy: og:video captured",
-      str(meta.get("og:video:secure_url", "")).startswith("https://vxreddit.com/redditvideo.mp4"),
+      (meta.get("og:video:secure_url") or [""])[0].startswith("https://vxreddit.com/redditvideo.mp4"),
       str(meta.get("og:video:secure_url")))
 
 # r51: vxReddit sometimes returns an HTTP-200 shell for a crosspost's own
@@ -2960,8 +2960,11 @@ check("r47: a crosspost of a normal subreddit post still resolves (round 14 kept
           "/r/Other/comments/1wuv547/")
       == "/r/AnantaLeaks/comments/1abcdef/")
 check("r47: an Arctic-reported profile permalink is accepted as the original",
-      'r"/(?:r|user)/[^/]+/comments/[a-z0-9]+/[^?#]*"'
-      in inspect.getsource(v3.resolve_post_media))
+      v3.resolve_crosspost_source(
+          own_path="/r/AnantaLeaks/comments/1wuv547/", base={},
+          arctic={"crosspost_parent_list": [{
+              "permalink": "/user/aphotide/comments/1wuv4j8/musor_drop_via_aphotide/"
+          }]})["path"] == "/user/aphotide/comments/1wuv4j8/musor_drop_via_aphotide/")
 
 
 class _R47Proxy:
@@ -6289,6 +6292,585 @@ check("r72 main: retraction seatbelt still records original ID with no heal for 
       not _r72_main_retract.gets and not _r72_main_retract.patches
       and _r72_records["TestSub_abc123"]["message_id"] == "msg1"
       and _r72_records["TestSub_abc123"]["payload"] == _r72_main_retract.posts[0][1])
+
+# Crosspost regressions live in this already-registered runner, not a new file.
+import unittest
+_crosspost_v3 = load_module("application_crosspost_v3", "testing area/reddit_main_v3.py")
+_crosspost_proxy = load_module("application_crosspost_proxy", "testing area/reddit_proxy.py")
+
+class _AppOriginalDiscoveryTests(unittest.TestCase):
+    def test_labeled_original_without_keyword(self):
+        path = _crosspost_v3.find_crosspost_original_path(
+            "See the [Original Post](/r/Alpha/comments/parent01/title/)",
+            "/r/Beta/comments/child001/",
+        )
+        self.assertEqual(path, "/r/Alpha/comments/parent01/")
+
+    def test_html_anchor_original_post(self):
+        path = _crosspost_v3.find_crosspost_original_path(
+            '<a href="https://www.reddit.com/r/Alpha/comments/parent02/x/">Original Post</a>',
+            "/r/Beta/comments/child002/",
+        )
+        self.assertEqual(path, "/r/Alpha/comments/parent02/")
+
+    def test_profile_original_still_resolves(self):
+        path = _crosspost_v3.find_crosspost_original_path(
+            'crossposted this from <a href="/user/someuser/comments/parent03/clip/">u/someuser</a>',
+            "/r/Beta/comments/child003/",
+        )
+        self.assertEqual(path, "/user/someuser/comments/parent03/")
+
+    def test_own_slugged_link_is_skipped(self):
+        html = (
+            'crossposted this from <a href="/r/Beta/comments/child004/child_slug/">self</a> '
+            '<a href="/r/Alpha/comments/parent04/orig_slug/">orig</a>'
+        )
+        path = _crosspost_v3.find_crosspost_original_path(html, "/r/Beta/comments/child004/child_slug/")
+        self.assertEqual(path, "/r/Alpha/comments/parent04/")
+
+    def test_body_link_without_crosspost_context_is_not_a_parent(self):
+        self.assertIsNone(_crosspost_v3.find_crosspost_original_path(
+            "related reading /r/Alpha/comments/parent05/title/",
+            "/r/Beta/comments/child005/",
+        ))
+
+    def test_distant_crosspost_keyword_is_not_a_parent(self):
+        text = (
+            "I like to crosspost sometimes.\n"
+            + ("word " * 80)
+            + "\nRelated reading /r/Alpha/comments/parent99/title/"
+        )
+        self.assertIsNone(_crosspost_v3.find_crosspost_original_path(
+            text, "/r/Beta/comments/child099/",
+        ))
+
+    def test_foreign_host_rejected(self):
+        self.assertIsNone(_crosspost_v3.find_crosspost_original_path(
+            "crosspost https://not-reddit.example/r/Alpha/comments/parent06/",
+            "/r/Beta/comments/child006/",
+        ))
+
+    def test_self_parent_id_is_dropped(self):
+        source = _crosspost_v3.resolve_crosspost_source(
+            own_path="/r/Beta/comments/child007/",
+            base={},
+            post_json={"crosspost_parent": "t3_child007"},
+        )
+        self.assertEqual(source, {})
+
+    def test_id_only_structured_parent(self):
+        source = _crosspost_v3.resolve_crosspost_source(
+            own_path="/r/Beta/comments/child011/",
+            base={},
+            post_json={"crosspost_parent": "t3_parent11"},
+        )
+        self.assertEqual(source.get("id"), "parent11")
+        self.assertNotEqual(source.get("id"), "child011")
+
+    def test_mismatched_parent_id_and_permalink_rejected(self):
+        source = _crosspost_v3.resolve_crosspost_source(
+            own_path="/r/Beta/comments/child012/",
+            base={},
+            post_json={
+                "crosspost_parent_list": [{
+                    "id": "child012",
+                    "permalink": "/r/Alpha/comments/parent12/orig/",
+                }],
+            },
+        )
+        self.assertEqual(source, {})
+
+    def test_scheme_relative_foreign_host_rejected(self):
+        self.assertIsNone(_crosspost_v3.find_crosspost_original_path(
+            "crosspost from //evil.example/r/Alpha/comments/parent13/",
+            "/r/Beta/comments/child013/",
+        ))
+
+    def test_structured_parent_one_hop(self):
+        source = _crosspost_v3.resolve_crosspost_source(
+            own_path="/r/Beta/comments/child008/",
+            base={},
+            post_json={
+                "crosspost_parent_list": [{
+                    "id": "parent08",
+                    "permalink": "/r/Alpha/comments/parent08/orig/",
+                    "media": {"reddit_video": {
+                        "fallback_url": "https://v.redd.it/videoid08/DASH_720.mp4",
+                    }},
+                }],
+            },
+        )
+        self.assertEqual(source.get("id"), "parent08")
+        self.assertEqual(source.get("vred_id"), "videoid08")
+        self.assertFalse(_crosspost_v3.is_same_reddit_post(source.get("path"), "/r/Beta/comments/child008/"))
+
+
+class _AppVideoEligibilityTests(unittest.TestCase):
+    def test_audio_cover_filtered(self):
+        cover = "https://_crosspost_proxy.embedez.com/render/audio?cover=https://i.redd.it/x.jpg"
+        self.assertTrue(_crosspost_proxy.is_audio_cover_url(cover))
+        self.assertFalse(_crosspost_proxy.is_motion_video_item({"kind": "video", "url": cover}))
+        media = _crosspost_proxy.filter_proxy_media([
+            {"kind": "video", "url": cover},
+            {"kind": "image", "url": "https://i.redd.it/x.jpg"},
+        ])
+        self.assertEqual(len(media), 1)
+        self.assertEqual(media[0]["kind"], "image")
+
+    def test_proxy_og_skips_audio_cover(self):
+        media = _crosspost_proxy._media_from_og({
+            "og:video": "https://_crosspost_proxy.embedez.com/render/audio?cover=x",
+            "og:image": ["https://i.redd.it/still.jpg"],
+        })
+        self.assertTrue(all(item["kind"] != "video" for item in media))
+
+    def test_proxy_og_keeps_first_motion_and_skips_later_cover(self):
+        page = (
+            '<meta property="og:video" content="https://v.redd.it/motion456/DASH_720.mp4"/>'
+            '<meta property="og:video" content="https://_crosspost_proxy.embedez.com/render/audio?cover=x"/>'
+        )
+        meta = _crosspost_proxy._og_meta(page)
+        media = _crosspost_proxy._media_from_og(meta)
+        videos = [item for item in media if item.get("kind") == "video"]
+        self.assertEqual(len(videos), 1)
+        self.assertIn("motion456", videos[0]["url"])
+        self.assertFalse(any(_crosspost_proxy.is_audio_cover_url(item.get("url")) for item in media))
+
+    def test_proxy_og_prefers_later_motion_video(self):
+        page = (
+            '<meta property="og:video" content="https://_crosspost_proxy.embedez.com/render/audio?cover=x"/>'
+            '<meta property="og:video" content="https://v.redd.it/motion123/DASH_1080.mp4"/>'
+            '<meta property="og:image" content="https://i.redd.it/still.jpg"/>'
+        )
+        meta = _crosspost_proxy._og_meta(page)
+        media = _crosspost_proxy._media_from_og(meta)
+        videos = [item for item in media if item.get("kind") == "video"]
+        self.assertEqual(len(videos), 1)
+        self.assertIn("motion123", videos[0]["url"])
+        self.assertFalse(any(_crosspost_proxy.is_audio_cover_url(item.get("url")) for item in media))
+
+    def test_encoded_video_id_and_preview_negative(self):
+        encoded = "https://x.test/?videoUrl=https%3A%2F%2Fv.redd.it%2Fvideoid09%2FDASH_1080.mp4"
+        self.assertEqual(_crosspost_v3.extract_vreddit_id_from_media_url(encoded), "videoid09")
+        self.assertIsNone(_crosspost_v3.extract_vreddit_id_from_media_url(
+            "https://external-preview.redd.it/videoid09.jpg"))
+
+    def test_images_are_not_usable_when_video_was_requested(self):
+        result = {"media": [{"kind": "image", "url": "https://i.redd.it/x.jpg"}]}
+        self.assertFalse(_crosspost_v3._proxy_result_usable(result, True))
+        self.assertTrue(_crosspost_v3._proxy_result_usable(result, False))
+
+    def test_path_aliases_only_for_profile_posts(self):
+        aliases = _crosspost_v3._path_aliases("/user/sampleuser/comments/parent10/")
+        self.assertEqual(aliases[0], "/user/sampleuser/comments/parent10/")
+        self.assertIn("/r/u_sampleuser/comments/parent10/", aliases)
+        self.assertEqual(_crosspost_v3._path_aliases("/r/Beta/comments/child010/"),
+                         ["/r/Beta/comments/child010/"])
+
+
+class _AppUnrelatedBodyLinkTests(unittest.TestCase):
+    def test_crosspost_keyword_plus_unrelated_link_is_not_a_parent(self):
+        text = (
+            "This is a crosspost. Unrelated discussion: "
+            "https://www.reddit.com/r/example/comments/abc123/topic/"
+        )
+        self.assertIsNone(_crosspost_v3.find_crosspost_original_path(
+            text, "/r/example/comments/child99/",
+        ))
+
+
+class _AppNewsIncidentMediaFixtures(unittest.TestCase):
+    """Both Ananta incidents are parser/resolver fixtures only — not routing."""
+
+    CASES = (
+        ("1x6h1mf", "1x6h1a5", "1y2gic17nlvh1"),
+        ("1x6lgak", "1x6lbhb", "22e7ve17smvh1"),
+    )
+
+    def test_structured_parent_recovers_motion_for_both_incidents(self):
+        for child, parent, video in self.CASES:
+            with self.subTest(child=child):
+                source = _crosspost_v3.resolve_crosspost_source(
+                    own_path=f"/r/NewsSub/comments/{child}/",
+                    base={},
+                    post_json={
+                        "crosspost_parent_list": [{
+                            "id": parent,
+                            "permalink": f"/r/SourceSub/comments/{parent}/orig/",
+                            "media": {"reddit_video": {
+                                "fallback_url": f"https://v.redd.it/{video}/DASH_1080.mp4",
+                            }},
+                        }],
+                    },
+                )
+                self.assertEqual(source.get("id"), parent)
+                self.assertEqual(source.get("vred_id"), video)
+                self.assertFalse(_crosspost_v3.is_same_reddit_post(
+                    source.get("path"), f"/r/NewsSub/comments/{child}/"))
+
+    def test_incident_dedup_keys_are_child_not_parent(self):
+        for child, parent, _video in self.CASES:
+            with self.subTest(child=child):
+                path = f"/r/NewsSub/comments/{child}/slug/"
+                key = f"NewsSub_{_crosspost_v3.extract_post_id(path)}"
+                self.assertEqual(key, f"NewsSub_{child}")
+                self.assertNotIn(parent, key)
+
+    def test_html_labeled_original_and_og_motion_for_both_incidents(self):
+        for child, parent, video in self.CASES:
+            with self.subTest(child=child):
+                html = (
+                    f'<a href="/r/SourceSub/comments/{parent}/orig/">Original Post</a>'
+                    f'<meta property="og:video" content="https://_crosspost_proxy.embedez.com/render/audio?cover=x"/>'
+                    f'<meta property="og:video" content="https://v.redd.it/{video}/DASH_1080.mp4"/>'
+                )
+                path = _crosspost_v3.find_crosspost_original_path(
+                    html, f"/r/NewsSub/comments/{child}/")
+                self.assertEqual(path, f"/r/SourceSub/comments/{parent}/")
+                meta = _crosspost_proxy._og_meta(html)
+                media = _crosspost_proxy._media_from_og(meta)
+                videos = [item for item in media if item.get("kind") == "video"]
+                self.assertEqual(len(videos), 1)
+                self.assertEqual(
+                    _crosspost_v3.extract_vreddit_id_from_media_url(videos[0]["url"]), video)
+                encoded = (
+                    "https://_crosspost_proxy.embedez.com/render/video.mp4?"
+                    f"videoUrl=https%3A%2F%2Fv.redd.it%2F{video}%2FCMAF_1080.mp4"
+                    f"&audioUrl=https%3A%2F%2Fv.redd.it%2F{video}%2FCMAF_AUDIO_128.mp4"
+                )
+                self.assertEqual(_crosspost_v3.extract_vreddit_id_from_media_url(encoded), video)
+
+
+class _AppChildIdentityTests(unittest.TestCase):
+    def test_card_path_helpers_keep_child_id(self):
+        child = "/r/Beta/comments/child011/slug/"
+        parent = "/r/Alpha/comments/parent11/"
+        self.assertEqual(_crosspost_v3.extract_post_id(child), "child011")
+        self.assertNotEqual(_crosspost_v3.extract_post_id(child), _crosspost_v3.extract_post_id(parent))
+        self.assertTrue(_crosspost_v3.is_same_reddit_post(child, "/r/Beta/comments/child011/"))
+
+
+class _AppNativeAndQualityTests(unittest.TestCase):
+    def test_arctic_native_path_resolves_structured_parent(self):
+        source = _crosspost_v3.resolve_crosspost_source(
+            own_path="/r/Beta/comments/child014/",
+            base={},
+            arctic={
+                "crosspost_parent_list": [{
+                    "id": "parent14",
+                    "permalink": "/r/Alpha/comments/parent14/orig/",
+                    "media": {"reddit_video": {
+                        "fallback_url": "https://v.redd.it/origvid14/DASH_1080.mp4",
+                    }},
+                }],
+            },
+        )
+        self.assertEqual(source.get("id"), "parent14")
+        self.assertEqual(source.get("vred_id"), "origvid14")
+        self.assertNotEqual(source.get("id"), "child014")
+        self.assertEqual(source.get("provenance"), "structured-archive")
+
+    def test_poster_only_proxy_does_not_replace_parent_video_id(self):
+        source = _crosspost_v3.resolve_crosspost_source(
+            own_path="/r/Beta/comments/child015/",
+            base={},
+            post_json={
+                "crosspost_parent_list": [{
+                    "id": "parent15",
+                    "permalink": "/r/Alpha/comments/parent15/orig/",
+                    "media": {"reddit_video": {
+                        "fallback_url": "https://v.redd.it/origvid15/DASH_1080.mp4",
+                    }},
+                }],
+            },
+        )
+        poster = {"media": [{"kind": "image", "url": "https://i.redd.it/poster.jpg"}]}
+        self.assertFalse(_crosspost_v3._proxy_result_usable(poster, True))
+        self.assertEqual(source.get("vred_id"), "origvid15")
+        self.assertNotEqual(source.get("vred_id"), "child015")
+
+    def test_validated_1080_beats_720_base(self):
+        quality = {"url": "ez1080", "width": 1920, "height": 1080, "has_audio": True}
+        base = {"url": "vx720", "width": 1280, "height": 720, "has_audio": True}
+        self.assertIs(_crosspost_v3.prefer_quality_candidate(quality, base), quality)
+
+    def test_default_720_cannot_displace_healthy_higher_vx(self):
+        quality = {"url": "ez720", "width": 1280, "height": 720, "has_audio": True}
+        base = {"url": "vx1080", "width": 1920, "height": 1080, "has_audio": True}
+        self.assertIs(_crosspost_v3.prefer_quality_candidate(quality, base), base)
+
+    def test_failed_quality_keeps_base(self):
+        base = {"url": "vx720", "width": 1280, "height": 720, "has_audio": True}
+        self.assertIs(_crosspost_v3.prefer_quality_candidate(None, base), base)
+
+    def test_audio_loss_keeps_vxreddit_base(self):
+        quality = {"url": "ez1080", "width": 1920, "height": 1080, "has_audio": False}
+        base = {"url": "vx720", "width": 1280, "height": 720, "has_audio": True}
+        self.assertIs(_crosspost_v3.prefer_quality_candidate(quality, base), base)
+
+    def test_encoded_1080_pairing_keeps_original_id_not_child(self):
+        video = "22e7ve17smvh1"
+        child = "1x6lgak"
+        encoded = (
+            "https://_crosspost_proxy.embedez.com/render/video.mp4?"
+            f"videoUrl=https%3A%2F%2Fv.redd.it%2F{video}%2FCMAF_1080.mp4"
+            f"&audioUrl=https%3A%2F%2Fv.redd.it%2F{video}%2FCMAF_AUDIO_128.mp4"
+        )
+        self.assertEqual(_crosspost_v3.extract_vreddit_id_from_media_url(encoded), video)
+        self.assertNotEqual(_crosspost_v3.extract_vreddit_id_from_media_url(encoded), child)
+        self.assertIsNone(_crosspost_v3.extract_vreddit_id_from_media_url(
+            "https://_crosspost_proxy.embedez.com/render/audio?cover=https://i.redd.it/x.jpg"))
+
+    def test_gallery_order_preserved_through_filter(self):
+        media = [
+            {"kind": "image", "url": "https://i.redd.it/a.jpg"},
+            {"kind": "gif", "url": "https://i.redd.it/b.gif"},
+            {"kind": "image", "url": "https://i.redd.it/c.jpg"},
+        ]
+        filtered = _crosspost_proxy.filter_proxy_media(media)
+        self.assertEqual([item["url"] for item in filtered], [item["url"] for item in media])
+
+    def test_audio_cover_failure_keeps_proxy_images(self):
+        mixed = [
+            {"kind": "image", "url": "https://i.redd.it/keep-a.jpg"},
+            {"kind": "video", "url": "https://_crosspost_proxy.embedez.com/render/audio?cover=https://i.redd.it/x.jpg"},
+            {"kind": "image", "url": "https://i.redd.it/keep-b.jpg"},
+        ]
+        filtered = _crosspost_proxy.filter_proxy_media(mixed)
+        self.assertEqual([item["kind"] for item in filtered], ["image", "image"])
+        self.assertTrue(_crosspost_v3._proxy_result_usable({"media": filtered}, False))
+        self.assertFalse(any(_crosspost_proxy.is_audio_cover_url(item.get("url")) for item in filtered))
+
+    def test_malformed_parent_id_is_not_a_source(self):
+        source = _crosspost_v3.resolve_crosspost_source(
+            own_path="/r/Beta/comments/child016/",
+            base={},
+            post_json={"crosspost_parent": "not a t3 id"},
+        )
+        self.assertEqual(source, {})
+
+    def test_child_card_keeps_identity_with_five_image_gallery(self):
+        child_url = "https://www.reddit.com/r/NewsSub/comments/1x6lgak/yacht/"
+        data = {
+            "title": "Child title stays",
+            "author": "child_author",
+            "body": "child body text",
+            "media": [{"kind": "image", "url": f"https://i.redd.it/g{i}.jpg"} for i in range(5)],
+            "stats": {"comments": 4, "ups": 8},
+            "crosspost": {
+                "path": "/user/orig/comments/1x6lbhb/",
+                "url": "https://www.reddit.com/user/orig/comments/1x6lbhb/",
+            },
+            "op_comment": None,
+            "youtube_url": None,
+        }
+        payload = _crosspost_v3.build_v3_payload("NewsSub", data, child_url, 1700000000)
+        blob = json.dumps(payload)
+        self.assertIn("Child title stays", blob)
+        self.assertIn("child_author", blob)
+        self.assertIn("r/NewsSub", blob)
+        self.assertIn("child body text", blob)
+        self.assertIn("Crosspost of", blob)
+        self.assertIn("u/orig", blob)
+        row = [c for c in payload["components"][0]["components"] if c.get("type") == 1][0]
+        read_post = row["components"][0]
+        self.assertEqual(read_post["label"], "Read Post")
+        self.assertEqual(read_post["url"], child_url)
+        self.assertNotIn("1x6lbhb", read_post["url"])
+        labels = [b["label"] for b in row["components"]]
+        self.assertEqual(labels, ["Read Post", "Citlali News", "Donate"])
+        self.assertEqual(payload["components"][0]["accent_color"], 16729344)
+        self.assertIn("<t:1700000000:f>", blob)
+        self.assertIn("4", blob)
+        self.assertIn("8", blob)
+        galleries = [c for c in payload["components"][0]["components"] if c.get("type") == 12]
+        urls = [item["media"]["url"] for g in galleries for item in g["items"]]
+        self.assertEqual(urls, [f"https://i.redd.it/g{i}.jpg" for i in range(5)])
+
+    def test_http_200_error_body_is_not_video(self):
+        self.assertTrue(_crosspost_v3._looks_like_error_body(b"<html>error</html>"))
+        self.assertTrue(_crosspost_v3._looks_like_error_body(b'{"error":"nope"}'))
+        self.assertTrue(_crosspost_v3._looks_like_error_body(b"\xef\xbb\xbf<html>"))
+        self.assertFalse(_crosspost_v3._looks_like_error_body(b"\x00\x00\x00 ftypmp42"))
+        self.assertFalse(_crosspost_v3._looks_like_error_body(b""))
+        self.assertFalse(_crosspost_v3._looks_like_error_body(None))
+
+    def test_compatibility_quality_upgrade_keeps_base_without_http(self):
+        class BoomSession:
+            def get(self, *args, **kwargs):
+                raise AssertionError("compatibility mode must not probe")
+
+        old = _crosspost_v3.VIDEO_QUALITY_MODE
+        _crosspost_v3.VIDEO_QUALITY_MODE = "compatibility"
+        try:
+            out = asyncio.run(_crosspost_v3.proxy_video_quality_upgrade(
+                BoomSession(), "22e7ve17smvh1",
+                "https://vx.example/base.mp4", "t"))
+        finally:
+            _crosspost_v3.VIDEO_QUALITY_MODE = old
+        self.assertEqual(out, "https://vx.example/base.mp4")
+
+
+
+
+
+class _AppArchiveLookupTests(unittest.TestCase):
+    def test_archive_attempts_are_reused_and_only_validated_one_hop_is_followed(self):
+        from unittest.mock import patch
+        module = load_module("archive_call_contract", "testing area/reddit_main_v3.py")
+        child = "/r/Child/comments/abc123/child/"
+        parent = "/r/Parent/comments/def456/original/"
+        async def scenario(mode):
+            calls = []
+            original = {"id": "def456", "permalink": parent}
+            record = {"id": "abc123", "permalink": child}
+            if mode == "structured":
+                record["crosspost_parent_list"] = [original]
+            elif mode == "self_parent":
+                record["crosspost_parent_list"] = [{"id": "abc123", "permalink": child}]
+            elif mode == "mismatched_parent":
+                record["crosspost_parent_list"] = [{"id": "wrongid", "permalink": parent}]
+            class Response:
+                status = 503 if mode == "error" else 200
+                async def __aenter__(self): return self
+                async def __aexit__(self, *args): return False
+                async def json(self, **kwargs):
+                    return {"data": [] if mode == "missing" else [original if mode == "known" else record]}
+            class Session:
+                def get(self, url, **kwargs):
+                    assert url == module.ARCTIC_POSTS_URL
+                    calls.append(kwargs["params"]["ids"])
+                    return Response()
+            async def proxy(*args, **kwargs):
+                return {"service": "vxreddit", "media": [{"kind": "image", "url": "https://i.redd.it/fixture.jpg"}],
+                        "stats": {"ups": 1, "comments": 0}}
+            async def gallery(*args, **kwargs): return []
+            async def dedupe(session, items): return items
+            base = dict(title="child title", author="child_author", body="child body",
+                        content_html="", youtube_url=None, vred_id=None, redgifs_url=None,
+                        thumb=None, crosspost_orig_path=parent if mode == "known" else None)
+            module._arctic_fail_count = 0
+            with patch.object(module, "reddit_proxy", types.SimpleNamespace(fetch_proxy_post=proxy)), \
+                 patch.object(module, "PROXY_MEDIA", True), \
+                 patch.object(module, "enrich_gallery_redlib", gallery), \
+                 patch.object(module, "_dedupe_media_final_urls", dedupe):
+                result = await module.resolve_post_media(Session(), base, None, path=child)
+            self.assertEqual(calls, ["def456"] if mode == "known" else ["abc123"], mode)
+            self.assertEqual(result["title"], "child title")
+            self.assertEqual(result["author"], "child_author")
+            self.assertEqual(result["body"], "child body")
+            self.assertEqual(len(result["media"]), 1)
+            if mode in ("known", "structured"):
+                self.assertTrue(module.is_same_reddit_post(result["crosspost"]["path"], parent))
+            else:
+                self.assertIsNone(result["crosspost"], mode)
+        for mode in ("success", "missing", "error", "known", "structured", "self_parent", "mismatched_parent"):
+            with self.subTest(mode=mode):
+                asyncio.run(scenario(mode))
+
+
+def _app_summary_shell(kind, log_text, status="success", epochs=True):
+    import subprocess
+    import textwrap
+    workflow = open(os.path.join(ROOT, ".github/workflows", kind + "_monitor.yml"), encoding="utf-8").read()
+    label = "Write Twitter monitor run summary" if kind == "twitter" else "Write monitor run summary"
+    body = workflow.split("      - name: " + label, 1)[1].split("        run: |\n", 1)[1]
+    body = textwrap.dedent(body).replace("${{ job.status }}", status)
+    with tempfile.TemporaryDirectory() as directory:
+        logfile = "twitter_monitor.log" if kind == "twitter" else "monitor.log"
+        if log_text is not None:
+            with open(os.path.join(directory, logfile), "w", encoding="utf-8") as stream:
+                stream.write(log_text)
+        destination = os.path.join(directory, "summary.md")
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GITHUB_STEP_SUMMARY": destination,
+               "TWITTER_CACHE_RESULT": "success", "CACHE_RESULT": "success"}
+        if epochs:
+            prefix = "TWITTER" if kind == "twitter" else "MONITOR"
+            env[prefix + "_START_EPOCH"] = "100"
+            env[prefix + "_END_EPOCH"] = "105"
+        completed = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=directory,
+                                   env=env, capture_output=True, text=True)
+        assert completed.returncode == 0, completed.stderr
+        with open(destination, encoding="utf-8") as stream:
+            return stream.read()
+
+
+_app_tw_log = "\n".join(
+    f"2026-10-17 04:00:42,885 [INFO] [{account}] feed OK via https://nitter.test — {count} entries."
+    for account, count in [("Ananta_EN",17),("HonkaiNA",20),("Wuthering_Waves",21),("PomPom_HonkaiSR",20),("TYPEII_EN",20)]
+) + "\n2026-10-17 04:00:45,346 [INFO] V3 Posted: TYPEII_EN_fixture (lang=en | source=fxtwitter)\n"
+_app_tw_summary = _app_summary_shell("twitter", _app_tw_log)
+check("existing Twitter summary handles timestamp-prefixed five-account production format",
+      "accounts observed in feed logs: 5" in _app_tw_summary
+      and "entries read: 98" in _app_tw_summary
+      and "successful feeds: 5" in _app_tw_summary
+      and "posts delivered: 1" in _app_tw_summary and "cache: success" in _app_tw_summary)
+_app_fail_log = (_app_tw_log + "2026-10-17 04:00:46,000 [WARNING] [Offline] NO working nitter instance this run\n"
+                 "2026-10-17 04:00:46,001 [INFO] [Offline] skipping — no feed / 0 entries.\n")
+_app_fail_summary = _app_summary_shell("twitter", _app_fail_log, status="failure")
+check("failed-feed and account observations handle logger prefixes without double-counting accounts",
+      "failed feeds: 1" in _app_fail_summary and "accounts observed in feed logs: 6" in _app_fail_summary
+      and "**Result:** failure" in _app_fail_summary)
+_app_empty_summary = _app_summary_shell("twitter", None, epochs=False)
+check("missing Twitter output is unavailable, not a healthy no-op or fabricated runtime",
+      "**Runtime:** unavailable" in _app_empty_summary and "observation coverage: unavailable" in _app_empty_summary
+      and "new candidates: not separately measured" in _app_empty_summary)
+_app_rd_summary = _app_summary_shell("reddit", "2026-10-17 05:50:32,826 [INFO] Combined feed OK: 100 entries covering 5 subreddit(s).\n"
+    "2026-10-17 05:50:38,580 [INFO] Found 42 new Reddit posts. Building V3 cards...\n"
+    "2026-10-17 05:50:49,770 [INFO] Reddit V3 Posted: fixture\n"
+    "2026-10-17 05:50:49,324 [INFO] card media via vxreddit — 1 item(s).\n")
+check("existing Reddit summary retains delivery and workflow persistence facts",
+      "entries read: 100" in _app_rd_summary and "new candidates: 42" in _app_rd_summary
+      and "posts delivered: 1" in _app_rd_summary and "cache commit/push: success" in _app_rd_summary
+      and "observed card-media provider labels:" in _app_rd_summary)
+_app_rd_empty = _app_summary_shell("reddit", None, epochs=False)
+check("missing Reddit measurements stay unavailable",
+      "entries read: unavailable" in _app_rd_empty and "new candidates: unavailable" in _app_rd_empty
+      and "**Runtime:** unavailable" in _app_rd_empty)
+check("measured Reddit no-new-candidates remains a real zero",
+      "new candidates: 0" in _app_summary_shell("reddit", "No new Reddit posts to post.\n"))
+
+_app_media_suite = unittest.TestSuite(
+    unittest.defaultTestLoader.loadTestsFromTestCase(value)
+    for name, value in list(globals().items())
+    if name.startswith("_App") and isinstance(value, type)
+    and issubclass(value, unittest.TestCase)
+)
+_app_media_result = unittest.TextTestRunner(verbosity=1).run(_app_media_suite)
+check("application crosspost media regressions", _app_media_result.wasSuccessful())
+
+# Attended update policy: exercise the actual inline guard without GitHub calls.
+def _check_attended_workflow_update_policy():
+    with open(os.path.join(ROOT, ".github/workflows/dependabot_auto_merge.yml"), encoding="utf-8") as fh:
+        source = fh.read()
+    import json
+    import shutil
+    import subprocess
+
+    if shutil.which("node"):
+        start = source.index("const requiresWorkflowReview =")
+        helper = source[start:source.index(";", start) + 1]
+        fixtures = [
+            ([{"filename": "requirements.txt"}], False),
+            ([{"filename": ".github/workflows/monitor.yml"}], True),
+            ([{"filename": "renamed.txt", "previous_filename": ".github/workflows/old.yml"}], True),
+            ([{"filename": ".github/workflows/deleted.yml", "status": "removed"}], True),
+            ([{"filename": "README.md"}], False),
+            ([{"filename": "requirements.txt"}] * 110 + [{"filename": ".github/workflows/ci.yml"}], True),
+        ]
+        code = helper + "\nconst cases = " + json.dumps(fixtures) + ";\n"
+        code += "for (const [files, want] of cases) { if (requiresWorkflowReview(files) !== want) process.exit(1); }"
+        subprocess.run(["node", "-e", code], check=True, capture_output=True, text=True)
+    assert "github.paginate(github.rest.pulls.listFiles" in source
+    assert "file.previous_filename" in source
+    with open(os.path.join(ROOT, ".github/workflows/python_version_bump.yml"), encoding="utf-8") as fh:
+        bump = fh.read()
+    assert "gh pr merge" not in bump
+    assert "vars.AUTO_MERGE_PYTHON_BUMP" not in bump
+
+
+_check_attended_workflow_update_policy()
+check("attended workflow update policy and rename-aware package guard", True)
 
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
