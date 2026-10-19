@@ -391,8 +391,8 @@ else:
 # and dropped: the main card keeps the first chunk (same layout, gallery,
 # stats, buttons), and the remainder is delivered as up to
 # MAX_CONTINUATIONS follow-up messages to the same webhook — text-only
-# Components V2 containers, same accent color, each opening with a small
-# "-# (continued)" line. Beyond the cap the last message ends with
+# Components V2 containers, same accent color, starting directly with the
+# remaining body text (no generated heading). Beyond the cap the last message ends with
 # "… full post on Reddit" (the Read Post button already links the post).
 # Retraction covers every part: continuation message IDs are recorded
 # alongside the main card's, so the tombstone/delete pass hits them all.
@@ -959,10 +959,9 @@ def feedtoken_probe_enabled() -> bool:
 MAX_BODY_CHARS = 16000
 # Round 66: follow-up messages carrying the body remainder (see the
 # ROUND 66 block above). 3800 leaves room under Discord's 4000-char
-# message limit for the "-# (continued)" heading line.
+# message limit. Follow-ups start directly with body text.
 MAX_CONTINUATIONS = 3
 CONTINUATION_CHAR_LIMIT = 3800
-CONTINUATION_HEADER = "-# (continued)"
 CONTINUATION_TAIL = "… full post on Reddit"
 
 # Buttons (style 5 = Link). YouTube button uses the animated starwardspark3.
@@ -2071,9 +2070,10 @@ def _format_markdown_tables(body: str | None) -> str:
     Discord renders no table markdown. Round 66 turned a table into
     per-row ``**bold-label**`` bullet blocks — complete, but a wall of
     bold that re-reads the column headings on every row. Round 71 renders
-    the same detected table as compact, grouped row blocks:
+    the same detected table as compact, grouped row blocks with a bold
+    row heading:
 
-        Patch 3.7
+        **Patch 3.7**
         - Drip Market: August 25/26, 2026
         - Beta Start: September 5, 2026
 
@@ -2158,7 +2158,7 @@ def _format_markdown_tables(body: str | None) -> str:
             heading0 = html_lib.unescape(headers[0]).strip()
             if heading0 and heading0.lower() not in label.lower():
                 label = f"{heading0} {label}"
-            out.append(label)
+            out.append(f"**{label}**")
             for heading, value in zip(headers[1:], row[1:]):
                 value = html_lib.unescape(value).strip()
                 if value:
@@ -2179,14 +2179,14 @@ def _format_markdown_tables(body: str | None) -> str:
 def build_continuation_payloads(rest: str) -> list:
     """Round 66: the follow-up message payloads that carry a card body's
     remainder (see the ROUND 66 block above). Text-only Components V2
-    containers, same accent color as the card, each opening with a small
-    "-# (continued)" line; capped at MAX_CONTINUATIONS messages — any
+    containers, same accent color as the card, starting directly with the
+    remaining body text; capped at MAX_CONTINUATIONS messages — any
     further remainder ends the last message with '… full post on Reddit'
     (the Read Post button already links the post)."""
     text = (rest or "").strip()
     if not text:
         return []
-    budget = CONTINUATION_CHAR_LIMIT - len(CONTINUATION_HEADER) - 1
+    budget = CONTINUATION_CHAR_LIMIT
     chunks = []
     while text and len(chunks) < MAX_CONTINUATIONS:
         if len(text) <= budget:
@@ -2203,7 +2203,7 @@ def build_continuation_payloads(rest: str) -> list:
         {"flags": IS_COMPONENTS_V2,
          "components": [{"type": 17, "accent_color": 16729344,
                          "components": [{"type": 10,
-                                         "content": f"{CONTINUATION_HEADER}\n{chunk}"}]}]}
+                                         "content": chunk}]}]}
         for chunk in chunks
     ]
 
@@ -2636,6 +2636,46 @@ def _line_stage(lines: list) -> list:
         kept.append(line)
     return kept
 
+def _preserve_html_tables(text: str) -> str:
+    """Preserve innermost rectangular data tables before RSS tag stripping.
+
+    RSS layout tables are not data tables: require a TH header row and
+    at least one equally wide data row. Never infer columns from flattened
+    prose. Unsupported spans and malformed rows retain the old cleanup.
+    Inline markup is already converted by clean_rss_body at this point.
+    """
+    def convert(match):
+        source = match.group(0)
+        if re.search(r"(?i)\b(?:rowspan|colspan)\s*=", source):
+            return source
+        rows = re.findall(r"(?is)<tr\b[^>]*>(.*?)</tr\s*>", source)
+        if len(rows) < 2:
+            return source
+        parsed = []
+        for row in rows:
+            cells = re.findall(r"(?is)<(th|td)\b[^>]*>(.*?)</\1\s*>", row)
+            if not cells:
+                return source
+            parsed.append(cells)
+        width = len(parsed[0])
+        if (width < 2 or any(tag.lower() != "th" for tag, _ in parsed[0])
+                or any(len(row) != width for row in parsed[1:])):
+            return source
+        def cell(value):
+            value = re.sub(r"<[^>]+>", " ", value)
+            value = html_lib.unescape(value)
+            return re.sub(r"\s+", " ", value).strip().replace("|", r"\|")
+        lines = ["|" + "|".join(cell(value) for _, value in row) + "|"
+                 for row in parsed]
+        lines.insert(1, "|" + "|".join(["---"] * width) + "|")
+        return "\n\n" + _format_markdown_tables("\n".join(lines)) + "\n\n"
+
+    # Match only tables without descendant tables, leaving the feed's
+    # outer layout wrapper alone while converting its inner data table.
+    return re.sub(r"(?is)<table\b[^>]*>(?:(?!<table\b).)*?</table\s*>",
+                  convert, text)
+
+
 def clean_rss_body(value: str | None) -> str:
     """
     Turn the RSS entry's content HTML into clean card text (Discord markdown).
@@ -2664,6 +2704,8 @@ def clean_rss_body(value: str | None) -> str:
     text = re.sub(r"(?i)</blockquote>", "\x02", text)
     # round 16: bold tags -> Discord bold (only when present in the source)
     text = re.sub(r"(?is)<(?:b|strong)\s*>(.*?)</(?:b|strong)>", r"**\1**", text)
+    # Preserve cell boundaries before the generic block/tag cleanup.
+    text = _preserve_html_tables(text)
     # round 16: list items -> Discord bullet lines
     text = re.sub(r"(?i)<li[^>]*>", "\n- ", text)
     text = re.sub(r"(?i)</li\s*>", " ", text)
