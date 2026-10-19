@@ -4310,8 +4310,7 @@ def _r66_chunks(conts):
     out = []
     for p in conts:
         chunk = p["components"][0]["components"][0]["content"]
-        assert chunk.startswith(v3.CONTINUATION_HEADER + "\n"), chunk[:30]
-        out.append(chunk[len(v3.CONTINUATION_HEADER) + 1:])
+        out.append(chunk)
     return out
 
 
@@ -4354,12 +4353,12 @@ check("r66: 5k body — exactly one continuation message",
 check("r66: 5k body — the continuation carries the whole remainder",
       _r66_chunks(_r66_conts5) == [_r66_rest5],
       str([len(c) for c in _r66_chunks(_r66_conts5)]))
-check("r66: continuation payload shape — V2 container, card accent, '-# (continued)' heading",
+check("r66: continuation payload shape — V2 container, card accent, no generated heading",
       all(p["flags"] == v3.IS_COMPONENTS_V2
           and p["components"][0]["type"] == 17
           and p["components"][0]["accent_color"] == 16729344
           and p["components"][0]["components"][0]["type"] == 10
-          and p["components"][0]["components"][0]["content"].startswith("-# (continued)\n")
+          and _r66_rest5.startswith(p["components"][0]["components"][0]["content"])
           and len(p["components"][0]["components"][0]["content"]) <= v3.CONTINUATION_CHAR_LIMIT
           for p in _r66_conts5), str(_r66_conts5)[:300])
 
@@ -4409,11 +4408,9 @@ _r66_h, _r66_t = v3.split_card_body(_r66_nospace, 300)
 check("r66: pathological no-boundary text still splits (progress) without slicing the link",
       len(_r66_h) == 300 and _r66_link in _r66_h and _r66_h + _r66_t == _r66_nospace,
       f"head_len={len(_r66_h)} link_intact={_r66_link in _r66_h}")
-# adversarial: the same straddle at a CONTINUATION boundary (~3784, not 3800,
-# because the '-# (continued)' heading claims the first 17 chars)
-_r66_adv = _r66_para("Adv", 3760) + "\n\n" + _r66_link + "\n\n" + _r66_para("Tail", 50)
-_r66_h, _r66_t = v3.split_card_body(_r66_adv, v3.CONTINUATION_CHAR_LIMIT
-                                    - len(v3.CONTINUATION_HEADER) - 1)
+# Adversarial link straddle at the full continuation text budget.
+_r66_adv = _r66_para("Adv", 3780) + "\n\n" + _r66_link + "\n\n" + _r66_para("Tail", 50)
+_r66_h, _r66_t = v3.split_card_body(_r66_adv, v3.CONTINUATION_CHAR_LIMIT)
 check("r66: adversarial link straddling the continuation boundary splits before it",
       _r66_t.startswith(_r66_link) and _r66_link in _r66_h + _r66_t
       and not (_r66_link[:-1] in _r66_h and _r66_link not in _r66_h),
@@ -4437,14 +4434,14 @@ _r66_tbl = ("|Patch|Drip Market|Beta Start|Livestream|First Half|Second Half|New
             "December 2, 2026|Lily (5\\* Spectro)|")
 check("r71: the real 1wxfuj5 table renders as grouped patch blocks (live 1wxfuj5)",
       v3._format_markdown_tables(_r66_tbl) ==
-      "Patch 3.7\n"
+      "**Patch 3.7**\n"
       "- Drip Market: August 25/26, 2026\n"
       "- Beta Start: September 5, 2026\n"
       "- Livestream: September 19, 2026\n"
       "- First Half: October 2, 2026\n"
       "- Second Half: October 23, 2026\n"
       "- New Characters: Hsin (5\\* Electro) & Suoming (5\\* Electro)\n\n"
-      "Patch 3.8\n"
+      "**Patch 3.8**\n"
       "- Drip Market: October 9/10, 2026\n"
       "- Beta Start: October 16, 2026\n"
       "- Livestream: October 30, 2026\n"
@@ -4461,14 +4458,14 @@ _r71_tbl = (
     "3.8 | October 6, 2026 | October 16, 2026 | October 30, 2026 | November 13, 2026 | "
     "December 2, 2026 | Lily (5* Spectro)")
 _r71_expected = (
-    "Patch 3.7\n"
+    "**Patch 3.7**\n"
     "- Drip Market: August 25/26, 2026\n"
     "- Beta Start: September 5, 2026\n"
     "- Livestream: September 19, 2026\n"
     "- First Half: October 2, 2026\n"
     "- Second Half: October 23, 2026\n"
     "- New Characters: Hsin (5* Electro) & Suoming (5* Electro)\n\n"
-    "Patch 3.8\n"
+    "**Patch 3.8**\n"
     "- Drip Market: October 6, 2026\n"
     "- Beta Start: October 16, 2026\n"
     "- Livestream: October 30, 2026\n"
@@ -4496,7 +4493,7 @@ check("r71: a valid table is still formatted before ordinary pipe prose",
           "| 3.7 | August 25/26, 2026 |\n\n"
           "Suoming | 5\\* Electro Sword")
       ==
-      "Patch 3.7\n"
+      "**Patch 3.7**\n"
       "- Drip Market: August 25/26, 2026\n\n"
       "Suoming | 5\\* Electro Sword",
       repr(v3._format_markdown_tables(
@@ -4510,7 +4507,7 @@ check("r71: pipe prose with a DIFFERENT cell count straight after a table "
           "| 3.7 | August 25/26, 2026 | x |\n"
           "Suoming | 5\\* Electro Sword")
       ==
-      "Patch 3.7\n"
+      "**Patch 3.7**\n"
       "- Drip Market: August 25/26, 2026\n"
       "- Notes: x\n\n"
       "Suoming | 5\\* Electro Sword",
@@ -4529,17 +4526,17 @@ check("r71: FAQ question gets a blank line after the heading",
 check("r71: a first cell already carrying the header word is never doubled",
       v3._format_markdown_tables(
           "| Patch | Drip Market |\n|---|---|\n| Patch 3.8 | October 9/10, 2026 |")
-      == "Patch 3.8\n- Drip Market: October 9/10, 2026",
+      == "**Patch 3.8**\n- Drip Market: October 9/10, 2026",
       repr(v3._format_markdown_tables(
           "| Patch | Drip Market |\n|---|---|\n| Patch 3.8 | October 9/10, 2026 |")))
 check("r71: an empty first header falls back to the verbatim cell",
       v3._format_markdown_tables(
           "| | Drip Market |\n|---|---|\n| 3.8 | October 9/10, 2026 |")
-      == "3.8\n- Drip Market: October 9/10, 2026")
+      == "**3.8**\n- Drip Market: October 9/10, 2026")
 check("r71: an empty first cell falls back to the 'Entry' label",
       v3._format_markdown_tables(
           "| | Drip Market |\n|---|---|\n| | October 9/10, 2026 |")
-      == "Entry\n- Drip Market: October 9/10, 2026")
+      == "**Entry**\n- Drip Market: October 9/10, 2026")
 check("r71: dates stay literal — NO Discord-timestamp guessing of body text",
       "<t:" not in v3._format_markdown_tables(_r66_tbl))
 _r71_mid = v3._format_markdown_tables("before\n\n" + _r66_tbl + "\nafter")
@@ -4550,11 +4547,11 @@ check("r71: table mid-body keeps the surrounding prose (a blank line closes the 
       repr(_r71_mid))
 check("r71: empty cells are skipped, not blank bullets",
       v3._format_markdown_tables("| Patch | Drip Market | Notes |\n|---|---|---|\n| 3.8 | | z |")
-      == "Patch 3.8\n- Notes: z",
+      == "**Patch 3.8**\n- Notes: z",
       repr(v3._format_markdown_tables("| Patch | Drip Market | Notes |\n|---|---|---|\n| 3.8 | | z |")))
 check("r71: escaped pipes survive as literal pipes",
       v3._format_markdown_tables("| Patch | a \\| b |\n|---|---|\n| 3.8 | x \\| y |")
-      == "Patch 3.8\n- a | b: x | y",
+      == "**Patch 3.8**\n- a | b: x | y",
       repr(v3._format_markdown_tables("| Patch | a \\| b |\n|---|---|\n| 3.8 | x \\| y |")))
 _r66_bad_tbls = [
     "| a | b |\n| c | d |",                                  # no separator row
@@ -4592,10 +4589,10 @@ _r66_live_conts = v3.build_continuation_payloads(_r66_live_rest)
 # 🕐 are not body text (the timestamp check below must not trip on them)
 _r66_live_parts = _r66_texts(_r66_live_p)[1:-1] + _r66_chunks(_r66_live_conts)
 # r66 guard updated in round 71: the end-to-end card assertion now pins the
-# grouped-block format instead of the old `**Patch 3.8**` bold labels.
+# grouped-block format with bold row headings.
 check("r71: 1wxfuj5 shape — the table converts to grouped blocks on the card itself",
-      any("Patch 3.8" in p and "- Drip Market: October 9/10, 2026" in p
-          and "**Patch" not in p for p in _r66_live_parts),
+      any("**Patch 3.8**" in p and "- Drip Market: October 9/10, 2026" in p
+          for p in _r66_live_parts),
       str(_r66_live_parts[1][:160]))
 check("r66: 1wxfuj5 shape — r65 entity hygiene holds on every part",
       all("&gt;" not in p and all(ln.strip() != ">" for ln in p.splitlines())
@@ -4734,12 +4731,11 @@ check("r66: live 1wxfuj5 megathread — the body is continued, not truncated (no
               for p in _r66_mega_parts),
       f"conts={len(_r66_mega_conts)} lens={[len(p) for p in _r66_mega_parts]}")
 # r66 guard updated in round 71: the full-megathread end-to-end check now
-# pins the grouped-block format (and the absence of the old bold labels).
+# pins the grouped-block format with bold row headings.
 check("r71: live 1wxfuj5 megathread — the release-date table is the grouped row blocks",
-      "Patch 3.7" in _r66_mega_joined and "Patch 3.8" in _r66_mega_joined
+      "**Patch 3.7**" in _r66_mega_joined and "**Patch 3.8**" in _r66_mega_joined
       and "- Drip Market: October 9/10, 2026" in _r66_mega_joined
-      and "- New Characters: Lily (5\\* Spectro)" in _r66_mega_joined
-      and "**Patch" not in _r66_mega_joined,
+      and "- New Characters: Lily (5\\* Spectro)" in _r66_mega_joined,
       str([p[:60] for p in _r66_mega_parts]))
 check("r66: live 1wxfuj5 megathread — pipe-list lines ('Suoming | 5\\* …') are NOT tables",
       "Suoming | 5\\* Electro Sword" in _r66_mega_joined
@@ -6871,6 +6867,55 @@ def _check_attended_workflow_update_policy():
 
 _check_attended_workflow_update_policy()
 check("attended workflow update policy and rename-aware package guard", True)
+
+# --- HTML RSS tables (r76) and continuation text (no generated heading) ----
+# HTML RSS tables must reach the same formatter as raw Markdown tables.
+_r76_headers = ["Patch", "Drip Market", "Beta Start", "Livestream",
+                "First Half", "Second Half", "New Characters"]
+# Values transcribed from the supplied 1x9geq7 screenshots (not a raw capture).
+_r76_rows = [
+    ["3.7", "August 25/26, 2026", "September 5, 2026", "September 19, 2026",
+     "October 2, 2026", "October 23, 2026", "Hsin (5* Electro) &amp; Suoming (5* Electro)"],
+    ["3.8", "October 6, 2026", "i have no idea, send help", "October 30, 2026",
+     "November 13, 2026", "December 2, 2026", "Lily (5* Spectro)"],
+    ["4.0", "November 20/21, 2026", "November 27, 2026", "December 11, 2026",
+     "December 25, 2026", "January 13, 2027", "Anna"],
+]
+_r76_html = ("<table><thead><tr>" + "".join("<th>" + h + "</th>" for h in _r76_headers)
+             + "</tr></thead><tbody>" + "".join("<tr>" + "".join("<td>" + c + "</td>" for c in row)
+             + "</tr>" for row in _r76_rows) + "</tbody></table>")
+_r76_md = "\n".join(["|".join(_r76_headers), "|".join(["---"] * 7)]
+                       + ["|".join(row) for row in _r76_rows])
+_r76_expected = v3._format_markdown_tables(_r76_md)
+check("r76: HTML screenshot transcription equals Markdown grouped output",
+      v3.clean_rss_body(_r76_html) == _r76_expected)
+check("r76: nested RSS layout wrapper preserves all three patch blocks and surrounding prose",
+      v3.clean_rss_body("<table><tr><td><p>Before</p>" + _r76_html
+                        + "<p>After</p></td></tr></table>")
+      == "Before\n\n" + _r76_expected + "\n\nAfter")
+check("r76: entity decoding and unknown beta wording stay faithful",
+      "Hsin (5* Electro) & Suoming (5* Electro)" in _r76_expected
+      and "- Beta Start: i have no idea, send help" in _r76_expected
+      and "**Patch 4.0**" in _r76_expected)
+check("r76: generic headers, links and literal pipes survive HTML conversion",
+      v3.clean_rss_body('<table><tr><th>Item</th><th>Notes</th></tr>'
+                        '<tr><td>A</td><td><a href="https://example.com">Details</a> x|y</td></tr></table>')
+      == "**Item A**\n- Notes: [Details](https://example.com) x|y")
+check("r76: malformed widths, layout tables and spans are not guessed",
+      all(v3._preserve_html_tables(x) == x for x in [
+          '<table><tr><td>Layout</td></tr></table>',
+          '<table><tr><th>A</th><th>B</th></tr><tr><td>x</td></tr></table>',
+          '<table><tr><th>A</th><th>B</th></tr><tr><td colspan="2">x</td></tr></table>']))
+check("r76: multiple sibling tables and repeated formatting are stable",
+      v3.clean_rss_body(_r76_html + _r76_html) == _r76_expected + "\n\n" + _r76_expected
+      and v3._format_markdown_tables(_r76_expected) == _r76_expected)
+
+check("continuations: exact body text, no generated label or leading newline",
+      _r66_chunks(v3.build_continuation_payloads("Remaining body text"))
+      == ["Remaining body text"])
+check("continuations: source-authored continued wording is preserved",
+      _r66_chunks(v3.build_continuation_payloads("(continued) by the author"))
+      == ["(continued) by the author"])
 
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
