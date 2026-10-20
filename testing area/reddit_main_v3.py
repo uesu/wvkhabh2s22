@@ -4853,8 +4853,7 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
         else:
             _cp_profile_name = None
         if _cp_profile_name:
-            header += (f"\n*🔁 Crosspost of [u/{_cp_profile_name}]"
-                       f"(https://www.reddit.com/user/{_cp_profile_name}/) Profile*")
+            header += f"\n*🔁 Crosspost of u/{_cp_profile_name} Profile*"
         elif not _cp_sub and _cp.get("subreddit"):
             # round 29: notice-only detection (no permalink available anywhere)
             _sub = _cp["subreddit"]
