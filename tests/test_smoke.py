@@ -1705,10 +1705,11 @@ check("r29 header: no crosspost -> no 🔁 line",
           ["components"][0]["components"][0]["content"])
 
 # r51: Reddit profile crossposts have three public permalink shapes. They
-# must all advertise the canonical profile, while r/<sub> cards keep the
-# exact legacy behavior asserted above.
-_R51_PROFILE_LINE = ("*🔁 Crosspost of [u/aphotide]"
-                     "(https://www.reddit.com/user/aphotide/) Profile*")
+# must all advertise the canonical profile as PLAIN text — no user-profile
+# Markdown link (expected display: "🔁 Crosspost of u/aphotide Profile") —
+# while r/<sub> cards keep the exact legacy linked behavior asserted above
+# and Read Post still points at the child post.
+_R51_PROFILE_LINE = "*🔁 Crosspost of u/aphotide Profile*"
 for _r51_name, _r51_crosspost in (
     ("/user", {"url": "https://www.reddit.com/user/aphotide/comments/1wuv4j8/title/",
                 "path": "/user/aphotide/comments/1wuv4j8/title/"}),
@@ -1717,9 +1718,37 @@ for _r51_name, _r51_crosspost in (
     ("/r/u_", {"url": "https://www.reddit.com/r/u_aphotide/comments/1wuv4j8/title/",
                 "path": "/r/u_aphotide/comments/1wuv4j8/title/"}),
 ):
-    check(f"r51 header: profile crosspost {_r51_name} uses canonical profile Markdown",
-          _R51_PROFILE_LINE in _r29_header(_r51_crosspost),
-          _r29_header(_r51_crosspost))
+    _r51_head = _r29_header(_r51_crosspost)
+    check(f"r51 header: profile crosspost {_r51_name} produces plain attribution",
+          _R51_PROFILE_LINE in _r51_head, _r51_head)
+    check(f"r51 header: profile crosspost {_r51_name} keeps username and Profile wording",
+          "u/aphotide" in _r51_head and "Profile*" in _r51_head, _r51_head)
+    check(f"r51 header: profile crosspost {_r51_name} has no user-profile Markdown link",
+          "[u/aphotide]" not in _r51_head
+          and "](https://www.reddit.com/user/" not in _r51_head
+          and "](https://www.reddit.com/u/" not in _r51_head, _r51_head)
+
+check("r51 header: subreddit crosspost links remain unchanged",
+      "*🔁 Crosspost of [Ananta2027]"
+      "(https://www.reddit.com/r/Ananta2027/comments/1wk5ymh/ufood/) Subreddit*"
+      in _r29_header({"url": "https://www.reddit.com/r/Ananta2027/comments/1wk5ymh/ufood/",
+                       "path": "/r/Ananta2027/comments/1wk5ymh/ufood/"}),
+      _r29_header({"url": "https://www.reddit.com/r/Ananta2027/comments/1wk5ymh/ufood/",
+                    "path": "/r/Ananta2027/comments/1wk5ymh/ufood/"}))
+check("r51 header: ordinary post header unchanged (title link intact, no attribution)",
+      _r29_header(None) == "### [T](https://www.reddit.com/r/AnantaLeaks/comments/1abc/)"
+                          "\n*by unknown in r/AnantaLeaks*", _r29_header(None))
+_r51_pl = v3.build_v3_payload(
+    "AnantaLeaks",
+    dict(_R29_BASE, crosspost={"url": "https://www.reddit.com/user/aphotide/comments/1wuv4j8/title/",
+                               "path": "/user/aphotide/comments/1wuv4j8/title/"}),
+    "https://www.reddit.com/r/AnantaLeaks/comments/1abc/t/", 1789749533)
+_r51_row = _r51_pl["components"][0]["components"][-1]
+check("r51: Read Post destination unchanged on profile crosspost cards",
+      _r51_row["components"][0]["label"] == "Read Post"
+      and _r51_row["components"][0]["url"]
+      == "https://www.reddit.com/r/AnantaLeaks/comments/1abc/t/",
+      str(_r51_row["components"][0]))
 
 
 # ---- round 30 (2026-09-19): pending-post recheck cache --------------------
