@@ -158,14 +158,14 @@ class _FakeClientSession:
 
 
 async def _run_main_case(age_seconds=120, listing=(("abc123",), 600),
-                         fresh_hold=None, listing_confirm=None, cached=False):
+                         fresh_hold=None, listing_confirm=None, cached=False):  # listing_confirm kept for backward compat, ignored (removed gate)
     names = [
         "SUBREDDITS", "TEST_POST_ID", "DRY_RUN", "fetch_combined_feed",
         "_fetch_new_listing", "verify_archive_post_live", "fetch_post_json",
         "resolve_post_media", "create_discohook_share", "load_posted",
         "load_pending", "save_posted", "save_pending", "save_posted_messages",
         "load_posted_messages", "RETRACT_DEAD_POSTS", "aiohttp",
-        "FRESH_HOLD_SECONDS", "LISTING_CONFIRM",
+        "FRESH_HOLD_SECONDS",
     ]
     old = {name: getattr(v3, name) for name in names}
     old_env = os.environ.get("DISCORD_WEBHOOK_URL")
@@ -180,8 +180,7 @@ async def _run_main_case(age_seconds=120, listing=(("abc123",), 600),
         v3.RETRACT_DEAD_POSTS = False
         if fresh_hold is not None:
             v3.FRESH_HOLD_SECONDS = fresh_hold
-        if listing_confirm is not None:
-            v3.LISTING_CONFIRM = listing_confirm
+        # listing_confirm removed in 2026-10-21 cleanup — ignored if passed
         v3.fetch_combined_feed = lambda session: _async_return(_Feed(age_seconds))
         if listing is None:
             v3._fetch_new_listing = lambda session, sub: _async_return(None)
@@ -247,20 +246,18 @@ async def _main_checks():
           "(settle timing unchanged)",
           sent == 0 and "TestSub_abc123" not in pending)
     sent, pending = await _run_main_case(listing=None)
-    check("r67: a listing outage still follows the existing retry behavior — "
-          "skipped this tick, never cached",
-          sent == 0 and "TestSub_abc123" not in pending)
+    check("r67 updated: listing outage no longer gates delivery (gate removed) — delivers",
+          sent == 1)
     sent, pending = await _run_main_case()
-    check("r67: the same candidate delivers once the listing is readable again",
+    check("r67 updated: normal delivery still works after outage case",
           sent == 1)
     sent, pending = await _run_main_case(listing=(("other",), 600))
-    check("r67: pristine listing evidence still gates delivery (absent -> "
-          "skipped, not blocked)", sent == 0 and "TestSub_abc123" not in pending)
+    check("r67 updated: absent from listing no longer gates delivery (gate removed) — delivers",
+          sent == 1)
 asyncio.run(_main_checks())
 
-# ROUND 64 ("Pristine Listing Protocol") end-to-end main() cases ------------
-# Precedence under test (round 67): dedup -> FRESH_HOLD floor -> pristine
-# listing confirmation -> deliver. Every case below uses
+# ROUND 64 (Pristine Listing Protocol) end-to-end main() cases — updated 2026-10-21: listing gate removed
+# Precedence under test (post-cleanup): dedup -> FRESH_HOLD floor -> deliver. Every case below uses
 # age_seconds/listing/fresh_hold/listing_confirm overrides added to
 # _run_main_case so a single harness exercises both gates (neither ever
 # touches `pending` -- every "skipped" assertion below also confirms no
@@ -271,16 +268,13 @@ async def _r64_checks():
                                           listing=(("abc123",), 600))
     check("r64: listed + older than FRESH_HOLD_SECONDS delivers", sent == 1)
 
-    # D.3: absent from the pristine listing -> skipped, never cached, then
-    # delivers the moment a later tick's listing includes it.
+    # D.3 updated 2026-10-21: absent from listing no longer gates — delivers regardless.
     sent, pending = await _run_main_case(age_seconds=120,
                                           listing=(("other",), 600))
-    check("r64: absent from pristine listing is skipped, not delivered",
-          sent == 0 and "TestSub_abc123" not in pending)
+    check("r64 updated: absent from listing delivers (gate removed)", sent == 1)
     sent, pending = await _run_main_case(age_seconds=120,
                                           listing=(("abc123",), 600))
-    check("r64: same candidate delivers instantly once a later tick lists it",
-          sent == 1)
+    check("r64 updated: listed still delivers", sent == 1)
 
     # D.4: younger than the 30s default floor -> skipped even when listed,
     # with NO pending/tracker entry (fully stateless); delivers once old
@@ -304,16 +298,13 @@ async def _r64_checks():
     check("r64: older than the listing's own span falls through to normal "
           "delivery (confirmation inapplicable)", sent == 1)
 
-    # D.6: outage -- no listing source readable this tick is NEVER read as
-    # absence: the candidate is skipped (not cached) and recovers next tick.
+    # D.6 updated 2026-10-21: outage no longer gates delivery — listing is not a delivery requirement
     sent, pending = await _run_main_case(age_seconds=120,
                                           listing=None)
-    check("r64: a listing outage skips the candidate without caching it",
-          sent == 0 and "TestSub_abc123" not in pending)
+    check("r64 updated: listing outage delivers (gate removed)", sent == 1)
     sent, pending = await _run_main_case(age_seconds=120,
                                           listing=(("abc123",), 600))
-    check("r64: the same candidate recovers on the next tick once the "
-          "listing is readable again", sent == 1)
+    check("r64 updated: listed still delivers after outage", sent == 1)
 
     # D.7 (round 67 guard update, annotated): the removed content gate used
     # to block here. With the gate gone the SAME candidate -- listed and past
@@ -345,16 +336,18 @@ async def _r64_checks():
     check("r64 addendum: FRESH_HOLD_SECONDS=0 disables the floor entirely "
           "(posts at age 0 once listed)", sent == 1)
 
-    # D.8: LISTING_CONFIRM=0 + FRESH_HOLD_SECONDS=0 together fully restore
-    # round-63 delivery byte-for-byte -- the two knobs are independent
-    # mechanisms, so true parity with pre-round-64 behavior needs BOTH off;
-    # proven here with a candidate that would fail EITHER gate alone
-    # (0s old, and absent from the listing) yet still delivers.
+    # D.8 updated 2026-10-21: LISTING_CONFIRM removed — FRESH_HOLD_SECONDS=0
+    # alone now restores the relevant parity (a 0s-old, listed post delivers).
+    # Legacy listing_confirm param is ignored.
+    sent, pending = await _run_main_case(age_seconds=0,
+                                          listing=(("abc123",), 600),
+                                          fresh_hold=0, listing_confirm=False)
+    check("r64 updated: FRESH_HOLD_SECONDS=0 alone bypasses the fresh hold (listing gate removed)", sent == 1)
+    # Also verify that legacy listing_confirm does not reactivate gate
     sent, pending = await _run_main_case(age_seconds=0,
                                           listing=(("other",), 600),
-                                          fresh_hold=0, listing_confirm=False)
-    check("r64: LISTING_CONFIRM=0 + FRESH_HOLD_SECONDS=0 restores round-63 "
-          "behavior byte-for-byte (both new gates fully bypassed)", sent == 1)
+                                          fresh_hold=0, listing_confirm=True)
+    check("r64 updated: legacy LISTING_CONFIRM=True does not reactivate removed gate", sent == 1)
 asyncio.run(_r64_checks())
 
 
@@ -421,9 +414,9 @@ for _r52_name in (
 # above still pins every mapping that SURVIVED round 66.
 check("r66 workflow drops the stale APPROVAL_RECHECK_SECONDS mapping",
       "APPROVAL_RECHECK_SECONDS" not in _wf)
-for _r66_name in ("FRESH_HOLD_SECONDS", "LISTING_CONFIRM"):
-    check(f"r66 workflow maps {_r66_name} as a Variable (round-64 pipeline)",
-          f"{_r66_name}: ${{{{ vars.{_r66_name} }}}}" in _wf)
+check("r66 updated: workflow maps FRESH_HOLD_SECONDS and no longer maps LISTING_CONFIRM (removed)",
+      "FRESH_HOLD_SECONDS: ${{ vars.FRESH_HOLD_SECONDS }}" in _wf
+      and "LISTING_CONFIRM" not in _wf)
 check("r66 continuation tombstone — greyed V2 notice for follow-up parts",
       (lambda p: p["flags"] == 1 << 15
        and p["components"][0]["type"] == 17
