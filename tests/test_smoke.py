@@ -2292,11 +2292,14 @@ for _r39_rel, _r39_expected in (
     check(f"r39 source fleet: {_r39_rel} has the reviewed X RSS order",
           _literal_list_constant(_r39_rel, "RSS_INSTANCES") == _r39_expected)
 
-# Preserved for history: r76 was 12-member
+# Preserved for history: r76 was 12-member; r77 was 16-member
 # Round 77 (2026-10-22): Teapawt operator expansion (4cuck/teapawt commit de02b80, README lists five public instances on same operator stack: nitter.cf, xitter.cf, teapaw.org, teapawt.net, teapawt.org — status.d420.net 01:29 UTC 100% healthy RSS true All) + Codeberg shitter wiki Working instance https://nitter.mie.foundation/ (fetch_page-verified RSS same top id 2112959650551173522). No Reddit frontend in Teapawt (Twitter/X only). nitter.cf/xitter.cf untouched per request; added three Teapawt hosts as operator-approved spares after the proven head, and mie.foundation above walled tail per no-block rule. V1/V2 retain separately.
+# Round 78 (2026-10-22 07:55 UTC): status.d420.net now lists nitter.gq + xitter.gq as Working, Healthy, 100%, RSS true, All, same teapawt operator/stack as nitter.cf/xitter.cf (teapawt 0.19.0, 60 pts, 455ms/450ms). Inserted as seats 3-4 — next operator-proven spares after 1-2, exactly as Teapawt spares. Fleet 16→18, serial fallback unchanged.
 _r77_x_expected = [
     "https://nitter.cf",
     "https://xitter.cf",
+    "https://nitter.gq",
+    "https://xitter.gq",
     "https://nitter.meowing.monster",
     "https://nitter.miningtcup.me",
     "https://teapaw.org",
@@ -2315,25 +2318,27 @@ _r77_x_expected = [
 check("r77 source fleet: Twitter V3 has the reviewed exact 16-member order",
       _literal_list_constant("testing area/twitter_v3.py", "RSS_INSTANCES") == _r77_x_expected)
 def test_r77_runner_proven_head_with_teapawt_and_mie():
-    """r77 (2026-10-22): operator pair untouched (nitter.cf/xitter.cf), r76 head preserved (meowing 3, miningtcup 4), then three Teapawt operator instances (teapaw.org, teapawt.net, teapawt.org — 4cuck/teapawt README + status.d420.net 2026-10-22 01:29 UTC 100% healthy RSS true All, fetch_page RSS same top id 2112959650551173522 as controls), followed by previous trials (freedit 8/8, gravitywell 5/8), eir-nya, thepixora, kareem, xcopy verdict at 13, mie.foundation Working instance from Codeberg wiki verified RSS, walled tail untouched. Membership 16, no deletions, operator pair intact."""
+    """r77 (2026-10-22) + r78 (2026-10-22 07:55 UTC): operator pair untouched (nitter.cf/xitter.cf), r78 adds nitter.gq/xitter.gq as seats 3-4 (status.d420.net Working 100% RSS All, same teapawt operator/stack as nitter.cf/xitter.cf), r76 head preserved (meowing 5, miningtcup 6) then three Teapawt operator instances (teapaw.org, teapawt.net, teapawt.org — 4cuck/teapawt README + status.d420.net 2026-10-22 01:29 UTC 100% healthy RSS true All, fetch_page RSS same top id 2112959650551173522 as controls), followed by previous trials (freedit 10/10, gravitywell 7/10), eir-nya, thepixora, kareem, xcopy verdict at 15, mie.foundation Working instance from Codeberg wiki verified RSS, walled tail untouched. Membership 18, no deletions, operator pair intact."""
     RSS_INSTANCES = x3.RSS_INSTANCES
     assert RSS_INSTANCES[0] == "https://nitter.cf"                # operator pair untouched per request
     assert RSS_INSTANCES[1] == "https://xitter.cf"
-    assert RSS_INSTANCES[2] == "https://nitter.meowing.monster"   # operator-directed seat 3 preserved
-    assert RSS_INSTANCES[3] == "https://nitter.miningtcup.me"     # operator-directed seat 4 preserved
-    assert RSS_INSTANCES[4] == "https://teapaw.org"               # Teapawt operator expansion (de02b80)
-    assert RSS_INSTANCES[5] == "https://teapawt.net"              # same operator, 100% healthy All
-    assert RSS_INSTANCES[6] == "https://teapawt.org"              # same operator, fastest ping 493ms
-    assert RSS_INSTANCES[7] == "https://nitter.freedit.eu"        # 8/8 union, TRIAL (was 5)
-    assert RSS_INSTANCES[8] == "https://nitter.gravitywell.xyz"   # 5/8 union, TRIAL (was 6)
-    assert RSS_INSTANCES[9] == "https://tw.eir-nya.gay"           # no block, 0 runner deliveries (was 7)
-    assert RSS_INSTANCES[10] == "https://shitter.thepixora.com"   # flapping 403 (was 8)
-    assert RSS_INSTANCES[11] == "https://nitter.kareem.one"       # hard 403 (was 9)
-    assert RSS_INSTANCES[12] == "https://xcopy.uk"                # verdict 403 x24 (was 10, now 12 via shift)
-    assert RSS_INSTANCES[13] == "https://nitter.mie.foundation"  # Codeberg Working instance verified RSS
+    assert RSS_INSTANCES[2] == "https://nitter.gq"                # r78: teapawt operator spares (status.d420.net 07:55 UTC Working 100% RSS All, 60 pts, 455ms/450ms)
+    assert RSS_INSTANCES[3] == "https://xitter.gq"                # same operator/stack as nitter.cf/xitter.cf
+    assert RSS_INSTANCES[4] == "https://nitter.meowing.monster"   # operator-directed seat 3 preserved → 5
+    assert RSS_INSTANCES[5] == "https://nitter.miningtcup.me"     # operator-directed seat 4 preserved → 6
+    assert RSS_INSTANCES[6] == "https://teapaw.org"               # Teapawt operator expansion (de02b80)
+    assert RSS_INSTANCES[7] == "https://teapawt.net"              # same operator, 100% healthy All
+    assert RSS_INSTANCES[8] == "https://teapawt.org"              # same operator, fastest ping 493ms
+    assert RSS_INSTANCES[9] == "https://nitter.freedit.eu"        # 8/8 union, TRIAL (was 5 → 9)
+    assert RSS_INSTANCES[10] == "https://nitter.gravitywell.xyz"   # 5/8 union, TRIAL (was 6 → 10)
+    assert RSS_INSTANCES[11] == "https://tw.eir-nya.gay"           # no block, 0 runner deliveries (was 7 → 11)
+    assert RSS_INSTANCES[12] == "https://shitter.thepixora.com"   # flapping 403 (was 8 → 12)
+    assert RSS_INSTANCES[13] == "https://nitter.kareem.one"       # hard 403 (was 9 → 13)
+    assert RSS_INSTANCES[14] == "https://xcopy.uk"                # verdict 403 x24 (was 10 → 14, now 12 via shift +2)
+    assert RSS_INSTANCES[15] == "https://nitter.mie.foundation"  # Codeberg Working instance verified RSS
     assert RSS_INSTANCES[-2] == "https://nitter.netbub.com"       # walled tier intact
     assert RSS_INSTANCES[-1] == "https://nitter.jaydenha.uk"      # walled last intact
-    assert len(RSS_INSTANCES) == len(set(RSS_INSTANCES)) == 16    # four added, nothing deleted
+    assert len(RSS_INSTANCES) == len(set(RSS_INSTANCES)) == 18    # two added (r78), nothing deleted
 
 
 # This suite runs as a linear script rather than through pytest's collector;
