@@ -87,7 +87,7 @@ jobs:
           # EMBEDEZ_API_KEY: ${{ secrets.EMBEDEZ_API_KEY }}   # round 13: no longer used —
           #   V3's proxy path (redditez/vxreddit/embeddit) is keyless; the secret
           #   can be deleted from the repo (only the old V2 needs it)
-          REDDIT_FEED_TOKEN: ${{ secrets.REDDIT_FEED_TOKEN }}   # your Reddit feed token (recommended — old.reddit.com -> Preferences -> Feeds; V3 also tries it on .json for full mode)
+          REDDIT_FEED_TOKEN: ${{ secrets.REDDIT_FEED_TOKEN }}   # your Reddit feed token (recommended — old.reddit.com -> Preferences -> Feeds; paste the full private RSS link `https://old.reddit.com/.rss?feed=<key>&user=<user>` (also `https://www.reddit.com/.rss?feed=…` / `https://reddit.com/.rss?feed=…` / `https://old.reddit.com/?feed=…` — host/path-agnostic, query-only) or any shorthand `<key>&user=<user>`/`?feed=<key>&user=<user>`/`feed=<key>&user=<user>`/bare `<key>`; V3 also tries it on .json for full mode)
           # round 24 (2026-09-18): miningtcup's DogWAF token — the SAME
           # value the Twitter monitor uses (NITTER_RSS_TOKEN), stored as a
           # repo SECRET in both repos (GitHub masks secrets in all logs);
@@ -125,12 +125,11 @@ jobs:
           # Media-waiting entries are re-checked every PENDING_RECHECK_SECONDS
           # (default 1800 s). Removed posts are never re-checked.
           PENDING_RECHECK_SECONDS: ${{ vars.PENDING_RECHECK_SECONDS }}
-          # Round 64 (2026-10-04; wired to the workflow in round 66):
-          # stateless delivery pipeline — FRESH_HOLD_SECONDS floors a
-          # candidate's age (default 30 s), LISTING_CONFIRM (default on)
-          # requires a pristine /new listing read before posting.
+          # Round 64 (2026-10-04; updated 2026-10-21 cleanup):
+          # stateless fresh-age hold — FRESH_HOLD_SECONDS floors a
+          # candidate's age (default 30 s). The companion pristine listing
+          # gate has been removed; no listing-confirm wiring remains.
           FRESH_HOLD_SECONDS: ${{ vars.FRESH_HOLD_SECONDS }}
-          LISTING_CONFIRM: ${{ vars.LISTING_CONFIRM }}
           # Dedup retention and per-run flood cap (round 34; all optional).
           MAX_CACHE_SIZE_PER_SUB: ${{ vars.MAX_CACHE_SIZE_PER_SUB }}
           MAX_CACHE_SIZE_TOTAL: ${{ vars.MAX_CACHE_SIZE_TOTAL }}
@@ -197,20 +196,22 @@ jobs:
         env:
           CACHE_BRANCH: ${{ github.ref_name }}
         run: |
+          # Entered persistence defaults to failed; only confirmed outcomes become unchanged/saved; never-ran stays not-reached (handled in summary)
           echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"
           set -o pipefail
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add -f posted_reddit.json proxy_health.json pending_reddit.json
+          git config --local user.email "github-actions[bot]@users.noreply.github.com" || { echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"; echo "::error::CACHE PREPARATION FAILED — git config failed"; exit 1; }
+          git config --local user.name "github-actions[bot]" || { echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"; echo "::error::CACHE PREPARATION FAILED — git config failed"; exit 1; }
+          git add -f posted_reddit.json proxy_health.json pending_reddit.json || { echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"; echo "::error::CACHE STAGING FAILED — git add failed"; exit 1; }
           if [ -f posted_messages.json ]; then
-            git add -f posted_messages.json
+            git add -f posted_messages.json || { echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"; echo "::error::CACHE STAGING FAILED — git add failed"; exit 1; }
           fi
 
           if git diff --cached --quiet; then
             echo "No cache changes to push."
-            echo "CACHE_RESULT=success" >> "$GITHUB_ENV"
+            echo "CACHE_RESULT=unchanged" >> "$GITHUB_ENV"
           else
             if ! git commit -m "auto: update reddit monitor caches"; then
+              echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"
               echo "::error::CACHE COMMIT FAILED — dedup cache was not persisted; rerun this monitor after resolving the repository state."
               exit 1
             fi
@@ -221,9 +222,9 @@ jobs:
             # SEMANTICALLY (git merges lines; these files carry meaning. The
             # 2026-10-03 run #4014 lost its dedup state to a line conflict
             # in pending_reddit.json that a JSON merge resolves trivially).
-            ours_dir="$(mktemp -d)"
+            ours_dir="$(mktemp -d)" || { echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"; echo "::error::CACHE PREPARATION FAILED — mktemp failed"; exit 1; }
             for f in posted_reddit.json proxy_health.json pending_reddit.json posted_messages.json; do
-              if [ -f "$f" ]; then cp "$f" "$ours_dir/$f"; fi
+              if [ -f "$f" ]; then cp "$f" "$ours_dir/$f" || { echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"; echo "::error::CACHE COPYING FAILED — cp $f failed"; exit 1; }; fi
             done
             pushed=0
             attempts=0
@@ -241,17 +242,19 @@ jobs:
               if [ "$attempt" -lt 3 ]; then
                 echo "::warning::Cache push attempt $attempt/3 failed; merging the live ${cache_branch} tip semantically before retry."
                 if ! git fetch origin "$cache_branch"; then
+                  echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"
                   echo "::error::CACHE PUSH RECOVERY FAILED — could not fetch the live tip; dedup cache was not persisted."
                   break
                 fi
-                git reset --hard FETCH_HEAD
+                git reset --hard FETCH_HEAD || { echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"; echo "::error::CACHE PUSH RECOVERY FAILED — reset failed; dedup cache was not persisted."; break; }
                 if ! python .github/scripts/merge_monitor_caches.py "$ours_dir" . posted_reddit.json proxy_health.json pending_reddit.json posted_messages.json; then
+                  echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"
                   echo "::error::CACHE PUSH RECOVERY FAILED — semantic merge failed; dedup cache was not persisted."
                   break
                 fi
-                git add -f posted_reddit.json proxy_health.json pending_reddit.json
+                git add -f posted_reddit.json proxy_health.json pending_reddit.json || { echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"; echo "::error::CACHE PUSH RECOVERY FAILED — staging failed after merge; dedup cache was not persisted."; break; }
                 if [ -f posted_messages.json ]; then
-                  git add -f posted_messages.json
+                  git add -f posted_messages.json || { echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"; echo "::error::CACHE PUSH RECOVERY FAILED — staging posted_messages failed; dedup cache was not persisted."; break; }
                 fi
                 if git diff --cached --quiet; then
                   echo "Live tip already contains our cache state — nothing left to push."
@@ -259,6 +262,7 @@ jobs:
                   break
                 fi
                 if ! git commit -m "auto: update reddit monitor caches"; then
+                  echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"
                   echo "::error::CACHE PUSH RECOVERY FAILED — merge commit failed; dedup cache was not persisted."
                   break
                 fi
@@ -267,48 +271,221 @@ jobs:
             done
 
             if [ "$pushed" -ne 1 ]; then
+              echo "CACHE_RESULT=failed" >> "$GITHUB_ENV"
               echo "::error::CACHE PUSH FAILED after ${attempts}/3 attempt(s) — dedup cache was not persisted; the next run may re-post. Rerun this monitor after GitHub recovers."
               exit 1
             fi
-          fi
-          echo "CACHE_RESULT=success" >> "$GITHUB_ENV"
 
-      # Reporting only: reads the local monitor log and performs no network or cache work.
+            echo "CACHE_RESULT=saved" >> "$GITHUB_ENV"
+          fi
+      # Reporting only: stable local run-result record, no network or scraping.
+      # Summary source: reddit_run_result.json -> GITHUB_STEP_SUMMARY (inline, no additional requests).
       - name: Write monitor run summary
         if: always()
         run: |
-          [ -f monitor.log ] || : > monitor.log
-          count_matches() { local pattern="$1"; grep -Ec "$pattern" monitor.log 2>/dev/null || true; }
-          extract_number() { local value; value=$(grep -Eo "$1" monitor.log 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || true); printf '%s\n' "${value:-unavailable}"; }
-          runtime=unavailable
+          RUNTIME=unavailable
           if [ -n "${MONITOR_START_EPOCH:-}" ] && [ -n "${MONITOR_END_EPOCH:-}" ]; then
-            runtime="$(( MONITOR_END_EPOCH - MONITOR_START_EPOCH ))s"
+            RUNTIME="$(( MONITOR_END_EPOCH - MONITOR_START_EPOCH ))s"
           fi
-          ok=$(count_matches 'proxy warm-up.*OK')
-          failed=$(count_matches 'proxy warm-up.*(DOWN|FAILED|unavailable|error)')
-          new_candidates=$(extract_number 'Found [0-9]+ new Reddit posts')
-          if grep -q 'No new Reddit posts to post\.' monitor.log; then new_candidates=0; fi
-          {
-            echo "## Reddit Feed Monitor — run summary"
-            echo
-            if [ "${{ job.status }}" = "success" ]; then echo "**Result:** success"; else echo "**Result:** failure"; fi
-            echo "**Runtime:** ${runtime}"
-            echo
-            echo "### Feed"
-            echo "- counts describe matching local log records, not an independent delivery/source-health audit"
-            echo "- entries read: $(extract_number 'Combined feed OK: [0-9]+ entries')"
-            echo "- new candidates: ${new_candidates}"
-            echo "- posts delivered: $(count_matches 'Reddit V3 Posted:')"
-            echo "- listing/retry-related log lines: $(count_matches 'skipped.*next tick|retried next tick')"
-            echo
-            echo "### Providers and videos"
-            echo "- provider/quality counts below are observed log matches, not exhaustive request or health totals"
-            echo "- proxy warmups: ${ok} OK, ${failed} failed"
-            echo "- accepted 1080p upgrades: $(count_matches 'EmbedEZ 1080p candidate accepted')"
-            echo "- quality fallback notices: $(count_matches 'retaining validated base')"
-            echo "- observed card-media provider labels: $(grep -Eo 'card media via [^ ]+' monitor.log 2>/dev/null | sort -u | tr '\n' ' ' || true)"
-            echo
-            echo "### State"
-            echo "- cache commit/push: ${CACHE_RESULT:-failed}"
-            echo "- summary source: local monitor.log only; no additional requests"
-          } >> "$GITHUB_STEP_SUMMARY"
+          export RUNTIME
+          export CACHE_RESULT
+          export JOB_STATUS="${{ job.status }}"
+          python3 - << 'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os, pathlib
+          runtime = os.environ.get("RUNTIME", "unavailable")
+          # Reporting correction: entered persistence defaults to failed; never-ran is not-reached
+          cache_result = os.environ.get("CACHE_RESULT")
+          if not cache_result:
+              cache_result = "not-reached"
+          job_status = os.environ.get("JOB_STATUS", "unavailable")
+          result_path = pathlib.Path("reddit_run_result.json")
+          data = {}
+          if result_path.exists():
+              try:
+                  raw = result_path.read_text(encoding="utf-8")
+                  loaded = json.loads(raw)
+                  if isinstance(loaded, dict):
+                      data = loaded
+                  else:
+                      data = {"error": "wrong_shape", "raw_type": type(loaded).__name__}
+              except Exception as e:
+                  data = {"error": f"malformed_json: {type(e).__name__}"}
+          def v(k, default="unavailable"):
+              val = data.get(k)
+              return str(val) if val is not None else default
+          def dict_str(d):
+              if not isinstance(d, dict) or not d:
+                  return "none"
+              return ", ".join(f"{k}: {v}" for k, v in sorted(d.items()))
+          print("## Reddit Feed Monitor — run summary")
+          print()
+          # Repository persistence (observed commit/push) vs local persistence (from run_result)
+          print(f"**Result:** {job_status}")
+          print(f"**Monitor runtime:** {runtime}")
+          # Repo persistence is from workflow env (observed git push), local is from run_result (file saves)
+          print(f"**Repository persistence:** {cache_result}")
+          local_persist = data.get("persistence_status", "unavailable")
+          print(f"**Local persistence:** {local_persist}")
+          if local_persist == "skipped_dry_run":
+              print(f"  - Dry-run: no local cache write (as intended)")
+          # Run completion with dry-run distinction
+          if data.get("completed") is True:
+              print(f"**Run status:** completed")
+              if data.get("dry_run") is True:
+                  print(f"  - Dry-run execution (no live delivery or persistence)")
+              elif data.get("dry_run") is False:
+                  print(f"  - Live execution")
+          elif data.get("completed") is False:
+              print(f"**Run status:** incomplete")
+              if data.get("error"):
+                  # Error already sanitized in engine
+                  print(f"**Error:** {data.get('error')}")
+          else:
+              print(f"**Run status:** unavailable")
+          print()
+          print("### Feed")
+          print(f"- Combined-feed entries: {v('combined_entries')}")
+          # Legacy phrasing for compatibility: Subreddits represented: X of Y
+          sub_rep = v('subreddits_represented')
+          comb_cov = v('combined_subreddits_covered')
+          cfg = v('subreddits_configured')
+          if sub_rep != "unavailable":
+              print(f"- Subreddits represented: {sub_rep} of {cfg}")
+              if comb_cov != "unavailable" and comb_cov != sub_rep:
+                  print(f"- Combined subreddits covered: {comb_cov} of {cfg} configured")
+          else:
+              print(f"- Combined subreddits covered: {comb_cov} of {cfg} configured")
+          print(f"- Combined fetch status: {v('combined_fetch_status')}")
+          if data.get('fallback_status') and data.get('fallback_status') != "not_attempted":
+              print(f"- Fallback status: {v('fallback_status')}")
+              print(f"- Fallback entries: {v('fallback_entries')}")
+              print(f"- Fallback subreddits covered: {v('fallback_subreddits_covered')}")
+          if data.get('arctic_candidates') is not None:
+              print(f"- Arctic candidates: {v('arctic_candidates')}")
+          print(f"- Unposted candidates considered: {v('unposted_candidates_considered')}")
+          print(f"- Candidates entering processing: {v('candidates_entering_processing')}")
+          print(f"- Delivered posts: {v('delivered')}")
+          if 'dry_run_would_deliver' in data:
+              print(f"- Dry-run would-deliver: {v('dry_run_would_deliver')}")
+          print(f"- Failed deliveries: {v('failed_delivery')}")
+          print()
+          print("### Skipped and deferred")
+          print(f"- Known-rejected archive candidates: {v('known_pending_suppressed')}")
+          if data.get('known_pending_by_reason'):
+              print(f"  - by reason: {dict_str(data.get('known_pending_by_reason'))}")
+          print(f"- Retry backoff: {v('retry_backoff')}")
+          if data.get('retry_backoff_by_reason'):
+              print(f"  - by reason: {dict_str(data.get('retry_backoff_by_reason'))}")
+          print(f"- Fresh-age hold: {v('fresh_hold')}")
+          print(f"- Newly rejected removed/deleted: {v('newly_rejected_removed')}")
+          if data.get('newly_rejected_by_reason'):
+              print(f"  - by reason: {dict_str(data.get('newly_rejected_by_reason'))}")
+          print(f"- Liveness not verified: {v('liveness_not_verified')}")
+          if data.get('liveness_by_reason'):
+              print(f"  - by reason: {dict_str(data.get('liveness_by_reason'))}")
+          print(f"- Media-wait: {v('media_wait')}")
+          print(f"- Partial-gallery: {v('partial_gallery')}")
+          print(f"- Flood-cap dropped: {v('flood_cap_dropped')}")
+          print(f"- Dedup skipped in run: {v('dedup_skipped_in_run')}")
+          print(f"- Other skipped: {v('other_skipped')}")
+          if data.get('other_by_reason'):
+              print(f"  - by reason: {dict_str(data.get('other_by_reason'))}")
+          print()
+          print("### Providers and media")
+          # Warmup: locally observed, no extra network (does not prove audio)
+          warmup_status = data.get("proxy_warmup_status", "unavailable")
+          warmup_services = data.get("proxy_warmup_services")
+          if warmup_status == "ok" and isinstance(warmup_services, dict):
+              details = ", ".join(f"{k}={'ok' if v.get('ok') else 'down'}" for k, v in sorted(warmup_services.items()))
+              print(f"- Proxy warmup: {warmup_status} ({details})")
+          elif warmup_status == "ok":
+              print(f"- Proxy warmup: {warmup_status}")
+          elif warmup_status == "disabled":
+              print(f"- Proxy warmup: disabled (PROXY_MEDIA=0 or module missing)")
+          elif warmup_status in ("failed", "unavailable", "not-reached"):
+              print(f"- Proxy warmup: {warmup_status}")
+          else:
+              print(f"- Proxy warmup: {warmup_status}")
+          # Video quality mode (local config, no network)
+          vq = data.get("video_quality", "unavailable")
+          print(f"- Video quality mode: {vq}")
+          # Required diagnostic distinctions (when actually observed, no extra network)
+          # 1. Media resolved via provider
+          via = data.get("media_resolved_via_provider")
+          if isinstance(via, dict) and via:
+              print(f"- Media resolved via provider: {dict_str(via)}")
+          elif data.get("unposted_candidates_considered") == 0:
+              print(f"- Media resolved via provider: none (no candidates)")
+          # 2. Final media endpoint/hosting category
+          endpoint = data.get("final_media_endpoint_category")
+          if isinstance(endpoint, dict) and endpoint:
+              print(f"- Final media endpoint: {dict_str(endpoint)}")
+          # 3. Final card media kind and tile count
+          kind_counts = data.get("final_card_media_kind_counts")
+          tile_total = data.get("final_card_media_tile_total")
+          if isinstance(kind_counts, dict) and kind_counts:
+              print(f"- Final card media: kind={dict_str(kind_counts)}, tiles={tile_total if tile_total is not None else 'unavailable'}")
+          elif data.get("delivered") and data.get("delivered") != 0:
+              # Fallback to legacy selected provider view for compatibility
+              providers = data.get("selected_media_providers") or data.get("media_provider_counts")
+              if isinstance(providers, dict) and providers:
+                  print(f"- Selected media provider: {dict_str(providers)}")
+          else:
+              if data.get("unposted_candidates_considered") == 0:
+                  print(f"- Final card media: none (no candidates)")
+              else:
+                  providers = data.get("selected_media_providers") or data.get("media_provider_counts")
+                  if isinstance(providers, dict) and providers:
+                      print(f"- Selected media provider: {dict_str(providers)}")
+          # 4. Optional quality candidate result + 5. Whether validated base retained
+          qa = data.get("quality_upgrades_accepted")
+          qf = data.get("quality_fallbacks", 0)
+          q_result = data.get("optional_quality_candidate_result")
+          base_retained = data.get("validated_base_retained")
+          if isinstance(q_result, dict) and q_result:
+              print(f"- Optional quality candidate: {dict_str(q_result)}")
+              if base_retained:
+                  print(f"  - Validated base retained: {base_retained}")
+          elif qa is not None or qf:
+              # Legacy compatibility
+              if qa is not None:
+                  print(f"- Quality upgrades accepted: {qa}")
+              if qf:
+                  print(f"- Quality fallbacks (base retained): {qf}")
+                  if data.get("quality_fallback_reasons"):
+                      print(f"  - by reason: {dict_str(data.get('quality_fallback_reasons'))}")
+              elif qa is not None and qa == 0:
+                  print(f"- Quality fallbacks (base retained): 0")
+              if base_retained:
+                  print(f"- Validated base retained: {base_retained}")
+          # 6. Terminal media fallback (proxy -> native), distinct from feed and quality fallback
+          term_fb = data.get("terminal_media_fallbacks")
+          if term_fb:
+              print(f"- Terminal media fallback (proxy -> native): {term_fb}")
+          # 7. Heal: queued, edit performed, or edit skipped after revalidation (distinct, no audio inference)
+          heal_q = data.get("heal_queued", 0)
+          heal_edit = data.get("heal_edit_performed", 0)
+          heal_skip = data.get("heal_skipped_after_revalidation", 0)
+          if heal_q or heal_edit or heal_skip:
+              print(f"- Heal: queued={heal_q}, edit_performed={heal_edit}, skipped_after_revalidation={heal_skip}")
+          elif data.get("delivered") and data.get("delivered") != 0:
+              # Show zero vs not-reached distinction when deliveries occurred but no heal
+              if heal_q == 0 and heal_edit == 0 and heal_skip == 0:
+                  print(f"- Heal: queued=0, edit_performed=0, skipped_after_revalidation=0 (no unresolved evidence)")
+          # Distinguish feed fallback (RSS per-subreddit) from video-quality and terminal fallback
+          if data.get("fallback_status") == "not_attempted":
+              print(f"- Feed fallback: not attempted (combined succeeded)")
+          elif data.get("fallback_status") in ("ok", "partial", "all_failed"):
+              print(f"- Feed fallback: {data.get('fallback_status')} ({v('fallback_entries')} entries, {v('fallback_subreddits_covered')} subreddits)")
+          elif data.get("fallback_status") is not None:
+              print(f"- Feed fallback: {v('fallback_status')}")
+          # Clarify: warmup and video validation do not prove audio inclusion
+          print(f"- Note: provider warmup, HTTP validation, player controls, or 'chain complete' do not prove audio inclusion")
+          print(f"- Note: per-candidate provider/quality/terminal-fallback/heal details in monitor.log; counts above are this run's local observations")
+          print()
+          print("Counts describe this run's local observations, not an independent subreddit-visibility or end-to-end health audit.")
+          print("Summary source: reddit_run_result.json (per-run, ignored) + monitor.log for provider diagnostics; no additional network requests.")
+          PY
+        env:
+          CACHE_RESULT: ${{ env.CACHE_RESULT }}
+          JOB_STATUS: ${{ job.status }}
