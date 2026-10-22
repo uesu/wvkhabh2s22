@@ -186,6 +186,14 @@ RSS_INSTANCES = [
     # Round 76 (2026-10-15): seats 1-2 untouched, as every round.
     "https://nitter.cf",
     "https://xitter.cf",
+    # Round 78 (2026-10-22): status.d420.net 2026-10-22 07:55 UTC now lists
+    # nitter.gq + xitter.gq as Working, Healthy, 100%, RSS true, All
+    # connectivity, same teapawt operator/stack as nitter.cf/xitter.cf
+    # (teapawt 0.19.0, 455ms/450ms, 60 pts). Inserted here as the next
+    # operator-proven spares — seats 3-4, answering only after 1-2 fail,
+    # exactly as the existing Teapawt spares.
+    "https://nitter.gq",
+    "https://xitter.gq",
     # Round 76 (2026-10-15): OPERATOR-DIRECTED SEAT 3, up from 4. This round's
     # ranking rule: no member that blocks GitHub Actions / Azure datacenter IPs
     # sits above one that doesn't (the xcopy.uk verdict at seat 10). meowing is
