@@ -230,7 +230,7 @@ import importlib.util
 import aiohttp
 import feedparser
 from email.utils import parsedate_to_datetime
-from urllib.parse import parse_qsl, quote, unquote, urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlsplit
 from dotenv import load_dotenv
 
 try:
@@ -259,6 +259,39 @@ DEFAULT_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 # Still used for the RSS feed (rate tier) AND now also attempted on the
 # .json endpoints (workaround for the 2026 datacenter JSON wall — see header).
 REDDIT_FEED_TOKEN = os.getenv("REDDIT_FEED_TOKEN", "").strip()
+
+
+def format_reddit_feed_query(raw_token: str) -> str:
+    """Normalize `REDDIT_FEED_TOKEN` into an encoded `feed=...` (+ optional `&user=...`) query.
+
+    Accepts any form copied from `old.reddit.com/prefs/feeds/`:
+      * `https://old.reddit.com/.rss?feed=<40-hex>&user=<username>` (full link,
+        also `https://www.reddit.com/.rss?feed=…`, `https://reddit.com/.rss?feed=…`,
+        `https://old.reddit.com/?feed=…` — host/path-agnostic, query-only)
+      * `?feed=<40-hex>&user=<username>` or `feed=<40-hex>&user=<username>`
+      * `<40-hex>&user=<username>`
+      * `<40-hex>`
+    """
+    tok = (raw_token or "").strip()
+    if not tok:
+        return ""
+    if tok.lower().startswith(("http://", "https://")):
+        q = urlsplit(tok).query
+    elif tok.startswith("?"):
+        q = tok[1:]
+    elif tok.lower().startswith("feed="):
+        q = tok
+    else:
+        q = f"feed={tok}"
+    pairs = [(k, v) for k, v in parse_qsl(q, keep_blank_values=False) if k.lower() in ("feed", "user")]
+    if not pairs or not any(k.lower() == "feed" for k, _ in pairs):
+        return ""
+    return urlencode(pairs)
+
+
+def _redact_url_queries(msg: object) -> str:
+    return re.sub(r"\?[^\s)'\"]+", "", str(msg))
+
 
 # round 24 (2026-09-18): miningtcup's DogWAF token — the SAME value as the
 # Twitter repo's NITTER_RSS_TOKEN (their nitter RSS token is a DogWAF
@@ -362,28 +395,149 @@ PROXY_VIDEO_HEAL = (os.getenv("PROXY_VIDEO_HEAL") or "1").strip().lower() not in
 PROXY_VIDEO_HEAL_DELAY = max(0, min(60, _env_int("PROXY_VIDEO_HEAL_DELAY", 6)))
 
 # ---------------------------------------------------------------------------
-# ■ ROUND 64 ("Pristine Listing Protocol", 2026-10-05)
-# A new post is delivered only when a pristine, cache-busted read of the
-# subreddit's /new listing proves it is actually live on the subreddit RIGHT
-# NOW, plus a flat minimum age computed from the post's own creation
-# timestamp. Both are stateless: neither writes a pending entry, and
-# "not there yet" is a this-tick skip, never a permanent block — the first
-# tick where the post appears (and clears the age floor) it posts instantly.
+# ■ ROUND 64 (Pristine Listing Protocol, 2026-10-05) — UPDATE 2026-10-21
+# A flat minimum age computed from the post's own creation timestamp.
 # No AutoModerator comment detection of any kind: no phrase matching, no
 # inference, no tracker state.
-#   FRESH_HOLD_SECONDS — section A: flat minimum post age (seconds) before a
-#     candidate is even considered; 0 disables the floor entirely.
-#   LISTING_CONFIRM — section B: 1 (default) requires the pristine /new
-#     listing to confirm the candidate before it posts; 0 disables the
-#     listing-confirmation gate (the FRESH_HOLD_SECONDS floor still applies
-#     independently; set both to 0 to fully restore pre-round-64 delivery).
+#   FRESH_HOLD_SECONDS — flat minimum post age (seconds) before a candidate
+#     is even considered; 0 disables the floor entirely (stateless, never a
+#     pending entry).
+# The companion LISTING_CONFIRM gate (pristine /new listing confirmation
+# with cache-busting _fresh= and no-cache headers) was REMOVED in the
+# 2026-10-21 cleanup (see docs/history/CHANGELOG_ARCHIVE.md and git log):
+# listing confirmation is no longer a delivery requirement and its env wiring
+# has been removed. The retraction seatbelt below keeps its own /new
+# listing read, but that is unrelated to delivery.
 # ---------------------------------------------------------------------------
 FRESH_HOLD_SECONDS = _env_int("FRESH_HOLD_SECONDS", 30)
-_LISTING_CONFIRM_RAW = os.getenv("LISTING_CONFIRM")
-if not _LISTING_CONFIRM_RAW or _LISTING_CONFIRM_RAW.strip().lower() in ("1", "true", "yes", "on"):
-    LISTING_CONFIRM = True
-else:
-    LISTING_CONFIRM = _LISTING_CONFIRM_RAW.strip().lower() not in ("0", "false", "no", "off")
+
+# ---------------------------------------------------------------------------
+# ■ RUN OUTCOME TRACKING (2026-10-21 cleanup)
+# Low-noise, accurate logs + structured run-summary. A small local counter
+# records each candidate's final disposition exactly once, at the branch
+# where it occurs. Aggregated INFO lines summarize quiet runs; per-candidate
+# details stay at DEBUG where noisy.
+# ---------------------------------------------------------------------------
+_RUN_RESULT_FILE = "reddit_run_result.json"
+
+# Global for media tracking (set per-run inside main)
+current_run_stats = None
+
+def _init_run_stats():
+    # Fresh per-invocation record; never reuse stale prior-run file.
+    # Feed coverage is measured from the feed itself, not from deduplicated
+    # candidates, and archive candidates never inflate RSS coverage.
+    return {
+        "combined_entries": None,
+        "combined_subreddits_covered": None,
+        "subreddits_configured": len(SUBREDDITS),
+        "combined_fetch_status": "unavailable",
+        "fallback_entries": None,
+        "fallback_subreddits_covered": None,
+        "fallback_status": "not_attempted",
+        "arctic_candidates": 0,
+        "arctic_subreddits_tried": 0,
+        # Compatibility aliases for older readers/summaries
+        "subreddits_represented": None,
+        "unposted_candidates_considered": 0,
+        "candidates_entering_processing": 0,
+        "delivered": 0,
+        "dry_run_would_deliver": 0,
+        "failed_delivery": 0,
+        "known_pending_suppressed": 0,
+        "known_pending_by_reason": {},
+        "retry_backoff": 0,
+        "retry_backoff_by_reason": {},
+        "fresh_hold": 0,
+        "newly_rejected_removed": 0,
+        "newly_rejected_by_reason": {},
+        "liveness_not_verified": 0,
+        "liveness_by_reason": {},
+        "media_wait": 0,
+        "partial_gallery": 0,
+        "other_skipped": 0,
+        "other_by_reason": {},
+        "flood_cap_dropped": 0,
+        "dedup_skipped_in_run": 0,
+        "completed": False,
+        "error": None,
+        "persistence_status": "not-reached",
+        "dry_run": bool(DRY_RUN) if 'DRY_RUN' in globals() else False,
+        "proxy_warmup_status": "not-reached",
+        "proxy_warmup_services": None,
+        "video_quality": os.getenv("REDDIT_VIDEO_QUALITY", "").strip() or "balanced",
+        # Media outcome tracking (existing observations only, no extra network)
+        "selected_media_providers": {},
+        "quality_upgrades_accepted": 0,
+        "quality_fallbacks": 0,
+        "quality_fallback_reasons": {},
+        "media_provider_counts": {},
+        # Required diagnostic distinctions (when actually observed)
+        "media_resolved_via_provider": {},
+        "final_media_endpoint_category": {},
+        "final_card_media_kind_counts": {},
+        "final_card_media_tile_total": 0,
+        "optional_quality_candidate_result": {},  # accepted/fallback counts
+        "validated_base_retained": 0,
+        "terminal_media_fallbacks": 0,
+        "heal_queued": 0,
+        "heal_edit_performed": 0,
+        "heal_skipped_after_revalidation": 0,
+    }
+
+def _inc_reason(counter_dict, reason, amount=1):
+    key = str(reason or "unknown")
+    counter_dict[key] = counter_dict.get(key, 0) + amount
+
+def _sanitize_error_message(msg, max_len=500):
+    """Redact credential-bearing URLs/tokens before emission."""
+    try:
+        s = str(msg or "")
+    except Exception:
+        s = "<unprintable>"
+    # Bound initial length
+    if len(s) > 1000:
+        s = s[:1000] + "..."
+    # Redact webhook URLs with secrets
+    # e.g. https://discord.com/api/webhooks/123/abc -> https://discord.com/api/webhooks/[REDACTED]
+    s = re.sub(r"https://discord\.com/api/webhooks/[^\s\"']+", "https://discord.com/api/webhooks/[REDACTED]", s)
+    s = re.sub(r"https://discordapp\.com/api/webhooks/[^\s\"']+", "https://discordapp.com/api/webhooks/[REDACTED]", s)
+    s = re.sub(r"https://canary\.discord\.com/api/webhooks/[^\s\"']+", "https://canary.discord.com/api/webhooks/[REDACTED]", s)
+    # Redact token query param
+    s = re.sub(r"token=[^\s&\"']+", "token=[REDACTED]", s, flags=re.IGNORECASE)
+    # Redact Authorization headers (cover Bearer token and whole header)
+    s = re.sub(r"Bearer\s+[^\s\"']+", "Bearer [REDACTED]", s, flags=re.IGNORECASE)
+    s = re.sub(r"Authorization:[^\n]*", "Authorization: [REDACTED]", s, flags=re.IGNORECASE)
+    # Bound final
+    if len(s) > max_len:
+        s = s[:max_len-3] + "..."
+    return s
+
+def _write_run_result(stats, extra=None):
+    try:
+        out = dict(stats)
+        if extra:
+            out.update(extra)
+        # Sanitize error before emission (redact secrets, bound length)
+        if "error" in out and out["error"] is not None:
+            try:
+                out["error"] = _sanitize_error_message(out["error"])
+            except Exception:
+                out["error"] = "<sanitization_failed>"
+        # Validate JSON is object-like; ensure completed flag present
+        if not isinstance(out, dict):
+            out = {"error": "invalid_run_result_shape", "raw": str(out)[:500]}
+        # ensure JSON serializable and sorted keys for stability
+        with open(_RUN_RESULT_FILE, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2, sort_keys=True, ensure_ascii=False)
+            f.write("\n")
+    except Exception as e:
+        try:
+            logging.error(f"Failed to write run result: {_sanitize_error_message(e)}")
+        except Exception:
+            logging.error("Failed to write run result: <unprintable>")
+
+
 
 # ---------------------------------------------------------------------------
 # ■ ROUND 66 (2026-10-05): LONG-POST CONTINUATIONS + TABLE RENDERING
@@ -552,43 +706,25 @@ def _rss_oldest_age(xml, now=None):
 async def _fetch_new_listing(session, subreddit):
     """Return ``(post_ids, oldest_age_seconds)`` for r/<subreddit>/new.
 
-    Round 63: the only remaining consumer was the retraction seatbelt
+    The only remaining consumer is the retraction seatbelt
     (``listing_absence_proves_dead``) — it just needs a snapshot of which
     post IDs are currently listed and how far back that listing reaches.
     Every mirror/RSS source is tried concurrently and the first usable
     answer wins; one flat, hardcoded timeout bounds the whole step. There is
     no HTML-vs-RSS provenance distinction any more — that existed solely to
     feed the mod-queue gate's release proof, which round 63 removed.
-
-    Round 64 ("Pristine Listing Protocol"): this is now ALSO the proof
-    the main delivery loop's listing-confirmation gate relies on, so every
-    request here is made PRISTINE — a unique ``_fresh=<unix ms>`` cache-buster
-    query param (CDN cache keys include the query string, so a unique value
-    guarantees an uncached read) plus ``Cache-Control``/``Pragma`` no-cache
-    request headers, on every mirror/RSS attempt. The per-subreddit,
-    once-per-run memoization below is unchanged — a fresh process (one per
-    cron tick) means that memo is itself never reused across runs.
+    The per-subreddit, once-per-run memoization below is unchanged — a fresh
+    process (one per cron tick) means that memo is itself never reused across runs.
     """
     if subreddit in _listing_cache:
         return _listing_cache[subreddit]
 
     _timeout = aiohttp.ClientTimeout(total=_LISTING_TIMEOUT_SECONDS)
-    # Round 64: one cache-buster value per _fetch_new_listing() call — every
-    # mirror/RSS attempt this call makes shares it (they fire within
-    # milliseconds of each other), but it is freshly computed on every call,
-    # so two listing reads (different subreddits, or different cron ticks)
-    # never share a value and no CDN/proxy can serve a cached response.
-    _fresh = int(time.time() * 1000)
-    _pristine_headers = {**BROWSER_HEADERS, "Cache-Control": "no-cache, no-store",
-                         "Pragma": "no-cache"}
 
     async def _html_listing(instance):
         try:
-            # miningtcup sits behind its DogWAF and rejects untokenized
-            # requests. The helper is a no-op for every non-miningtcup URL
-            # (same helper the post page uses).
-            url = _with_miningtcup_token(f"{instance}/r/{subreddit}/new?limit=100&_fresh={_fresh}")
-            async with session.get(url, headers=_pristine_headers, timeout=_timeout,
+            url = _with_miningtcup_token(f"{instance}/r/{subreddit}/new?limit=100")
+            async with session.get(url, headers=BROWSER_HEADERS, timeout=_timeout,
                                    allow_redirects=True) as resp:
                 if resp.status != 200 or "html" not in (resp.headers.get("Content-Type") or "").lower():
                     return None
@@ -602,12 +738,11 @@ async def _fetch_new_listing(session, subreddit):
 
     async def _rss_listing(instance):
         try:
-            url = f"{instance}/r/{subreddit}/new.rss?limit=100&_fresh={_fresh}"
-            if REDDIT_FEED_TOKEN:
-                # Feed tokens are credentials; quote them as a query value and
-                # never include the resulting URL in a log message.
-                url += f"&feed={quote(REDDIT_FEED_TOKEN, safe='')}"
-            async with session.get(url, headers=_pristine_headers, timeout=_timeout,
+            url = f"{instance}/r/{subreddit}/new.rss?limit=100"
+            feed_q = format_reddit_feed_query(REDDIT_FEED_TOKEN)
+            if feed_q:
+                url += f"&{feed_q}"
+            async with session.get(url, headers=BROWSER_HEADERS, timeout=_timeout,
                                    allow_redirects=True) as resp:
                 xml = await resp.text() if resp.status == 200 else None
         except Exception:
@@ -647,11 +782,10 @@ async def _fetch_new_listing(session, subreddit):
             task.cancel()
 
     if result is not None:
-        logging.info(f"LISTING: r/{subreddit} pristine /new ({len(result[0])} entries).")
+        logging.info(f"LISTING: r/{subreddit} /new ({len(result[0])} entries).")
     else:
-        logging.info(f"LISTING: r/{subreddit} pristine /new listing unavailable this run "
-                     f"(all sources) — an outage, not absence: the round-64 listing-confirmation "
-                     f"gate and the retraction seatbelt both fail open (skip/retry next tick).")
+        logging.info(f"LISTING: r/{subreddit} /new listing unavailable this run "
+                     f"(all sources) — check unavailable, no absence conclusion drawn.")
     _listing_cache[subreddit] = result
     return result
 
@@ -686,17 +820,40 @@ async def _fetch_new_listing(session, subreddit):
 # failure mode: it fails closed via permalink validation, costs nothing while
 # the native token feed answers, and the tier revives by itself once patched redlib
 # builds deploy. Re-audit bodies before promoting anything.
+# Round 78 (2026-10-22): Game-Express audit 2026-10-22 01:10-02:50Z live-probed 85+
+# candidates across redlib-instances, redlib v3.0.0 (#588/#592), farside,
+# frontend-blocklist, etc. on 3 Azure westus3 runs + all 3 code paths. 7 new
+# full dual-path winners + 5 listing-only reserves verified. This tier adopts
+# the blueprint (2->9 dual, +5 reserves) + keeps timeout-but-still-works per
+# production #9283 (2026-10-22 03:35 UTC westcentralus: REDLIB-REACH 4/9 —
+# artemislena, privacyredirect, privadency.com, safereddit 1/1). Fully-working
+# dual first, listing-only/partial next, timeout-but-still-works at tail. Trap
+# hosts (rl.blitzw.in honeypot, red.arancia.click parked, redlib.jaydenha.uk
+# fake, l.opnxng.com alias) never added; kareem excluded (Azure ASN caveat).
 REDDIT_RSS_INSTANCES = [
-    "https://www.reddit.com",
-    "https://old.reddit.com",
+    "https://www.reddit.com",              # [0] Primary w/ REDDIT_FEED_TOKEN
+    "https://old.reddit.com",              # [1] Auth alt origin (same token)
     # Token-gated fallback; harmlessly skipped when NITTER_RSS_TOKEN is empty.
-    "https://redlib.miningtcup.me",
-    "https://redlib.catsarch.com",
-    "https://redlib.nadeko.net",
-    "https://redlib.privadency.com",
-    "https://safereddit.com",
-    "https://red.artemislena.eu",
-    "https://redlib.privacyredirect.com",
+    "https://redlib.miningtcup.me",        # [2] Private token-gated
+    # Verified full dual-path public hosts (/new 200 OK + /comments/<id>/ 200 OK, zero challenge):
+    "https://redlib.catsarch.com",         # Existing healthy dual #1
+    "https://redlib.privacyredirect.com",  # Existing healthy dual #2
+    "https://snoo.habedieeh.re",           # NEW dual — up-to-date #592, inline CMAF MP4
+    "https://redlib.tiekoetter.com",       # NEW dual — DE dedicated, fast
+    "https://redlib.nohost.network",       # NEW dual — inline CMAF + full comments
+    "https://redlib-1.privadency.com",     # NEW dual — direct backend bypassing 2s splash
+    "https://redlib-2.privadency.com",     # NEW dual — direct backend #2
+    "https://reddit.idevicehacked.com",    # NEW dual — US, inline gallery on /new
+    # Verified /new listing-only reserves (pre-#592 /comments/ error; recover after v3.0.0):
+    "https://red.artemislena.eu",          # Existing /new pass (pre-#592)
+    "https://rl.awy.one",                  # NEW /new pass — zero challenge
+    "https://redlib.kylrth.com",           # NEW /new pass — CF, 301 from libreddit.kylrth.com
+    "https://redlib.freedit.eu",           # NEW /new pass — DE direct
+    "https://redlib.utilibre.org",         # NEW /new pass — FR collective
+    # Timeout-but-still-works per live production #9283 (2026-10-22 03:35 UTC, westcentralus): REDLIB-REACH 4/9 showed these still answering 1/1 despite prior 2s splash/rate-limit — keep at tail per instruction (partial/timeout still works):
+    "https://redlib.privadency.com",       # Restored tail — privadency.com root 1/1 in #9283 (direct backends already above)
+    "https://safereddit.com",              # Restored tail — safereddit 1/1 in #9283 (rate-limit transient)
+    "https://redlib.nadeko.net",           # Restored tail — nadeko 0/1 in #9283 but GoAway timeout partially works on retry; kept at very last per keep-if-partial rule
 ]
 
 RATE_LIMIT_RETRY_DELAY_1 = 6
@@ -1035,7 +1192,10 @@ def _shrink_posted_cache(posted: set, keep_newest: frozenset = frozenset()) -> s
     """
     by_sub: dict = {}
     for key in posted:
-        by_sub.setdefault(key.partition("_")[0], []).append(key)
+        # Keys are "{sub}_{post_id}" where sub may contain underscores;
+        # post_id never does, so split on the LAST underscore.
+        sub = key.rsplit("_", 1)[0] if "_" in key else key
+        by_sub.setdefault(sub, []).append(key)
 
     def _trim(keys: list, quota: int) -> list:
         keys.sort()  # leet ids: chronological within a subreddit
@@ -1078,6 +1238,13 @@ def cap_new_posts(new_posts: list, cap: int) -> list:
     """Round 34: bound one run's post count (MAX_POSTS_PER_RUN note).
     `new_posts` is sorted oldest-first; keep the NEWEST `cap` entries and
     log the dropped oldest (they retry next run inside the 48 h window)."""
+    if cap <= 0:
+        if new_posts:
+            logging.warning(f"POST FLOOD GUARD: {len(new_posts)} new posts this run "
+                            f"exceed the cap of {cap} — posting the newest {cap}; the "
+                            f"{len(new_posts)} oldest retry next run inside the 48 h "
+                            f"window. Dropped: {[p[2] for p in new_posts]}")
+        return []
     if len(new_posts) <= cap:
         return new_posts
     dropped = [p[2] for p in new_posts[:len(new_posts) - cap]]
@@ -1104,8 +1271,8 @@ def save_posted(posted: set, keep_newest: frozenset = frozenset()) -> set:
             json.dump(sorted(kept), f, indent=2)
         return kept
     except Exception as e:
-        logging.error(f"Error saving cache: {e}")
-        return set()
+        logging.error(f"Error saving cache: {_sanitize_error_message(e)}")
+        raise
 
 
 def load_pending() -> dict:
@@ -1122,15 +1289,27 @@ def load_pending() -> dict:
 def save_pending(pending: dict) -> None:
     # Prune entries older than PENDING_MAX_AGE_SECONDS (the 48h posting
     # window has passed — collect() can no longer pick the post up anyway).
+    def _first_seen_age_ok(v: dict, now: float) -> bool:
+        raw = v.get("first_seen")
+        if raw is None:
+            raw = v.get("last_checked")
+        if raw is None:
+            # No timestamp at all — keep so we don't silently drop a pending entry
+            return True
+        try:
+            ts = float(raw)
+        except (TypeError, ValueError):
+            return True
+        return now - ts <= PENDING_MAX_AGE_SECONDS
     try:
         now = time.time()
         pruned = {k: v for k, v in pending.items()
-                  if isinstance(v, dict)
-                  and now - float(v.get("first_seen") or 0) <= PENDING_MAX_AGE_SECONDS}
+                  if isinstance(v, dict) and _first_seen_age_ok(v, now)}
         with open(PENDING_FILE, "w", encoding="utf-8") as f:
             json.dump(dict(sorted(pruned.items())), f, indent=2)
     except Exception as e:
-        logging.error(f"Error saving pending cache: {e}")
+        logging.error(f"Error saving pending cache: {_sanitize_error_message(e)}")
+        raise
 
 
 def load_posted_messages() -> dict:
@@ -1150,17 +1329,26 @@ def load_posted_messages() -> dict:
 def save_posted_messages(messages: dict) -> None:
     if not RETRACT_DEAD_POSTS:
         return
+    def _msg_age_ok(v: dict, now: float) -> bool:
+        raw = v.get("delivered_at")
+        if raw is None:
+            return True
+        try:
+            ts = float(raw)
+        except (TypeError, ValueError):
+            return True
+        return now - ts <= RETRACT_WINDOW_SECONDS
     try:
         now = time.time()
         pruned = {
             k: v for k, v in (messages or {}).items()
-            if isinstance(v, dict) and not v.get("retracted")
-            and now - float(v.get("delivered_at") or 0) <= RETRACT_WINDOW_SECONDS
+            if isinstance(v, dict) and not v.get("retracted") and _msg_age_ok(v, now)
         }
         with open(POSTED_MESSAGES_FILE, "w", encoding="utf-8") as f:
             json.dump(dict(sorted(pruned.items())), f, indent=2)
     except Exception as e:
-        logging.error(f"Error saving posted-message cache: {e}")
+        logging.error(f"Error saving posted-message cache: {_sanitize_error_message(e)}")
+        raise
 
 
 def mark_pending(pending: dict, key: str, reason: str, now: float,
@@ -1190,7 +1378,11 @@ def pending_due(pending: dict, key: str, now: float) -> bool:
     entry = pending.get(key)
     if not isinstance(entry, dict):
         return True
-    return now - float(entry.get("last_checked") or 0) >= PENDING_RECHECK_SECONDS
+    try:
+        last = float(entry.get("last_checked") or 0)
+    except (TypeError, ValueError):
+        return True
+    return now - last >= PENDING_RECHECK_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -1229,7 +1421,10 @@ def _pending_throttle_skip(pending: dict, key: str, now: float, entry) -> bool:
         # Arctic resurface -> skip (never re-verified); RSS re-appearance
         # (a restore, fresh "updated" stamp) -> run the full pipeline.
         return isinstance(entry, _ArcticEntry)
-    last = float(pend.get("last_checked") or 0) if isinstance(pend, dict) else 0.0
+    try:
+        last = float(pend.get("last_checked") or 0) if isinstance(pend, dict) else 0.0
+    except (TypeError, ValueError):
+        last = 0.0
     return now - last < PENDING_RECHECK_SECONDS
 
 
@@ -1255,12 +1450,12 @@ SUBREDDIT_PROFILE_RE = re.compile(r"^/r/u_([^/\s?]+)/comments/([a-zA-Z0-9]+)", r
 def normalize_reddit_path(link: str) -> str | None:
     """A reddit permalink -> '/r/<sub>/comments/<id>/...' or, for a profile
     post, the canonical '/user/<name>/comments/<id>/...' (round 47)."""
-    match = re.search(r"(/r/[^\s?]+)", link or "")
+    match = re.search(r"(/r/[^\s?&#'\";<>]+)", link or "", re.I)
     if match:
         return match.group(1).rstrip("/") + "/"
     # Round 47: profile posts ("/user/<name>/comments/<id>/", or the short
     # "/u/<name>/..." form some mirrors emit) are real posts too.
-    match = re.search(r"/u(?:ser)?/([^/\s?]+)/comments/([a-zA-Z0-9]+)(/[^\s?]*)?", link or "")
+    match = re.search(r"/u(?:ser)?/([^/\s?]+)/comments/([a-zA-Z0-9]+)(/[^\s?]*)?", link or "", re.I)
     if match:
         tail = (match.group(3) or "").rstrip("/")
         return f"/user/{match.group(1)}/comments/{match.group(2)}{tail}/"
@@ -1304,7 +1499,9 @@ def extract_subreddit(path: str) -> str | None:
 
 
 def extract_post_id(path: str) -> str | None:
-    match = re.search(r"/comments/([a-zA-Z0-9]+)/", path)
+    if not path:
+        return None
+    match = re.search(r"/comments/([a-zA-Z0-9]+)(?:/|[?#]|$)", path)
     return match.group(1) if match else None
 
 
@@ -2787,15 +2984,16 @@ async def _fetch_feed(session: aiohttp.ClientSession, feed_url: str, label: str)
                     return None
                 return feed
         except Exception as e:
-            logging.info(f"[{label}] error: {e}")
+            logging.info(f"[{label}] error: {_redact_url_queries(e)}")
             return None
 
 
 def _combined_feed_url() -> str:
     """ONE feed for all tracked subreddits: /r/a+b+c/new.rss?limit=100 (+ token)."""
     url = "https://www.reddit.com/r/" + "+".join(SUBREDDITS) + f"/new.rss?limit={COMBINED_FEED_LIMIT}"
-    if REDDIT_FEED_TOKEN:
-        url += f"&feed={REDDIT_FEED_TOKEN}"
+    feed_q = format_reddit_feed_query(REDDIT_FEED_TOKEN)
+    if feed_q:
+        url += f"&{feed_q}"
     return url
 
 
@@ -2817,8 +3015,9 @@ async def fetch_working_reddit_feed(session: aiohttp.ClientSession, subreddit: s
     """Fallback mode: tries each RSS source in order for one subreddit."""
     for instance in REDDIT_RSS_INSTANCES:
         feed_url = f"{instance}/r/{subreddit}/new/.rss"
-        if REDDIT_FEED_TOKEN and "reddit.com" in instance:
-            feed_url += f"?feed={REDDIT_FEED_TOKEN}"
+        feed_q = format_reddit_feed_query(REDDIT_FEED_TOKEN)
+        if feed_q and "reddit.com" in instance:
+            feed_url += f"?{feed_q}"
         feed = await _fetch_feed(session, feed_url, instance)
         if feed:
             logging.info(f"Successfully fetched r/{subreddit} from {instance}")
@@ -2974,8 +3173,10 @@ async def fetch_post_json(session: aiohttp.ClientSession, post_id: str, use_oaut
         # Anonymous .json is 403 from datacenters; the token MIGHT lift it.
         # Round 31: only reached when REDDIT_JSON_PROBE allows it
         # (auto = only with an OAuth app; force = always; off = never).
-        url = (f"https://www.reddit.com/comments/{post_id}.json"
-               f"?limit=25&raw_json=1&feed={REDDIT_FEED_TOKEN}")
+        feed_q = format_reddit_feed_query(REDDIT_FEED_TOKEN)
+        if not feed_q:
+            return None
+        url = f"https://www.reddit.com/comments/{post_id}.json?limit=25&raw_json=1&{feed_q}"
         headers = dict(BROWSER_HEADERS)
         await asyncio.sleep(FEEDTOKEN_JSON_STAGGER)  # anonymous tier ~1 req/min
     else:
@@ -3014,7 +3215,7 @@ async def fetch_post_json(session: aiohttp.ClientSession, post_id: str, use_oaut
         logging.info(f"[{post_id}] post JSON OK via {source} (FULL MODE).")
         return post
     except Exception as e:
-        logging.info(f"[{post_id}] post JSON error: {e} — native mode.")
+        logging.info(f"[{post_id}] post JSON error: {_redact_url_queries(e)} — native mode.")
         return None
 
 
@@ -3439,7 +3640,7 @@ async def proxy_video_quality_upgrade(session: aiohttp.ClientSession, vid: str |
     extra probe happens only on Reddit-video posts (never on image, GIF,
     photo or gallery paths).
     """
-    global _video_quality_budget_used
+    global _video_quality_budget_used, current_run_stats
     if not vid or not base_url:
         return base_url
     mode = VIDEO_QUALITY_MODE if VIDEO_QUALITY_MODE in VIDEO_QUALITY_MODES else "balanced"
@@ -3472,6 +3673,15 @@ async def proxy_video_quality_upgrade(session: aiohttp.ClientSession, vid: str |
         logging.info(f"[{label or 'proxy'}] quality fallback: candidate=embedez; "
                      f"retaining validated base provider={_provider_for_url(base_url)}; "
                      "reason=quality_candidate_unavailable")
+        try:
+            if isinstance(current_run_stats, dict):
+                current_run_stats["quality_fallbacks"] = current_run_stats.get("quality_fallbacks", 0) + 1
+                reason = "quality_candidate_unavailable"
+                current_run_stats["quality_fallback_reasons"][reason] = current_run_stats["quality_fallback_reasons"].get(reason, 0) + 1
+                current_run_stats["optional_quality_candidate_result"]["fallback_unavailable"] = current_run_stats["optional_quality_candidate_result"].get("fallback_unavailable", 0) + 1
+                current_run_stats["validated_base_retained"] = current_run_stats.get("validated_base_retained", 0) + 1
+        except Exception:
+            pass
         return base_url
     facts = await probe_video_facts(session, base_url,
                                    timeout=float(VIDEO_NATIVE_TIMEOUT_SECONDS))
@@ -3486,10 +3696,25 @@ async def proxy_video_quality_upgrade(session: aiohttp.ClientSession, vid: str |
         logging.info(f"[{label or 'proxy'}] EmbedEZ 1080p candidate accepted: "
                      f"provider=embedez, content_type={content_type}, "
                      f"{_video_evidence(quality)}, reason=validated quality improvement.")
+        try:
+            if isinstance(current_run_stats, dict):
+                current_run_stats["quality_upgrades_accepted"] = current_run_stats.get("quality_upgrades_accepted", 0) + 1
+                current_run_stats["optional_quality_candidate_result"]["accepted"] = current_run_stats["optional_quality_candidate_result"].get("accepted", 0) + 1
+        except Exception:
+            pass
         return quality["url"]
     logging.info(f"[{label or 'proxy'}] quality fallback: candidate=embedez; "
                  f"retaining validated base provider={_provider_for_url(base_url)}; "
                  "reason=quality_candidate_not_superior_or_unvalidated")
+    try:
+        if isinstance(current_run_stats, dict):
+            current_run_stats["quality_fallbacks"] = current_run_stats.get("quality_fallbacks", 0) + 1
+            reason = "quality_candidate_not_superior_or_unvalidated"
+            current_run_stats["quality_fallback_reasons"][reason] = current_run_stats["quality_fallback_reasons"].get(reason, 0) + 1
+            current_run_stats["optional_quality_candidate_result"]["fallback_not_superior"] = current_run_stats["optional_quality_candidate_result"].get("fallback_not_superior", 0) + 1
+            current_run_stats["validated_base_retained"] = current_run_stats.get("validated_base_retained", 0) + 1
+    except Exception:
+        pass
     return base_url
 
 
@@ -3998,8 +4223,9 @@ async def _fetch_post_rss(session: aiohttp.ClientSession, path: str):
     """
     for instance in REDDIT_RSS_INSTANCES:
         url = f"{instance}{path}.rss"
-        if REDDIT_FEED_TOKEN and "reddit.com" in instance:
-            url += f"?feed={REDDIT_FEED_TOKEN}"
+        feed_q = format_reddit_feed_query(REDDIT_FEED_TOKEN)
+        if feed_q and "reddit.com" in instance:
+            url += f"?{feed_q}"
         feed = await _fetch_feed(session, url, f"post-rss {instance}")
         if feed:
             return feed
@@ -4306,16 +4532,57 @@ def _motion_video_url(item: dict | None) -> str | None:
 
 
 def _log_media_outcome(label: str, media: list, *, fallback_reason: str | None = None):
+    global current_run_stats
     kinds = [x.get("kind") for x in media if isinstance(x, dict)]
     kind = kinds[0] if kinds else "none"
     provider = "none"
+    endpoint = "none"
     for item in media:
         if isinstance(item, dict) and item.get("url"):
             provider = _provider_for_url(item["url"]) or "unknown"
+            # Final endpoint/hosting category (host-based)
+            try:
+                import urllib.parse as _up
+                host = _up.urlparse(str(item["url"])).netloc.lower()
+                if host:
+                    endpoint = host
+                    # Normalize known categories for readability
+                    if "v.redd.it" in host:
+                        endpoint = "v.redd.it"
+                    elif "i.redd.it" in host:
+                        endpoint = "i.redd.it"
+                    elif "vxreddit" in host:
+                        endpoint = "vxreddit"
+                    elif "embedez" in host or "redditez" in host:
+                        endpoint = "embedez"
+                    elif "embeddit" in host:
+                        endpoint = "embeddit"
+                    elif "preview.redd.it" in host:
+                        endpoint = "preview.redd.it"
+                else:
+                    endpoint = provider
+            except Exception:
+                endpoint = provider
             break
     logging.info(
         f"[{label or 'media'}] media-outcome kind={kind} provider={provider} "
         f"fallback={fallback_reason or 'none'}")
+    # Track for summary (existing observation only, no extra network)
+    try:
+        if isinstance(current_run_stats, dict):
+            prov = provider or "none"
+            current_run_stats["selected_media_providers"][prov] = current_run_stats["selected_media_providers"].get(prov, 0) + 1
+            current_run_stats["media_provider_counts"][prov] = current_run_stats["media_provider_counts"].get(prov, 0) + 1
+            # Final media endpoint/hosting category
+            ep = endpoint or prov
+            current_run_stats["final_media_endpoint_category"][ep] = current_run_stats["final_media_endpoint_category"].get(ep, 0) + 1
+            # Final card media kind and tile count
+            k = kind or "none"
+            current_run_stats["final_card_media_kind_counts"][k] = current_run_stats["final_card_media_kind_counts"].get(k, 0) + 1
+            current_run_stats["final_card_media_tile_total"] += len(media) if isinstance(media, list) else 0
+
+    except Exception:
+        pass
 
 
 async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
@@ -4598,11 +4865,22 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                 proxy_media_used = True
                 logging.info(f"[{label or 'proxy'}] card media via "
                              f"{_provider_for_url(proxy_video['url'])} — 1 video tile.")
+                try:
+                    if isinstance(current_run_stats, dict):
+                        via = str(proxy.get("service") or _provider_for_url(proxy_video['url']) or "unknown")
+                        current_run_stats["media_resolved_via_provider"][via] = current_run_stats["media_resolved_via_provider"].get(via, 0) + 1
+                except Exception:
+                    pass
             elif has_video:
                 # Stills are not an eligible fallback for a video post.
                 _use_proxy_text()
                 logging.info(f"[{label or 'proxy'}] proxy returned stills for a video "
                              f"post — native video chain will run.")
+                try:
+                    if isinstance(current_run_stats, dict):
+                        current_run_stats["terminal_media_fallbacks"] = current_run_stats.get("terminal_media_fallbacks", 0) + 1
+                except Exception:
+                    pass
             elif (not video_dead and not arctic_is_video and redlib_items
                   and any(x["kind"] == "video" for x in redlib_items)):
                 # round 38c: a redlib gallery WITH a video item is the most
@@ -4613,11 +4891,21 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                 proxy_media_used = True
                 logging.info(f"[{label or 'proxy'}] card media via redlib harvest "
                              f"(gallery video) — {len(media)} item(s).")
+                try:
+                    if isinstance(current_run_stats, dict):
+                        current_run_stats["media_resolved_via_provider"]["redlib"] = current_run_stats["media_resolved_via_provider"].get("redlib", 0) + 1
+                except Exception:
+                    pass
             elif (not video_dead and not arctic_is_video and arctic_items
                   and len(arctic_items) >= max(1, len(proxy_images))):
                 media = [dict(item) for item in arctic_items]
                 _use_proxy_text()
                 proxy_media_used = True
+                try:
+                    if isinstance(current_run_stats, dict):
+                        current_run_stats["media_resolved_via_provider"]["arctic"] = current_run_stats["media_resolved_via_provider"].get("arctic", 0) + 1
+                except Exception:
+                    pass
             elif (not video_dead and not arctic_is_video and redlib_items
                   and len(redlib_items) >= max(1, len(proxy_images))):
                 # image post: the COMPLETE ordered gallery from the redlib
@@ -4630,17 +4918,33 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                 logging.info(f"[{label or 'proxy'}] card media via redlib harvest "
                              f"— {len(media)} item(s) (body/stats via "
                              f"{proxy['service']}).")
+                try:
+                    if isinstance(current_run_stats, dict):
+                        current_run_stats["media_resolved_via_provider"]["redlib"] = current_run_stats["media_resolved_via_provider"].get("redlib", 0) + 1
+                except Exception:
+                    pass
             elif not video_dead and not arctic_is_video and proxy_images:
                 media = proxy_images
                 _use_proxy_text()
                 proxy_media_used = True
                 logging.info(f"[{label or 'proxy'}] card media via {proxy['service']} "
                              f"— {len(media)} item(s).")
+                try:
+                    if isinstance(current_run_stats, dict):
+                        via = str(proxy.get("service") or "unknown")
+                        current_run_stats["media_resolved_via_provider"][via] = current_run_stats["media_resolved_via_provider"].get(via, 0) + 1
+                except Exception:
+                    pass
             else:
                 # no usable proxy media (a dead proxy video counts too — the
                 # native DASH chain has audio)
                 logging.info(f"[{label or 'proxy'}] no usable proxy media — "
                              f"falling back to the native RSS path.")
+                try:
+                    if isinstance(current_run_stats, dict):
+                        current_run_stats["terminal_media_fallbacks"] = current_run_stats.get("terminal_media_fallbacks", 0) + 1
+                except Exception:
+                    pass
         # round 14: redditez og pages often lack the stats line (they live in
         # the oembed, not the og tags) — backfill from the Embeddit JSON
         # (one extra request, ~1 s, not bot-gated)
@@ -5152,12 +5456,22 @@ async def heal_proxy_video_message(session, webhook_url: str, message_id: str,
             if check_resp.status != 200:
                 logging.info(f"[{label}] proxy-video media heal skipped: "
                              f"revalidation HTTP {check_resp.status}")
+                try:
+                    if isinstance(current_run_stats, dict):
+                        current_run_stats["heal_skipped_after_revalidation"] = current_run_stats.get("heal_skipped_after_revalidation", 0) + 1
+                except Exception:
+                    pass
                 return False
             try:
                 current = await check_resp.json(content_type=None)
             except Exception:
                 logging.info(f"[{label}] proxy-video media heal skipped: "
                              "revalidation response was not JSON")
+                try:
+                    if isinstance(current_run_stats, dict):
+                        current_run_stats["heal_skipped_after_revalidation"] = current_run_stats.get("heal_skipped_after_revalidation", 0) + 1
+                except Exception:
+                    pass
                 return False
         still_unresolved = [url for url in unresolved_reddit_video_items(current)
                             if url.strip() in expected_urls]
@@ -5165,6 +5479,11 @@ async def heal_proxy_video_message(session, webhook_url: str, message_id: str,
             logging.info(f"[{label}] proxy-video media heal skipped after "
                          f"{PROXY_VIDEO_HEAL_DELAY}s revalidation: the queued "
                          "video is no longer explicitly unresolved")
+            try:
+                if isinstance(current_run_stats, dict):
+                    current_run_stats["heal_skipped_after_revalidation"] = current_run_stats.get("heal_skipped_after_revalidation", 0) + 1
+            except Exception:
+                pass
             return False
 
         async with session.patch(
@@ -5174,6 +5493,11 @@ async def heal_proxy_video_message(session, webhook_url: str, message_id: str,
             if resp.status in (200, 204):
                 logging.info(f"[{label}] proxy-video media heal edit succeeded "
                              f"after {PROXY_VIDEO_HEAL_DELAY}s revalidation")
+                try:
+                    if isinstance(current_run_stats, dict):
+                        current_run_stats["heal_edit_performed"] = current_run_stats.get("heal_edit_performed", 0) + 1
+                except Exception:
+                    pass
                 return True
             logging.warning(f"[{label}] proxy-video media heal edit HTTP {resp.status}: "
                             f"{(await resp.text())[:200]}")
@@ -5325,6 +5649,11 @@ def test_post_entries(now: float) -> list:
 async def main():
     if not SUBREDDITS:
         logging.error("No subreddits configured in SUBREDDITS environment variable.")
+        # write minimal run result for failure case
+        try:
+            _write_run_result(_init_run_stats(), {"combined_fetch_status": "no_subreddits", "error": "no_subreddits_configured"})
+        except Exception:
+            pass
         return
     if not REDDIT_FEED_TOKEN:
         logging.warning("REDDIT_FEED_TOKEN not set — running anonymously. The combined feed "
@@ -5372,7 +5701,7 @@ async def main():
     # of the backstop, so the next eviction burst is visible in the log.
     _sub_counts: dict = {}
     for _k in posted:
-        _pfx = _k.partition("_")[0]
+        _pfx = _k.rsplit("_", 1)[0] if "_" in _k else _k
         _sub_counts[_pfx] = _sub_counts.get(_pfx, 0) + 1
     _hot = {s: n for s, n in _sub_counts.items() if n >= MAX_CACHE_SIZE_PER_SUB - 10}
     if _hot or len(posted) >= MAX_CACHE_SIZE_TOTAL * 9 // 10:
@@ -5384,545 +5713,817 @@ async def main():
 
     use_oauth = bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET)
 
-    async with aiohttp.ClientSession() as session:
-        # ---- round 13: proxy warm-up (writes proxy_health.json) ----------
-        global _proxy_health
-        if PROXY_MEDIA and reddit_proxy is not None:
-            _proxy_health = await reddit_proxy.proxy_warmup(session)
-        else:
-            logging.info("Proxy media off (PROXY_MEDIA=0 or module missing) — "
-                         "native media only.")
+    run_stats = _init_run_stats()
+    global current_run_stats
+    current_run_stats = run_stats
+    # Initialize fresh record; mark incomplete until successful completion
+    run_stats["completed"] = False
+    _write_run_result(run_stats, {"status": "started"})  # ensure stale prior file is not reused; will be overwritten on completion
+    # Use try/finally to preserve counters on unexpected failure without masking exception
+    try:
+        combined_fetch_status = "unavailable"
+        combined_entries_val = None
+        subreddits_represented_val = None
 
-        # ---- TEST POST mode (round 12): rebuild one specific post --------
-        if TEST_POST_ID:
-            logging.info(f"TEST POST mode: {TEST_POST_ID} (dry_run={DRY_RUN}) — "
-                         f"feed + dedup cache bypassed on purpose.")
-            new_posts = test_post_entries(now)
-        else:
-            # ---- PRIMARY: one combined request for all subreddits ---------
-            combined = await fetch_combined_feed(session)
-            new_posts = []  # (subreddit, path, unique_key, published_ts, activity_ts, entry)
-
-            def collect(entries, known_subreddit: str | None):
-                for entry in entries:
-                    raw_link = str(getattr(entry, "link", ""))
-                    path = normalize_reddit_path(raw_link)
-                    if not path:
-                        continue
-                    sub = known_subreddit or _subreddit_by_name(extract_subreddit(path))
-                    if not sub:
-                        continue
-                    post_id = extract_post_id(path)
-                    if not post_id:
-                        continue
-                    unique_key = f"{sub}_{post_id}"
-                    if unique_key in posted:
-                        continue
-                    published_parsed = entry.get("published_parsed")
-                    updated_parsed = entry.get("updated_parsed")
-                    published_ts = time.mktime(published_parsed) if published_parsed else now
-                    updated_ts = time.mktime(updated_parsed) if updated_parsed else published_ts
-                    activity_ts = max(published_ts, updated_ts)
-                    if not is_first_run and (now - activity_ts > MAX_AGE_SECONDS):
-                        continue
-                    new_posts.append((sub, path, unique_key, published_ts, activity_ts, entry))
-
-            if combined and combined.entries:
-                entries = [combined.entries[0]] if is_first_run else combined.entries
-                collect(entries, None)
-            else:
-                logging.info("Combined feed unavailable — falling back to per-subreddit feeds...")
-
-                async def _staggered_fetch(sub: str, index: int):
-                    await asyncio.sleep(index * FEED_FETCH_STAGGER)
-                    return await fetch_working_reddit_feed(session, sub)
-
-                tasks = [_staggered_fetch(sub, i) for i, sub in enumerate(SUBREDDITS)]
-                feeds = await asyncio.gather(*tasks)
-                for subreddit, feed in zip(SUBREDDITS, feeds):
-                    if not feed or not feed.entries:
-                        continue
-                    entries = [feed.entries[0]] if is_first_run else feed.entries
-                    collect(entries, subreddit)
-
-            # ---- round 17: Arctic Shift search backup ---------------------
-            # Subreddits RSS left EMPTY (missing from the combined 100-entry
-            # feed, dead/bot-walled per-sub feeds, quiet subs) are re-checked
-            # against the Arctic Shift archive search. Archive posts are
-            # wrapped as feedparser-style entries and run through the SAME
-            # collect() above — dedup cache + 48h freshness window apply
-            # unchanged; crossposts found in the archive get the original
-            # post's media via the existing native crosspost path. Soft-fail:
-            # any search error just leaves that sub at zero.
-            covered_subs = {p[0] for p in new_posts}
-            for sub in SUBREDDITS:
-                if sub in covered_subs:
-                    continue
+        async with aiohttp.ClientSession() as session:
+            # ---- round 13: proxy warm-up (writes proxy_health.json) ----------
+            global _proxy_health
+            if PROXY_MEDIA and reddit_proxy is not None:
                 try:
-                    arc_posts = await fetch_arctic_subreddit_posts(
-                        session, sub, after_epoch=now - MAX_AGE_SECONDS,
-                        label=sub)
-                except Exception:
-                    arc_posts = []
-                if not arc_posts:
-                    continue
-                logging.info(f"[arctic {sub}] RSS had no new posts — trying "
-                             f"{len(arc_posts)} post(s) from the archive.")
-                arc_entries = [_ArcticEntry(p) for p in arc_posts]
-                if is_first_run:
-                    arc_entries = arc_entries[:1]  # anti-flood (same as RSS)
-                collect(arc_entries, sub)
+                    _proxy_health = await reddit_proxy.proxy_warmup(session)
+                    # Record for reporting (no extra network)
+                    try:
+                        run_stats["proxy_warmup_status"] = "ok" if _proxy_health else "unavailable"
+                        run_stats["proxy_warmup_services"] = _proxy_health if isinstance(_proxy_health, dict) else None
+                    except Exception:
+                        run_stats["proxy_warmup_status"] = "unavailable"
+                except Exception as e:
+                    logging.error(f"Proxy warmup failed: {_sanitize_error_message(e)}")
+                    run_stats["proxy_warmup_status"] = "failed"
+                    run_stats["proxy_warmup_services"] = None
+            else:
+                logging.info("Proxy media off (PROXY_MEDIA=0 or module missing) — "
+                             "native media only.")
+                run_stats["proxy_warmup_status"] = "disabled"
+                run_stats["proxy_warmup_services"] = None
+            # Refresh video quality from env (in case var set per-run)
+            try:
+                run_stats["video_quality"] = os.getenv("REDDIT_VIDEO_QUALITY", "").strip() or "balanced"
+            except Exception:
+                pass
 
-        total_found = len(new_posts)
-        if total_found == 0:
-            logging.info("No new Reddit posts to post.")
+            # ---- TEST POST mode (round 12): rebuild one specific post --------
+            if TEST_POST_ID:
+                logging.info(f"TEST POST mode: {TEST_POST_ID} (dry_run={DRY_RUN}) — "
+                             f"feed + dedup cache bypassed on purpose.")
+                new_posts = test_post_entries(now)
+                # Test mode does not populate combined stats; mark as test_post
+                combined_fetch_status = "test_post"
+                run_stats["combined_entries"] = 0
+                run_stats["subreddits_represented"] = 0
+            else:
+                # ---- PRIMARY: one combined request for all subreddits ---------
+                combined = await fetch_combined_feed(session)
+                new_posts = []  # (subreddit, path, unique_key, published_ts, activity_ts, entry)
+
+                def collect(entries, known_subreddit: str | None):
+                    for entry in entries:
+                        raw_link = str(getattr(entry, "link", ""))
+                        path = normalize_reddit_path(raw_link)
+                        if not path:
+                            continue
+                        sub = known_subreddit or _subreddit_by_name(extract_subreddit(path))
+                        if not sub:
+                            continue
+                        post_id = extract_post_id(path)
+                        if not post_id:
+                            continue
+                        unique_key = f"{sub}_{post_id}"
+                        if unique_key in posted:
+                            # Dedup at collect stage: already posted, skip silently but count
+                            # This is before candidate counting, so track separately
+                            run_stats["dedup_skipped_in_run"] += 1
+                            logging.debug(f"[{unique_key}] already posted (dedup) — skipped at collect.")
+                            continue
+                        published_parsed = entry.get("published_parsed")
+                        updated_parsed = entry.get("updated_parsed")
+                        published_ts = time.mktime(published_parsed) if published_parsed else now
+                        updated_ts = time.mktime(updated_parsed) if updated_parsed else published_ts
+                        activity_ts = max(published_ts, updated_ts)
+                        if not is_first_run and (now - activity_ts > MAX_AGE_SECONDS):
+                            continue
+                        new_posts.append((sub, path, unique_key, published_ts, activity_ts, entry))
+
+                if combined and combined.entries is not None:
+                    # Combined fetch succeeded (even if 0 entries => empty, distinct from failed fetch)
+                    try:
+                        covered = set()
+                        for e in combined.entries:
+                            p = normalize_reddit_path(str(getattr(e, "link", "")))
+                            s = _subreddit_by_name(extract_subreddit(p)) if p else None
+                            if s:
+                                covered.add(s)
+                        combined_entries_val = len(combined.entries)
+                        subreddits_represented_val = len(covered)
+                        # Empty but successful parse is distinct from failed fetch
+                        combined_fetch_status = "ok" if combined_entries_val > 0 else "empty"
+                    except Exception:
+                        combined_entries_val = len(combined.entries) if combined and hasattr(combined, 'entries') and combined.entries is not None else 0
+                        subreddits_represented_val = None
+                        combined_fetch_status = "ok"
+                    entries = [combined.entries[0]] if is_first_run and combined.entries else []
+                    if not is_first_run:
+                        entries = combined.entries or []
+                    # Only collect from combined feed (RSS) here; archive is separate
+                    if entries:
+                        collect(entries, None)
+                    # Fallback not attempted when combined succeeded (even if empty)
+                    run_stats["fallback_status"] = "not_attempted"
+                    run_stats["fallback_entries"] = None
+                    run_stats["fallback_subreddits_covered"] = None
+                else:
+                    # Combined fetch failed or returned no feed object
+                    logging.info("Combined feed unavailable — falling back to per-subreddit feeds...")
+                    combined_fetch_status = "unavailable" if combined is None else "failed"
+                    combined_entries_val = None
+                    subreddits_represented_val = None
+                    run_stats["fallback_status"] = "attempted"
+
+                    async def _staggered_fetch(sub: str, index: int):
+                        await asyncio.sleep(index * FEED_FETCH_STAGGER)
+                        return await fetch_working_reddit_feed(session, sub)
+
+                    tasks = [_staggered_fetch(sub, i) for i, sub in enumerate(SUBREDDITS)]
+                    feeds = await asyncio.gather(*tasks)
+                    # Track per-subreddit fallback coverage independently of deduplication
+                    fallback_entries_total = 0
+                    fallback_covered = set()
+                    fallback_successful = 0
+                    for subreddit, feed in zip(SUBREDDITS, feeds):
+                        if feed is None:
+                            continue
+                        # Successful parse even with 0 entries counts as coverage attempt; distinct from failed fetch
+                        if hasattr(feed, 'entries') and feed.entries is not None:
+                            fallback_successful += 1
+                            if feed.entries:
+                                fallback_covered.add(subreddit)
+                                fallback_entries_total += len(feed.entries)
+                                entries = [feed.entries[0]] if is_first_run else feed.entries
+                                collect(entries, subreddit)
+                            else:
+                                # empty feed: no candidates, but subreddit was successfully read (coverage)
+                                fallback_covered.add(subreddit)
+                        # else: failed fetch (None) not counted as covered
+                    run_stats["fallback_entries"] = fallback_entries_total if fallback_successful else None
+                    run_stats["fallback_subreddits_covered"] = len(fallback_covered) if fallback_successful else None
+                    if fallback_successful == 0:
+                        run_stats["fallback_status"] = "all_failed"
+                    else:
+                        run_stats["fallback_status"] = "partial" if len(fallback_covered) < len(SUBREDDITS) else "ok"
+
+                # ---- round 17: Arctic Shift search backup ---------------------
+                # Archive is NOT feed coverage — keep separate counters and never
+                # inflate RSS metrics. Only subreddits still empty after RSS feed(s)
+                # are tried via archive, and archive candidates are tracked as
+                # arctic, not as combined/fallback entries.
+                # Count RSS-covered subreddits before archive for fallback logic
+                _rss_covered_subs = {p[0] for p in new_posts}
+                arctic_candidates_total = 0
+                arctic_subs_tried = 0
+                for sub in SUBREDDITS:
+                    if sub in _rss_covered_subs:
+                        continue
+                    arctic_subs_tried += 1
+                    try:
+                        arc_posts = await fetch_arctic_subreddit_posts(
+                            session, sub, after_epoch=now - MAX_AGE_SECONDS,
+                            label=sub)
+                    except Exception:
+                        arc_posts = []
+                    if not arc_posts:
+                        continue
+                    logging.info(f"[arctic {sub}] RSS had no new posts — trying "
+                                 f"{len(arc_posts)} post(s) from the archive.")
+                    arc_entries = [_ArcticEntry(p) for p in arc_posts]
+                    if is_first_run:
+                        arc_entries = arc_entries[:1]  # anti-flood (same as RSS)
+                    # Track archive candidates separately
+                    arctic_candidates_total += len(arc_entries)
+                    collect(arc_entries, sub)
+
+                run_stats["arctic_candidates"] = arctic_candidates_total
+                run_stats["arctic_subreddits_tried"] = arctic_subs_tried
+
+                # Populate run_stats feed fields from feed itself, never from deduped candidates or archive
+                # Use unavailable/not applicable when metric cannot be established
+                if combined_entries_val is None:
+                    run_stats["combined_entries"] = "unavailable" if combined_fetch_status in ("unavailable", "failed") else combined_entries_val
+                else:
+                    run_stats["combined_entries"] = combined_entries_val
+                if subreddits_represented_val is None:
+                    # No successful combined feed => represented is not applicable
+                    run_stats["combined_subreddits_covered"] = "unavailable" if combined_fetch_status in ("unavailable", "failed") else subreddits_represented_val
+                    run_stats["subreddits_represented"] = run_stats["combined_subreddits_covered"]
+                else:
+                    run_stats["combined_subreddits_covered"] = subreddits_represented_val
+                    run_stats["subreddits_represented"] = subreddits_represented_val
+                run_stats["combined_fetch_status"] = combined_fetch_status
+
+            total_found = len(new_posts)
+            run_stats["unposted_candidates_considered"] = total_found
+
+            if total_found == 0:
+                logging.info(f"Reddit monitor: no unposted candidates to consider (combined feed {run_stats['combined_entries']} entries, "
+                             f"{run_stats['subreddits_represented']} of {run_stats['subreddits_configured']} subreddits represented; "
+                             f"dedup skipped {run_stats['dedup_skipped_in_run']} in collect).")
+                if RETRACT_DEAD_POSTS and not DRY_RUN:
+                    try:
+                        await retract_dead_posts(session, posted_messages, now)
+                    except Exception as e:
+                        logging.error(f"Retract failed (no-candidates): {_sanitize_error_message(e)}")
+                # Persistence handling for no-candidates (including dry-run)
+                if DRY_RUN:
+                    logging.info("DRY RUN finished (no candidates): cache NOT saved, Discord NOT touched.")
+                    run_stats["persistence_status"] = "skipped_dry_run"
+                    run_stats["completed"] = True
+                    run_stats["dry_run"] = True
+                    logging.info(f"Run summary: {run_stats['unposted_candidates_considered']} considered, "
+                                 f"{run_stats['candidates_entering_processing']} entering processing, "
+                                 f"{run_stats['delivered']} delivered, {run_stats['dedup_skipped_in_run']} dedup, "
+                                 f"{run_stats['known_pending_suppressed']} known-pending, {run_stats['retry_backoff']} retry-backoff, "
+                                 f"{run_stats['fresh_hold']} fresh-hold.")
+                    _write_run_result(run_stats, {"monitor_runtime_note": "no_candidates", "dry_run": True, "completed": True, "persistence_status": "skipped_dry_run"})
+                    return
+                else:
+                    try:
+                        saved = save_posted(posted, frozenset(posted - posted_at_start))
+                        _verify_dedup_save(posted_at_start, posted, saved)
+                        save_pending(pending)
+                        save_posted_messages(posted_messages)
+                        # Determine local persistence outcome: unchanged vs saved
+                        if posted == posted_at_start:
+                            run_stats["persistence_status"] = "unchanged"
+                        else:
+                            run_stats["persistence_status"] = "saved"
+                        run_stats["completed"] = True
+                        run_stats["error"] = None
+                        run_stats["dry_run"] = False
+                    except Exception as e:
+                        run_stats["persistence_status"] = "failed"
+                        run_stats["completed"] = False
+                        run_stats["error"] = f"{type(e).__name__}:{_sanitize_error_message(e)}"
+                        logging.error(f"Persistence failed (no-candidates): {_sanitize_error_message(e)}")
+                    logging.info(f"Run summary: {run_stats['unposted_candidates_considered']} considered, "
+                                 f"{run_stats['candidates_entering_processing']} entering processing, "
+                                 f"{run_stats['delivered']} delivered, {run_stats['dedup_skipped_in_run']} dedup, "
+                                 f"{run_stats['known_pending_suppressed']} known-pending, {run_stats['retry_backoff']} retry-backoff, "
+                                 f"{run_stats['fresh_hold']} fresh-hold.")
+                    _write_run_result(run_stats, {"monitor_runtime_note": "no_candidates", "completed": run_stats["completed"], "persistence_status": run_stats["persistence_status"], "error": run_stats["error"], "dry_run": False})
+                    if not run_stats["completed"]:
+                        # Preserve original exception context for reporting without leaking secrets
+                        raise RuntimeError(f"persistence_failed:{run_stats['error']}")
+                    return
+
+            # Accurate stage log replaces misleading "Found X new Reddit posts. Building V3 cards..."
+            logging.info(f"Reddit candidates: {total_found} unposted candidate(s) considered from "
+                         f"{run_stats['combined_entries']} feed entries covering "
+                         f"{run_stats['subreddits_represented']} of {run_stats['subreddits_configured']} subreddit(s) represented.")
+
+            # newest first per sub for stable ordering
+            new_posts.sort(key=lambda p: p[3])
+
+            # Round 34: per-run flood cap (see MAX_POSTS_PER_RUN) — any future
+            # cache loss causes ONE capped run with a loud log line, not a mass
+            # re-post storm.
+            _before_cap = len(new_posts)
+            new_posts = cap_new_posts(new_posts, MAX_POSTS_PER_RUN)
+            _after_cap = len(new_posts)
+            if _before_cap != _after_cap:
+                run_stats["flood_cap_dropped"] = _before_cap - _after_cap
+                logging.warning(f"Flood cap: {run_stats['flood_cap_dropped']} candidate(s) dropped (cap {MAX_POSTS_PER_RUN}).")
+
+            # Round 72: defer edits until every card/continuation has been sent.
+            # Multiple proxy videos warm up concurrently; healthy posts never
+            # wait behind a preceding card's repair delay.
+            proxy_video_heal_queue = []
+            for subreddit, path, unique_key, published_ts, activity_ts, entry in new_posts:
+                # Round 34: double dedup (belt and braces) — collect() already
+                # skips keys in the loaded cache, but a key can surface twice in
+                # ONE run's feed (new + mod-queue listings) or via any future
+                # code path; re-check the live set before the expensive pipeline.
+                # TEST POST rebuilds are exempt (re-testing a cached post is
+                # their whole point).
+                if not TEST_POST_ID and unique_key in posted:
+                    run_stats["dedup_skipped_in_run"] += 1
+                    logging.debug(f"[{unique_key}] already posted (dedup) — skipped.")
+                    continue
+                webhook_url = get_webhook_for_subreddit(subreddit)
+                if not webhook_url:
+                    logging.error(f"No webhook configured for r/{subreddit}. Skipping {unique_key}.")
+                    run_stats["other_skipped"] += 1
+                    _inc_reason(run_stats["other_by_reason"], "missing_webhook")
+                    continue
+
+                reddit_url = f"https://www.reddit.com{path}"
+                _entry_source36 = ("arctic" if isinstance(entry, _ArcticEntry)
+                                   else "rss")
+
+                # ---- round 30 (2026-09-19): pending-post recheck throttle ----
+                # A post an earlier run skipped (removed/deleted, still pending
+                # approval, media not filled yet) is re-verified at most once
+                # every PENDING_RECHECK_SECONDS — not every 5-minute run. When it
+                # IS due, the full pipeline below runs unchanged, so a
+                # newly-approved / restored / media-complete post is caught and
+                # posted on its next due run. TEST POST + DRY RUN bypass this
+                # (manual tools must always exercise the full pipeline).
+                if (not TEST_POST_ID and not DRY_RUN
+                        and unique_key in pending
+                        and _pending_throttle_skip(pending, unique_key, now, entry)):
+                    _pend = pending[unique_key]
+                    _pend_reason = str(_pend.get("reason") or "unknown")
+                    if _pend.get("reason") in _NO_RECHECK_REASONS:
+                        run_stats["known_pending_suppressed"] += 1
+                        _inc_reason(run_stats["known_pending_by_reason"], _pend_reason)
+                        logging.debug(f"[{unique_key}] pending ({_pend_reason}) — "
+                                     f"not re-checking (removed posts re-enter via RSS "
+                                     f"when restored; entry expires at the 48 h window).")
+                    else:
+                        _due_in = int(PENDING_RECHECK_SECONDS
+                                      - (now - float(_pend.get("last_checked") or 0)))
+                        run_stats["retry_backoff"] += 1
+                        _inc_reason(run_stats["retry_backoff_by_reason"], _pend_reason)
+                        logging.debug(f"[{unique_key}] pending ({_pend_reason}) — "
+                                     f"skipping recheck, due again in ~{_due_in}s.")
+                    continue
+
+                # ---- round 64 (updated 2026-10-21): stateless fresh hold ----
+                # A flat floor computed from the post's OWN creation timestamp —
+                # no first-seen tracking, no pending entry. A candidate still
+                # under the floor simply re-qualifies from the feed next tick.
+                if not TEST_POST_ID and FRESH_HOLD_SECONDS > 0:
+                    _post_age = now - float(published_ts or now)
+                    if _post_age < FRESH_HOLD_SECONDS:
+                        run_stats["fresh_hold"] += 1
+                        logging.debug(f"[{unique_key}] age {_post_age:.1f}s < "
+                                     f"FRESH_HOLD_SECONDS ({FRESH_HOLD_SECONDS}s) — "
+                                     f"skipped this tick (stateless, not cached), "
+                                     f"re-evaluated next tick.")
+                        continue
+
+                # pending with RSS re-appearance: eligible for reconsideration via RSS
+                if (unique_key in pending
+                        and str(pending[unique_key].get("reason") or "") in _NO_RECHECK_REASONS
+                        and not isinstance(entry, _ArcticEntry)):
+                    logging.debug(f"RESTORED: {unique_key} pending "
+                                 f"({pending[unique_key].get('reason')}) reappeared via RSS — "
+                                 f"running full pipeline (posts if live).")
+
+                # Count as entering processing before heavy work
+                run_stats["candidates_entering_processing"] += 1
+
+                if entry is not None:
+                    base = entry_to_base_data(entry)
+                    post_json = await fetch_post_json(session, extract_post_id(path) or "",
+                                                      use_oauth=use_oauth)
+                else:
+                    # TEST POST mode: no RSS entry (feed bypassed on purpose).
+                    # Try the post JSON (FULL MODE); when JSON is unavailable
+                    # (native mode), build the base from the RSS feed entry or
+                    # the redlib post page (round 12c).
+                    post_json = await fetch_post_json(session, extract_post_id(path) or "",
+                                                      use_oauth=use_oauth)
+                    if post_json:
+                        st = str(post_json.get("selftext") or "")
+                        base = {
+                            "title": _clean_post_title(post_json.get("title")),
+                            "author": _clean_author_name(post_json.get("author")),
+                            "content_html": st,
+                            "thumb": None,
+                            "body": strip_html(st),
+                            "crosspost_orig_path": normalize_reddit_path(
+                                str(post_json.get("crosspost_post_link") or "")),
+                            "vred_id": extract_vreddit_id(st) or extract_vreddit_id(str(post_json.get("url") or "")),
+                            "redgifs_url": extract_redgifs_url(st),
+                            "youtube_url": extract_youtube_url(st, str(post_json.get("url") or "")),
+                        }
+                    else:
+                        base = await fetch_test_post_base(session, path, TEST_POST_ID)
+                        if not base and PROXY_MEDIA and reddit_proxy is not None:
+                            # round 13: build a minimal base from a proxy service
+                            # (title/author/body) so the test post still works
+                            # when no RSS/redlib source has the post — media is
+                            # then resolved from the same service in
+                            # resolve_post_media.
+                            proxy = await fetch_proxy_post_memo(session, path,
+                                                                label=TEST_POST_ID,
+                                                                health=_proxy_health)
+                            if proxy and proxy.get("title"):
+                                base = {
+                                    "title": _clean_post_title(proxy["title"]),
+                                    "author": _clean_author_name(proxy.get("author")),
+                                    "content_html": proxy.get("body") or "",
+                                    "thumb": None,
+                                    "body": proxy.get("body") or "",
+                                    "crosspost_orig_path": find_crosspost_original_path(
+                                        proxy.get("body") or "", path),
+                                    # the proxy body can carry the post's video
+                                    # link (e.g. a crosspost of a video shows the
+                                    # original's v.redd.it URL)
+                                    "vred_id": extract_vreddit_id(proxy.get("body") or ""),
+                                    "redgifs_url": extract_redgifs_url(proxy.get("body") or ""),
+                                    "youtube_url": extract_youtube_url(proxy.get("body") or ""),
+                                }
+                                logging.info(f"[{TEST_POST_ID}] test post base built from "
+                                             f"proxy service {proxy['service']}.")
+                        if not base:
+                            logging.error(f"TEST POST {TEST_POST_ID}: post JSON unavailable "
+                                          f"(native mode), and the post is neither in the "
+                                          f"combined feed (100-entry window), its own RSS "
+                                          f"feed, any redlib instance, nor any proxy "
+                                          f"service (redditez/vxreddit/embeddit) — cannot "
+                                          f"build the test post. Add REDDIT_CLIENT_ID/"
+                                          f"SECRET secrets for reliable testing.")
+                            run_stats["other_skipped"] += 1
+                            _inc_reason(run_stats["other_by_reason"], "test_post_no_base")
+                            run_stats["candidates_entering_processing"] -= 1
+                            continue
+
+                # ---- round 18: skip soft-removed / deleted / pending-approval
+                # posts. The archive (round 17) and occasionally the RSS feed
+                # still carries posts the moderators removed or the author
+                # deleted — their pages show a removal notice instead of the
+                # real content. They are NOT posted and NOT added to the dedup
+                # cache: if the post is approved later it surfaces again and
+                # posts normally. Explicit TEST POST rebuilds are unaffected.
+                if not TEST_POST_ID:
+                    _r_title = str((post_json or {}).get("title") or base.get("title") or "")
+                    _r_body = (strip_html(str((post_json or {}).get("selftext") or ""))
+                               or str(base.get("body") or ""))
+                    _removed = removed_post_reason(_r_title, _r_body)
+                    if _removed:
+                        mark_pending(pending, unique_key, _removed, now,
+                                     source=_entry_source36, title=_r_title[:200],
+                                     published_ts=published_ts)
+                        run_stats["newly_rejected_removed"] += 1
+                        _inc_reason(run_stats["newly_rejected_by_reason"], _removed)
+                        logging.info(f"[{unique_key}] post appears removed/deleted/"
+                                     f"awaiting approval ({_removed}) — skipping, not "
+                                     f"cached (eligible for reconsideration when returned by RSS, subject to normal checks).")
+                        continue
+
+                # ---- round 20 + round 32: liveness gate for ALL sourced posts ----
+                # The Arctic archive can carry posts that are no longer live on
+                # reddit (removed / deleted / still pending approval) — and,
+                # live-verified 2026-09-20 (post 1wl41aj, "Post is awaiting
+                # moderator approval."): the RSS feed ALSO delivers queued posts
+                # with their REAL content (no banner in the feed text), which the
+                # round-18 text filter cannot see — the post was built + posted
+                # to Discord while still in the mod queue. So the gate now runs
+                # for RSS-sourced posts too, with feed_ok=False (the feed cannot
+                # verify the feed — the redlib post pages are the independent
+                # fallback). Otherwise skip + don't cache: a queued post
+                # re-checks on the short approval interval and posts the moment
+                # a live source can see it.
+                if not TEST_POST_ID and entry is not None:
+                    _live, _why = await verify_archive_post_live(
+                        session, path, label=unique_key,
+                        feed_ok=not isinstance(entry, _ArcticEntry))
+                    if not _live:
+                        _live_reason = ("pending approval" if "awaiting moderator approval" in _why
+                                     else "removal_notice" if "removal notice" in _why
+                                     else "sources_down" if "all live sources are down" in _why
+                                     else "not_live")
+                        mark_pending(pending, unique_key,
+                                     _live_reason if _live_reason != "not_live" else _live_reason, now,
+                                     source=_entry_source36,
+                                     title=str(base.get("title") or "")[:200],
+                                     published_ts=published_ts)
+                        run_stats["liveness_not_verified"] += 1
+                        _inc_reason(run_stats["liveness_by_reason"], _why)
+                        logging.info(f"[{unique_key}] post not verified live "
+                                     f"({_why}) — skipping, not cached (will "
+                                     f"post once approved/restored).")
+                        continue
+
+                try:
+                    data = await resolve_post_media(session, base, post_json,
+                                                    path=path, label=unique_key)
+                    # ---- round 23 (2026-09-18): Arctic media-hint gate ------
+                    # Arctic fills gallery_data / media_metadata ASYNCHRONOUSLY
+                    # after capture, so a brand-new media post can be archived
+                    # with its text but not its media for a while. If the record
+                    # positively says the post has media (see _arctic_media_hint)
+                    # but no source served any this run, never post a media-less
+                    # card (1wj38fc: posted once without images, then cached
+                    # forever). Skip + don't cache: the next run retries, and
+                    # once the media is available (Arctic fields filled, or a
+                    # proxy renders the og: tags) the full gallery posts. The
+                    # 48h freshness window bounds the retries.
+                    if (not TEST_POST_ID and not DRY_RUN and post_json is None
+                            and isinstance(entry, _ArcticEntry)
+                            and not data["media"]
+                            and _arctic_media_hint(getattr(entry, "_arctic_post", None))):
+                        mark_pending(pending, unique_key, "media_wait", now)
+                        run_stats["media_wait"] += 1
+                        logging.debug(f"[{unique_key}] archive record says this post "
+                                     f"has media (gallery/media_metadata) but no "
+                                     f"source served any yet (Arctic fills those "
+                                     f"asynchronously) — skipping, not cached "
+                                     f"(retries next run).")
+                        continue
+                    # Round 25: known partial archive galleries wait without caching.
+                    # Unknown counts cannot gate; video cards intentionally use one tile.
+                    if (not TEST_POST_ID and not DRY_RUN and post_json is None
+                            and isinstance(entry, _ArcticEntry)
+                            and data["media"]
+                            and not any(m["kind"] == "video" for m in data["media"])):
+                        _arctic_n = _arctic_media_count(getattr(entry, "_arctic_post", None))
+                        if _arctic_n > len(data["media"]):
+                            mark_pending(pending, unique_key, "partial_gallery", now)
+                            run_stats["partial_gallery"] += 1
+                            logging.debug(f"[{unique_key}] archive record lists "
+                                         f"{_arctic_n} gallery items but the sources "
+                                         f"served only {len(data['media'])} this run — "
+                                         f"skipping, not cached (retries next run).")
+                            continue
+                    posted_ts = int(max(published_ts, activity_ts))
+                    # Round 66: the body beyond the card budget is continued in
+                    # follow-up messages (see build_continuation_payloads).
+                    payload, body_rest = build_v3_payload(subreddit, data, reddit_url,
+                                                          posted_ts, return_remainder=True)
+                    continuations = build_continuation_payloads(body_rest)
+
+                    if DRY_RUN:
+                        kinds = ",".join(sorted({m["kind"] for m in data["media"]})) or "text"
+                        mode = "full" if data["full_mode"] else "native"
+                        logging.info(f"DRY RUN (Discord NOT touched): {unique_key} "
+                                     f"(media={kinds} | {mode} | {len(data['media'])} item(s))")
+                        logging.debug(f"DRY RUN payload for {unique_key}:\n"
+                                     f"{json.dumps(payload, indent=2, ensure_ascii=False)}")
+                        if continuations:
+                            logging.info(f"DRY RUN: {unique_key} body continues in "
+                                         f"{len(continuations)} follow-up message(s).")
+                            for _ci, _cont in enumerate(continuations, 1):
+                                logging.debug(f"DRY RUN continuation {_ci} for {unique_key}:\n"
+                                             f"{json.dumps(_cont, indent=2, ensure_ascii=False)}")
+                        if data.get("youtube_url") and YOUTUBE_LINK_MESSAGE:
+                            logging.info(f"DRY RUN 2nd message for {unique_key} "
+                                         f"(YouTube link only): {data['youtube_url']}")
+                        run_stats["dry_run_would_deliver"] += 1
+                        continue
+
+                    inspect_video_response = _has_video_media(data)
+                    target_url = f"{webhook_url}?with_components=true"
+                    # Only video cards (or the retraction seatbelt) need the
+                    # created message JSON. Ordinary cards still use the old POST.
+                    if RETRACT_DEAD_POSTS or inspect_video_response:
+                        target_url += "&wait=true"
+                    async with session.post(target_url, json=payload,
+                                            timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status in (200, 204):
+                            message_json = None
+                            if (RETRACT_DEAD_POSTS or inspect_video_response) and resp.status == 200:
+                                try:
+                                    message_json = await resp.json(content_type=None)
+                                except Exception:
+                                    message_json = None
+                            posted.add(unique_key)
+                            # ROUND 48b: delivery telemetry. Every post logs how
+                            # long it took from Reddit creation to Discord, and —
+                            # when it had been held — what held it and for how
+                            # long. This is the only way to calibrate the gate
+                            # against a subreddit's real approval latency without
+                            # guessing (grep the Actions log for LATENCY).
+                            _pend_entry = pending.pop(unique_key, None)  # posted — no longer pending
+                            if RETRACT_DEAD_POSTS and isinstance(message_json, dict) and message_json.get("id"):
+                                posted_messages[unique_key] = {
+                                    "subreddit": subreddit,
+                                    "path": path,
+                                    "message_id": str(message_json["id"]),
+                                    "delivered_at": int(now),
+                                    "published_ts": int(published_ts),
+                                    "payload": payload,
+                                }
+                            kinds = ",".join(sorted({m["kind"] for m in data["media"]})) or "text"
+                            mode = ("full" if data["full_mode"] else
+                                    ("proxy: " + _provider_for_url(data["media"][0].get("url", ""))
+                                     if data["media"] and data["media"][0].get("kind") == "video"
+                                     and _provider_for_url(data["media"][0].get("url", "")) != "thumbnail"
+                                     else "native-dash" if data["media"] and
+                                     _provider_for_url(data["media"][0].get("url", "")) == "native-dash"
+                                     else "native"))
+                            _latency = max(0.0, now - float(published_ts or now))
+                            _held_note = ""
+                            if isinstance(_pend_entry, dict):
+                                _first = float(_pend_entry.get("first_seen") or 0)
+                                _held = max(0.0, now - _first) if _first else 0.0
+                                _held_note = (f" | held {_held / 60:.1f}min as "
+                                              f"'{_pend_entry.get('reason')}'")
+                            logging.info(f"Reddit V3 Posted: {unique_key} (media={kinds} | {mode} | "
+                                         f"{len(data['media'])} item(s)) | LATENCY "
+                                         f"{_latency / 60:.1f}min after creation{_held_note}")
+                            run_stats["delivered"] += 1
+                            # Round 66: a body that exceeded the card budget
+                            # continues in follow-up messages — same webhook,
+                            # same mechanism/ordering as the YouTube link
+                            # message below. Message IDs are recorded so the
+                            # retraction seatbelt covers EVERY part.
+                            for _ci, _cont in enumerate(continuations, 1):
+                                try:
+                                    _cont_url = f"{webhook_url}?with_components=true"
+                                    if RETRACT_DEAD_POSTS:
+                                        _cont_url += "&wait=true"
+                                    async with session.post(_cont_url, json=_cont,
+                                                            timeout=aiohttp.ClientTimeout(total=15)) as c_resp:
+                                        if c_resp.status in (200, 204):
+                                            if RETRACT_DEAD_POSTS and c_resp.status == 200:
+                                                try:
+                                                    _c_json = await c_resp.json(content_type=None)
+                                                except Exception:
+                                                    _c_json = None
+                                                if isinstance(_c_json, dict) and _c_json.get("id"):
+                                                    _record = posted_messages.get(unique_key)
+                                                    if isinstance(_record, dict) and _record.get("message_id"):
+                                                        _ids = _record.setdefault(
+                                                            "message_ids", [_record["message_id"]])
+                                                        if str(_c_json["id"]) not in _ids:
+                                                            _ids.append(str(_c_json["id"]))
+                                            logging.info(f"Body continuation posted for {unique_key} "
+                                                         f"(part { _ci + 1 } of "
+                                                         f"{len(continuations) + 1}).")
+                                        else:
+                                            logging.error(f"Body continuation HTTP {c_resp.status} for "
+                                                          f"{unique_key}: {(await c_resp.text())[:200]}")
+                                except Exception as c_e:
+                                    logging.error(f"Body continuation failed for {unique_key}: {c_e}")
+                                await asyncio.sleep(1.0)
+                            await create_discohook_share(session, payload, unique_key)
+                            # round 13: YouTube posts get a SECOND, plain message
+                            # containing ONLY the YouTube link (Discord shows the
+                            # official preview for a bare link). It waits for the
+                            # card above to land first; the card's own YouTube
+                            # thumb + animated button stay as they are.
+                            if data.get("youtube_url") and YOUTUBE_LINK_MESSAGE:
+                                try:
+                                    async with session.post(
+                                        webhook_url,
+                                        json={"content": data["youtube_url"]},
+                                        timeout=aiohttp.ClientTimeout(total=15),
+                                    ) as yt_resp:
+                                        if yt_resp.status in (200, 204):
+                                            logging.info(f"YouTube link message posted: "
+                                                         f"{data['youtube_url']}")
+                                        else:
+                                            logging.error(f"YouTube link message "
+                                                          f"HTTP {yt_resp.status}: "
+                                                          f"{(await yt_resp.text())[:200]}")
+                                except Exception as yt_e:
+                                    logging.error(f"YouTube link message failed: {yt_e}")
+                                await asyncio.sleep(1.0)
+                            # A missing/invalid wait=true response cannot be edited.
+                            # Round 72 + follow-up: only Discord-reported unresolved
+                            # *non-native* video items queue a repair, and only on
+                            # evidence: an explicit non-positive dimension, or a
+                            # Discord proxy_url with incomplete video metadata.
+                            # Sparse metadata without a proxy attempt is unknown,
+                            # not failure — healthy cards stay untouched. The
+                            # queued URLs travel with the entry: the edit below
+                            # revalidates them and may only act on one of them.
+                            unresolved = _unresolved_healable_video_items(message_json, data)
+                            if (unresolved and isinstance(message_json, dict)
+                                    and message_json.get("id")):
+                                proxy_video_heal_queue.append(
+                                    (webhook_url, str(message_json["id"]), payload,
+                                     unique_key, unresolved))
+                                logging.info(f"[{unique_key}] proxy-video heal queued: Discord "
+                                             f"returned {len(unresolved)} video item(s) with "
+                                             "unresolved-media evidence; the edit is "
+                                             "revalidated before it is sent.")
+                                try:
+                                    if isinstance(current_run_stats, dict):
+                                        current_run_stats["heal_queued"] = current_run_stats.get("heal_queued", 0) + 1
+                                except Exception:
+                                    pass
+                            await asyncio.sleep(1.5)
+                        else:
+                            body = await resp.text()
+                            logging.error(f"Discord error {resp.status} for {unique_key}: {body}")
+                            run_stats["failed_delivery"] += 1
+                            _inc_reason(run_stats.get("other_by_reason", {}), f"discord_{resp.status}")
+                except Exception as e:
+                    logging.error(f"Failed building/posting {unique_key}: {_sanitize_error_message(e)}")
+                    run_stats["failed_delivery"] += 1
+                    _inc_reason(run_stats.get("other_by_reason", {}), type(e).__name__ if e else "exception")
+
+            if proxy_video_heal_queue and not DRY_RUN:
+                logging.info(f"MEDIA-HEAL: {len(proxy_video_heal_queue)} unresolved Reddit "
+                             "video card(s) queued; revalidating them concurrently after "
+                             "delivery and editing only the still-unresolved ones.")
+                await asyncio.gather(*(
+                    heal_proxy_video_message(session, url, mid, payload, label, urls)
+                    for url, mid, payload, label, urls in proxy_video_heal_queue),
+                    return_exceptions=True)
+
             if RETRACT_DEAD_POSTS and not DRY_RUN:
                 await retract_dead_posts(session, posted_messages, now)
-            saved = save_posted(posted, frozenset(posted - posted_at_start))
-            _verify_dedup_save(posted_at_start, posted, saved)
-            save_pending(pending)
-            save_posted_messages(posted_messages)
-            return
 
-        logging.info(f"Found {total_found} new Reddit posts. Building V3 cards...")
+        log_redlib_reachability()   # round 49: which mirrors actually answered
 
-        # newest first per sub for stable ordering
-        new_posts.sort(key=lambda p: p[3])
+        # Aggregated INFO summary (stage-accurate)
+        logging.info(f"Run summary: {run_stats['unposted_candidates_considered']} considered, "
+                     f"{run_stats['candidates_entering_processing']} entering card processing, "
+                     f"{run_stats['delivered'] + run_stats['dry_run_would_deliver']} delivered "
+                     f"({run_stats['delivered']} real, {run_stats['dry_run_would_deliver']} dry-run), "
+                     f"{run_stats['failed_delivery']} failed, "
+                     f"{run_stats['known_pending_suppressed']} known-pending, "
+                     f"{run_stats['retry_backoff']} retry-backoff, "
+                     f"{run_stats['fresh_hold']} fresh-hold, "
+                     f"{run_stats['newly_rejected_removed']} newly rejected, "
+                     f"{run_stats['liveness_not_verified']} liveness-unverified, "
+                     f"{run_stats['media_wait']} media-wait, "
+                     f"{run_stats['partial_gallery']} partial-gallery, "
+                     f"{run_stats['flood_cap_dropped']} flood-cap dropped, "
+                     f"{run_stats['dedup_skipped_in_run']} dedup skipped in run, "
+                     f"{run_stats['other_skipped']} other skipped.")
 
-        # Round 34: per-run flood cap (see MAX_POSTS_PER_RUN) — any future
-        # cache loss causes ONE capped run with a loud log line, not a mass
-        # re-post storm.
-        new_posts = cap_new_posts(new_posts, MAX_POSTS_PER_RUN)
+        # Detailed breakdown at DEBUG
+        if run_stats["known_pending_by_reason"]:
+            logging.info(f"Known-pending by reason (aggregate): {run_stats['known_pending_by_reason']}")
+        if run_stats["retry_backoff_by_reason"]:
+            logging.debug(f"Retry-backoff by reason: {run_stats['retry_backoff_by_reason']}")
+        if run_stats["newly_rejected_by_reason"]:
+            logging.debug(f"Newly rejected by reason: {run_stats['newly_rejected_by_reason']}")
+        if run_stats["liveness_by_reason"]:
+            logging.debug(f"Liveness unverified by reason: {run_stats['liveness_by_reason']}")
+        if run_stats["other_by_reason"]:
+            logging.debug(f"Other skipped by reason: {run_stats['other_by_reason']}")
 
-        # Round 72: defer edits until every card/continuation has been sent.
-        # Multiple proxy videos warm up concurrently; healthy posts never
-        # wait behind a preceding card's repair delay.
-        proxy_video_heal_queue = []
-        for subreddit, path, unique_key, published_ts, activity_ts, entry in new_posts:
-            # Round 34: double dedup (belt and braces) — collect() already
-            # skips keys in the loaded cache, but a key can surface twice in
-            # ONE run's feed (new + mod-queue listings) or via any future
-            # code path; re-check the live set before the expensive pipeline.
-            # TEST POST rebuilds are exempt (re-testing a cached post is
-            # their whole point).
-            if not TEST_POST_ID and unique_key in posted:
-                continue
-            webhook_url = get_webhook_for_subreddit(subreddit)
-            if not webhook_url:
-                logging.error(f"No webhook configured for r/{subreddit}. Skipping {unique_key}.")
-                continue
-
-            reddit_url = f"https://www.reddit.com{path}"
-            _entry_source36 = ("arctic" if isinstance(entry, _ArcticEntry)
-                               else "rss")
-
-            # ---- round 30 (2026-09-19): pending-post recheck throttle ----
-            # A post an earlier run skipped (removed/deleted, still pending
-            # approval, media not filled yet) is re-verified at most once
-            # every PENDING_RECHECK_SECONDS — not every 5-minute run. When it
-            # IS due, the full pipeline below runs unchanged, so a
-            # newly-approved / restored / media-complete post is caught and
-            # posted on its next due run. TEST POST + DRY RUN bypass this
-            # (manual tools must always exercise the full pipeline).
-            if (not TEST_POST_ID and not DRY_RUN
-                    and unique_key in pending
-                    and _pending_throttle_skip(pending, unique_key, now, entry)):
-                _pend = pending[unique_key]
-                if _pend.get("reason") in _NO_RECHECK_REASONS:
-                    logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — "
-                                 f"not re-checking (removed posts re-enter via RSS "
-                                 f"when restored; entry expires at the 48 h window).")
-                else:
-                    _due_in = int(PENDING_RECHECK_SECONDS
-                                  - (now - float(_pend.get("last_checked") or 0)))
-                    logging.info(f"[{unique_key}] pending ({_pend.get('reason')}) — "
-                                 f"skipping recheck, due again in ~{_due_in}s.")
-                continue
-
-            # ---- round 64: stateless 30s fresh hold (section A) ---------
-            # A flat floor computed from the post's OWN creation timestamp —
-            # no first-seen tracking, no pending entry. A candidate still
-            # under the floor simply re-qualifies from the feed next tick.
-            if not TEST_POST_ID and FRESH_HOLD_SECONDS > 0:
-                _post_age = now - float(published_ts or now)
-                if _post_age < FRESH_HOLD_SECONDS:
-                    logging.info(f"[{unique_key}] age {_post_age:.1f}s < "
-                                 f"FRESH_HOLD_SECONDS ({FRESH_HOLD_SECONDS}s) — "
-                                 f"skipped this tick (stateless, not cached), "
-                                 f"re-evaluated next tick.")
-                    continue
-
-            # ---- round 64: pristine listing confirmation (section B) ----
-            # Delivers only when a cache-busted, pristine read of the
-            # subreddit's /new listing proves the post is live right now.
-            # Absent -> skip this tick (never cached); appears -> posts on
-            # the very next tick. A candidate older than the listing's own
-            # span (scrolled past limit=100) cannot be proven OR disproven,
-            # so confirmation is inapplicable and it falls through normally.
-            # An unreadable listing is an OUTAGE, never read as absence —
-            # every new candidate for that subreddit is skipped and retried.
-            if not TEST_POST_ID and LISTING_CONFIRM:
-                _r64_listing = await _fetch_new_listing(session, subreddit)
-                if _r64_listing is None:
-                    logging.info(f"[{unique_key}] pristine /new listing unavailable "
-                                 f"for r/{subreddit} this tick (outage, not absence) "
-                                 f"— skipped (not cached), retried next tick.")
-                    continue
-                _r64_ids, _r64_oldest_age = _r64_listing
-                _r64_candidate_id = (extract_post_id(path) or "").lower()
-                _r64_post_age = now - float(published_ts or now)
-                if _r64_oldest_age is not None and _r64_post_age > _r64_oldest_age:
-                    logging.info(f"[{unique_key}] older than the pristine listing's own "
-                                 f"span — confirmation inapplicable, falling through to "
-                                 f"normal delivery.")
-                elif _r64_candidate_id not in _r64_ids:
-                    logging.info(f"[{unique_key}] not in pristine listing — skipped "
-                                 f"this tick (not cached), re-checked next tick.")
-                    continue
-
-            if (unique_key in pending
-                    and str(pending[unique_key].get("reason") or "") in _NO_RECHECK_REASONS
-                    and not isinstance(entry, _ArcticEntry)):
-                logging.info(f"RESTORED: {unique_key} pending "
-                             f"({pending[unique_key].get('reason')}) reappeared via RSS — "
-                             f"running full pipeline (posts if live).")
-
-            if entry is not None:
-                base = entry_to_base_data(entry)
-                post_json = await fetch_post_json(session, extract_post_id(path) or "",
-                                                  use_oauth=use_oauth)
-            else:
-                # TEST POST mode: no RSS entry (feed bypassed on purpose).
-                # Try the post JSON (FULL MODE); when JSON is unavailable
-                # (native mode), build the base from the RSS feed entry or
-                # the redlib post page (round 12c).
-                post_json = await fetch_post_json(session, extract_post_id(path) or "",
-                                                  use_oauth=use_oauth)
-                if post_json:
-                    st = str(post_json.get("selftext") or "")
-                    base = {
-                        "title": _clean_post_title(post_json.get("title")),
-                        "author": _clean_author_name(post_json.get("author")),
-                        "content_html": st,
-                        "thumb": None,
-                        "body": strip_html(st),
-                        "crosspost_orig_path": normalize_reddit_path(
-                            str(post_json.get("crosspost_post_link") or "")),
-                        "vred_id": extract_vreddit_id(st) or extract_vreddit_id(str(post_json.get("url") or "")),
-                        "redgifs_url": extract_redgifs_url(st),
-                        "youtube_url": extract_youtube_url(st, str(post_json.get("url") or "")),
-                    }
-                else:
-                    base = await fetch_test_post_base(session, path, TEST_POST_ID)
-                    if not base and PROXY_MEDIA and reddit_proxy is not None:
-                        # round 13: build a minimal base from a proxy service
-                        # (title/author/body) so the test post still works
-                        # when no RSS/redlib source has the post — media is
-                        # then resolved from the same service in
-                        # resolve_post_media.
-                        proxy = await fetch_proxy_post_memo(session, path,
-                                                            label=TEST_POST_ID,
-                                                            health=_proxy_health)
-                        if proxy and proxy.get("title"):
-                            base = {
-                                "title": _clean_post_title(proxy["title"]),
-                                "author": _clean_author_name(proxy.get("author")),
-                                "content_html": proxy.get("body") or "",
-                                "thumb": None,
-                                "body": proxy.get("body") or "",
-                                "crosspost_orig_path": find_crosspost_original_path(
-                                    proxy.get("body") or "", path),
-                                # the proxy body can carry the post's video
-                                # link (e.g. a crosspost of a video shows the
-                                # original's v.redd.it URL)
-                                "vred_id": extract_vreddit_id(proxy.get("body") or ""),
-                                "redgifs_url": extract_redgifs_url(proxy.get("body") or ""),
-                                "youtube_url": extract_youtube_url(proxy.get("body") or ""),
-                            }
-                            logging.info(f"[{TEST_POST_ID}] test post base built from "
-                                         f"proxy service {proxy['service']}.")
-                    if not base:
-                        logging.error(f"TEST POST {TEST_POST_ID}: post JSON unavailable "
-                                      f"(native mode), and the post is neither in the "
-                                      f"combined feed (100-entry window), its own RSS "
-                                      f"feed, any redlib instance, nor any proxy "
-                                      f"service (redditez/vxreddit/embeddit) — cannot "
-                                      f"build the test post. Add REDDIT_CLIENT_ID/"
-                                      f"SECRET secrets for reliable testing.")
-                        continue
-
-            # ---- round 18: skip soft-removed / deleted / pending-approval
-            # posts. The archive (round 17) and occasionally the RSS feed
-            # still carries posts the moderators removed or the author
-            # deleted — their pages show a removal notice instead of the
-            # real content. They are NOT posted and NOT added to the dedup
-            # cache: if the post is approved later it surfaces again and
-            # posts normally. Explicit TEST POST rebuilds are unaffected.
-            if not TEST_POST_ID:
-                _r_title = str((post_json or {}).get("title") or base.get("title") or "")
-                _r_body = (strip_html(str((post_json or {}).get("selftext") or ""))
-                           or str(base.get("body") or ""))
-                _removed = removed_post_reason(_r_title, _r_body)
-                if _removed:
-                    mark_pending(pending, unique_key, _removed, now,
-                                 source=_entry_source36, title=_r_title[:200],
-                                 published_ts=published_ts)
-                    logging.info(f"[{unique_key}] post appears removed/deleted/"
-                                 f"awaiting approval ({_removed}) — skipping, not "
-                                 f"cached (will post once approved).")
-                    continue
-
-            # ---- round 20 + round 32: liveness gate for ALL sourced posts ----
-            # The Arctic archive can carry posts that are no longer live on
-            # reddit (removed / deleted / still pending approval) — and,
-            # live-verified 2026-09-20 (post 1wl41aj, "Post is awaiting
-            # moderator approval."): the RSS feed ALSO delivers queued posts
-            # with their REAL content (no banner in the feed text), which the
-            # round-18 text filter cannot see — the post was built + posted
-            # to Discord while still in the mod queue. So the gate now runs
-            # for RSS-sourced posts too, with feed_ok=False (the feed cannot
-            # verify the feed — the redlib post pages are the independent
-            # fallback). Otherwise skip + don't cache: a queued post
-            # re-checks on the short approval interval and posts the moment
-            # a live source can see it.
-            if not TEST_POST_ID and entry is not None:
-                _live, _why = await verify_archive_post_live(
-                    session, path, label=unique_key,
-                    feed_ok=not isinstance(entry, _ArcticEntry))
-                if not _live:
-                    mark_pending(pending, unique_key,
-                                 "pending approval" if "awaiting moderator approval" in _why
-                                 else "removal_notice" if "removal notice" in _why
-                                 else "sources_down" if "all live sources are down" in _why
-                                 else "not_live", now,
-                                 source=_entry_source36,
-                                 title=str(base.get("title") or "")[:200],
-                                 published_ts=published_ts)
-                    logging.info(f"[{unique_key}] post not verified live "
-                                 f"({_why}) — skipping, not cached (will "
-                                 f"post once approved/restored).")
-                    continue
-
+        if DRY_RUN:
+            logging.info("DRY RUN finished: cache NOT saved, Discord NOT touched.")
+            run_stats["persistence_status"] = "skipped_dry_run"
+            run_stats["completed"] = True
+            run_stats["dry_run"] = True
+            run_stats["error"] = None
+            _write_run_result(run_stats, {"dry_run": True, "completed": True, "persistence_status": "skipped_dry_run"})
+        else:
             try:
-                data = await resolve_post_media(session, base, post_json,
-                                                path=path, label=unique_key)
-                # ---- round 23 (2026-09-18): Arctic media-hint gate ------
-                # Arctic fills gallery_data / media_metadata ASYNCHRONOUSLY
-                # after capture, so a brand-new media post can be archived
-                # with its text but not its media for a while. If the record
-                # positively says the post has media (see _arctic_media_hint)
-                # but no source served any this run, never post a media-less
-                # card (1wj38fc: posted once without images, then cached
-                # forever). Skip + don't cache: the next run retries, and
-                # once the media is available (Arctic fields filled, or a
-                # proxy renders the og: tags) the full gallery posts. The
-                # 48h freshness window bounds the retries.
-                if (not TEST_POST_ID and not DRY_RUN and post_json is None
-                        and isinstance(entry, _ArcticEntry)
-                        and not data["media"]
-                        and _arctic_media_hint(getattr(entry, "_arctic_post", None))):
-                    mark_pending(pending, unique_key, "media_wait", now)
-                    logging.info(f"[{unique_key}] archive record says this post "
-                                 f"has media (gallery/media_metadata) but no "
-                                 f"source served any yet (Arctic fills those "
-                                 f"asynchronously) — skipping, not cached "
-                                 f"(retries next run).")
-                    continue
-                # Round 25: known partial archive galleries wait without caching.
-                # Unknown counts cannot gate; video cards intentionally use one tile.
-                if (not TEST_POST_ID and not DRY_RUN and post_json is None
-                        and isinstance(entry, _ArcticEntry)
-                        and data["media"]
-                        and not any(m["kind"] == "video" for m in data["media"])):
-                    _arctic_n = _arctic_media_count(getattr(entry, "_arctic_post", None))
-                    if _arctic_n > len(data["media"]):
-                        mark_pending(pending, unique_key, "partial_gallery", now)
-                        logging.info(f"[{unique_key}] archive record lists "
-                                     f"{_arctic_n} gallery items but the sources "
-                                     f"served only {len(data['media'])} this run — "
-                                     f"skipping, not cached (retries next run).")
-                        continue
-                posted_ts = int(max(published_ts, activity_ts))
-                # Round 66: the body beyond the card budget is continued in
-                # follow-up messages (see build_continuation_payloads).
-                payload, body_rest = build_v3_payload(subreddit, data, reddit_url,
-                                                      posted_ts, return_remainder=True)
-                continuations = build_continuation_payloads(body_rest)
-
-                if DRY_RUN:
-                    kinds = ",".join(sorted({m["kind"] for m in data["media"]})) or "text"
-                    mode = "full" if data["full_mode"] else "native"
-                    logging.info(f"DRY RUN (Discord NOT touched): {unique_key} "
-                                 f"(media={kinds} | {mode} | {len(data['media'])} item(s))")
-                    logging.info(f"DRY RUN payload for {unique_key}:\n"
-                                 f"{json.dumps(payload, indent=2, ensure_ascii=False)}")
-                    if continuations:
-                        logging.info(f"DRY RUN: {unique_key} body continues in "
-                                     f"{len(continuations)} follow-up message(s).")
-                        for _ci, _cont in enumerate(continuations, 1):
-                            logging.info(f"DRY RUN continuation {_ci} for {unique_key}:\n"
-                                         f"{json.dumps(_cont, indent=2, ensure_ascii=False)}")
-                    if data.get("youtube_url") and YOUTUBE_LINK_MESSAGE:
-                        logging.info(f"DRY RUN 2nd message for {unique_key} "
-                                     f"(YouTube link only): {data['youtube_url']}")
-                    continue
-
-                inspect_video_response = _has_video_media(data)
-                target_url = f"{webhook_url}?with_components=true"
-                # Only video cards (or the retraction seatbelt) need the
-                # created message JSON. Ordinary cards still use the old POST.
-                if RETRACT_DEAD_POSTS or inspect_video_response:
-                    target_url += "&wait=true"
-                async with session.post(target_url, json=payload,
-                                        timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status in (200, 204):
-                        message_json = None
-                        if (RETRACT_DEAD_POSTS or inspect_video_response) and resp.status == 200:
-                            try:
-                                message_json = await resp.json(content_type=None)
-                            except Exception:
-                                message_json = None
-                        posted.add(unique_key)
-                        # ROUND 48b: delivery telemetry. Every post logs how
-                        # long it took from Reddit creation to Discord, and —
-                        # when it had been held — what held it and for how
-                        # long. This is the only way to calibrate the gate
-                        # against a subreddit's real approval latency without
-                        # guessing (grep the Actions log for LATENCY).
-                        _pend_entry = pending.pop(unique_key, None)  # posted — no longer pending
-                        if RETRACT_DEAD_POSTS and isinstance(message_json, dict) and message_json.get("id"):
-                            posted_messages[unique_key] = {
-                                "subreddit": subreddit,
-                                "path": path,
-                                "message_id": str(message_json["id"]),
-                                "delivered_at": int(now),
-                                "published_ts": int(published_ts),
-                                "payload": payload,
-                            }
-                        kinds = ",".join(sorted({m["kind"] for m in data["media"]})) or "text"
-                        mode = ("full" if data["full_mode"] else
-                                ("proxy: " + _provider_for_url(data["media"][0].get("url", ""))
-                                 if data["media"] and data["media"][0].get("kind") == "video"
-                                 and _provider_for_url(data["media"][0].get("url", "")) != "thumbnail"
-                                 else "native-dash" if data["media"] and
-                                 _provider_for_url(data["media"][0].get("url", "")) == "native-dash"
-                                 else "native"))
-                        _latency = max(0.0, now - float(published_ts or now))
-                        _held_note = ""
-                        if isinstance(_pend_entry, dict):
-                            _first = float(_pend_entry.get("first_seen") or 0)
-                            _held = max(0.0, now - _first) if _first else 0.0
-                            _held_note = (f" | held {_held / 60:.1f}min as "
-                                          f"'{_pend_entry.get('reason')}'")
-                        logging.info(f"Reddit V3 Posted: {unique_key} (media={kinds} | {mode} | "
-                                     f"{len(data['media'])} item(s)) | LATENCY "
-                                     f"{_latency / 60:.1f}min after creation{_held_note}")
-                        # Round 66: a body that exceeded the card budget
-                        # continues in follow-up messages — same webhook,
-                        # same mechanism/ordering as the YouTube link
-                        # message below. Message IDs are recorded so the
-                        # retraction seatbelt covers EVERY part.
-                        for _ci, _cont in enumerate(continuations, 1):
-                            try:
-                                _cont_url = f"{webhook_url}?with_components=true"
-                                if RETRACT_DEAD_POSTS:
-                                    _cont_url += "&wait=true"
-                                async with session.post(_cont_url, json=_cont,
-                                                        timeout=aiohttp.ClientTimeout(total=15)) as c_resp:
-                                    if c_resp.status in (200, 204):
-                                        if RETRACT_DEAD_POSTS and c_resp.status == 200:
-                                            try:
-                                                _c_json = await c_resp.json(content_type=None)
-                                            except Exception:
-                                                _c_json = None
-                                            if isinstance(_c_json, dict) and _c_json.get("id"):
-                                                _record = posted_messages.get(unique_key)
-                                                if isinstance(_record, dict) and _record.get("message_id"):
-                                                    _ids = _record.setdefault(
-                                                        "message_ids", [_record["message_id"]])
-                                                    if str(_c_json["id"]) not in _ids:
-                                                        _ids.append(str(_c_json["id"]))
-                                        logging.info(f"Body continuation posted for {unique_key} "
-                                                     f"(part { _ci + 1 } of "
-                                                     f"{len(continuations) + 1}).")
-                                    else:
-                                        logging.error(f"Body continuation HTTP {c_resp.status} for "
-                                                      f"{unique_key}: {(await c_resp.text())[:200]}")
-                            except Exception as c_e:
-                                logging.error(f"Body continuation failed for {unique_key}: {c_e}")
-                            await asyncio.sleep(1.0)
-                        await create_discohook_share(session, payload, unique_key)
-                        # round 13: YouTube posts get a SECOND, plain message
-                        # containing ONLY the YouTube link (Discord shows the
-                        # official preview for a bare link). It waits for the
-                        # card above to land first; the card's own YouTube
-                        # thumb + animated button stay as they are.
-                        if data.get("youtube_url") and YOUTUBE_LINK_MESSAGE:
-                            try:
-                                async with session.post(
-                                    webhook_url,
-                                    json={"content": data["youtube_url"]},
-                                    timeout=aiohttp.ClientTimeout(total=15),
-                                ) as yt_resp:
-                                    if yt_resp.status in (200, 204):
-                                        logging.info(f"YouTube link message posted: "
-                                                     f"{data['youtube_url']}")
-                                    else:
-                                        logging.error(f"YouTube link message "
-                                                      f"HTTP {yt_resp.status}: "
-                                                      f"{(await yt_resp.text())[:200]}")
-                            except Exception as yt_e:
-                                logging.error(f"YouTube link message failed: {yt_e}")
-                            await asyncio.sleep(1.0)
-                        # A missing/invalid wait=true response cannot be edited.
-                        # Round 72 + follow-up: only Discord-reported unresolved
-                        # *non-native* video items queue a repair, and only on
-                        # evidence: an explicit non-positive dimension, or a
-                        # Discord proxy_url with incomplete video metadata.
-                        # Sparse metadata without a proxy attempt is unknown,
-                        # not failure — healthy cards stay untouched. The
-                        # queued URLs travel with the entry: the edit below
-                        # revalidates them and may only act on one of them.
-                        unresolved = _unresolved_healable_video_items(message_json, data)
-                        if (unresolved and isinstance(message_json, dict)
-                                and message_json.get("id")):
-                            proxy_video_heal_queue.append(
-                                (webhook_url, str(message_json["id"]), payload,
-                                 unique_key, unresolved))
-                            logging.info(f"[{unique_key}] proxy-video heal queued: Discord "
-                                         f"returned {len(unresolved)} video item(s) with "
-                                         "unresolved-media evidence; the edit is "
-                                         "revalidated before it is sent.")
-                        await asyncio.sleep(1.5)
-                    else:
-                        body = await resp.text()
-                        logging.error(f"Discord error {resp.status} for {unique_key}: {body}")
+                saved = save_posted(posted, frozenset(posted - posted_at_start))
+                _verify_dedup_save(posted_at_start, posted, saved)
+                save_pending(pending)
+                save_posted_messages(posted_messages)
+                if posted == posted_at_start:
+                    run_stats["persistence_status"] = "unchanged"
+                else:
+                    run_stats["persistence_status"] = "saved"
+                run_stats["completed"] = True
+                run_stats["error"] = None
+                run_stats["dry_run"] = False
+                logging.info("Reddit V3 Monitor execution finished.")
+                _write_run_result(run_stats, {"dry_run": False, "completed": True, "persistence_status": run_stats["persistence_status"], "saved": bool(saved)})
             except Exception as e:
-                logging.error(f"Failed building/posting {unique_key}: {e}")
-
-        if proxy_video_heal_queue and not DRY_RUN:
-            logging.info(f"MEDIA-HEAL: {len(proxy_video_heal_queue)} unresolved Reddit "
-                         "video card(s) queued; revalidating them concurrently after "
-                         "delivery and editing only the still-unresolved ones.")
-            await asyncio.gather(*(
-                heal_proxy_video_message(session, url, mid, payload, label, urls)
-                for url, mid, payload, label, urls in proxy_video_heal_queue),
-                return_exceptions=True)
-
-        if RETRACT_DEAD_POSTS and not DRY_RUN:
-            await retract_dead_posts(session, posted_messages, now)
-
-    log_redlib_reachability()   # round 49: which mirrors actually answered
-
-    if DRY_RUN:
-        logging.info("DRY RUN finished: cache NOT saved, Discord NOT touched.")
-    else:
-        saved = save_posted(posted, frozenset(posted - posted_at_start))
-        _verify_dedup_save(posted_at_start, posted, saved)
-        save_pending(pending)
-        save_posted_messages(posted_messages)
-        logging.info("Reddit V3 Monitor execution finished.")
+                run_stats["persistence_status"] = "failed"
+                run_stats["completed"] = False
+                run_stats["error"] = f"{type(e).__name__}:{_sanitize_error_message(e)}"
+                logging.error(f"Persistence failed: {_sanitize_error_message(e)}")
+                _write_run_result(run_stats, {"dry_run": False, "completed": False, "persistence_status": "failed", "error": run_stats["error"]})
+                raise
 
 
+
+    except Exception as e:
+        # Preserve observed counters and mark incomplete; sanitize error before emission
+        sanitized = _sanitize_error_message(e)
+        run_stats["completed"] = False
+        # Determine if persistence was already attempted
+        if run_stats.get("persistence_status") == "not-reached":
+            # Heuristic: if exception appears to be persistence-related, mark failed, else keep not-reached
+            msg_lower = sanitized.lower()
+            if "persistence_failed" in sanitized.lower() or "save" in type(e).__name__.lower() or "cache" in msg_lower:
+                run_stats["persistence_status"] = "failed"
+            # else leave as not-reached (failure before persistence)
+        # Preserve first error if already set (e.g. persistence failure), else set sanitized
+        if not run_stats.get("error"):
+            run_stats["error"] = f"{type(e).__name__}:{sanitized}"
+        try:
+            logging.error(f"Run failed ({type(e).__name__}): {sanitized}")
+        except Exception:
+            pass
+        try:
+            _write_run_result(run_stats, {"completed": False, "error": run_stats["error"], "persistence_status": run_stats["persistence_status"]})
+        except Exception:
+            pass
+        raise
+    finally:
+        # Ensure a result file exists even if earlier writes failed; never overwrite a successful completion
+        try:
+            p = pathlib.Path(_RUN_RESULT_FILE)
+            needs_write = False
+            if not p.exists():
+                needs_write = True
+            else:
+                try:
+                    d = json.loads(p.read_text(encoding="utf-8"))
+                    # If file already has completed True, don't overwrite with incomplete
+                    if isinstance(d, dict) and d.get("completed") is True and run_stats.get("completed") is True:
+                        needs_write = False
+                    elif isinstance(d, dict) and d.get("completed") is True and not run_stats.get("completed"):
+                        # Existing success should not be overwritten by finally's incomplete
+                        needs_write = False
+                    elif not run_stats.get("completed") and not p.exists():
+                        needs_write = True
+                    elif not run_stats.get("completed") and isinstance(d, dict) and not d.get("completed"):
+                        # Already incomplete, no need to rewrite unless missing error
+                        needs_write = False
+                    else:
+                        # No file or incomplete without prior success
+                        if not isinstance(d, dict) or not d.get("completed"):
+                            needs_write = not p.exists()
+                except Exception:
+                    needs_write = not p.exists()
+            if needs_write and not run_stats.get("completed"):
+                # Only write incomplete marker if no file exists and we're incomplete
+                _write_run_result(run_stats, {"completed": False, "persistence_status": run_stats.get("persistence_status", "not-reached")})
+        except Exception:
+            pass
 if __name__ == "__main__":
     asyncio.run(main())

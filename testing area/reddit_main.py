@@ -47,6 +47,7 @@ import asyncio
 import logging
 import aiohttp
 import feedparser
+from urllib.parse import parse_qsl, urlencode, urlsplit
 from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -72,6 +73,39 @@ DEFAULT_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 # value from any feed link (the token itself, without "?feed=").
 # Store it as the REDDIT_FEED_TOKEN secret.
 REDDIT_FEED_TOKEN = os.getenv("REDDIT_FEED_TOKEN", "").strip()
+
+
+def format_reddit_feed_query(raw_token: str) -> str:
+    """Normalize `REDDIT_FEED_TOKEN` into an encoded `feed=...` (+ optional `&user=...`) query.
+
+    Accepts any form copied from `old.reddit.com/prefs/feeds/`:
+      * `https://old.reddit.com/.rss?feed=<40-hex>&user=<username>` (full link,
+        also `https://www.reddit.com/.rss?feed=…`, `https://reddit.com/.rss?feed=…`,
+        `https://old.reddit.com/?feed=…` — host/path-agnostic, query-only)
+      * `?feed=<40-hex>&user=<username>` or `feed=<40-hex>&user=<username>`
+      * `<40-hex>&user=<username>`
+      * `<40-hex>`
+    """
+    tok = (raw_token or "").strip()
+    if not tok:
+        return ""
+    if tok.lower().startswith(("http://", "https://")):
+        q = urlsplit(tok).query
+    elif tok.startswith("?"):
+        q = tok[1:]
+    elif tok.lower().startswith("feed="):
+        q = tok
+    else:
+        q = f"feed={tok}"
+    pairs = [(k, v) for k, v in parse_qsl(q, keep_blank_values=False) if k.lower() in ("feed", "user")]
+    if not pairs or not any(k.lower() == "feed" for k, _ in pairs):
+        return ""
+    return urlencode(pairs)
+
+
+def _redact_url_queries(msg: object) -> str:
+    return re.sub(r"\?[^\s)'\"]+", "", str(msg))
+
 
 CACHE_FILE = "posted_reddit.json"
 MAX_CACHE_SIZE = 500
@@ -262,15 +296,16 @@ async def _fetch_feed(session: aiohttp.ClientSession, feed_url: str, label: str)
                     return None
                 return feed
         except Exception as e:
-            logging.info(f"[{label}] error: {e}")
+            logging.info(f"[{label}] error: {_redact_url_queries(e)}")
             return None
 
 
 def _combined_feed_url() -> str:
     """ONE feed for all tracked subreddits: /r/a+b+c/new.rss?limit=100 (+ token)."""
     url = "https://www.reddit.com/r/" + "+".join(SUBREDDITS) + f"/new.rss?limit={COMBINED_FEED_LIMIT}"
-    if REDDIT_FEED_TOKEN:
-        url += f"&feed={REDDIT_FEED_TOKEN}"
+    feed_q = format_reddit_feed_query(REDDIT_FEED_TOKEN)
+    if feed_q:
+        url += f"&{feed_q}"
     return url
 
 
@@ -293,8 +328,9 @@ async def fetch_working_reddit_feed(session: aiohttp.ClientSession, subreddit: s
     for instance in REDDIT_RSS_INSTANCES:
         feed_url = f"{instance}/r/{subreddit}/new/.rss"
         # The personal feed token only applies to Reddit's own hosts.
-        if REDDIT_FEED_TOKEN and "reddit.com" in instance:
-            feed_url += f"?feed={REDDIT_FEED_TOKEN}"
+        feed_q = format_reddit_feed_query(REDDIT_FEED_TOKEN)
+        if feed_q and "reddit.com" in instance:
+            feed_url += f"?{feed_q}"
         feed = await _fetch_feed(session, feed_url, instance)
         if feed:
             logging.info(f"Successfully fetched r/{subreddit} from {instance}")

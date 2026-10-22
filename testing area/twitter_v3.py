@@ -203,6 +203,22 @@ RSS_INSTANCES = [
     # the hot path (d420 93%, IPv4, RSS OK). The chain's head is now entirely
     # runner-proven for the first time.
     "https://nitter.miningtcup.me",
+    # Round 77 (2026-10-22): Teapawt operator expansion — the 4cuck/teapawt repo's
+    # README (up to commit de02b80, Oct 22 01:29 UTC) now lists five public
+    # instances on the same operator stack (status.d420.net, 100% healthy,
+    # RSS true, All connectivity, 2026-10-22 01:29 UTC): nitter.cf, xitter.cf,
+    # teapaw.org, teapawt.net, teapawt.org. nitter.cf/xitter.cf stay seats 1-2
+    # untouched per operator approval. The three new Teapawt hosts share the same
+    # codebase (teapawt 0.19.0), same SOCKS5 exit pool and same runner outcome:
+    # fetch_page-verified RSS on /nasa/rss returns the same top id as the
+    # controls (2112959650551173522, Oct 21 17:30 UTC) with 100% healthy / All.
+    # No Reddit frontend exists in the Teapawt codebase (Twitter/X only —
+    # verified via README + src/config), so REDDIT_RSS_INSTANCES unchanged.
+    # Placed here as the next runner-proven, operator-approved spares — seats 5-7
+    # only answer after the proven head fails, exactly as the existing trials.
+    "https://teapaw.org",
+    "https://teapawt.net",
+    "https://teapawt.org",
     # Round 76 (2026-10-15): up from 6. The only host in the fleet with FULL
     # union coverage: all five News-Express accounts body-verified 2026-10-14,
     # plus all three Game-Express-exclusive handles probed this round
@@ -211,7 +227,7 @@ RSS_INSTANCES = [
     # refusals on record anywhere, from any vantage. Not on d420, zero runner
     # evidence: TRIAL — seats 5+ only ever answer when the runner-proven head
     # above has failed, which is exactly when a verified independent spare
-    # matters.
+    # matters. Round 77: TRIAL seats 8+ (three Teapawt spares inserted above).
     "https://nitter.freedit.eu",
     # Round 76 (2026-10-15): up from 9. 5/8 union coverage: honkaistarrail,
     # ZZZ_EN, TYPEII_EN, PomPom_HonkaiSR and Ananta_EN serve current with
@@ -257,6 +273,15 @@ RSS_INSTANCES = [
     # on it. Demoted, not deleted; moves back up the day it answers the
     # runners.
     "https://xcopy.uk",
+    # Round 77 (2026-10-22): Nitter host from Codeberg shitter wiki (revision
+    # history https://codeberg.org/shitter/shitter/wiki/Instances?action=_revision,
+    # live list https://codeberg.org/shitter/shitter/wiki/Instances). Working
+    # instances table lists https://nitter.mie.foundation/ as Working (not Tor,
+    # not Redirector, not Rate-limited, not Formerly-taken-down). fetch_page
+    # verified RSS on /nasa/rss returns the same top id as controls
+    # (2112959650551173522) with current through Oct 21. Placed above walled
+    # tail but below measured runner refusals — next trial per evidence.
+    "https://nitter.mie.foundation",
     # Round 59: demoted, not deleted; these serve challenge walls (2026-10-14 probes:
     # netbub fronts a go-away anti-scrape challenge, jaydenha a click-to-enter
     # interstitial; d420 shows jaydenha flapping, 6 blips on the day, on an outdated
