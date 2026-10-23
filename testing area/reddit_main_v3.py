@@ -2009,6 +2009,51 @@ def _clean_post_title(value) -> str:
     return re.sub(r"\s+", " ", title)[:400]
 
 
+# Round 80 (2026-10-23): trailing emoji outside markdown link for Discord forward fidelity.
+# Discord Components V2 `### [title](url)` is strict markdown — an emoji inside the
+# bracket like `[…😂](url)` can render in-channel but breaks on Forward (raw
+# `([url] *by` leak seen on AnantaLeaks_1xd1tks "You'll never guess…😂"). Emojis are
+# presentation only, not source/HTML/JSON — move a trailing emoji block outside the link
+# (`### [clean](url) 😂`) for all future posts, no perf loss, no source fetch change.
+import unicodedata as _ud80
+
+
+def _is_emoji_char80(ch: str) -> bool:
+    if ch in ("\u200d", "\ufe0f", "\ufe0e", "\u20e3", "\U000e0020"):
+        return True
+    o = ord(ch)
+    if 0x1F3FB <= o <= 0x1F3FF:  # skin tones
+        return True
+    if 0x1F1E6 <= o <= 0x1F1FF:  # flags
+        return True
+    try:
+        cat = _ud80.category(ch)
+    except Exception:
+        cat = ""
+    # So = Symbol other (most emoji), Sk = modifier, plus Cf for ZWJ sequences already handled
+    return cat in ("So", "Sk")
+
+
+def _split_trailing_emoji80(title: str) -> tuple[str, str]:
+    """Return (clean_title, emoji_suffix) with trailing emoji block outside link."""
+    s = str(title or "")
+    if not s:
+        return s, ""
+    # collect trailing emoji chars
+    emo = ""
+    i = len(s) - 1
+    while i >= 0 and _is_emoji_char80(s[i]):
+        emo = s[i] + emo
+        i -= 1
+    if not emo:
+        return s, ""
+    clean = s[: i + 1].rstrip()
+    # don't leave empty link text like "😂" alone
+    if not clean:
+        return s, ""
+    return clean, emo
+
+
 # ---------------------------------------------------------------------------
 # ■ ROUND 18 (2026-09-17): SOFT-REMOVED / DELETED POST DETECTION
 # The Arctic Shift archive (round 17) — and occasionally the RSS feed —
@@ -5151,7 +5196,12 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
     as (payload, rest) so the posting loop can deliver it as follow-up
     continuation messages (build_continuation_payloads).
     """
-    header = f"### [{_clean_post_title(data['title'])}]({reddit_url})\n*by {_clean_author_name(data['author'])} in r/{subreddit}*"
+    _raw_title80 = _clean_post_title(data["title"])
+    _clean80, _emo80 = _split_trailing_emoji80(_raw_title80)
+    if _emo80:
+        header = f"### [{_clean80}]({reddit_url}) {_emo80}\n*by {_clean_author_name(data['author'])} in r/{subreddit}*"
+    else:
+        header = f"### [{_raw_title80}]({reddit_url})\n*by {_clean_author_name(data['author'])} in r/{subreddit}*"
     if data["crosspost"]:
         _cp = data["crosspost"]
         _cp_url = _cp.get("url") or ""
