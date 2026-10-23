@@ -192,8 +192,8 @@ v3._fetch_feed = _fetch_feed_fake
 asyncio.run(v3._fetch_post_rss(None, "/r/AnantaLeaks/comments/1wgq3cy/"))
 v3._fetch_feed = orig_fetch_feed
 check("post-rss: url = instance + permalink + .rss",
-      bool(captured) and captured[0].startswith(
-          "https://www.reddit.com/r/AnantaLeaks/comments/1wgq3cy/.rss"), str(captured[:1]))
+      bool(captured) and captured[0] == f"{v3.REDDIT_RSS_INSTANCES[0]}/r/AnantaLeaks/comments/1wgq3cy/.rss",
+      str(captured[:1]))
 check("post-rss: falls through every instance when all fail",
       len(captured) == len(v3.REDDIT_RSS_INSTANCES), str(len(captured)))
 
@@ -2395,8 +2395,9 @@ _r78_reddit_expected = [
     "https://safereddit.com",
     "https://redlib.nadeko.net",
 ]
-check("r78 source fleet: Reddit V3 has the reviewed exact 19-member order",
-      _literal_list_constant("testing area/reddit_main_v3.py", "REDDIT_RSS_INSTANCES") == _r78_reddit_expected)
+# r78 preserved as historical record (19-member) — superseded by r82 23-member
+check("r78 source fleet: Reddit V3 historical 19-member order (preserved)",
+      True)
 # Preserve r75 9-member set as historical (for audit, not current fleet)
 check("r75: Reddit RSS mirror membership unchanged (historical 9-member, preserved)", True)
 _r75_reddit_expected = {
@@ -2410,30 +2411,98 @@ _r75_reddit_fleet = _literal_list_constant(
     "testing area/reddit_main_v3.py", "REDDIT_RSS_INSTANCES")
 # r75 membership check superseded by r78 — kept as non-enforced record
 check("r75: Reddit RSS mirror membership historical record", True)
-def test_r78_reddit_dual_plus_listing_reserves():
-    """r78 (2026-10-22): Game-Express audit verified 7 dual +5 listing. News-Express adopts blueprint: primary www/old, miningtcup token, catsarch+privacyredirect existing dual, 6 new dual (snoo, tiekoetter, nohost, 1-privadency, 2-privadency, idevicehacked), then 5 listing reserves (artemislena existing + rl.awy, kylrth, freedit, utilibre) + 3 timeout-but-still-works tail (privadency.com, safereddit, nadeko) per production #9283 REDLIB-REACH 4/9. Traps never added; kareem excluded. 19 total."""
+# r82 (2026-10-23): Game-Express PR #63 — 23-member fleet (19 kept + 4 new: mint, jeremyh, jeikobu, vanillax), privacyredirect demoted to Tier 3
+_r82_reddit_expected = [
+    "https://redlib.mint.lgbt",
+    "https://reddit.idevicehacked.com",
+    "https://redlib.catsarch.com",
+    "https://snoo.habedieeh.re",
+    "https://redlib.miningtcup.me",
+    "https://redlib.tiekoetter.com",
+    "https://redlib.nohost.network",
+    "https://redlib-1.privadency.com",
+    "https://redlib-2.privadency.com",
+    "https://reddit.jeremyh.xyz",
+    "https://redlib.jeikobu.net",
+    "https://redlib.vanillax.me",
+    "https://red.artemislena.eu",
+    "https://rl.awy.one",
+    "https://redlib.kylrth.com",
+    "https://redlib.freedit.eu",
+    "https://redlib.utilibre.org",
+    "https://www.reddit.com",
+    "https://old.reddit.com",
+    "https://redlib.privacyredirect.com",
+    "https://redlib.privadency.com",
+    "https://safereddit.com",
+    "https://redlib.nadeko.net",
+]
+check("r82 source fleet: Reddit V3 has the reviewed exact 23-member 3-tier order (Game-Express PR #63 + keep nohost/kylrth)",
+      _literal_list_constant("testing area/reddit_main_v3.py", "REDDIT_RSS_INSTANCES") == _r82_reddit_expected)
+
+def test_r82_reddit_tiered_fleet_no_deletion():
+    """r82 (2026-10-23): Game-Express PR #63 — 19 kept + 4 new (mint, jeremyh, jeikobu, vanillax), 0 deletions (keep nohost/kylrth which Game excludes), privacyredirect Tier 1 -> Tier 3 demotion, 3-tier ranking. 23 total."""
     RSS = v3.REDDIT_RSS_INSTANCES
-    assert RSS[0] == "https://www.reddit.com"
-    assert RSS[1] == "https://old.reddit.com"
-    assert RSS[2] == "https://redlib.miningtcup.me"
-    assert RSS[3] == "https://redlib.catsarch.com"          # existing healthy dual #1
-    assert RSS[4] == "https://redlib.privacyredirect.com"    # existing healthy dual #2
-    assert RSS[5] == "https://snoo.habedieeh.re"             # NEW dual #592 + CMAF
-    assert RSS[6] == "https://redlib.tiekoetter.com"         # NEW dual DE
-    assert RSS[7] == "https://redlib.nohost.network"         # NEW dual YunoHost CMAF
-    assert RSS[8] == "https://redlib-1.privadency.com"       # NEW dual backend #1
-    assert RSS[9] == "https://redlib-2.privadency.com"       # NEW dual backend #2
-    assert RSS[10] == "https://reddit.idevicehacked.com"     # NEW dual US gallery inline
-    assert RSS[11] == "https://red.artemislena.eu"           # existing /new pass (pre-#592)
-    assert RSS[12] == "https://rl.awy.one"                   # NEW /new pass CF
-    assert RSS[13] == "https://redlib.kylrth.com"            # NEW /new pass CF
-    assert RSS[14] == "https://redlib.freedit.eu"            # NEW /new pass DE
-    assert RSS[15] == "https://redlib.utilibre.org"           # NEW /new pass FR
-    assert RSS[16] == "https://redlib.privadency.com"       # Restored tail — #9283 1/1 timeout but still works
-    assert RSS[17] == "https://safereddit.com"              # Restored tail — #9283 1/1
-    assert RSS[18] == "https://redlib.nadeko.net"            # Restored tail — timeout but partial (0/1 in #9283 but GoAway retry)
-    assert len(RSS) == len(set(RSS)) == 19
+    assert len(RSS) == len(set(RSS)) == 23
+    # Tier 1 — 9 hosts dual-path + miningtcup token
+    assert RSS[0] == "https://redlib.mint.lgbt"             # NEW #0 mint.lgbt 0.36.0 Shreddit
+    assert RSS[1] == "https://reddit.idevicehacked.com"     # NEW #1 idevicehacked 0.40.0 (promoted from #10)
+    assert RSS[2] == "https://redlib.catsarch.com"
+    assert RSS[3] == "https://snoo.habedieeh.re"
+    assert RSS[4] == "https://redlib.miningtcup.me"
+    assert RSS[5] == "https://redlib.tiekoetter.com"
+    assert RSS[6] == "https://redlib.nohost.network"         # kept (Game excludes, News keeps)
+    assert RSS[7] == "https://redlib-1.privadency.com"
+    assert RSS[8] == "https://redlib-2.privadency.com"
+    # Tier 2 — 8 hosts listing-only
+    assert RSS[9] == "https://reddit.jeremyh.xyz"            # NEW listing-only
+    assert RSS[10] == "https://redlib.jeikobu.net"           # NEW
+    assert RSS[11] == "https://redlib.vanillax.me"           # NEW mitchross v2.3.6
+    assert RSS[12] == "https://red.artemislena.eu"
+    assert RSS[13] == "https://rl.awy.one"
+    assert RSS[14] == "https://redlib.kylrth.com"            # kept (Game excludes)
+    assert RSS[15] == "https://redlib.freedit.eu"
+    assert RSS[16] == "https://redlib.utilibre.org"
+    # Tier 3 — 6 hosts token/legacy tail
+    assert RSS[17] == "https://www.reddit.com"
+    assert RSS[18] == "https://old.reddit.com"
+    assert RSS[19] == "https://redlib.privacyredirect.com"   # demoted Tier 1 #4 -> Tier 3 #19
+    assert RSS[20] == "https://redlib.privadency.com"
+    assert RSS[21] == "https://safereddit.com"
+    assert RSS[22] == "https://redlib.nadeko.net"
+    # 0 deletions — all 19 original hosts still present
+    _r78_all = [
+        "https://www.reddit.com", "https://old.reddit.com", "https://redlib.miningtcup.me",
+        "https://redlib.catsarch.com", "https://redlib.privacyredirect.com", "https://snoo.habedieeh.re",
+        "https://redlib.tiekoetter.com", "https://redlib.nohost.network", "https://redlib-1.privadency.com",
+        "https://redlib-2.privadency.com", "https://reddit.idevicehacked.com", "https://red.artemislena.eu",
+        "https://rl.awy.one", "https://redlib.kylrth.com", "https://redlib.freedit.eu",
+        "https://redlib.utilibre.org", "https://redlib.privadency.com", "https://safereddit.com", "https://redlib.nadeko.net",
+    ]
+    for h in _r78_all:
+        assert h in RSS, f"deleted host {h} — must keep all 19"
     # traps never added
+    assert "https://redlib.kareem.one" not in RSS
+    assert "https://rl.blitzw.in" not in RSS
+    assert "https://red.arancia.click" not in RSS
+    assert "https://redlib.jaydenha.uk" not in RSS
+    assert "https://l.opnxng.com" not in RSS
+
+def test_r78_reddit_dual_plus_listing_reserves():
+    """r78 (2026-10-22): Game-Express audit verified 7 dual +5 listing. News-Express adopts blueprint: primary www/old, miningtcup token, catsarch+privacyredirect existing dual, 6 new dual (snoo, tiekoetter, nohost, 1-privadency, 2-privadency, idevicehacked), then 5 listing reserves (artemislena existing + rl.awy, kylrth, freedit, utilibre) + 3 timeout-but-still-works tail (privadency.com, safereddit, nadeko) per production #9283 REDLIB-REACH 4/9. Traps never added; kareem excluded. 19 total — now historical (preserved for audit, superseded by r82 23-member)."""
+    RSS = v3.REDDIT_RSS_INSTANCES
+    # Historical: verify r78 fleet is subset of current 23 (no deletion)
+    _r78 = [
+        "https://www.reddit.com", "https://old.reddit.com", "https://redlib.miningtcup.me",
+        "https://redlib.catsarch.com", "https://redlib.privacyredirect.com", "https://snoo.habedieeh.re",
+        "https://redlib.tiekoetter.com", "https://redlib.nohost.network", "https://redlib-1.privadency.com",
+        "https://redlib-2.privadency.com", "https://reddit.idevicehacked.com", "https://red.artemislena.eu",
+        "https://rl.awy.one", "https://redlib.kylrth.com", "https://redlib.freedit.eu",
+        "https://redlib.utilibre.org", "https://redlib.privadency.com", "https://safereddit.com", "https://redlib.nadeko.net",
+    ]
+    for h in _r78:
+        assert h in RSS
+    # traps never added (still holds on 23-member)
     assert "https://redlib.kareem.one" not in RSS
     assert "https://rl.blitzw.in" not in RSS
     assert "https://red.arancia.click" not in RSS
