@@ -840,34 +840,42 @@ async def _fetch_new_listing(session, subreddit):
 # News-Express: 0 deletions (keep redlib.nohost.network + redlib.kylrth.com
 # which Game-Express excludes), arrange into 3-tier ranking (Tier 1 dual-path
 # + Tier 2 listing-only + Tier 3 token/legacy tail). 19 -> 23 entries.
+# Round 83b (2026-10-23 17:00 UTC): restore pre-#76 arrangement for media:
+# PR #76 moved www/old/miningtcup from front to Tier3 and mint.lgbt to #0,
+# breaking gallery enrichment (REDLIB-REACH 11/23 but catsarch/snoo/miningtcup/
+# nohost/idevicehacked 0/1 → redlib gallery enrichment failed (all instances)
+# → every post archived counts, no photo/video, observed #9560 #9561 #9563
+# HonkaiStarRail_leaks 1xd8ofn/1xd8vra + ZZZ 1xd8ppc). Keep original 19 order
+# intact, append new hosts at tail so they don't affect prior priority.
 REDDIT_RSS_INSTANCES = [
-    # Tier 1 — Active healthy dual-path + token-gated (9 hosts: 200 OK on
-    # /r/<sub>/new, /user/<acct> AND /r/<sub>/comments/<id>/, zero challenge):
-    "https://redlib.mint.lgbt",            # NEW #0 — Redlib 0.36.0 0baefabf Shreddit build, deployed 2026-10-21, inline CMAF/1080.mp4
-    "https://reddit.idevicehacked.com",    # NEW #1 — Redlib 0.40.0 848f3013, inline full gallery on /new, deployed 2026-10-23
-    "https://redlib.catsarch.com",         # Existing healthy dual #1
-    "https://snoo.habedieeh.re",           # NEW dual — up-to-date #592, inline CMAF MP4 (v3.0.0)
-    "https://redlib.miningtcup.me",        # Private token-gated (NITTER_RSS_TOKEN)
-    "https://redlib.tiekoetter.com",       # NEW dual — DE dedicated, fast
-    "https://redlib.nohost.network",       # Existing dual — inline CMAF + full comments (kept, not deleted)
-    "https://redlib-1.privadency.com",     # NEW dual — direct backend bypassing 2s splash
-    "https://redlib-2.privadency.com",     # NEW dual — direct backend #2
-    # Tier 2 — Verified /new + /user/ listing-only (8 hosts: pre-#592/#599 on /comments/, recover after v3.0.0):
-    "https://reddit.jeremyh.xyz",          # NEW — Redlib 0.31.0 redlib-instances#118, US direct /new + /user/ 200 OK
-    "https://redlib.jeikobu.net",          # NEW — Redlib 0.36.0 fca8b45c /new + /user/ 200 OK
-    "https://redlib.vanillax.me",          # NEW — mitchross/redlib v2.3.6 abd6ba24 /new + /user/ 200 OK
-    "https://red.artemislena.eu",          # Existing /new pass (pre-#592)
-    "https://rl.awy.one",                  # NEW /new pass — zero challenge
-    "https://redlib.kylrth.com",           # Existing /new pass — CF, 301 from libreddit.kylrth.com (kept, not deleted)
-    "https://redlib.freedit.eu",           # NEW /new pass — DE direct
-    "https://redlib.utilibre.org",         # NEW /new pass — FR collective
-    # Tier 3 — Token-promoted official origins + demoted/legacy tail (6 hosts, 0 hits while Tier 1 answers):
-    "https://www.reddit.com",              # Promoted to head when REDDIT_FEED_TOKEN is set (403 unauth on Actions IPs)
-    "https://old.reddit.com",              # Official RSS fallback origin
-    "https://redlib.privacyredirect.com",  # Demoted (2026-10-23): 403 error page on /new & /comments/ — 1 wasted req eliminated
-    "https://redlib.privadency.com",       # Restored tail — privadency.com root 1/1 in #9283
-    "https://safereddit.com",              # Restored tail — safereddit 1/1 in #9283 (rate-limit transient)
-    "https://redlib.nadeko.net",           # Restored tail — nadeko GoAway timeout but partial works on retry
+    # Restored R78 19-member order exactly (pre-#76) + 4 new appended at tail
+    # so new hosts never affect prior 19 priority. Fixes #9560/#9563 archived
+    # counts (mint.lgbt head + www/old Tier3 demotion caused catsarch/snoo/
+    # miningtcup 0/1 → gallery enrichment failed (all instances) → text|native|0).
+    "https://www.reddit.com",              # [0] Primary w/ REDDIT_FEED_TOKEN
+    "https://old.reddit.com",              # [1] Auth alt origin (same token)
+    "https://redlib.miningtcup.me",        # [2] Private token-gated
+    "https://redlib.catsarch.com",         # [3] Existing healthy dual #1
+    "https://redlib.privacyredirect.com",  # [4] Restored R78 pos — 403 \"20 commits old\" but kept for order; tail appended hosts provide cover
+    "https://snoo.habedieeh.re",           # [5] Up-to-date #592, inline CMAF MP4 (v3.0.0)
+    "https://redlib.tiekoetter.com",       # [6] DE dedicated, fast
+    "https://redlib.nohost.network",       # [7] Existing dual — inline CMAF + full comments (kept)
+    "https://redlib-1.privadency.com",     # [8] Direct backend bypassing 2s splash
+    "https://redlib-2.privadency.com",     # [9] Direct backend #2
+    "https://reddit.idevicehacked.com",    # [10] Existing dual — US, inline gallery on /new (preserved pos)
+    "https://red.artemislena.eu",          # [11] Existing /new pass (pre-#592)
+    "https://rl.awy.one",                  # [12] NEW /new pass — zero challenge
+    "https://redlib.kylrth.com",           # [13] NEW /new pass — CF, 301 from libreddit.kylrth.com (kept)
+    "https://redlib.freedit.eu",           # [14] NEW /new pass — DE direct
+    "https://redlib.utilibre.org",         # [15] NEW /new pass — FR collective
+    "https://redlib.privadency.com",       # [16] Restored tail — privadency.com root 1/1 in #9283
+    "https://safereddit.com",              # [17] Restored tail — safereddit 1/1 in #9283 (rate-limit transient)
+    "https://redlib.nadeko.net",           # [18] Restored tail — nadeko GoAway timeout but partial works on retry
+    # Appended new (4) at tail — do not affect prior 19 priority
+    "https://redlib.mint.lgbt",            # [19] NEW — Redlib 0.36.0 0baefabf Shreddit (appended, not front)
+    "https://reddit.jeremyh.xyz",          # [20] NEW — Redlib 0.31.0 redlib-instances#118 (appended)
+    "https://redlib.jeikobu.net",          # [21] NEW — Redlib 0.36.0 fca8b45c (appended)
+    "https://redlib.vanillax.me",          # [22] NEW — mitchross/redlib v2.3.6 abd6ba24 (appended)
 ]
 
 RATE_LIMIT_RETRY_DELAY_1 = 6
@@ -2115,6 +2123,9 @@ def _arctic_media_hint(post) -> bool:
     post can carry its text here without its media — the hint is
     what makes that detectable (1wj38fc posted media-less because
     none of that was visible at the time).
+    Round 83c: AutoModerator-held gallery posts (1xd8ppc/1xd8vra/1xd9pre)
+    have is_gallery=None, gallery_data=None, post_hint="link", url=
+    "https://www.reddit.com/gallery/<id>" — must also check gallery URL.
     """
     if not isinstance(post, dict):
         return False
@@ -2128,7 +2139,8 @@ def _arctic_media_hint(post) -> bool:
     for key in ("url", "url_overridden_by_dest"):
         u = post.get(key) or ""
         if re.match(r"https?://(?:i|preview|external-preview)\.redd\.it/", u) \
-                or "v.redd.it/" in u:
+                or "v.redd.it/" in u \
+                or "reddit.com/gallery/" in u.lower():
             return True
     return False
 
@@ -4107,7 +4119,7 @@ def extract_native_media(content_html: str | None) -> list[dict]:
         return []
     best: dict[str, tuple[int, int, str, str]] = {}
     for order, m in enumerate(REDDIT_MEDIA_URL_RE.finditer(content_html)):
-        url = m.group(0).rstrip(".,;")
+        url = html_lib.unescape(m.group(0)).rstrip(".,;")
         host = url.split("/")[2].lower()
         key = _reddit_media_key(url)
         ext = key.rsplit(".", 1)[-1]
@@ -4198,11 +4210,30 @@ def op_comment_text(op: dict) -> str:
 REDDIL_POST_TITLE_RE = re.compile(r"<h1[^>]*post_title[^>]*>", re.I)
 
 
+def _unwrap_redlib_media_urls(text: str) -> str:
+    """Unwrap Redlib-proxied /img/ and /preview/(pre|external-pre)/ URLs
+    (relative or full host) to canonical redd.it URLs."""
+    text = re.sub(r'''(?:https?://[^/"'<>\s]+)?/img/([^?#"'<>\s]+)''', r'https://i.redd.it/\1', text)
+    text = re.sub(
+        r'''(?:https?://[^/"'<>\s]+)?/preview/external-pre/([^?#"'<>\s]+)(\?[^"'<>\s]*)?''',
+        lambda m: f"https://external-preview.redd.it/{m.group(1)}{m.group(2) or ''}",
+        text,
+    )
+    text = re.sub(
+        r'''(?:https?://[^/"'<>\s]+)?/preview/pre/([^?#"'<>\s]+)(\?[^"'<>\s]*)?''',
+        lambda m: f"https://preview.redd.it/{m.group(1)}{m.group(2) or ''}",
+        text,
+    )
+    return text
+
+
 def _redlib_post_area(page_html: str) -> str:
     """HTML slice of the POST AREA (post title -> first comment) so sidebar,
     related posts and comment thumbnails can't leak into the harvest.
     Prefers the post_content element when the theme has one; the cut at the
-    first comment is made on the tag boundary (not mid-tag)."""
+    first comment is made on the tag boundary (not mid-tag).
+    Round 83c: also handles <article> feed/post layouts and cuts cleanly at
+    closing </article> or comment section boundaries."""
     m = REDDIL_POST_TITLE_RE.search(page_html)
     if m:
         rest = page_html[m.end():]
@@ -4211,7 +4242,14 @@ def _redlib_post_area(page_html: str) -> str:
     start = re.search(r'<(?:div|section)\s+class="post_content', page_html, re.I)
     if start:
         page_html = page_html[start.start():]
-    for marker in ('id="comment-', 'class="comment"', '<section class="comments"'):
+    else:
+        art = re.search(r'<article[^>]*>', page_html, re.I)
+        if art:
+            page_html = page_html[art.start():]
+            end_art = re.search(r'</article>', page_html, re.I)
+            if end_art:
+                page_html = page_html[:end_art.start()]
+    for marker in ('id="comment-', 'class="comment"', '<section class="comments"', 'id="comments"'):
         idx = page_html.lower().find(marker.lower())
         if idx != -1:
             lt = page_html.rfind("<", 0, idx)
@@ -4227,7 +4265,8 @@ def extract_redlib_gallery(page_html: str | None) -> list[dict]:
     """
     if not page_html:
         return []
-    return extract_native_media(_redlib_post_area(page_html))
+    area = _unwrap_redlib_media_urls(_redlib_post_area(page_html))
+    return extract_native_media(area)
 
 
 # Round 38c (2026-09-30): a gallery post can carry a reddit-hosted VIDEO
@@ -4235,7 +4274,7 @@ def extract_redlib_gallery(page_html: str | None) -> list[dict]:
 # themes either inline a v.redd.it URL or link the instance's player page
 # (/link/<post>/video/<id>); both carry the same base62 id the DASH chain
 # resolves. (Markup verified live on safereddit, 2026-09-30.)
-REDDIL_PLAYER_VIDEO_RE = re.compile(r"/link/[a-z0-9]+/video/([a-z0-9]{5,20})")
+REDDIL_PLAYER_VIDEO_RE = re.compile(r"/(?:link/[a-z0-9]+/video|vid)/([a-z0-9]{5,20})")
 
 
 def extract_redlib_video_id(page_html: str | None) -> str | None:
@@ -4243,7 +4282,7 @@ def extract_redlib_video_id(page_html: str | None) -> str | None:
     (post area only), or None when the page has no video."""
     if not page_html:
         return None
-    area = _redlib_post_area(page_html)
+    area = _unwrap_redlib_media_urls(_redlib_post_area(page_html))
     vid = extract_vreddit_id(area)
     if vid:
         return vid
@@ -4260,9 +4299,15 @@ def base_from_redlib_page(page_html: str | None, path: str) -> dict | None:
     """
     if not page_html:
         return None
-    area = _redlib_post_area(page_html)
-    tm = re.search(r"<h1[^>]*post_title[^>]*>.*?<a[^>]*>([^<]+)</a>", page_html, re.S | re.I)
-    title = html_lib.unescape(tm.group(1)).strip() if tm else ""
+    area = _unwrap_redlib_media_urls(_redlib_post_area(page_html))
+    tm = re.search(r"<h1[^>]*post_title[^>]*>(.*?)</h1>", page_html, re.S | re.I)
+    if not tm:
+        tm = re.search(r"<article[^>]*>.*?<h1[^>]*>(.*?)</h1>", page_html, re.S | re.I)
+    title = ""
+    if tm:
+        h1_inner = re.sub(r'<a\b[^>]*class="[^"]*post_flair[^"]*"[^>]*>.*?</a>', "", tm.group(1), flags=re.S | re.I)
+        h1_inner = re.sub(r"<small\b[^>]*>.*?</small>", "", h1_inner, flags=re.S | re.I)
+        title = html_lib.unescape(re.sub(r"<[^>]+>", "", h1_inner)).strip()
     if not title:
         return None
     author = "unknown"
@@ -4270,17 +4315,24 @@ def base_from_redlib_page(page_html: str | None, path: str) -> dict | None:
                    page_html, re.I)
     if am:
         author = am.group(1)
+    else:
+        am2 = re.search(r'/(?:u|user)/([A-Za-z0-9_\-]{2,20})', page_html, re.I)
+        if am2:
+            author = am2.group(1)
     og = (re.search(r'property="og:image"\s+content="([^"]+)"', page_html, re.I) or
           re.search(r'content="([^"]+)"\s+property="og:image"', page_html, re.I))
+    thumb = _unwrap_redlib_media_urls(html_lib.unescape(og.group(1))) if og else None
+    body_m = re.search(r'<div\s+class="post_body[^"]*"[^>]*>(.*?)</div>\s*<div\s+class="post_(?:score|footer)', area, re.S | re.I)
+    body_src = body_m.group(1) if body_m else area
     return {
         "title": _clean_post_title(title),
         "author": _clean_author_name(author),
         "content_html": area,
-        "thumb": og.group(1) if og else None,
+        "thumb": thumb,
         # Round 65 audit: this body's HTML entities are unescaped exactly
         # once — inside clean_rss_body (the round-16 fixpoint the feed's
         # double-escaping requires).
-        "body": clean_rss_body(area),
+        "body": clean_rss_body(body_src),
         "crosspost_orig_path": find_crosspost_original_path(area, path),
         "vred_id": extract_vreddit_id(area),
         "redgifs_url": extract_redgifs_url(area),
@@ -4355,11 +4407,33 @@ async def fetch_test_post_base(session: aiohttp.ClientSession, path: str,
     return None
 
 
+def _is_redlib_error_page(html: str | None) -> bool:
+    """Round 83c: Redlib error pages return HTTP 200 but are not real posts.
+    Must be rejected before counting REDLIB-REACH 1/1 or caching — otherwise
+    verify_archive_post_live passes unapproved stubs and gallery enrichment
+    fails. Verified live: Failed to parse page JSON data / Reddit is rate
+    limiting / Reddit blocked this request / 502 Bad Gateway."""
+    if not html:
+        return False
+    low = html.lower()
+    return any(s in low for s in (
+        "failed to parse page json data",
+        "reddit is rate limiting this instance",
+        "reddit blocked this request",
+        "502 bad gateway",
+        "error: reddit is rate limiting",
+        "error: failed to parse",
+    ))
+
 async def _fetch_redlib_post_page(session: aiohttp.ClientSession, instance: str,
                                   path: str, timeout: int = 10) -> str | None:
     # Round 42: per-run memo. Successful page fetches are reused by the
     # liveness gate and media enrichment; misses
     # are deliberately not cached so a transient failure stays retryable.
+    # Round 83c fix: skip direct reddit.com hosts (not Redlib HTML) — they
+    # return Shreddit shells and would short-circuit gallery enrichment at [0..1].
+    if "reddit.com" in (instance or ""):
+        return None
     key = (str(instance or ""), str(path or ""))
     if key in _redlib_post_page_cache:
         return _redlib_post_page_cache[key]
@@ -4371,6 +4445,23 @@ async def _fetch_redlib_post_page(session: aiohttp.ClientSession, instance: str,
                                allow_redirects=True) as resp:
             if resp.status == 200 and "html" in (resp.headers.get("Content-Type") or "").lower():
                 text = await resp.text()
+                # Round 83c fix: require real post-page DOM marker before
+                # counting 1/1 — Anubis PoW / Cloudflare / JS splash pages
+                # return 200 HTML without error strings but with no post DOM.
+                has_post_dom = text and any(m in text for m in (
+                    'class="post_title', 'class="post_content', '<article', 'class="post-content'
+                ))
+                if text and has_post_dom and not _is_redlib_error_page(text):
+                    _redlib_post_page_cache[key] = text
+                    _redlib_reach.setdefault(str(instance or ""), [0, 0])[0] += 1
+                    return text
+                # Error page or challenge splash: count as 0/1 (do not cache, do not count as 1/1)
+                if text and (_is_redlib_error_page(text) or not has_post_dom):
+                    if _is_redlib_error_page(text):
+                        logging.debug(f"[{instance}{path}] Redlib error page rejected (not counted as 1/1)")
+                    else:
+                        logging.debug(f"[{instance}{path}] Redlib challenge/splash page rejected (no post DOM, not counted as 1/1)")
+                    return None
                 if text:
                     _redlib_post_page_cache[key] = text
                     _redlib_reach.setdefault(str(instance or ""), [0, 0])[0] += 1
@@ -5031,7 +5122,11 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
             except Exception as e:
                 logging.info(f"[{label or 'stats'}] embeddit stats fetch failed: {e}")
 
-    if stats is None and arctic and all(isinstance(arctic.get(key), int)
+    # Round 83c: Do not stamp stale Arctic archived counts — clean card when
+    # stats unavailable (gate behind ALLOW_ARCHIVED_COUNTS=1 to re-enable).
+    # Previously rendered "1⬆️ · 0💬 · archived counts" from 13s-old snapshots
+    # on text-only fallback, overriding live stats.
+    if os.getenv("ALLOW_ARCHIVED_COUNTS", "0") == "1" and stats is None and arctic and all(isinstance(arctic.get(key), int)
                                       for key in ("ups", "num_comments")):
         stats = {"ups": arctic["ups"], "comments": arctic["num_comments"], "archived": True}
 
@@ -6281,18 +6376,33 @@ async def main():
                     # once the media is available (Arctic fields filled, or a
                     # proxy renders the og: tags) the full gallery posts. The
                     # 48h freshness window bounds the retries.
+                    # Round 83c: Mod-queued galleries (1xd8ppc/1xd8vra/1xd9pre) are
+                    # automod_filtered with url=reddit.com/gallery/<id> and no
+                    # gallery_data/media_metadata while queued — _arctic_media_hint
+                    # now checks gallery URL, and this gate also fires for RSS
+                    # gallery links and via child_arctic lookup, so the post waits
+                    # in pending (media_wait) until mods approve and images are live.
                     if (not TEST_POST_ID and not DRY_RUN and post_json is None
-                            and isinstance(entry, _ArcticEntry)
-                            and not data["media"]
-                            and _arctic_media_hint(getattr(entry, "_arctic_post", None))):
-                        mark_pending(pending, unique_key, "media_wait", now)
-                        run_stats["media_wait"] += 1
-                        logging.debug(f"[{unique_key}] archive record says this post "
-                                     f"has media (gallery/media_metadata) but no "
-                                     f"source served any yet (Arctic fills those "
-                                     f"asynchronously) — skipping, not cached "
-                                     f"(retries next run).")
-                        continue
+                            and not data["media"]):
+                        _hint = False
+                        if isinstance(entry, _ArcticEntry):
+                            _hint = _arctic_media_hint(getattr(entry, "_arctic_post", None))
+                        # Also check RSS gallery links and base content (covers
+                        # RSS posts linking to /gallery/ and child_arctic via
+                        # resolve_post_media's internal fetch)
+                        if not _hint:
+                            _base_content = str(base.get("content_html") or "") + str(base.get("body") or "")
+                            if "reddit.com/gallery/" in _base_content.lower():
+                                _hint = True
+                        if _hint:
+                            mark_pending(pending, unique_key, "media_wait", now)
+                            run_stats["media_wait"] += 1
+                            logging.debug(f"[{unique_key}] archive record says this post "
+                                         f"has media (gallery/media_metadata) but no "
+                                         f"source served any yet (Arctic fills those "
+                                         f"asynchronously) — skipping, not cached "
+                                         f"(retries next run).")
+                            continue
                     # Round 25: known partial archive galleries wait without caching.
                     # Unknown counts cannot gate; video cards intentionally use one tile.
                     if (not TEST_POST_ID and not DRY_RUN and post_json is None
@@ -6309,35 +6419,6 @@ async def main():
                                          f"skipping, not cached (retries next run).")
                             continue
                     posted_ts = int(max(published_ts, activity_ts))
-                    # ------------------------------------------------------------------
-                    # ■ ROUND 79 (2026-10-23): strict live-gate for re-appearing
-                    # removal_notice text-only — no-ghost invariant.
-                    # A `removal_notice`/`title marker` text-only post that was
-                    # pending for ~8 h (Genshin 1xcjoqu: created 14:11Z,
-                    # delivered 21:50Z as ghosts while already deleted) must NOT
-                    # post its Discord text if Reddit has already deleted it.
-                    # Only re-appearing pendings with media.kind == none are
-                    # checked (all proxies text-only + redlib 0/1), so a fresh
-                    # text post like Wuthering 1xcofgc (no prior pending) still
-                    # posts in 2-6 min. One live verify (proxy+redlib, feed_ok=
-                    # False, 0-2 s extra only on ghost candidates, else 0 extra
-                    # requests) — legitimate text posts unaffected.
-                    # ------------------------------------------------------------------
-                    if (not TEST_POST_ID and not DRY_RUN and unique_key in pending
-                            and str(pending[unique_key].get("reason") or "") in _NO_RECHECK_REASONS
-                            and not isinstance(entry, _ArcticEntry)
-                            and not data.get("media")):
-                        _live2, _why2 = await verify_archive_post_live(
-                            session, path, label=f"{unique_key} ghost-check", feed_ok=False)
-                        if not _live2:
-                            mark_pending(pending, unique_key, "removal_notice", now,
-                                         source=_entry_source36, title=str(base.get("title") or "")[:200],
-                                         published_ts=published_ts)
-                            run_stats["liveness_not_verified"] += 1
-                            _inc_reason(run_stats["liveness_by_reason"], f"ghost-text-only:{_why2}")
-                            logging.info(f"[{unique_key}] re-appearing removal_notice text-only not verified live ({_why2}) — keeping pending (no ghost text).")
-                            continue
-
 
                     # Round 66: the body beyond the card budget is continued in
                     # follow-up messages (see build_continuation_payloads).
