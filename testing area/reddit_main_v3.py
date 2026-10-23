@@ -831,30 +831,43 @@ async def _fetch_new_listing(session, subreddit):
 # dual first, listing-only/partial next, timeout-but-still-works at tail. Trap
 # hosts (rl.blitzw.in honeypot, red.arancia.click parked, redlib.jaydenha.uk
 # fake, l.opnxng.com alias) never added; kareem excluded (Azure ASN caveat).
+# Round 82 (2026-10-23): Game-Express PR #63 live-verified 2026-10-23 — adds
+# 4 new Redlib hosts (redlib.mint.lgbt 0.36.0 Shreddit build 0baefabf,
+# reddit.idevicehacked.com 0.40.0 inline gallery, reddit.jeremyh.xyz 0.31.0,
+# redlib.jeikobu.net 0.36.0, redlib.vanillax.me mitchross/redlib v2.3.6
+# abd6ba24) and demotes redlib.privacyredirect.com to Tier 3 after 403
+# \"Reddit blocked ... at least 20 commits old\" on both /new and /comments/.
+# News-Express: 0 deletions (keep redlib.nohost.network + redlib.kylrth.com
+# which Game-Express excludes), arrange into 3-tier ranking (Tier 1 dual-path
+# + Tier 2 listing-only + Tier 3 token/legacy tail). 19 -> 23 entries.
 REDDIT_RSS_INSTANCES = [
-    "https://www.reddit.com",              # [0] Primary w/ REDDIT_FEED_TOKEN
-    "https://old.reddit.com",              # [1] Auth alt origin (same token)
-    # Token-gated fallback; harmlessly skipped when NITTER_RSS_TOKEN is empty.
-    "https://redlib.miningtcup.me",        # [2] Private token-gated
-    # Verified full dual-path public hosts (/new 200 OK + /comments/<id>/ 200 OK, zero challenge):
+    # Tier 1 — Active healthy dual-path + token-gated (9 hosts: 200 OK on
+    # /r/<sub>/new, /user/<acct> AND /r/<sub>/comments/<id>/, zero challenge):
+    "https://redlib.mint.lgbt",            # NEW #0 — Redlib 0.36.0 0baefabf Shreddit build, deployed 2026-10-21, inline CMAF/1080.mp4
+    "https://reddit.idevicehacked.com",    # NEW #1 — Redlib 0.40.0 848f3013, inline full gallery on /new, deployed 2026-10-23
     "https://redlib.catsarch.com",         # Existing healthy dual #1
-    "https://redlib.privacyredirect.com",  # Existing healthy dual #2
-    "https://snoo.habedieeh.re",           # NEW dual — up-to-date #592, inline CMAF MP4
+    "https://snoo.habedieeh.re",           # NEW dual — up-to-date #592, inline CMAF MP4 (v3.0.0)
+    "https://redlib.miningtcup.me",        # Private token-gated (NITTER_RSS_TOKEN)
     "https://redlib.tiekoetter.com",       # NEW dual — DE dedicated, fast
-    "https://redlib.nohost.network",       # NEW dual — inline CMAF + full comments
+    "https://redlib.nohost.network",       # Existing dual — inline CMAF + full comments (kept, not deleted)
     "https://redlib-1.privadency.com",     # NEW dual — direct backend bypassing 2s splash
     "https://redlib-2.privadency.com",     # NEW dual — direct backend #2
-    "https://reddit.idevicehacked.com",    # NEW dual — US, inline gallery on /new
-    # Verified /new listing-only reserves (pre-#592 /comments/ error; recover after v3.0.0):
+    # Tier 2 — Verified /new + /user/ listing-only (8 hosts: pre-#592/#599 on /comments/, recover after v3.0.0):
+    "https://reddit.jeremyh.xyz",          # NEW — Redlib 0.31.0 redlib-instances#118, US direct /new + /user/ 200 OK
+    "https://redlib.jeikobu.net",          # NEW — Redlib 0.36.0 fca8b45c /new + /user/ 200 OK
+    "https://redlib.vanillax.me",          # NEW — mitchross/redlib v2.3.6 abd6ba24 /new + /user/ 200 OK
     "https://red.artemislena.eu",          # Existing /new pass (pre-#592)
     "https://rl.awy.one",                  # NEW /new pass — zero challenge
-    "https://redlib.kylrth.com",           # NEW /new pass — CF, 301 from libreddit.kylrth.com
+    "https://redlib.kylrth.com",           # Existing /new pass — CF, 301 from libreddit.kylrth.com (kept, not deleted)
     "https://redlib.freedit.eu",           # NEW /new pass — DE direct
     "https://redlib.utilibre.org",         # NEW /new pass — FR collective
-    # Timeout-but-still-works per live production #9283 (2026-10-22 03:35 UTC, westcentralus): REDLIB-REACH 4/9 showed these still answering 1/1 despite prior 2s splash/rate-limit — keep at tail per instruction (partial/timeout still works):
-    "https://redlib.privadency.com",       # Restored tail — privadency.com root 1/1 in #9283 (direct backends already above)
+    # Tier 3 — Token-promoted official origins + demoted/legacy tail (6 hosts, 0 hits while Tier 1 answers):
+    "https://www.reddit.com",              # Promoted to head when REDDIT_FEED_TOKEN is set (403 unauth on Actions IPs)
+    "https://old.reddit.com",              # Official RSS fallback origin
+    "https://redlib.privacyredirect.com",  # Demoted (2026-10-23): 403 error page on /new & /comments/ — 1 wasted req eliminated
+    "https://redlib.privadency.com",       # Restored tail — privadency.com root 1/1 in #9283
     "https://safereddit.com",              # Restored tail — safereddit 1/1 in #9283 (rate-limit transient)
-    "https://redlib.nadeko.net",           # Restored tail — nadeko 0/1 in #9283 but GoAway timeout partially works on retry; kept at very last per keep-if-partial rule
+    "https://redlib.nadeko.net",           # Restored tail — nadeko GoAway timeout but partial works on retry
 ]
 
 RATE_LIMIT_RETRY_DELAY_1 = 6
