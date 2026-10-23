@@ -638,7 +638,7 @@ async def round15_flows():
             {"kind": "image", "url": "https://example.com/screenshot.jpg"}], "stats": None, "body": ""})
         result = await v3.resolve_post_media(None, base, None, "/r/Sub/comments/cross1/title/")
         check("r15 screenshot rejected", result["media"] == [{"kind": "video", "url": "https://example.com/fallback.mp4"}])
-        check("r15 archived stats labelled", result["stats"].get("archived") is True)
+        check("r15 archived stats not shown (Round 83c: clean card, no stale Arctic archived counts)", result["stats"] is None)
     fake_proxy.fetch_proxy_post = AsyncMock(return_value={"service": "test", "media": items[:2],
                                                          "body": "FirstSecond", "stats": None})
     with patch.object(v3, "reddit_proxy", fake_proxy), patch.object(v3, "PROXY_MEDIA", True), \
@@ -1844,15 +1844,14 @@ check("r30 throttle runs BEFORE any network work (the whole point)",
 check("r30/round-18/round-20/32/r63/r67 gates: all skip paths record a pending "
       "entry (settle/mod-queue/dup-media/repost gates removed round 63; the "
       "content gate's call removed round 67 -- only removed-post-reason, "
-      "archive-liveness, media-wait/partial-gallery + round-79 ghost text-only remain)",
-      _r30_main.count("mark_pending(pending, unique_key") == 5
+      "archive-liveness, media-wait/partial-gallery remain; ghost gates removed 2026-10-23)",
+      _r30_main.count("mark_pending(pending, unique_key") == 4
       and "mark_pending(pending, unique_key, _removed, now" in _r30_main
       and "mark_pending(pending, unique_key,\n" in _r30_main
       and 'mark_pending(pending, unique_key, "media_wait", now)' in _r30_main
       and 'mark_pending(pending, unique_key, "partial_gallery", now)' in _r30_main
-      and 'mark_pending(pending, unique_key, "removal_notice", now' in _r30_main
-      and "ghost-check" in _r30_main
-      and "ghost-text-only" in _r30_main,
+      and "ghost-check" not in _r30_main
+      and "arctic-ghost-check" not in _r30_main,
       str(_r30_main.count("mark_pending(pending, unique_key")))
 check("r30 posted: a successful post clears the pending entry",
       "pending.pop(unique_key, None)" in _r30_main)
@@ -2411,65 +2410,64 @@ _r75_reddit_fleet = _literal_list_constant(
     "testing area/reddit_main_v3.py", "REDDIT_RSS_INSTANCES")
 # r75 membership check superseded by r78 — kept as non-enforced record
 check("r75: Reddit RSS mirror membership historical record", True)
-# r82 (2026-10-23): Game-Express PR #63 — 23-member fleet (19 kept + 4 new: mint, jeremyh, jeikobu, vanillax), privacyredirect demoted to Tier 3
+# r82 (2026-10-23): Game-Express PR #63 — 23-member fleet (19 kept + 4 new: mint, jeremyh, jeikobu, vanillax), r83b restores R78 19 intact then appends 4 at tail
 _r82_reddit_expected = [
-    "https://redlib.mint.lgbt",
-    "https://reddit.idevicehacked.com",
-    "https://redlib.catsarch.com",
-    "https://snoo.habedieeh.re",
+    "https://www.reddit.com",
+    "https://old.reddit.com",
     "https://redlib.miningtcup.me",
+    "https://redlib.catsarch.com",
+    "https://redlib.privacyredirect.com",
+    "https://snoo.habedieeh.re",
     "https://redlib.tiekoetter.com",
     "https://redlib.nohost.network",
     "https://redlib-1.privadency.com",
     "https://redlib-2.privadency.com",
-    "https://reddit.jeremyh.xyz",
-    "https://redlib.jeikobu.net",
-    "https://redlib.vanillax.me",
+    "https://reddit.idevicehacked.com",
     "https://red.artemislena.eu",
     "https://rl.awy.one",
     "https://redlib.kylrth.com",
     "https://redlib.freedit.eu",
     "https://redlib.utilibre.org",
-    "https://www.reddit.com",
-    "https://old.reddit.com",
-    "https://redlib.privacyredirect.com",
     "https://redlib.privadency.com",
     "https://safereddit.com",
     "https://redlib.nadeko.net",
+    "https://redlib.mint.lgbt",
+    "https://reddit.jeremyh.xyz",
+    "https://redlib.jeikobu.net",
+    "https://redlib.vanillax.me",
 ]
-check("r82 source fleet: Reddit V3 has the reviewed exact 23-member 3-tier order (Game-Express PR #63 + keep nohost/kylrth)",
+check("r82 source fleet: Reddit V3 has the reviewed exact 23-member order (R78 19 preserved exactly + 4 new appended at tail)",
       _literal_list_constant("testing area/reddit_main_v3.py", "REDDIT_RSS_INSTANCES") == _r82_reddit_expected)
 
 def test_r82_reddit_tiered_fleet_no_deletion():
-    """r82 (2026-10-23): Game-Express PR #63 — 19 kept + 4 new (mint, jeremyh, jeikobu, vanillax), 0 deletions (keep nohost/kylrth which Game excludes), privacyredirect Tier 1 -> Tier 3 demotion, 3-tier ranking. 23 total."""
+    """r82 (2026-10-23): Game-Express PR #63 — 19 kept + 4 new (mint, jeremyh, jeikobu, vanillax), 0 deletions (keep nohost/kylrth which Game excludes), 3-tier ranking. 23 total. r83b: preserve R78 19 order exactly (privacyredirect at #4), append 4 at tail so media (catsarch/snoo/miningtcup etc) priority unchanged."""
     RSS = v3.REDDIT_RSS_INSTANCES
     assert len(RSS) == len(set(RSS)) == 23
-    # Tier 1 — 9 hosts dual-path + miningtcup token
-    assert RSS[0] == "https://redlib.mint.lgbt"             # NEW #0 mint.lgbt 0.36.0 Shreddit
-    assert RSS[1] == "https://reddit.idevicehacked.com"     # NEW #1 idevicehacked 0.40.0 (promoted from #10)
-    assert RSS[2] == "https://redlib.catsarch.com"
-    assert RSS[3] == "https://snoo.habedieeh.re"
-    assert RSS[4] == "https://redlib.miningtcup.me"
-    assert RSS[5] == "https://redlib.tiekoetter.com"
-    assert RSS[6] == "https://redlib.nohost.network"         # kept (Game excludes, News keeps)
-    assert RSS[7] == "https://redlib-1.privadency.com"
-    assert RSS[8] == "https://redlib-2.privadency.com"
-    # Tier 2 — 8 hosts listing-only
-    assert RSS[9] == "https://reddit.jeremyh.xyz"            # NEW listing-only
-    assert RSS[10] == "https://redlib.jeikobu.net"           # NEW
-    assert RSS[11] == "https://redlib.vanillax.me"           # NEW mitchross v2.3.6
-    assert RSS[12] == "https://red.artemislena.eu"
-    assert RSS[13] == "https://rl.awy.one"
-    assert RSS[14] == "https://redlib.kylrth.com"            # kept (Game excludes)
-    assert RSS[15] == "https://redlib.freedit.eu"
-    assert RSS[16] == "https://redlib.utilibre.org"
-    # Tier 3 — 6 hosts token/legacy tail
-    assert RSS[17] == "https://www.reddit.com"
-    assert RSS[18] == "https://old.reddit.com"
-    assert RSS[19] == "https://redlib.privacyredirect.com"   # demoted Tier 1 #4 -> Tier 3 #19
-    assert RSS[20] == "https://redlib.privadency.com"
-    assert RSS[21] == "https://safereddit.com"
-    assert RSS[22] == "https://redlib.nadeko.net"
+    # Preserved R78 19 order exactly (0-18)
+    assert RSS[0] == "https://www.reddit.com"
+    assert RSS[1] == "https://old.reddit.com"
+    assert RSS[2] == "https://redlib.miningtcup.me"
+    assert RSS[3] == "https://redlib.catsarch.com"
+    assert RSS[4] == "https://redlib.privacyredirect.com"
+    assert RSS[5] == "https://snoo.habedieeh.re"
+    assert RSS[6] == "https://redlib.tiekoetter.com"
+    assert RSS[7] == "https://redlib.nohost.network"
+    assert RSS[8] == "https://redlib-1.privadency.com"
+    assert RSS[9] == "https://redlib-2.privadency.com"
+    assert RSS[10] == "https://reddit.idevicehacked.com"
+    assert RSS[11] == "https://red.artemislena.eu"
+    assert RSS[12] == "https://rl.awy.one"
+    assert RSS[13] == "https://redlib.kylrth.com"
+    assert RSS[14] == "https://redlib.freedit.eu"
+    assert RSS[15] == "https://redlib.utilibre.org"
+    assert RSS[16] == "https://redlib.privadency.com"
+    assert RSS[17] == "https://safereddit.com"
+    assert RSS[18] == "https://redlib.nadeko.net"
+    # Appended 4 new at tail (do not affect prior 19 priority)
+    assert RSS[19] == "https://redlib.mint.lgbt"             # NEW appended
+    assert RSS[20] == "https://reddit.jeremyh.xyz"           # NEW appended
+    assert RSS[21] == "https://redlib.jeikobu.net"           # NEW
+    assert RSS[22] == "https://redlib.vanillax.me"           # NEW mitchross
     # 0 deletions — all 19 original hosts still present
     _r78_all = [
         "https://www.reddit.com", "https://old.reddit.com", "https://redlib.miningtcup.me",
