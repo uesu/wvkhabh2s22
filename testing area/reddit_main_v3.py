@@ -17,14 +17,15 @@
 #        2026 note: new API access may require Reddit's approval form
 #        (Responsible Builder Policy) — not guaranteed, so V3 never depends
 #        on it. If you get one, just add the two secrets; no code change.
-#     b) FEED TOKEN ON .json (ROUND 31: only when the OAuth app above exists,
-#        or REDDIT_JSON_PROBE=force — see JSON_PROBE_MODE below):
-#        www.reddit.com/comments/<id>.json?…&feed=<REDDIT_FEED_TOKEN>.
-#        Anonymous .json is 403 from datacenters (verified 2026-09-20), and
-#        the feed token's documented role is the RSS rate tier — so without
-#        an OAuth app the attempt is pure 65 s + a 403 log line per run with
-#        new posts, and auto mode skips it entirely. A 403 result is
-#        remembered for that run.
+#     b) FEED TOKEN ON .json (ROUND 79: auto now powers .json FIRST when a
+#        valid REDDIT_FEED_TOKEN exists — see feedtoken_probe_enabled()
+#        below; anonymous .json is still 403 from datacenters, verified
+#        2026-09-20 — stagger capped to ≤2 s for the token tier vs 65 s
+#        anonymous, instant 1-request RSS fallback, 403 remembered for the run):
+#        www.reddit.com/comments/<id>.json?limit=25&raw_json=1&{feed_q}
+#        (feed_q = format_reddit_feed_query(REDDIT_FEED_TOKEN); host/path-
+#        agnostic — old.reddit.com/.rss?feed=… etc; auto OFF when token
+#        empty/invalid, force=always, off=never).
 #     FULL MODE adds: every photo (20-photo posts → 2nd container),
 #     upvotes/comments stats, video fallback_url (with audio), and true
 #     crosspost full-embeds (fetches the original post, 1 level).
@@ -1079,20 +1080,23 @@ DASH_QUALITIES = (720, 1080, 480, 360)
 
 # Feed-token .json attempt: anonymous .json is ~1 req/min from datacenters, so
 # this is the polite sleep before each attempt (lower it ONLY if your token
-# reliably works on .json).
+# reliably works on .json). Round 79 (2026-10-23): token-powered .json is
+# instant-fallback (capped to ≤2s) even when the env default stays 65 — see
+# fetch_post_json below.
 FEEDTOKEN_JSON_STAGGER = _env_int("FEEDTOKEN_JSON_STAGGER", 65)
 
 # ---------------------------------------------------------------------------
-# ■ ROUND 31 (2026-09-20): FEED-TOKEN .json FULL-MODE PROBE GATE
+# ■ ROUND 31 (2026-09-20): FEED-TOKEN .json FULL-MODE PROBE GATE — ROUND 79
 # Live-verified: Reddit 403s .json from datacenter IPs, so without an OAuth
 # app the round-12 probe was 65 s of guaranteed 403 log noise per run with
 # new posts (first attempt only — a 403 is remembered for the rest of the
 # run; steady-state runs never reached it).
-#   auto (default; unset/empty = auto) — probe runs only when BOTH
-#          REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET are set (a real app
-#          exists — then this is the legacy fallback under a working
-#          OAuth path);
-#   force — legacy behavior: always try (65 s wait) on a run with new posts;
+#   auto (default; unset/empty = auto) — Round 79: powers .json FIRST when
+#          REDDIT_FEED_TOKEN (format_reddit_feed_query valid) exists OR when
+#          BOTH REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET are set (real app);
+#          a 403 is remembered for the run and the next post uses the 1-req
+#          RSS fallback instantly — no extra run cost;
+#   force — legacy behavior: always try (token stagger capped ≤2s);
 #   off   — never.
 # Repo Variable REDDIT_JSON_PROBE (wired in reddit_monitor.yml).
 # ---------------------------------------------------------------------------
@@ -1100,13 +1104,19 @@ JSON_PROBE_MODE = os.getenv("REDDIT_JSON_PROBE", "auto").strip().lower()
 
 
 def feedtoken_probe_enabled() -> bool:
-    """Round 31: should the feed-token .json FULL-MODE probe run?"""
+    """Round 31 + Round 79: should the feed-token .json FULL-MODE probe run?"""
     if JSON_PROBE_MODE == "off":
         return False
     if JSON_PROBE_MODE == "force":
         return True
-    # auto (default; also any unrecognized value): only with a real app.
-    return bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET)
+    # auto (default; also any unrecognized value): legacy OAuth path OR new
+    # token-powered path (instant fallback, see fetch_post_json). Empty
+    # REDDIT_FEED_TOKEN keeps the old OFF behavior for the r31 test.
+    if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
+        return True
+    if REDDIT_FEED_TOKEN and format_reddit_feed_query(REDDIT_FEED_TOKEN):
+        return True
+    return False
 
 # Text display budget (Discord: 4000 chars total per message across all
 # text components; we keep header+body+stats comfortably under it).
@@ -3171,14 +3181,20 @@ async def fetch_post_json(session: aiohttp.ClientSession, post_id: str, use_oaut
     elif not _feedtoken_json_failed and REDDIT_FEED_TOKEN and feedtoken_probe_enabled():
         # Workaround attempt: the personal feed token on a .json endpoint.
         # Anonymous .json is 403 from datacenters; the token MIGHT lift it.
-        # Round 31: only reached when REDDIT_JSON_PROBE allows it
-        # (auto = only with an OAuth app; force = always; off = never).
+        # Round 79: auto now powers .json FIRST when REDDIT_FEED_TOKEN exists
+        # (host/path-agnostic via format_reddit_feed_query); a 403 is
+        # remembered for the run and the caller falls back to the 1-request
+        # combined RSS path instantly — savings, no perf loss.
         feed_q = format_reddit_feed_query(REDDIT_FEED_TOKEN)
         if not feed_q:
             return None
         url = f"https://www.reddit.com/comments/{post_id}.json?limit=25&raw_json=1&{feed_q}"
         headers = dict(BROWSER_HEADERS)
-        await asyncio.sleep(FEEDTOKEN_JSON_STAGGER)  # anonymous tier ~1 req/min
+        # Token tier is instant vs anonymous 65s: cap stagger to ≤2s for the
+        # token path so a run with new posts never pays 65s + 403 noise.
+        _stagger = min(FEEDTOKEN_JSON_STAGGER, 2) if REDDIT_FEED_TOKEN and feed_q else FEEDTOKEN_JSON_STAGGER
+        if _stagger:
+            await asyncio.sleep(_stagger)
     else:
         return None
 
@@ -5660,20 +5676,23 @@ async def main():
                         "(1 request/run) usually fits the ~1 req/min limit, but add your feed "
                         "token (old.reddit.com -> Preferences -> Feeds) as REDDIT_FEED_TOKEN "
                         "to be bulletproof. (V3 also uses it on .json for FULL MODE — "
-                        "round 31: only when an OAuth app exists or REDDIT_JSON_PROBE=force.)")
+                        "round 79: auto now powers .json FIRST when the token is valid "
+                        "(instant fallback, 403 remembered for the run); set "
+                        "REDDIT_JSON_PROBE=off to disable.)")
     if not (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET):
         if feedtoken_probe_enabled():
             logging.info("No Reddit OAuth app secrets — V3 uses native RSS data; the feed "
-                         "token .json FULL-MODE probe runs FORCED (REDDIT_JSON_PROBE=force — "
-                         "legacy behavior: 65 s wait + one attempt per run with new posts, "
-                         "403 expected from datacenter IPs).")
+                         "token .json FULL-MODE probe is ENABLED (token-powered: .json FIRST "
+                         "with instant RSS fallback — ≤2 s stagger, 1 req, 403 remembered for "
+                         "the run; force keeps the same cap, off disables).")
         else:
             if JSON_PROBE_MODE == "off":
                 _probe_why = "REDDIT_JSON_PROBE=off"
             else:
-                _probe_why = ("no OAuth app secrets — datacenter IPs 403 the .json route "
-                              "anyway, so the probe would only cost 65 s + a 403 log line "
-                              "per run with new posts")
+                _probe_why = ("no REDDIT_FEED_TOKEN (auto needs a valid feed token) — "
+                              "datacenter IPs 403 the .json route, so without a token the "
+                              "probe would only cost 65 s + a 403 log line per run with "
+                              "new posts; add REDDIT_FEED_TOKEN for token-powered .json")
             logging.info("No Reddit OAuth app secrets — V3 uses native RSS data; the feed "
                          "token .json FULL-MODE probe is skipped (" + _probe_why + "). "
                          "Set REDDIT_JSON_PROBE=force to re-enable, or add "
@@ -6227,6 +6246,36 @@ async def main():
                                          f"skipping, not cached (retries next run).")
                             continue
                     posted_ts = int(max(published_ts, activity_ts))
+                    # ------------------------------------------------------------------
+                    # ■ ROUND 79 (2026-10-23): strict live-gate for re-appearing
+                    # removal_notice text-only — no-ghost invariant.
+                    # A `removal_notice`/`title marker` text-only post that was
+                    # pending for ~8 h (Genshin 1xcjoqu: created 14:11Z,
+                    # delivered 21:50Z as ghosts while already deleted) must NOT
+                    # post its Discord text if Reddit has already deleted it.
+                    # Only re-appearing pendings with media.kind == none are
+                    # checked (all proxies text-only + redlib 0/1), so a fresh
+                    # text post like Wuthering 1xcofgc (no prior pending) still
+                    # posts in 2-6 min. One live verify (proxy+redlib, feed_ok=
+                    # False, 0-2 s extra only on ghost candidates, else 0 extra
+                    # requests) — legitimate text posts unaffected.
+                    # ------------------------------------------------------------------
+                    if (not TEST_POST_ID and not DRY_RUN and unique_key in pending
+                            and str(pending[unique_key].get("reason") or "") in _NO_RECHECK_REASONS
+                            and not isinstance(entry, _ArcticEntry)
+                            and not data.get("media")):
+                        _live2, _why2 = await verify_archive_post_live(
+                            session, path, label=f"{unique_key} ghost-check", feed_ok=False)
+                        if not _live2:
+                            mark_pending(pending, unique_key, "removal_notice", now,
+                                         source=_entry_source36, title=str(base.get("title") or "")[:200],
+                                         published_ts=published_ts)
+                            run_stats["liveness_not_verified"] += 1
+                            _inc_reason(run_stats["liveness_by_reason"], f"ghost-text-only:{_why2}")
+                            logging.info(f"[{unique_key}] re-appearing removal_notice text-only not verified live ({_why2}) — keeping pending (no ghost text).")
+                            continue
+
+
                     # Round 66: the body beyond the card budget is continued in
                     # follow-up messages (see build_continuation_payloads).
                     payload, body_rest = build_v3_payload(subreddit, data, reddit_url,
