@@ -484,6 +484,15 @@ def _init_run_stats():
         "heal_queued": 0,
         "heal_edit_performed": 0,
         "heal_skipped_after_revalidation": 0,
+        # Redlib instance reachability telemetry (REDLIB-REACH)
+        "redlib_reach": None,
+        "redlib_reach_answered": None,
+        "redlib_reach_probed": None,
+        "redlib_instances_configured": (
+            len([u for u in REDDIT_RSS_INSTANCES if not _is_direct_reddit_host(u)])
+            if "REDDIT_RSS_INSTANCES" in globals() and "_is_direct_reddit_host" in globals()
+            else None
+        ),
     }
 
 def _inc_reason(counter_dict, reason, amount=1):
@@ -876,6 +885,10 @@ REDDIT_RSS_INSTANCES = [
     "https://reddit.jeremyh.xyz",          # [20] NEW — Redlib 0.31.0 redlib-instances#118 (appended)
     "https://redlib.jeikobu.net",          # [21] NEW — Redlib 0.36.0 fca8b45c (appended)
     "https://redlib.vanillax.me",          # [22] NEW — mitchross/redlib v2.3.6 abd6ba24 (appended)
+    # Round 86 (2026-10-24): 2 newly verified live Redlib instances from redlib-org/redlib-instances
+    # (0 deletions; prior 23 order preserved intact at indices 0..22)
+    "https://redlib.reallyaweso.me",       # [23] NEW — full dual-path (/new + /user/ + /comments/ 200 OK)
+    "https://redlib.ducks.party",          # [24] NEW — Redlib 0.40.0 (/new 200 OK w/ inline gallery carousel)
 ]
 
 RATE_LIMIT_RETRY_DELAY_1 = 6
@@ -1045,8 +1058,15 @@ async def fetch_proxy_post_memo(session, path: str, label: str = "", health=None
         return None
     key = (id(reddit_proxy), str(path or ""), bool(need_video))
     use_cache = hasattr(reddit_proxy, "__file__")
-    if use_cache and key in _proxy_post_cache:
-        return _proxy_post_cache[key]
+    if use_cache:
+        if key in _proxy_post_cache:
+            return _proxy_post_cache[key]
+        if need_video:
+            any_key = (id(reddit_proxy), str(path or ""), False)
+            cached_any = _proxy_post_cache.get(any_key)
+            if _proxy_result_has_motion_video(cached_any):
+                _proxy_post_cache[key] = cached_any
+                return cached_any
     result = await reddit_proxy.fetch_proxy_post(session, path, label=label,
                                                  health=health, need_video=need_video)
     # ROUND 47: a PROFILE post ("/user/<name>/comments/<id>/") is the same
@@ -1074,6 +1094,8 @@ async def fetch_proxy_post_memo(session, path: str, label: str = "", health=None
                 result = best
     if use_cache and result:
         _proxy_post_cache[key] = result
+        if not need_video and _proxy_result_has_motion_video(result):
+            _proxy_post_cache[(id(reddit_proxy), str(path or ""), True)] = result
     return result
 
 
@@ -4407,6 +4429,12 @@ async def fetch_test_post_base(session: aiohttp.ClientSession, path: str,
     return None
 
 
+def _is_direct_reddit_host(instance: str | None) -> bool:
+    """True only for official reddit.com hostnames (never substring-matching safereddit.com)."""
+    host = str(instance or "").strip().lower().split("://")[-1].split("/")[0].split(":")[0]
+    return host in ("reddit.com", "www.reddit.com", "old.reddit.com") or host.endswith(".reddit.com")
+
+
 def _is_redlib_error_page(html: str | None) -> bool:
     """Round 83c: Redlib error pages return HTTP 200 but are not real posts.
     Must be rejected before counting REDLIB-REACH 1/1 or caching — otherwise
@@ -4423,6 +4451,11 @@ def _is_redlib_error_page(html: str | None) -> bool:
         "502 bad gateway",
         "error: reddit is rate limiting",
         "error: failed to parse",
+        "error: reddit error",
+        "the backend server is having issues",
+        "redlib on the clearnet is no longer available",
+        "__goaway_challenge",
+        "rate limit exceeded",
     ))
 
 async def _fetch_redlib_post_page(session: aiohttp.ClientSession, instance: str,
@@ -4430,9 +4463,9 @@ async def _fetch_redlib_post_page(session: aiohttp.ClientSession, instance: str,
     # Round 42: per-run memo. Successful page fetches are reused by the
     # liveness gate and media enrichment; misses
     # are deliberately not cached so a transient failure stays retryable.
-    # Round 83c fix: skip direct reddit.com hosts (not Redlib HTML) — they
-    # return Shreddit shells and would short-circuit gallery enrichment at [0..1].
-    if "reddit.com" in (instance or ""):
+    # Round 83c/86 fix: skip direct reddit.com hosts by exact hostname (not
+    # substring — "reddit.com" in instance previously matched safereddit.com).
+    if _is_direct_reddit_host(instance):
         return None
     key = (str(instance or ""), str(path or ""))
     if key in _redlib_post_page_cache:
@@ -4696,7 +4729,8 @@ def _motion_video_url(item: dict | None) -> str | None:
     return url or None
 
 
-def _log_media_outcome(label: str, media: list, *, fallback_reason: str | None = None):
+def _log_media_outcome(label: str, media: list, *, fallback_reason: str | None = None,
+                       provider_hint: str | None = None):
     global current_run_stats
     kinds = [x.get("kind") for x in media if isinstance(x, dict)]
     kind = kinds[0] if kinds else "none"
@@ -4705,6 +4739,8 @@ def _log_media_outcome(label: str, media: list, *, fallback_reason: str | None =
     for item in media:
         if isinstance(item, dict) and item.get("url"):
             provider = _provider_for_url(item["url"]) or "unknown"
+            if provider == "unknown" and provider_hint and provider_hint != "unknown":
+                provider = provider_hint
             # Final endpoint/hosting category (host-based)
             try:
                 import urllib.parse as _up
@@ -4966,13 +5002,14 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
     # posts (the DASH chain handles those). Any failure here simply falls
     # through to the round-12 native path.
     proxy_media_used = False
+    media_provider: str | None = "full" if post_json else None
     redlib_items: list[dict] = []
     redlib_done = False
     if not post_json and PROXY_MEDIA and reddit_proxy is not None and fetch_path:
         tasks = [fetch_proxy_post_memo(session, fetch_path,
                                        label=label, health=_proxy_health,
                                        need_video=bool(has_video))]
-        if not (base.get("vred_id") or base.get("redgifs_url")):
+        if not (has_video or arctic_is_video or base.get("vred_id") or base.get("redgifs_url")):
             tasks.append(enrich_gallery_redlib(session, fetch_path, label or "gallery"))
         results = await asyncio.gather(*tasks, return_exceptions=True)
         redlib_done = len(tasks) > 1
@@ -5028,11 +5065,14 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                 media = [proxy_video]
                 _use_proxy_text()
                 proxy_media_used = True
+                _url_prov = _provider_for_url(proxy_video["url"])
+                media_provider = (_url_prov if _url_prov and _url_prov != "unknown"
+                                  else str(proxy.get("service") or "unknown"))
                 logging.info(f"[{label or 'proxy'}] card media via "
-                             f"{_provider_for_url(proxy_video['url'])} — 1 video tile.")
+                             f"{media_provider} — 1 video tile.")
                 try:
                     if isinstance(current_run_stats, dict):
-                        via = str(proxy.get("service") or _provider_for_url(proxy_video['url']) or "unknown")
+                        via = str(proxy.get("service") or _url_prov or "unknown")
                         current_run_stats["media_resolved_via_provider"][via] = current_run_stats["media_resolved_via_provider"].get(via, 0) + 1
                 except Exception:
                     pass
@@ -5054,6 +5094,7 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                          if not (has_video and _is_external_preview(x["url"]))]
                 _use_proxy_text()
                 proxy_media_used = True
+                media_provider = "redlib"
                 logging.info(f"[{label or 'proxy'}] card media via redlib harvest "
                              f"(gallery video) — {len(media)} item(s).")
                 try:
@@ -5066,6 +5107,10 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                 media = [dict(item) for item in arctic_items]
                 _use_proxy_text()
                 proxy_media_used = True
+                media_provider = "arctic"
+                logging.info(f"[{label or 'proxy'}] card media via arctic "
+                             f"— {len(media)} item(s) (body/stats via "
+                             f"{proxy['service']}).")
                 try:
                     if isinstance(current_run_stats, dict):
                         current_run_stats["media_resolved_via_provider"]["arctic"] = current_run_stats["media_resolved_via_provider"].get("arctic", 0) + 1
@@ -5080,6 +5125,7 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                          if not (has_video and _is_external_preview(x["url"]))]
                 _use_proxy_text()
                 proxy_media_used = True
+                media_provider = "redlib"
                 logging.info(f"[{label or 'proxy'}] card media via redlib harvest "
                              f"— {len(media)} item(s) (body/stats via "
                              f"{proxy['service']}).")
@@ -5092,6 +5138,7 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                 media = proxy_images
                 _use_proxy_text()
                 proxy_media_used = True
+                media_provider = str(proxy.get("service") or "unknown")
                 logging.info(f"[{label or 'proxy'}] card media via {proxy['service']} "
                              f"— {len(media)} item(s).")
                 try:
@@ -5139,6 +5186,11 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
 
     if video_url:
         media.append({"kind": "video", "url": video_url})
+        _v_prov = _provider_for_url(video_url)
+        if _v_prov and _v_prov != "unknown":
+            media_provider = _v_prov
+        elif not media_provider:
+            media_provider = "native"
         # drop the video's own screenshot (external-preview) if one slipped in
         media = [x for x in media
                  if x["kind"] in ("video", "gif") or not _is_external_preview(x["url"])]
@@ -5154,6 +5206,7 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                 ok, _ = await media_url_ok(session, base["redgifs_url"], timeout=30, video=True)
                 if ok:
                     media.append({"kind": "video", "url": base["redgifs_url"]})
+                    media_provider = media_provider or "redgifs"
             if (not any(x["kind"] == "video" for x in media)
                     and not proxy_media_used):
                 # round 14: skipped entirely when the proxy path already
@@ -5162,6 +5215,9 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                 # when the winning branch produced an empty list.
                 if arctic_items and not any(x["kind"] == "video" for x in redlib_items):
                     media = [dict(item) for item in arctic_items]
+                    media_provider = "arctic"
+                    logging.info(f"[{label or 'native'}] card media via arctic "
+                                 f"— {len(media)} item(s).")
                 elif redlib_items:
                     # round 14: the COMPLETE ordered gallery (incl. GIFs,
                     # full-res i.redd.it) from the parallel redlib harvest —
@@ -5169,6 +5225,7 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                     # gallery items + GIFs)
                     media = [dict(x) for x in redlib_items
                              if not (has_video and _is_external_preview(x["url"]))]
+                    media_provider = "redlib"
                     logging.info(f"[{label or 'native'}] card media via redlib "
                                  f"harvest — {len(media)} item(s).")
                 else:
@@ -5187,11 +5244,15 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                                     p["url"] = swap
                                     logging.info(f"photo via i.redd.it full-res swap ({swap}).")
                         media.append(p)
+                    if media and not media_provider:
+                        media_provider = "native"
             if not media and not redlib_done and fetch_path:
                 # (legacy, e.g. video posts where the harvest was skipped):
                 # best-effort redlib harvest of the post page (parallel,
                 # ~10s worst case, no retry).
                 media = await enrich_gallery_redlib(session, fetch_path, label or "gallery")
+                if media:
+                    media_provider = "redlib"
             if not media and base.get("thumb"):
                 # legacy fallback: the feed's single thumbnail
                 thumb = base["thumb"]
@@ -5207,6 +5268,8 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                             media.append({"kind": "image", "url": thumb})
                     else:
                         media.append({"kind": "image", "url": thumb})
+                if media and not media_provider:
+                    media_provider = "native"
         elif video_poster and not media:
             # FULL MODE, video chain failed -> first frame (never a silent video)
             media.append({"kind": "image", "url": video_poster})
@@ -5226,12 +5289,14 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
         yt_media_url, yt_thumb = await resolve_youtube_media(session, yt_vid, yt_live)
         if yt_media_url and not any(x["kind"] == "video" for x in media):
             media.append({"kind": "video", "url": yt_media_url})
+            media_provider = media_provider or "youtube"
         if not any(x["kind"] == "video" for x in media):
             # thumbnail + button (round-12 default): the YT thumb is the
             # canonical preview — replace external screenshots, add if absent
             media = [x for x in media if not _is_external_preview(x["url"])]
             if not any(x["kind"] == "image" for x in media):
                 media.append({"kind": "image", "url": yt_thumb})
+                media_provider = media_provider or "youtube"
 
     body = _drop_youtube_line(body, yt_url)
     # round 29 (2026-09-19): a crosspost with an empty selftext gets the
@@ -5254,7 +5319,8 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
     fallback_reason = None
     if has_video and not any(_motion_video_url(x) for x in media):
         fallback_reason = "video-unresolved"
-    _log_media_outcome(label, media, fallback_reason=fallback_reason)
+    _log_media_outcome(label, media, fallback_reason=fallback_reason,
+                       provider_hint=media_provider)
     return {
         "title": title,
         "author": _clean_author_name(author),
@@ -5267,6 +5333,8 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
         "youtube_id": yt_vid,
         "youtube_live": yt_live,
         "full_mode": bool(post_json),
+        "media_provider": media_provider,
+        "proxy_media_used": proxy_media_used,
     }
 
 
@@ -5867,6 +5935,7 @@ async def main():
     _listing_cache.clear()
     _redlib_post_page_cache.clear()
     _proxy_post_cache.clear()
+    _redlib_reach.clear()
     is_first_run = len(posted) == 0
     now = time.time()
     # Round 34: remember the pre-run cache so every save can be verified
@@ -6149,6 +6218,47 @@ async def main():
             # newest first per sub for stable ordering
             new_posts.sort(key=lambda p: p[3])
 
+            # Round 86 (2026-10-24, live #9651): filter out known-pending
+            # archive ghosts, retry-backoff items, and stateless fresh-hold
+            # items BEFORE applying the per-run flood cap (MAX_POSTS_PER_RUN).
+            _eligible_for_cap = []
+            for subreddit, post_path, unique_key, published_ts, activity_ts, entry in new_posts:
+                # Round 30/32: pending-post recheck throttle — previously
+                # rejected/held posts are only re-checked once every
+                # PENDING_RECHECK_SECONDS (default 30 min), and removed/deleted
+                # posts are not re-checked unless restored via RSS.
+                if (not TEST_POST_ID and not DRY_RUN
+                        and unique_key in pending
+                        and _pending_throttle_skip(pending, unique_key, now, entry)):
+                    _pend = pending[unique_key]
+                    _pend_reason = str(_pend.get("reason") or "unknown")
+                    if _pend.get("reason") in _NO_RECHECK_REASONS:
+                        run_stats["known_pending_suppressed"] += 1
+                        _inc_reason(run_stats["known_pending_by_reason"], _pend_reason)
+                        logging.debug(f"[{unique_key}] pending ({_pend_reason}) — "
+                                     f"not re-checking (removed posts re-enter via RSS "
+                                     f"when restored; entry expires at the 48 h window).")
+                    else:
+                        _due_in = int(PENDING_RECHECK_SECONDS
+                                      - (now - float(_pend.get("last_checked") or 0)))
+                        run_stats["retry_backoff"] += 1
+                        _inc_reason(run_stats["retry_backoff_by_reason"], _pend_reason)
+                        logging.debug(f"[{unique_key}] pending ({_pend_reason}) — "
+                                     f"skipping recheck, due again in ~{_due_in}s.")
+                    continue
+                # ---- round 64 (updated 2026-10-21): minimum-age hold (FRESH_HOLD_SECONDS) ----
+                if not TEST_POST_ID and FRESH_HOLD_SECONDS > 0:
+                    _post_age = now - float(published_ts or now)
+                    if _post_age < FRESH_HOLD_SECONDS:
+                        run_stats["fresh_hold"] += 1
+                        logging.debug(f"[{unique_key}] age {_post_age:.1f}s < "
+                                     f"FRESH_HOLD_SECONDS ({FRESH_HOLD_SECONDS}s) — "
+                                     f"skipped this tick (stateless, not cached), "
+                                     f"re-evaluated next tick.")
+                        continue
+                _eligible_for_cap.append((subreddit, post_path, unique_key, published_ts, activity_ts, entry))
+            new_posts = _eligible_for_cap
+
             # Round 34: per-run flood cap (see MAX_POSTS_PER_RUN) — any future
             # cache loss causes ONE capped run with a loud log line, not a mass
             # re-post storm.
@@ -6184,48 +6294,6 @@ async def main():
                 reddit_url = f"https://www.reddit.com{path}"
                 _entry_source36 = ("arctic" if isinstance(entry, _ArcticEntry)
                                    else "rss")
-
-                # ---- round 30 (2026-09-19): pending-post recheck throttle ----
-                # A post an earlier run skipped (removed/deleted, still pending
-                # approval, media not filled yet) is re-verified at most once
-                # every PENDING_RECHECK_SECONDS — not every 5-minute run. When it
-                # IS due, the full pipeline below runs unchanged, so a
-                # newly-approved / restored / media-complete post is caught and
-                # posted on its next due run. TEST POST + DRY RUN bypass this
-                # (manual tools must always exercise the full pipeline).
-                if (not TEST_POST_ID and not DRY_RUN
-                        and unique_key in pending
-                        and _pending_throttle_skip(pending, unique_key, now, entry)):
-                    _pend = pending[unique_key]
-                    _pend_reason = str(_pend.get("reason") or "unknown")
-                    if _pend.get("reason") in _NO_RECHECK_REASONS:
-                        run_stats["known_pending_suppressed"] += 1
-                        _inc_reason(run_stats["known_pending_by_reason"], _pend_reason)
-                        logging.debug(f"[{unique_key}] pending ({_pend_reason}) — "
-                                     f"not re-checking (removed posts re-enter via RSS "
-                                     f"when restored; entry expires at the 48 h window).")
-                    else:
-                        _due_in = int(PENDING_RECHECK_SECONDS
-                                      - (now - float(_pend.get("last_checked") or 0)))
-                        run_stats["retry_backoff"] += 1
-                        _inc_reason(run_stats["retry_backoff_by_reason"], _pend_reason)
-                        logging.debug(f"[{unique_key}] pending ({_pend_reason}) — "
-                                     f"skipping recheck, due again in ~{_due_in}s.")
-                    continue
-
-                # ---- round 64 (updated 2026-10-21): stateless fresh hold ----
-                # A flat floor computed from the post's OWN creation timestamp —
-                # no first-seen tracking, no pending entry. A candidate still
-                # under the floor simply re-qualifies from the feed next tick.
-                if not TEST_POST_ID and FRESH_HOLD_SECONDS > 0:
-                    _post_age = now - float(published_ts or now)
-                    if _post_age < FRESH_HOLD_SECONDS:
-                        run_stats["fresh_hold"] += 1
-                        logging.debug(f"[{unique_key}] age {_post_age:.1f}s < "
-                                     f"FRESH_HOLD_SECONDS ({FRESH_HOLD_SECONDS}s) — "
-                                     f"skipped this tick (stateless, not cached), "
-                                     f"re-evaluated next tick.")
-                        continue
 
                 # pending with RSS re-appearance: eligible for reconsideration via RSS
                 if (unique_key in pending
@@ -6478,10 +6546,14 @@ async def main():
                                     "payload": payload,
                                 }
                             kinds = ",".join(sorted({m["kind"] for m in data["media"]})) or "text"
+                            _m_prov = str(data.get("media_provider") or "").strip()
+                            if not _m_prov and data.get("media"):
+                                _m_prov = _provider_for_url(data["media"][0].get("url", "")) or ""
                             mode = ("full" if data["full_mode"] else
-                                    ("proxy: " + _provider_for_url(data["media"][0].get("url", ""))
-                                     if data["media"] and data["media"][0].get("kind") == "video"
-                                     and _provider_for_url(data["media"][0].get("url", "")) != "thumbnail"
+                                    (f"proxy: {_m_prov}"
+                                     if data.get("media")
+                                     and (data.get("proxy_media_used") or data["media"][0].get("kind") == "video")
+                                     and _m_prov not in ("", "unknown", "thumbnail", "native", "native-dash")
                                      else "native-dash" if data["media"] and
                                      _provider_for_url(data["media"][0].get("url", "")) == "native-dash"
                                      else "native"))
@@ -6600,7 +6672,18 @@ async def main():
             if RETRACT_DEAD_POSTS and not DRY_RUN:
                 await retract_dead_posts(session, posted_messages, now)
 
-        log_redlib_reachability()   # round 49: which mirrors actually answered
+        _reach_line = log_redlib_reachability()   # round 49: which mirrors actually answered
+        run_stats["redlib_instances_configured"] = len([
+            u for u in REDDIT_RSS_INSTANCES if not _is_direct_reddit_host(u)
+        ])
+        if _reach_line:
+            run_stats["redlib_reach"] = _reach_line
+            run_stats["redlib_reach_answered"] = sum(1 for ok, _t in _redlib_reach.values() if ok)
+            run_stats["redlib_reach_probed"] = len(_redlib_reach)
+        else:
+            run_stats["redlib_reach"] = None
+            run_stats["redlib_reach_answered"] = 0
+            run_stats["redlib_reach_probed"] = 0
 
         # Aggregated INFO summary (stage-accurate)
         logging.info(f"Run summary: {run_stats['unposted_candidates_considered']} considered, "

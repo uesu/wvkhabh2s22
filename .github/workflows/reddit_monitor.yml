@@ -409,6 +409,23 @@ jobs:
           # Video quality mode (local config, no network)
           vq = data.get("video_quality", "unavailable")
           print(f"- Video quality mode: {vq}")
+          # Redlib instance reachability (REDLIB-REACH, local observation only, no extra network)
+          redlib_line = data.get("redlib_reach")
+          if not redlib_line:
+              log_path = pathlib.Path("monitor.log")
+              if log_path.exists():
+                  try:
+                      for ln in reversed(log_path.read_text(encoding="utf-8", errors="ignore").splitlines()):
+                          if "REDLIB-REACH:" in ln:
+                              redlib_line = "REDLIB-REACH: " + ln.split("REDLIB-REACH:", 1)[1].strip()
+                              break
+                  except Exception:
+                      pass
+          redlib_cfg = data.get("redlib_instances_configured")
+          if isinstance(redlib_line, str) and redlib_line.strip():
+              print(f"- Instances (REDLIB-REACH): {redlib_line.strip()}")
+          elif redlib_cfg is not None:
+              print(f"- Instances (REDLIB-REACH): not probed this run ({redlib_cfg} Redlib instance(s) configured)")
           # Required diagnostic distinctions (when actually observed, no extra network)
           # 1. Media resolved via provider
           via = data.get("media_resolved_via_provider")

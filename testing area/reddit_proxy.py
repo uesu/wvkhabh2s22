@@ -1488,11 +1488,18 @@ async def fetch_proxy_post(session, path: str, label: str = "",
                     continue
                 if _better_media(result, r, best_media_result, best_rank):
                     if best_media_result is not None:
-                        logging.info(f"[{label}] {service} has "
-                                     f"{len(result['media'])} media item(s) vs "
-                                     f"{len(best_media_result['media'])} from "
-                                     f"{best_media_result['service']} - "
-                                     f"replacing the winner.")
+                        if len(result["media"]) == len(best_media_result["media"]):
+                            logging.info(f"[{label}] {service} tied "
+                                         f"{best_media_result['service']} at "
+                                         f"{len(result['media'])} media item(s) - "
+                                         f"preferring higher-priority {service} "
+                                         f"(replacing the winner).")
+                        else:
+                            logging.info(f"[{label}] {service} has "
+                                         f"{len(result['media'])} media item(s) vs "
+                                         f"{len(best_media_result['media'])} from "
+                                         f"{best_media_result['service']} - "
+                                         f"replacing the winner.")
                     best_media_result, best_rank = result, r
                     logging.info(f"[{label}] proxy media via {service} - "
                                  f"{len(result['media'])} item(s) (best so far).")
