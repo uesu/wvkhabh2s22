@@ -102,7 +102,9 @@ class _Session:
     a test can prove exactly how many round-trips a path costs.
     """
 
-    def __init__(self, patch_replies=None, patch_default=None, patch_status=200):
+    def __init__(self, patch_replies=None, patch_default=None, patch_status=200, message_reply=None, message_status=503):
+        self.message_reply = message_reply
+        self.message_status = message_status
         self.routes = {}
         self.patch_replies = list(patch_replies or [])
         self.patch_default = patch_default if patch_default is not None else {"components": []}
@@ -140,6 +142,9 @@ class _Session:
         return self._send("HEAD", url, headers)
 
     def get(self, url, headers=None, **kw):
+        if "/messages/" in url:
+            self.requests.append(("GET", url, dict(headers or {})))
+            return _Resp(self.message_status, {}, self.message_reply)
         return self._send("GET", url, headers)
 
     def patch(self, url, json=None, **kw):
@@ -593,6 +598,25 @@ try:
           and _s.patches[0][0] == "https://discord.com/api/webhooks/1/abc/messages/999"
                                   "?with_components=true"
           and _s.patches[0][1] == _payload, str(_s.patches))
+
+    _s = _Session(message_reply=_HEALTHY, message_status=200)
+    asyncio.run(x3.heal_unresolved_media(
+        _s, [("https://discord.com/api/webhooks/1/abc", "999", _payload, "WW/2105")]))
+    check("media revalidation: resolved during wait sends one GET and zero PATCHes",
+          len(_s.requests) == 1 and _s.patches == [])
+
+    _s = _Session(message_reply=_COLD, message_status=200, patch_replies=[_HEALTHY])
+    asyncio.run(x3.heal_unresolved_media(
+        _s, [("https://discord.com/api/webhooks/1/abc", "999", _payload, "WW/2105")]))
+    check("media revalidation: still unresolved gets one identical bounded edit",
+          len(_s.requests) == 1 and _s.patches == [
+              ("https://discord.com/api/webhooks/1/abc/messages/999?with_components=true", _payload)])
+
+    for status in (401, 403, 404):
+        _s = _Session(message_status=status)
+        asyncio.run(x3.heal_unresolved_media(
+            _s, [("https://discord.com/api/webhooks/1/abc", "999", _payload, "WW/2105")]))
+        check(f"media revalidation: terminal GET {status} prevents pointless edit", _s.patches == [])
 
     _s = _Session(patch_replies=[_COLD] * 10)
     asyncio.run(x3.heal_unresolved_media(

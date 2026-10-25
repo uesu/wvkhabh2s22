@@ -1071,6 +1071,23 @@ async def heal_unresolved_media(session: aiohttp.ClientSession, pending: list) -
         url = f"{webhook_url}/messages/{message_id}?with_components=true"
         for attempt in range(1, max(1, MEDIA_HEAL_ATTEMPTS) + 1):
             await asyncio.sleep(MEDIA_HEAL_DELAY_SECONDS)
+            # Discord may finish proxying during the wait. Revalidate before editing
+            # so a healthy video is not repeatedly PATCHed based on stale POST metadata.
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as current:
+                    if current.status == 200:
+                        message = await current.json()
+                        if (isinstance(message, dict) and isinstance(message.get("components"), list)
+                                and not heal_eligible_items(message)):
+                            logging.info(f"MEDIA-HEAL {key}: skipped after revalidation — "
+                                         "no unresolved eligible media remains.")
+                            return
+                    elif current.status in (401, 403, 404):
+                        logging.info(f"MEDIA-HEAL {key}: revalidation HTTP {current.status}; stopped.")
+                        return
+            except Exception:
+                # A transient GET failure does not disable the existing bounded heal.
+                logging.info(f"MEDIA-HEAL {key}: revalidation unavailable; retaining bounded edit.")
             try:
                 async with session.patch(url, json=payload) as resp:
                     if resp.status != 200:
@@ -1090,8 +1107,7 @@ async def heal_unresolved_media(session: aiohttp.ClientSession, pending: list) -
             logging.info(f"MEDIA-HEAL {key}: still unresolved after edit "
                          f"#{attempt} ({len(still_bad)} item(s)).")
         logging.warning(f"MEDIA-HEAL {key}: media still unresolved after "
-                        f"{MEDIA_HEAL_ATTEMPTS} edit(s) — Discord's proxy is "
-                        f"refusing this asset, not just cold.")
+                        f"{MEDIA_HEAL_ATTEMPTS} edit(s); playback remains unverified.")
 
     logging.info(f"MEDIA-HEAL: {len(pending)} message(s) posted with unresolved "
                  f"media — re-editing each in {MEDIA_HEAL_DELAY_SECONDS}s.")

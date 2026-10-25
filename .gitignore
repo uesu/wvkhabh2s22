@@ -8,8 +8,10 @@ posted_tweets.json
 posted_reddit.json
 proxy_health.json
 pending_reddit.json
-# Created only when Reddit dead-post retraction is enabled; force-added by the workflow.
+# Reddit retraction and durable long-body delivery state; force-added by the workflow.
 posted_messages.json
+# Same-directory atomic-save scratch files (may remain after process termination).
+.posted-messages-*
 # Local run-result record for the Reddit monitor (workflow summary source)
 reddit_run_result.json
 

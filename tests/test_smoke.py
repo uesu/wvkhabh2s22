@@ -4813,22 +4813,147 @@ _r66_p12, _r66_rest12 = v3.build_v3_payload(_r66_sub, _r66_data(_r66_body12),
 _r66_t12 = _r66_texts(_r66_p12)
 _r66_conts12 = v3.build_continuation_payloads(_r66_rest12)
 _r66_chunks12 = _r66_chunks(_r66_conts12)
-check("r66: 12k-class body — capped at exactly three continuations",
-      len(_r66_conts12) == 3, str(len(_r66_conts12)))
-check("r66: 12k-class body — the last continuation ends with the 'full post on Reddit' pointer",
-      _r66_chunks12[-1].endswith("\n\n… full post on Reddit"),
-      repr(_r66_chunks12[-1][-60:]))
-_r66_c3_base = _r66_chunks12[-1][: -len("\n\n… full post on Reddit")]
-_r66_delivered = "\n\n".join([_r66_t12[1]] + _r66_chunks12[:2] + [_r66_c3_base])
-check("r66: 12k-class body — every delivered chunk is a paragraph-safe prefix of the body",
-      _r66_body12.startswith(_r66_delivered) and len(_r66_delivered) < len(_r66_body12),
-      f"delivered={len(_r66_delivered)} body={len(_r66_body12)}")
-check("r66: 12k-class body — beyond the cap only the spill is dropped (the last para)",
-      _r66_body12[len(_r66_delivered):].strip() == _r66_paras12[-1],
-      repr(_r66_body12[len(_r66_delivered):][:60]))
-check("r66: 12k-class body — no continuation slice ever cuts a paragraph",
-      all(chunk in _r66_body12 for chunk in _r66_chunks12[:2]),
-      str([len(c) for c in _r66_chunks12[:2]]))
+# User-requested full-post policy supersedes round 66's three-follow-up cap.
+check("full text: 12k-class body includes part five",
+      len(_r66_conts12) == 4, str(len(_r66_conts12)))
+check("full text: every paragraph arrives in order without a truncation pointer",
+      "\n\n".join([_r66_t12[1]] + _r66_chunks12) == _r66_body12)
+_rfull_body = "\n\n".join(_r66_para(f"Full{i}", 1000) for i in range(45))
+_rfull_card, _rfull_rest = v3.build_v3_payload(
+    _r66_sub, _r66_data(_rfull_body), _r66_url, _r66_ts, return_remainder=True)
+_rfull_chunks = _r66_chunks(v3.build_continuation_payloads(_rfull_rest))
+check("full text: over 40k body retains all paragraphs beyond ten messages",
+      len(_rfull_chunks) > 10
+      and "\n\n".join([_r66_texts(_rfull_card)[1]] + _rfull_chunks) == _rfull_body
+      and all(len(c) <= 4000 for c in _rfull_chunks))
+_rfull_token = "x" * 45000
+check("full text: oversized token makes progress and loses no characters",
+      "".join(_r66_chunks(v3.build_continuation_payloads(_rfull_token))) == _rfull_token)
+
+# Continuation delivery uses actual helper + mocked Discord and durable disk saves.
+def _test_full_body_delivery_resume():
+    import asyncio
+    import copy
+    import tempfile
+    from pathlib import Path
+
+    class Response:
+        def __init__(self, status, message):
+            self.status, self.message = status, message
+            self.headers = {"Retry-After": "1"}
+
+        async def __aenter__(self):
+            if isinstance(self.message, Exception):
+                raise self.message
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def json(self, **kwargs):
+            return self.message
+
+    class Session:
+        def __init__(self, responses):
+            self.responses, self.calls = iter(responses), []
+
+        def post(self, url, json, **kwargs):
+            assert "wait=true" in url
+            self.calls.append(copy.deepcopy(json))
+            return next(self.responses)
+
+    class ConnectorError(Exception):
+        pass
+
+    original = (v3.POSTED_MESSAGES_FILE, v3.RETRACT_DEAD_POSTS, v3.asyncio.sleep,
+                v3._DISCORD_CONNECTOR_ERRORS)
+    async def no_wait(_delay):
+        pass
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            v3.POSTED_MESSAGES_FILE = str(Path(tmp) / "messages.json")
+            v3.RETRACT_DEAD_POSTS = False
+            v3.asyncio.sleep = no_wait
+            v3._DISCORD_CONNECTOR_ERRORS = (ConnectorError,)
+            pages = v3.build_continuation_payloads("x" * 18000)
+            records = {"key": {"subreddit": "TestSub", "delivered_at": time.time(),
+                               "message_id": "main", "message_ids": ["main"],
+                               "continuations": pages, "continuation_next": 0}}
+            first = Session([Response(200, {"id": "page1"}), Response(429, {})])
+            asyncio.run(v3.deliver_body_continuations(first, "https://example.test", "key", records))
+            records = v3.load_posted_messages()
+            assert records["key"]["continuation_next"] == 1
+            assert records["key"]["message_ids"] == ["main", "page1"]
+            assert first.calls == pages[:2]
+            waiting = Session([])
+            asyncio.run(v3.deliver_body_continuations(waiting, "https://example.test", "key", records))
+            assert waiting.calls == []
+            records["key"]["continuation_retry_at"] = 0
+            resume = Session([Response(200, {"id": f"page{i+1}"}) for i in range(1, len(pages))])
+            asyncio.run(v3.deliver_body_continuations(resume, "https://example.test", "key", records))
+            settled = v3.load_posted_messages()["key"]
+            assert resume.calls == pages[1:] and settled["continuations"] == []
+            assert settled["message_ids"] == ["main"] + [f"page{i+1}" for i in range(len(pages))]
+            # Completion after a long deferral must survive until ordinary dedup saves.
+            records["old"] = {"delivered_at": time.time() - v3.RETRACT_WINDOW_SECONDS - 3600,
+                              "message_id": "old-main", "message_ids": ["old-main"],
+                              "continuations": pages[:1], "continuation_next": 0}
+            asyncio.run(v3.deliver_body_continuations(
+                Session([Response(200, {"id": "old-page"})]),
+                "https://example.test", "old", records))
+            assert v3.load_posted_messages()["old"]["message_ids"] == ["old-main", "old-page"]
+            records["connect"] = {"continuations": pages[:1], "continuation_next": 0}
+            disconnected = Session([Response(200, ConnectorError("connection refused"))])
+            asyncio.run(v3.deliver_body_continuations(
+                disconnected, "https://example.test", "connect", records))
+            records = v3.load_posted_messages()
+            assert "continuation_hold" not in records["connect"]
+            assert records["connect"]["continuation_next"] == 0
+            assert records["connect"]["continuation_retry_at"] > time.time()
+            records["connect"]["continuation_retry_at"] = 0
+            asyncio.run(v3.deliver_body_continuations(
+                Session([Response(200, {"id": "retried"})]),
+                "https://example.test", "connect", records))
+            assert v3.load_posted_messages()["connect"]["message_ids"] == ["retried"]
+            for response in (Response(200, {}), Response(500, {}), Response(200, TimeoutError("timeout"))):
+                records["key"] = {"continuations": pages, "continuation_next": 0}
+                uncertain = Session([response])
+                asyncio.run(v3.deliver_body_continuations(uncertain, "https://example.test", "key", records))
+                records = v3.load_posted_messages()
+                assert records["key"]["continuation_hold"]
+                assert records["key"]["continuation_next"] == 0
+                asyncio.run(v3.deliver_body_continuations(uncertain, "https://example.test", "key", records))
+                assert len(uncertain.calls) == 1
+            saved = Path(v3.POSTED_MESSAGES_FILE).read_bytes()
+            try:
+                v3.save_posted_messages({"bad": {"continuations": [object()]}})
+            except TypeError:
+                pass
+            else:
+                raise AssertionError("invalid cache write succeeded")
+            assert Path(v3.POSTED_MESSAGES_FILE).read_bytes() == saved
+            assert not list(Path(tmp).glob(".posted-messages-*"))
+            for corrupt in ("{", "[]", '{"key": []}',
+                            '{"key": {"continuations": "invalid"}}',
+                            '{"key": {"continuations": [{}], "continuation_next": -1}}',
+                            '{"key": {"continuations": [{}], "continuation_next": 2}}',
+                            '{"key": {"continuation_retry_at": "NaN"}}'):
+                Path(v3.POSTED_MESSAGES_FILE).write_text(corrupt)
+                try:
+                    v3.load_posted_messages()
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("corrupt delivery cache silently discarded")
+    finally:
+        (v3.POSTED_MESSAGES_FILE, v3.RETRACT_DEAD_POSTS, v3.asyncio.sleep,
+         v3._DISCORD_CONNECTOR_ERRORS) = original
+
+try:
+    _test_full_body_delivery_resume()
+    check("full text: durable resume after rate limit, all IDs, uncertain outcomes held", True)
+except Exception as _full_error:
+    check("full text: durable resume after rate limit, all IDs, uncertain outcomes held", False, repr(_full_error))
 
 # --- safe splits: NEVER inside a link / URL / spoiler / marker pair -------
 _r66_link = "[Set](https://example.com/honkai-set)"
@@ -5212,7 +5337,7 @@ check("r66: 15-photo long-body card keeps the round-38c two-container split (10 
       and [c["type"] for c in _r66_g15["components"][1]["components"]] == [14, 12, 10, 14, 1],
       str([[c["type"] for c in cont["components"]] for cont in _r66_g15["components"]]))
 check("r66: gallery card body split feeds the SAME continuation pipeline",
-      len(_r66_g15_conts) == 3
+      len(_r66_g15_conts) == 4
       and all(c["components"][0]["components"][0]["type"] == 10
               and len(c["components"][0]["components"]) == 1 for c in _r66_g15_conts),
       f"conts={len(_r66_g15_conts)}")
@@ -5334,10 +5459,9 @@ check("r66: reddit_monitor.yml — round-61 deploy steps untouched",
       and "git pull --rebase" not in _r66_wf)
 
 # --- engine source guards ---------------------------------------------------
-check("r66: budgets — main card cap raised for continuations, 3 × 3800 more",
-      v3.MAX_BODY_CHARS == 16000 and v3.MAX_CONTINUATIONS == 3
-      and v3.CONTINUATION_CHAR_LIMIT == 3800,
-      f"{v3.MAX_BODY_CHARS}/{v3.MAX_CONTINUATIONS}/{v3.CONTINUATION_CHAR_LIMIT}")
+check("full text: per-message budget remains 3800; no body or page truncation",
+      v3.CONTINUATION_CHAR_LIMIT == 3800
+      and "[:MAX_BODY_CHARS]" not in inspect.getsource(v3))
 _r66_bv3_src = inspect.getsource(v3.build_v3_payload)
 # r66 guards updated in round 71: the renderer was renamed
 # `_markdown_tables_to_bullets` -> `_format_markdown_tables` and its output
@@ -6522,9 +6646,10 @@ _r72_main = inspect.getsource(v3.main)
 check("r72: both repository Variables are workflow-wired",
       all(f"{name}: ${{{{ vars.{name} }}}}" in _r72_workflow
           for name in ("PROXY_VIDEO_HEAL", "PROXY_VIDEO_HEAL_DELAY")))
-check("r72: video/retract cards request wait=true and read the created message",
-      "if RETRACT_DEAD_POSTS or inspect_video_response:" in _r72_main
-      and "if (RETRACT_DEAD_POSTS or inspect_video_response) and resp.status == 200:" in _r72_main)
+# Full-body delivery also needs confirmed IDs; preserve both original conditions.
+check("r72: video/retract/continuation cards request wait=true and read the created message",
+      "if RETRACT_DEAD_POSTS or inspect_video_response or continuations:" in _r72_main
+      and "if (RETRACT_DEAD_POSTS or inspect_video_response or continuations) and resp.status == 200:" in _r72_main)
 check("r72: only an explicit unresolved item with message ID queues an edit after posting loop",
       "unresolved = _unresolved_healable_video_items(message_json, data)" in _r72_main
       and "if (unresolved and isinstance(message_json, dict)" in _r72_main
@@ -6589,17 +6714,18 @@ class _R72MainSession:
 
 
 async def _r72_main_case(media, response, current=None, enabled=True,
-                         retract=False, status=200):
+                         retract=False, status=200, body="hi", session_type=_R72MainSession,
+                         save_records=None):
     base = {"title": "Title", "author": "Author", "body": "hi", "content_html": "",
             "thumb": None, "crosspost_orig_path": None, "vred_id": None,
             "redgifs_url": None, "youtube_url": None}
-    data = {"title": "Title", "author": "Author", "body": "hi", "media": media,
+    data = {"title": "Title", "author": "Author", "body": body, "media": media,
             "stats": None, "crosspost": None, "op_comment": None,
             "youtube_url": None, "full_mode": False}
     posted = set()
     records = {}
     class _Aio:
-        ClientSession = _R72MainSession
+        ClientSession = session_type
         ClientTimeout = staticmethod(lambda total=None: None)
     from contextlib import ExitStack
     with ExitStack() as stack:
@@ -6629,9 +6755,131 @@ async def _r72_main_case(media, response, current=None, enabled=True,
                 ("save_posted", {"side_effect": lambda keys, fresh: set(keys)}),
                 ("save_pending", {}), ("save_posted_messages", {}),
                 ("get_webhook_for_subreddit", {"return_value": "https://discord.test/webhook"})):
+            if name == "save_posted_messages" and save_records is not None:
+                kwargs["side_effect"] = save_records
             stack.enter_context(patch.object(v3, name, **kwargs))
         await v3.main()
     return _R72MainSession.last, posted, records
+
+
+async def _test_multipart_main_ambiguity():
+    import copy
+
+    class InterruptedSession(_R72MainSession):
+        before_send = None
+        error_type = TimeoutError
+
+        def post(self, url, json=None, **kw):
+            # The main card must already have a durable ambiguity hold at this boundary.
+            self.before_send = copy.deepcopy(saved[-1]) if saved else {}
+            self.posts.append((url, json))
+            raise self.error_type("main response lost")
+
+    saved = []
+    await _r72_main_case([], None, body="long body " * 1000,
+                        session_type=InterruptedSession,
+                        save_records=lambda records: saved.append(copy.deepcopy(records)))
+    record = InterruptedSession.last.before_send["TestSub_abc123"]
+    assert record["continuation_hold"] == "main_outcome_unknown"
+    assert record["continuations"] and record["continuation_next"] == 0
+    assert saved[-1]["TestSub_abc123"]["continuation_hold"] == "main_outcome_unknown"
+    assert len(InterruptedSession.last.posts) == 1
+    class ConnectorError(Exception):
+        pass
+    class DisconnectedSession(InterruptedSession):
+        error_type = ConnectorError
+    with patch.object(v3, "_DISCORD_CONNECTOR_ERRORS", (ConnectorError,)):
+        await _r72_main_case([], None, body="long body " * 1000,
+                            session_type=DisconnectedSession,
+                            save_records=lambda records: saved.append(copy.deepcopy(records)))
+    assert saved[-1] == {} and len(DisconnectedSession.last.posts) == 1
+    for status in (400, 429, 500):
+        session, posted, records = await _r72_main_case(
+            [], None, status=status, body="long body " * 1000)
+        assert len(session.posts) == 1 and not posted
+        assert ("TestSub_abc123" in records) == (status == 500)
+        if status == 500:
+            assert records["TestSub_abc123"]["continuation_hold"] == "main_outcome_unknown"
+
+
+try:
+    asyncio.run(_test_multipart_main_ambiguity())
+    check("r88: multipart main ambiguity is persisted before Discord POST", True)
+except Exception as _main_hold_error:
+    check("r88: multipart main ambiguity is persisted before Discord POST", False, repr(_main_hold_error))
+
+
+async def _test_completed_continuations_recover_missing_dedup(ambiguous=False):
+    """Crash after final page save, before the ordinary dedup save: never repost."""
+    from contextlib import ExitStack
+    from pathlib import Path
+    import tempfile
+    from types import SimpleNamespace
+
+    class Entry(dict):
+        __getattr__ = dict.get
+
+    class Session:
+        posts = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def post(self, *args, **kwargs):
+            self.posts.append((args, kwargs))
+            raise AssertionError("confirmed main card must not be sent again")
+
+    with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+        for name, value in (
+                ("CACHE_FILE", str(Path(tmp) / "posted.json")),
+                ("PENDING_FILE", str(Path(tmp) / "pending.json")),
+                ("POSTED_MESSAGES_FILE", str(Path(tmp) / "messages.json")),
+                ("_RUN_RESULT_FILE", str(Path(tmp) / "result.json")),
+                ("SUBREDDITS", ["TestSub"]), ("TEST_POST_ID", ""),
+                ("DRY_RUN", False), ("PROXY_MEDIA", False),
+                ("RETRACT_DEAD_POSTS", False), ("FRESH_HOLD_SECONDS", 0),
+                ("aiohttp", SimpleNamespace(ClientSession=Session,
+                                             ClientTimeout=lambda total=None: None)),
+                ("fetch_combined_feed", AsyncMock(return_value=SimpleNamespace(entries=[
+                    Entry(link="https://reddit.com/r/TestSub/comments/abc123/title/",
+                          published_parsed=time.gmtime(time.time() - 60))]))),
+                ("fetch_arctic_subreddit_posts", AsyncMock(return_value=[])),
+                ("fetch_post_json", AsyncMock(return_value={})),
+                ("resolve_post_media", AsyncMock(return_value={
+                    "title": "T", "author": "A", "body": "body", "media": [],
+                    "stats": None, "crosspost": None, "op_comment": None,
+                    "youtube_url": None, "full_mode": False})),
+                ("get_webhook_for_subreddit", lambda _sub: "https://discord.test/webhook")):
+            stack.enter_context(patch.object(v3, name, value))
+        record = {"subreddit": "TestSub", "message_id": "main",
+                  "message_ids": ["main", "page1", "page2"],
+                  "delivered_at": time.time(), "continuations": [], "continuation_next": 2}
+        if ambiguous:
+            record.update(message_ids=[], continuation_next=0,
+                          continuation_hold="main_outcome_unknown",
+                          continuations=v3.build_continuation_payloads("body"))
+            record.pop("message_id")
+        v3.save_posted_messages({"TestSub_abc123": record})
+        # The ordinary posted cache never reached disk before the interrupted run.
+        await v3.main()
+        assert v3.fetch_post_json.await_count == 0
+        assert v3.resolve_post_media.await_count == 0
+        assert Session.posts == []
+        assert "TestSub_abc123" in v3.load_posted()
+        assert json.loads(Path(v3._RUN_RESULT_FILE).read_text())["persistence_status"] == "saved"
+        assert v3.load_posted_messages()["TestSub_abc123"]["message_ids"] == record["message_ids"]
+
+for _restart_label, _ambiguous in (
+        ("full text: completed page IDs recover dedup after interrupted final save", False),
+        ("r88: ambiguous main send is held across actual-loop restart without replay", True)):
+    try:
+        asyncio.run(_test_completed_continuations_recover_missing_dedup(ambiguous=_ambiguous))
+        check(_restart_label, True)
+    except Exception as _restart_error:
+        check(_restart_label, False, repr(_restart_error))
 
 
 _r72_main_proxy, _r72_posted, _ = asyncio.run(_r72_main_case(

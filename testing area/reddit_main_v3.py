@@ -219,6 +219,8 @@
 #   run: python "testing area/reddit_main_v3.py"
 # ---------------------------------------------------------------------------
 import os
+import tempfile
+import math
 import re
 import json
 import time
@@ -233,6 +235,10 @@ import feedparser
 from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlsplit
 from dotenv import load_dotenv
+
+# Capture the real exception class before offline tests replace the aiohttp client.
+_DISCORD_CONNECTOR_ERRORS = ((aiohttp.ClientConnectorError,)
+                             if hasattr(aiohttp, "ClientConnectorError") else ())
 
 try:
     import reddit_signals
@@ -553,11 +559,11 @@ def _write_run_result(stats, extra=None):
 # ■ ROUND 66 (2026-10-05): LONG-POST CONTINUATIONS + TABLE RENDERING
 # A body that no longer fits the card's text budget is no longer truncated
 # and dropped: the main card keeps the first chunk (same layout, gallery,
-# stats, buttons), and the remainder is delivered as up to
-# MAX_CONTINUATIONS follow-up messages to the same webhook — text-only
+# stats, buttons), and the remainder is delivered as content-driven
+# follow-up messages to the same webhook — text-only
 # Components V2 containers, same accent color, starting directly with the
-# remaining body text (no generated heading). Beyond the cap the last message ends with
-# "… full post on Reddit" (the Read Post button already links the post).
+# remaining body text (no generated heading). The original three-follow-up
+# and 16k source caps were removed on 2026-10-25 for full-post delivery.
 # Retraction covers every part: continuation message IDs are recorded
 # alongside the main card's, so the tombstone/delete pass hits them all.
 # Every split (main budget AND continuation boundaries) lands on a safe
@@ -1161,18 +1167,10 @@ def feedtoken_probe_enabled() -> bool:
         return True
     return False
 
-# Text display budget (Discord: 4000 chars total per message across all
-# text components; we keep header+body+stats comfortably under it).
-# Round 66: this is now the MAIN CARD's body budget — a longer body is
-# continued in follow-up messages (MAX_CONTINUATIONS × ~3800 chars more;
-# see build_v3_payload/build_continuation_payloads) instead of truncated.
-MAX_BODY_CHARS = 16000
-# Round 66: follow-up messages carrying the body remainder (see the
-# ROUND 66 block above). 3800 leaves room under Discord's 4000-char
-# message limit. Follow-ups start directly with body text.
-MAX_CONTINUATIONS = 3
+# Text-only continuations reserve 200 characters below Discord's 4000 limit.
+# Full-post policy (2026-10-25): retain the entire retrieved body and emit as
+# many messages as needed. The main card keeps its separate geometry budget.
 CONTINUATION_CHAR_LIMIT = 3800
-CONTINUATION_TAIL = "… full post on Reddit"
 
 # Buttons (style 5 = Link). YouTube button uses the animated starwardspark3.
 READ_POST_EMOJI = {"id": "1472388018689282261", "name": "starwardhmm", "animated": True}
@@ -1366,24 +1364,38 @@ def save_pending(pending: dict) -> None:
 
 
 def load_posted_messages() -> dict:
-    if not RETRACT_DEAD_POSTS:
-        return {}
     try:
         with open(POSTED_MESSAGES_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            raise ValueError("posted-message cache must be an object")
+        for key, record in data.items():
+            if not isinstance(record, dict):
+                raise ValueError("posted-message record must be an object")
+            if "continuations" in record:
+                pages = record["continuations"]
+                index = record.get("continuation_next", 0)
+                if (not isinstance(pages, list) or type(index) is not int or index < 0
+                        or (pages and index >= len(pages))
+                        or any(not isinstance(page, dict) for page in pages)):
+                    raise ValueError("invalid saved continuation progress")
+            if "message_ids" in record and (
+                    not isinstance(record["message_ids"], list)
+                    or any(not isinstance(mid, str) or not mid for mid in record["message_ids"])):
+                raise ValueError("invalid saved continuation message IDs")
+            if not math.isfinite(float(record.get("continuation_retry_at") or 0)):
+                raise ValueError("invalid saved continuation retry time")
+        return data
     except FileNotFoundError:
         return {}
     except Exception as e:
-        logging.error(f"Error reading posted-message cache: {e}")
-        return {}
+        logging.error(f"Error reading posted-message cache: {_sanitize_error_message(e)}")
+        raise
 
 
 def save_posted_messages(messages: dict) -> None:
-    if not RETRACT_DEAD_POSTS:
-        return
     def _msg_age_ok(v: dict, now: float) -> bool:
-        raw = v.get("delivered_at")
+        raw = v.get("continuation_completed_at", v.get("delivered_at"))
         if raw is None:
             return True
         try:
@@ -1395,10 +1407,22 @@ def save_posted_messages(messages: dict) -> None:
         now = time.time()
         pruned = {
             k: v for k, v in (messages or {}).items()
-            if isinstance(v, dict) and not v.get("retracted") and _msg_age_ok(v, now)
+            if isinstance(v, dict) and not v.get("retracted")
+            and (v.get("continuations") or _msg_age_ok(v, now))
         }
-        with open(POSTED_MESSAGES_FILE, "w", encoding="utf-8") as f:
-            json.dump(dict(sorted(pruned.items())), f, indent=2)
+        directory = os.path.dirname(os.path.abspath(POSTED_MESSAGES_FILE))
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                             prefix=".posted-messages-", delete=False) as f:
+                temporary = f.name
+                json.dump(dict(sorted(pruned.items())), f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, POSTED_MESSAGES_FILE)
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
     except Exception as e:
         logging.error(f"Error saving posted-message cache: {_sanitize_error_message(e)}")
         raise
@@ -2479,15 +2503,14 @@ def build_continuation_payloads(rest: str) -> list:
     """Round 66: the follow-up message payloads that carry a card body's
     remainder (see the ROUND 66 block above). Text-only Components V2
     containers, same accent color as the card, starting directly with the
-    remaining body text; capped at MAX_CONTINUATIONS messages — any
-    further remainder ends the last message with '… full post on Reddit'
-    (the Read Post button already links the post)."""
+    remaining body text. Continue until the complete readable source body
+    is consumed; message count depends on content, including part five and beyond."""
     text = (rest or "").strip()
     if not text:
         return []
     budget = CONTINUATION_CHAR_LIMIT
     chunks = []
-    while text and len(chunks) < MAX_CONTINUATIONS:
+    while text:
         if len(text) <= budget:
             chunks.append(text)
             text = ""
@@ -2496,8 +2519,6 @@ def build_continuation_payloads(rest: str) -> list:
         chunks.append(text[:point].rstrip())
         text = text[point:].lstrip()
     chunks = [c for c in chunks if c.strip()]
-    if text and chunks:
-        chunks[-1] = chunks[-1].rstrip() + f"\n\n{CONTINUATION_TAIL}"
     return [
         {"flags": IS_COMPONENTS_V2,
          "components": [{"type": 17, "accent_color": 16729344,
@@ -2505,6 +2526,78 @@ def build_continuation_payloads(rest: str) -> list:
                                          "content": chunk}]}]}
         for chunk in chunks
     ]
+
+
+async def deliver_body_continuations(session, webhook_url: str, key: str, records: dict) -> None:
+    """Resume confirmed rejections without reposting the main card or confirmed pages.
+
+    An uncertain POST outcome is held for manual reconciliation: retrying a timeout
+    could duplicate a message Discord already accepted. Persist only public payloads/IDs.
+    """
+    record = records[key]
+    pages = record.get("continuations") or []
+    if (record.get("continuation_hold") or record.get("retracted")
+            or float(record.get("continuation_retry_at") or 0) > time.time()):
+        return
+    while record.get("continuation_next", 0) < len(pages):
+        index = record.get("continuation_next", 0)
+        record["last_checked"] = time.time()
+        # A crash after POST but before confirmation leaves a deliberate hold.
+        record["continuation_hold"] = "outcome_unknown"
+        save_posted_messages(records)
+        try:
+            async with session.post(
+                    f"{webhook_url}?with_components=true&wait=true", json=pages[index],
+                    timeout=aiohttp.ClientTimeout(total=15)) as response:
+                if response.status == 200:
+                    message = await response.json(content_type=None)
+                    if not isinstance(message, dict) or not message.get("id"):
+                        logging.error("Body continuation response missing message ID for %s", key)
+                        return
+                    ids = record.setdefault("message_ids", [])
+                    if str(message["id"]) not in ids:
+                        ids.append(str(message["id"]))
+                    record["continuation_next"] = index + 1
+                    record["last_checked"] = time.time()
+                    record.pop("continuation_hold", None)
+                    logging.info("Body continuation posted for %s (part %s of %s).",
+                                 key, index + 2, len(pages) + 1)
+                    if index + 1 == len(pages):
+                        record["continuations"] = []
+                        record["continuation_completed_at"] = time.time()
+                    save_posted_messages(records)
+                elif response.status == 429:
+                    # Explicit rejection; defer to a later scheduled run without
+                    # interleaving later parts or replaying accepted pages.
+                    record.pop("continuation_hold", None)
+                    try:
+                        retry_after = float(response.headers.get("Retry-After", "60"))
+                    except (TypeError, ValueError):
+                        retry_after = 60.0
+                    record["continuation_retry_at"] = time.time() + max(1.0, min(retry_after, 86400.0))
+                    logging.warning("Body continuation rate limited for %s; deferred", key)
+                    return
+                else:
+                    # Server errors may occur after accepting the write too.
+                    record["continuation_hold"] = f"http_{response.status}"
+                    logging.error("Body continuation HTTP %s for %s; reconciliation required",
+                                  response.status, key)
+                    return
+        except _DISCORD_CONNECTOR_ERRORS as error:
+            # TCP was never established: no message can have been accepted.
+            record.pop("continuation_hold", None)
+            record["continuation_retry_at"] = time.time() + 60
+            logging.warning("Body continuation not sent for %s: %s; deferred",
+                            key, _sanitize_error_message(error))
+            return
+        except Exception as error:
+            logging.error("Body continuation uncertain for %s: %s; reconciliation required",
+                          key, _sanitize_error_message(error))
+            return
+        finally:
+            save_posted_messages(records)
+        if record.get("continuation_next", 0) < len(pages):
+            await asyncio.sleep(1.0)
 
 
 def strip_html(value: str | None) -> str:
@@ -5048,7 +5141,7 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                     # Round 65 audit: proxy bodies arrive pre-unescaped
                     # (exactly once) from reddit_proxy.py's parsers
                     # (clean_proxy_body & friends) — no second unescape here.
-                    body = proxy["body"][:MAX_BODY_CHARS]
+                    body = proxy["body"]
 
             video_dead = bool(proxy_video) and not video_ok
             if proxy_video and video_ok:
@@ -5324,7 +5417,7 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
     return {
         "title": title,
         "author": _clean_author_name(author),
-        "body": body[:MAX_BODY_CHARS] + ("…" if len(body) > MAX_BODY_CHARS else ""),
+        "body": body,
         "media": media,
         "stats": stats,
         "crosspost": crosspost,
@@ -5929,18 +6022,35 @@ async def main():
     # the full quality budget available.
     reset_video_quality_budget()
 
-    posted = load_posted()
-    pending = load_pending()
-    posted_messages = load_posted_messages()
+    run_stats = _init_run_stats()
+    global current_run_stats
+    current_run_stats = run_stats
+    # Initialize fresh record; mark incomplete until successful completion
+    run_stats["completed"] = False
+    _write_run_result(run_stats, {"status": "started"})  # ensure stale prior file is not reused; will be overwritten on completion
+    try:
+        posted = load_posted()
+        # Capture disk state before recovering keys so retention/save checks include them.
+        posted_at_start = set(posted)
+        pending = load_pending()
+        posted_messages = load_posted_messages()
+    except Exception as error:
+        run_stats["error"] = f"{type(error).__name__}:{_sanitize_error_message(error)}"
+        _write_run_result(run_stats, {"status": "failed", "completed": False})
+        raise
+    message_state_at_start = json.dumps(posted_messages, sort_keys=True)
+    # Partial/completed records and main ambiguity holds suppress blind reposts.
+    # The final page save clears continuations before ordinary dedup is saved; keep
+    # the durable next-index marker as evidence across that interruption window.
+    posted.update(key for key, value in posted_messages.items()
+                  if isinstance(value, dict) and
+                  (value.get("continuations") or "continuation_next" in value))
     _listing_cache.clear()
     _redlib_post_page_cache.clear()
     _proxy_post_cache.clear()
     _redlib_reach.clear()
     is_first_run = len(posted) == 0
     now = time.time()
-    # Round 34: remember the pre-run cache so every save can be verified
-    # (a just-posted key missing from the saved file = it WILL re-post).
-    posted_at_start = set(posted)
     # Round 34: saturation warning — the pre-round-34 cap failure was
     # completely silent (lexicographic eviction logged nothing). Warn when a
     # sub is within 10 keys of its per-sub quota or the total is within 10%
@@ -5959,12 +6069,6 @@ async def main():
 
     use_oauth = bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET)
 
-    run_stats = _init_run_stats()
-    global current_run_stats
-    current_run_stats = run_stats
-    # Initialize fresh record; mark incomplete until successful completion
-    run_stats["completed"] = False
-    _write_run_result(run_stats, {"status": "started"})  # ensure stale prior file is not reused; will be overwritten on completion
     # Use try/finally to preserve counters on unexpected failure without masking exception
     try:
         combined_fetch_status = "unavailable"
@@ -5972,6 +6076,13 @@ async def main():
         subreddits_represented_val = None
 
         async with aiohttp.ClientSession() as session:
+            if not DRY_RUN and not TEST_POST_ID:
+                for resume_key, resume_record in list(posted_messages.items()):
+                    if not isinstance(resume_record, dict) or not resume_record.get("continuations"):
+                        continue
+                    resume_webhook = get_webhook_for_subreddit(resume_record.get("subreddit", ""))
+                    if resume_webhook:
+                        await deliver_body_continuations(session, resume_webhook, resume_key, posted_messages)
             # ---- round 13: proxy warm-up (writes proxy_health.json) ----------
             global _proxy_health
             if PROXY_MEDIA and reddit_proxy is not None:
@@ -6187,7 +6298,8 @@ async def main():
                         save_pending(pending)
                         save_posted_messages(posted_messages)
                         # Determine local persistence outcome: unchanged vs saved
-                        if posted == posted_at_start:
+                        if (posted == posted_at_start
+                                and json.dumps(posted_messages, sort_keys=True) == message_state_at_start):
                             run_stats["persistence_status"] = "unchanged"
                         else:
                             run_stats["persistence_status"] = "saved"
@@ -6274,6 +6386,7 @@ async def main():
             # wait behind a preceding card's repair delay.
             proxy_video_heal_queue = []
             for subreddit, path, unique_key, published_ts, activity_ts, entry in new_posts:
+                main_post_connecting = False
                 # Round 34: double dedup (belt and braces) — collect() already
                 # skips keys in the loaded cache, but a key can surface twice in
                 # ONE run's feed (new + mod-queue listings) or via any future
@@ -6515,15 +6628,28 @@ async def main():
 
                     inspect_video_response = _has_video_media(data)
                     target_url = f"{webhook_url}?with_components=true"
-                    # Only video cards (or the retraction seatbelt) need the
-                    # created message JSON. Ordinary cards still use the old POST.
-                    if RETRACT_DEAD_POSTS or inspect_video_response:
+                    # Video cards, retraction and multi-part bodies need confirmed
+                    # message IDs. Ordinary single text cards keep the old POST.
+                    if RETRACT_DEAD_POSTS or inspect_video_response or continuations:
                         target_url += "&wait=true"
+                    if continuations:
+                        # Persist before POST: a lost main response must not replay page one.
+                        posted_messages[unique_key] = {
+                            "subreddit": subreddit, "path": path,
+                            "delivered_at": time.time(), "published_ts": int(published_ts),
+                            "payload": payload, "continuations": continuations,
+                            "continuation_next": 0, "message_ids": [],
+                            "continuation_hold": "main_outcome_unknown",
+                            "last_checked": time.time(),
+                        }
+                        save_posted_messages(posted_messages)
+                    main_post_connecting = True
                     async with session.post(target_url, json=payload,
                                             timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        main_post_connecting = False
                         if resp.status in (200, 204):
                             message_json = None
-                            if (RETRACT_DEAD_POSTS or inspect_video_response) and resp.status == 200:
+                            if (RETRACT_DEAD_POSTS or inspect_video_response or continuations) and resp.status == 200:
                                 try:
                                     message_json = await resp.json(content_type=None)
                                 except Exception:
@@ -6536,15 +6662,17 @@ async def main():
                             # against a subreddit's real approval latency without
                             # guessing (grep the Actions log for LATENCY).
                             _pend_entry = pending.pop(unique_key, None)  # posted — no longer pending
-                            if RETRACT_DEAD_POSTS and isinstance(message_json, dict) and message_json.get("id"):
-                                posted_messages[unique_key] = {
+                            if (RETRACT_DEAD_POSTS or continuations) and isinstance(message_json, dict) and message_json.get("id"):
+                                record = posted_messages.setdefault(unique_key, {})
+                                record.update({
                                     "subreddit": subreddit,
                                     "path": path,
                                     "message_id": str(message_json["id"]),
                                     "delivered_at": int(now),
                                     "published_ts": int(published_ts),
                                     "payload": payload,
-                                }
+                                })
+                                record.pop("continuation_hold", None)
                             kinds = ",".join(sorted({m["kind"] for m in data["media"]})) or "text"
                             _m_prov = str(data.get("media_provider") or "").strip()
                             if not _m_prov and data.get("media"):
@@ -6573,35 +6701,20 @@ async def main():
                             # same mechanism/ordering as the YouTube link
                             # message below. Message IDs are recorded so the
                             # retraction seatbelt covers EVERY part.
-                            for _ci, _cont in enumerate(continuations, 1):
-                                try:
-                                    _cont_url = f"{webhook_url}?with_components=true"
-                                    if RETRACT_DEAD_POSTS:
-                                        _cont_url += "&wait=true"
-                                    async with session.post(_cont_url, json=_cont,
-                                                            timeout=aiohttp.ClientTimeout(total=15)) as c_resp:
-                                        if c_resp.status in (200, 204):
-                                            if RETRACT_DEAD_POSTS and c_resp.status == 200:
-                                                try:
-                                                    _c_json = await c_resp.json(content_type=None)
-                                                except Exception:
-                                                    _c_json = None
-                                                if isinstance(_c_json, dict) and _c_json.get("id"):
-                                                    _record = posted_messages.get(unique_key)
-                                                    if isinstance(_record, dict) and _record.get("message_id"):
-                                                        _ids = _record.setdefault(
-                                                            "message_ids", [_record["message_id"]])
-                                                        if str(_c_json["id"]) not in _ids:
-                                                            _ids.append(str(_c_json["id"]))
-                                            logging.info(f"Body continuation posted for {unique_key} "
-                                                         f"(part { _ci + 1 } of "
-                                                         f"{len(continuations) + 1}).")
-                                        else:
-                                            logging.error(f"Body continuation HTTP {c_resp.status} for "
-                                                          f"{unique_key}: {(await c_resp.text())[:200]}")
-                                except Exception as c_e:
-                                    logging.error(f"Body continuation failed for {unique_key}: {c_e}")
-                                await asyncio.sleep(1.0)
+                            if continuations:
+                                record = posted_messages.setdefault(unique_key, {
+                                    "subreddit": subreddit, "path": path,
+                                    "delivered_at": int(now), "published_ts": int(published_ts),
+                                })
+                                record["continuations"] = continuations
+                                record["continuation_next"] = 0
+                                record["message_ids"] = ([record["message_id"]]
+                                                         if record.get("message_id") else [])
+                                if not record.get("message_id"):
+                                    record["continuation_hold"] = "main_message_id_unknown"
+                                save_posted_messages(posted_messages)
+                                await deliver_body_continuations(
+                                    session, webhook_url, unique_key, posted_messages)
                             await create_discohook_share(session, payload, unique_key)
                             # round 13: YouTube posts get a SECOND, plain message
                             # containing ONLY the YouTube link (Discord shows the
@@ -6651,10 +6764,24 @@ async def main():
                                     pass
                             await asyncio.sleep(1.5)
                         else:
+                            if continuations and 400 <= resp.status < 500:
+                                # Explicit main rejection is safe to reconsider from the feed.
+                                posted_messages.pop(unique_key, None)
+                                save_posted_messages(posted_messages)
                             body = await resp.text()
                             logging.error(f"Discord error {resp.status} for {unique_key}: {body}")
                             run_stats["failed_delivery"] += 1
                             _inc_reason(run_stats.get("other_by_reason", {}), f"discord_{resp.status}")
+                except _DISCORD_CONNECTOR_ERRORS as e:
+                    record = posted_messages.get(unique_key)
+                    if (main_post_connecting and isinstance(record, dict)
+                            and record.get("continuation_hold") == "main_outcome_unknown"):
+                        posted_messages.pop(unique_key)
+                        save_posted_messages(posted_messages)
+                    logging.error("Connection failed before posting %s: %s; retry allowed",
+                                  unique_key, _sanitize_error_message(e))
+                    run_stats["failed_delivery"] += 1
+                    _inc_reason(run_stats.get("other_by_reason", {}), type(e).__name__)
                 except Exception as e:
                     logging.error(f"Failed building/posting {unique_key}: {_sanitize_error_message(e)}")
                     run_stats["failed_delivery"] += 1
@@ -6727,7 +6854,8 @@ async def main():
                 _verify_dedup_save(posted_at_start, posted, saved)
                 save_pending(pending)
                 save_posted_messages(posted_messages)
-                if posted == posted_at_start:
+                if (posted == posted_at_start
+                        and json.dumps(posted_messages, sort_keys=True) == message_state_at_start):
                     run_stats["persistence_status"] = "unchanged"
                 else:
                     run_stats["persistence_status"] = "saved"
