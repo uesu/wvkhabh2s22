@@ -219,6 +219,7 @@
 #   run: python "testing area/reddit_main_v3.py"
 # ---------------------------------------------------------------------------
 import os
+import pathlib
 import tempfile
 import math
 import re
