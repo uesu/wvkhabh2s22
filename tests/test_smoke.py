@@ -9192,6 +9192,14 @@ if _sync_wf_path.is_file():
           and "python tests/test_twitter_media.py" in _sync_wf_src
           and "python .github/scripts/sync_prod.py" in _sync_wf_src)
 
+# ---- Documentation credits (README is excluded from production syncs) ----
+_readme_path = os.path.join(ROOT, "README.md")
+if os.path.isfile(_readme_path):
+    with open(_readme_path, encoding="utf-8") as _readme_file:
+        _readme_text = _readme_file.read()
+    check("credits: README has no Arena AI contributor row",
+          not re.search(r"^\|\s*\*\*Arena AI\*\*\s*\|", _readme_text, re.MULTILINE))
+
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
     sys.exit(1)
