@@ -3,6 +3,13 @@ name: CI — syntax + offline smoke test
 # Safety gate for Dependabot PRs (and any PR): proves the monitor scripts
 # still install and compile after a dependency or runtime bump BEFORE anything
 # can be merged to main. Runs on every PR + push to main.
+#
+# Supply chain (round 57 + round 89): every `uses:` stays pinned to an
+# immutable 40-hex commit SHA, and its version comment stays a BARE
+# `# vX.Y.Z` at end of line. zizmor's ref-version-mismatch audit only
+# verifies a pin whose comment it can parse, so an annotated comment
+# ("# v7 — SHA-pinned ...") silently disables that check — put notes on the
+# line above instead. Guarded by tests/test_smoke.py (r89).
 
 on:
   pull_request:
@@ -19,10 +26,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7 — SHA-pinned (round 57, immutable supply chain)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7 — SHA-pinned (round 57)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           # Exact stable CPython pin; update deliberately after CI validates it.
           python-version: '3.14.8'

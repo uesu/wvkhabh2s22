@@ -711,10 +711,45 @@ def _line_stage(lines: list) -> list:
         kept.append(line)
     return kept
 
+def _wrap_proxy_inline_markdown(inner: str, marker: str) -> str:
+    """Wrap non-empty HTML inline content in Discord Markdown `marker` per line."""
+    if not inner:
+        return ""
+    normalized = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", inner)
+    out = []
+    for ln in normalized.split("\n"):
+        visible = re.sub(r"<[^>]+>", "", ln).strip()
+        if not visible:
+            out.append(ln)
+            continue
+        m = re.match(r"^([ \t]*)(.*?)([ \t]*)$", ln, flags=re.S)
+        lead, core, trail = (m.group(1), m.group(2), m.group(3)) if m else ("", ln.strip(), "")
+        if core.startswith(marker) and core.endswith(marker) and len(core) > 2 * len(marker):
+            out.append(f"{lead}{core}{trail}")
+        else:
+            out.append(f"{lead}{marker}{core}{marker}{trail}")
+    return "\n".join(out)
+
+
+def _format_proxy_html_heading(inner: str) -> str:
+    cleaned = re.sub(r"(?i)<\s*br\s*/?\s*>", " ", inner or "")
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return "\n"
+    while cleaned.startswith("**") and cleaned.endswith("**") and len(cleaned) > 4:
+        inner_core = cleaned[2:-2].strip()
+        if "**" in inner_core:
+            break
+        cleaned = inner_core
+    return f"\n\n**{cleaned}**\n\n"
+
+
 def clean_proxy_body(value) -> str:
     """selftext/og:description HTML -> clean Discord-markdown card text:
       • <a href="URL">text</a>  ->  [text](URL)   (links stay clickable)
-      • <b>/<strong>            ->  **bold**
+      • <b>/<strong>/<h1..h6>   ->  **bold**
+      • <i>/<em> and <del>/<s>  ->  *italic* / ~~strikethrough~~
       • paragraph/list/heading boundaries -> real newlines
       • redd.it media links ([text](url)) and BARE redd.it URLs are removed
         — the media already sits in the gallery, not in the text (fixes the
@@ -722,9 +757,37 @@ def clean_proxy_body(value) -> str:
     """
     if not value:
         return ""
-    text = re.sub(r"(?is)<span\s+[^>]*\bclass=[\"\x27][^\"\x27]*\b(?:md-)?spoiler(?:-text)?\b[^\"\x27]*[\"\x27][^>]*>(.*?)</span>", r"||\1||", value)
+    text = re.sub(
+        r"(?is)<span\s+[^>]*\bclass=[\"\x27][^\"\x27]*\b(?:md-)?spoiler(?:-text)?\b[^\"\x27]*[\"\x27][^>]*>(.*?)</span>",
+        lambda m: _wrap_proxy_inline_markdown(m.group(1), "||"),
+        value,
+    )
+    text = re.sub(
+        r"(?is)<span\b[^>]*\bstyle=[\"\x27][^\"\x27]*font-weight\s*:\s*(?:bold|[6-9]00)\b[^\"\x27]*[\"\x27][^>]*>(.*?)</span\s*>",
+        lambda m: _wrap_proxy_inline_markdown(m.group(1), "**"),
+        text,
+    )
     text = re.sub(r'(?is)<a\s[^>]*href="([^"]+)"[^>]*>(.*?)</a>', r'[\2](\1)', text)
-    text = re.sub(r"(?is)<(?:b|strong)\s*>(.*?)</(?:b|strong)>", r"**\1**", text)
+    text = re.sub(
+        r"(?is)<(b|strong)\b[^>]*>(.*?)</\1\s*>",
+        lambda m: _wrap_proxy_inline_markdown(m.group(2), "**"),
+        text,
+    )
+    text = re.sub(
+        r"(?is)<(i|em)\b[^>]*>(.*?)</\1\s*>",
+        lambda m: _wrap_proxy_inline_markdown(m.group(2), "*"),
+        text,
+    )
+    text = re.sub(
+        r"(?is)<(del|s|strike)\b[^>]*>(.*?)</\1\s*>",
+        lambda m: _wrap_proxy_inline_markdown(m.group(2), "~~"),
+        text,
+    )
+    text = re.sub(
+        r"(?is)<h([1-6])\b[^>]*>(.*?)</h\1\s*>",
+        lambda m: _format_proxy_html_heading(m.group(2)),
+        text,
+    )
     # round 16: same structural markdown as the RSS path
     text = re.sub(r"(?is)<blockquote[^>]*>", "\x01", text)
     text = re.sub(r"(?i)</blockquote>", "\x02", text)
@@ -1413,6 +1476,8 @@ async def fetch_proxy_post(session, path: str, label: str = "",
     rank = {service: i for i, service in enumerate(order)}
     fallback_result = None
     fallback_rank = len(order)
+    fallback_stats = None
+    fallback_stats_rank = len(order)
     best_media_result = None
     best_rank = len(order)
 
@@ -1477,12 +1542,16 @@ async def fetch_proxy_post(session, path: str, label: str = "",
                 if need_video and not any(is_motion_video_item(m) for m in result["media"]):
                     if r < fallback_rank:
                         fallback_result, fallback_rank = result, r
+                    if result.get("stats") and r < fallback_stats_rank:
+                        fallback_stats, fallback_stats_rank = result["stats"], r
                     logging.info(f"[{label}] {service} result has no video - "
                                  f"keeping it only as a text/stats fallback.")
                     continue
                 if not result["media"]:
                     if r < fallback_rank:
                         fallback_result, fallback_rank = result, r
+                    if result.get("stats") and r < fallback_stats_rank:
+                        fallback_stats, fallback_stats_rank = result["stats"], r
                     logging.info(f"[{label}] {service} returned text only "
                                  f"(no media) - still waiting for media.")
                     continue
@@ -1569,11 +1638,14 @@ async def fetch_proxy_post(session, path: str, label: str = "",
         logging.info(f"[{label}] proxy media winner - "
                      f"{len(best_media_result['media'])} item(s).")
         return best_media_result
-    if isinstance(fallback_result, dict) and fallback_result.get("media"):
-        if any(is_audio_cover_url(m.get("url"))
-               for m in fallback_result["media"] if isinstance(m, dict)):
-            fallback_result = dict(fallback_result)
-            fallback_result["media"] = filter_proxy_media(fallback_result["media"])
+    if isinstance(fallback_result, dict):
+        if fallback_result.get("stats") is None and fallback_stats is not None:
+            fallback_result = dict(fallback_result, stats=fallback_stats)
+        if fallback_result.get("media"):
+            if any(is_audio_cover_url(m.get("url"))
+                   for m in fallback_result["media"] if isinstance(m, dict)):
+                fallback_result = dict(fallback_result)
+                fallback_result["media"] = filter_proxy_media(fallback_result["media"])
     return fallback_result
 
 

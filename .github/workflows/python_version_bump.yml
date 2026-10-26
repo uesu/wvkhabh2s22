@@ -95,7 +95,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7 — SHA-pinned (round 57, immutable supply chain)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           token: ${{ secrets.BUMP_PAT }}
 
@@ -213,7 +213,7 @@ jobs:
       # ---- THE GATE: install the candidate and run the offline validation --
       - name: Install the candidate interpreter
         if: steps.resolve.outputs.bump == 'yes'
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7 — SHA-pinned (round 57)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ steps.resolve.outputs.latest }}
           cache: 'pip'
@@ -271,19 +271,37 @@ jobs:
             docs/DEPENDABOT.md
             tests/test_smoke.py
           )
+          # Round 89: this workflow is copied into both production repositories
+          # by sync_prod.py, and neither production repository carries the
+          # dev-only sync_prod.yml. Cover that pin where it exists (development
+          # lockstep) and skip it with a notice where it does not — absence of
+          # one optional surface must not fail the runtime bump closed.
+          OPTIONAL_ALLOWLIST=(
+            .github/workflows/sync_prod.yml
+          )
+          TARGETS=("${ALLOWLIST[@]}")
           printf 'Allowlisted files to update:\n'
           printf '  %s\n' "${ALLOWLIST[@]}"
           for file in "${ALLOWLIST[@]}"; do
             test -f "$file" || { echo "::error::Expected runtime file missing: $file"; exit 1; }
             grep -Fq "$CURRENT" "$file" || { echo "::error::$file does not contain expected current pin $CURRENT"; exit 1; }
           done
-          for file in "${ALLOWLIST[@]}"; do
+          for file in "${OPTIONAL_ALLOWLIST[@]}"; do
+            if [ -f "$file" ]; then
+              TARGETS+=("$file")
+              printf '  %s (optional, present)\n' "$file"
+            else
+              echo "::notice::Optional runtime file absent in this repository; skipping: $file"
+            fi
+          done
+          for file in "${TARGETS[@]}"; do
+            grep -Fq "$CURRENT" "$file" || { echo "::error::$file does not contain expected current pin $CURRENT"; exit 1; }
             sed -i "s/${CURRENT}/${LATEST}/g" "$file"
           done
           OLD_SLUG="python-$(echo "$CURRENT" | tr -d '.')"
           NEW_SLUG="python-$(echo "$LATEST" | tr -d '.')"
           sed -i "s/${OLD_SLUG}/${NEW_SLUG}/g" docs/PYTHON_RUNTIME.md
-          for file in "${ALLOWLIST[@]}"; do
+          for file in "${TARGETS[@]}"; do
             grep -Fq "$LATEST" "$file" || { echo "::error::$file was not updated"; exit 1; }
           done
           # Protect the complete historical tree and reject edits outside the
@@ -293,7 +311,7 @@ jobs:
           fi
           UNEXPECTED="$(
             git diff --name-only |
-              grep -vFxf <(printf '%s\n' "${ALLOWLIST[@]}" .github/workflows/python_version_bump.yml) ||
+              grep -vFxf <(printf '%s\n' "${TARGETS[@]}" .github/workflows/python_version_bump.yml) ||
               true
           )"
           if [ -n "$UNEXPECTED" ]; then
@@ -321,7 +339,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo '---- final diff/stat before PR ----'
           git --no-pager diff --stat
-          git --no-pager diff -- .github/workflows/ci.yml .github/workflows/reddit_monitor.yml .github/workflows/twitter_monitor.yml README.md docs/PYTHON_RUNTIME.md docs/CI_SMOKE.md docs/DEPENDABOT.md tests/test_smoke.py
+          git --no-pager diff -- "${TARGETS[@]}"
 
       # The rewrite touches the test suite itself (the round-39 pin guard),
       # so the tree is verified AGAIN afterwards. This is the gate that

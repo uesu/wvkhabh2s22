@@ -2201,6 +2201,59 @@ def _arctic_media_count(post) -> int:
     return len(arctic_gallery_items(post))
 
 
+_FENCED_CODE_LINE_RE = re.compile(r"^\s*(`{3,}|~{3,})([^\n`~]*)$")
+_MD_SUBHEADING_RE = re.compile(r"^(\s*(?:>\s*)*)#{4,6}[ \t]+(.+?)[ \t]*#*$")
+_REDDIT_SPOILER_RE = re.compile(r"(?<!`)>!\s*(.+?)\s*!<(?!`)")
+
+
+def _normalize_reddit_markdown(text: str) -> str:
+    """Normalize Reddit-specific Markdown constructs that Discord renders raw.
+
+    - Converts native Reddit spoilers (`>!text!<`) outside code spans/fences
+      into Discord spoilers (`||text||`).
+    - Converts level 4–6 Markdown headings (`####`–`######`, which Discord
+      Components V2 renders as literal `#` characters) into `**bold**` lines
+      without double-wrapping headings that are already bolded.
+    Never forces formatting onto plain prose lines and never raises.
+    """
+    if not text:
+        return ""
+    out_lines = []
+    in_fence = False
+    fence_marker = ""
+    for line in text.splitlines():
+        fm = _FENCED_CODE_LINE_RE.match(line)
+        if fm:
+            marker = fm.group(1)
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker[0] * len(marker)
+            elif marker[0] == fence_marker[0] and len(marker) >= len(fence_marker):
+                in_fence = False
+                fence_marker = ""
+            out_lines.append(line)
+            continue
+        if in_fence:
+            out_lines.append(line)
+            continue
+        hm = _MD_SUBHEADING_RE.match(line)
+        if hm:
+            prefix, heading = hm.group(1), hm.group(2).strip()
+            if heading:
+                if heading.startswith("**") and heading.endswith("**") and len(heading) > 4:
+                    line = f"{prefix}{heading}"
+                else:
+                    line = f"{prefix}**{heading}**"
+        if ">!" in line and "!<" in line:
+            parts = re.split(r"(`+[^`\n]*`+)", line)
+            line = "".join(
+                part if idx % 2 == 1 else _REDDIT_SPOILER_RE.sub(r"||\1||", part)
+                for idx, part in enumerate(parts)
+            )
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+
 def _clean_plain_body(text) -> str:
     """Plain (non-HTML) selftext -> card body — the Arctic archive path.
 
@@ -2213,8 +2266,30 @@ def _clean_plain_body(text) -> str:
     """
     if text in ("[removed]", "[deleted]"):
         return ""
-    text = html_lib.unescape(str(text or ""))
+    text = _normalize_reddit_markdown(html_lib.unescape(str(text or "")))
     return _collapse_blanks(_line_stage([line.strip() for line in text.splitlines()]))
+
+
+_HTML_TAG_RE = re.compile(r"(?i)</?[a-z][a-z0-9]*(?:\s[^<>]*)?/?>")
+
+
+def _clean_selftext(value: str | None) -> str:
+    """Clean Reddit JSON `selftext` while preserving paragraphs and Markdown.
+
+    Unlike `strip_html` (used for single-line OP comment summaries), JSON
+    `selftext` is raw Markdown with single-escaped HTML entities; collapsing
+    all whitespace to single spaces would flatten multi-page paragraphs,
+    headings, lists, and tables. Input that actually contains HTML markup (the
+    RSS/test-post `content_html` route) keeps going through the HTML cleaner,
+    and that detection must stay tag-agnostic: an allowlist of tags leaked raw
+    `<pre>`, `<code>` and inline-styled `<span>` markup into the card body.
+    Falls back gracefully on any input.
+    """
+    if not value or value in ("[removed]", "[deleted]"):
+        return ""
+    if _HTML_TAG_RE.search(value):
+        return clean_rss_body(value)
+    return _clean_plain_body(value)
 
 
 def _drop_youtube_line(body: str, youtube_url: str | None) -> str:
@@ -2294,10 +2369,12 @@ _PROTECTED_SPAN_RES = (
     re.compile(r"https?://[^\s<>\[\)]+"),
     # Discord spoiler
     re.compile(r"\|\|[^|\n]*\|\|"),
-    # bold / italic marker pairs
+    # bold / italic / strikethrough / inline-code marker pairs
     re.compile(r"\*\*[^*\n]*\*\*"),
     re.compile(r"(?<!\*)\*[^*\n]+\*(?!\*)"),
     re.compile(r"_[^_\n]+_"),
+    re.compile(r"~~[^~\n]+~~"),
+    re.compile(r"`[^`\n]+`"),
 )
 
 
@@ -2353,6 +2430,70 @@ def _safe_split_point(text: str, limit: int) -> int:
     return max(1, limit)
 
 
+def _open_fence_state(text: str):
+    """Return `(fence_chars, info)` if `text` ends inside an unclosed code fence."""
+    open_fence = None
+    for ln in text.splitlines():
+        fm = _FENCED_CODE_LINE_RE.match(ln)
+        if not fm:
+            continue
+        marker, info = fm.group(1), fm.group(2).strip()
+        if open_fence is None:
+            open_fence = (marker[0] * len(marker), info)
+        elif marker[0] == open_fence[0][0] and len(marker) >= len(open_fence[0]):
+            open_fence = None
+    return open_fence
+
+
+def _rebalance_split_pair(head: str, tail: str, limit: int) -> tuple:
+    """Best-effort, non-throwing cross-page formatter balance guard.
+
+    If a page split lands inside a fenced code block (```lang ... ```) or
+    hard-splits an oversized inline `**`/`||`/`~~` span, close the open
+    marker on `head` (only when `len(head) + len(closing) <= limit`) and
+    reopen it on `tail`. Never forces formatting when none was open, never
+    exceeds `limit`, and falls back to `(head, tail)` on any unexpected input.
+    """
+    try:
+        if not head or not tail:
+            return head, tail
+        open_fence = _open_fence_state(head)
+        if open_fence is not None:
+            fence, info = open_fence
+            close_seq = f"\n{fence}"
+            reopen_seq = f"{fence}{info}\n"
+            if len(head) + len(close_seq) <= limit:
+                return head + close_seq, reopen_seq + tail
+            return head, tail
+        last_line = head.rsplit("\n", 1)[-1]
+        first_line = tail.split("\n", 1)[0]
+        for marker in ("**", "||", "~~"):
+            if (last_line.count(marker) % 2 == 1
+                    and first_line.count(marker) % 2 == 1
+                    and len(head) + len(marker) <= limit):
+                return head + marker, marker + tail
+    except Exception:
+        return head, tail
+    return head, tail
+
+
+def _split_with_balance(text: str, limit: int) -> tuple:
+    """Split `text` within `limit` chars and rebalance open fences/emphasis."""
+    reserve = 0
+    prefix = text[:limit]
+    open_fence = _open_fence_state(prefix)
+    if open_fence is not None:
+        reserve = len(open_fence[0]) + 1
+    else:
+        last_ln = prefix.rsplit("\n", 1)[-1]
+        if any(last_ln.count(m) % 2 == 1 for m in ("**", "||", "~~")):
+            reserve = 2
+    eff_limit = limit - reserve if limit > reserve + 40 else limit
+    point = _safe_split_point(text, eff_limit)
+    head, tail = text[:point].rstrip(), text[point:].lstrip()
+    return _rebalance_split_pair(head, tail, limit)
+
+
 def split_card_body(text: str, limit: int) -> tuple:
     """Round 66: (head, tail) split of a card body at a safe boundary —
     paragraph break preferred, then line break, then space, never inside
@@ -2361,8 +2502,7 @@ def split_card_body(text: str, limit: int) -> tuple:
     text = text or ""
     if len(text) <= limit:
         return text, ""
-    point = _safe_split_point(text, limit)
-    return text[:point].rstrip(), text[point:].lstrip()
+    return _split_with_balance(text, limit)
 
 
 _TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-+:?$")
@@ -2500,12 +2640,8 @@ def _format_markdown_tables(body: str | None) -> str:
     return _collapse_blanks(spaced)
 
 
-def build_continuation_payloads(rest: str) -> list:
-    """Round 66: the follow-up message payloads that carry a card body's
-    remainder (see the ROUND 66 block above). Text-only Components V2
-    containers, same accent color as the card, starting directly with the
-    remaining body text. Continue until the complete readable source body
-    is consumed; message count depends on content, including part five and beyond."""
+def _split_continuation_chunks(rest: str) -> list:
+    """Split continuation remainder into safe `<= CONTINUATION_CHAR_LIMIT` chunks."""
     text = (rest or "").strip()
     if not text:
         return []
@@ -2516,16 +2652,30 @@ def build_continuation_payloads(rest: str) -> list:
             chunks.append(text)
             text = ""
             break
-        point = _safe_split_point(text, budget)
-        chunks.append(text[:point].rstrip())
-        text = text[point:].lstrip()
-    chunks = [c for c in chunks if c.strip()]
+        head, text = _split_with_balance(text, budget)
+        chunks.append(head)
+    return [c for c in chunks if c.strip()]
+
+
+def build_continuation_payloads(rest: str) -> list:
+    """Round 66: the follow-up message payloads that carry a card body's
+    remainder (see the ROUND 66 block above). Text-only Components V2
+    containers, same accent color as the card, starting directly with the
+    remaining body text and ending with a subtext `-# 📜 Page X/Y` footer.
+    Continue until the complete readable source body is consumed; message
+    count depends on content, including part five and beyond."""
+    chunks = _split_continuation_chunks(rest)
+    if not chunks:
+        return []
+    total_pages = len(chunks) + 1
     return [
         {"flags": IS_COMPONENTS_V2,
          "components": [{"type": 17, "accent_color": 16729344,
-                         "components": [{"type": 10,
-                                         "content": chunk}]}]}
-        for chunk in chunks
+                         "components": [
+                             {"type": 10, "content": chunk},
+                             {"type": 10, "content": f"-# 📜 Page {idx}/{total_pages}"},
+                         ]}]}
+        for idx, chunk in enumerate(chunks, start=2)
     ]
 
 
@@ -3069,6 +3219,49 @@ def _preserve_html_tables(text: str) -> str:
                   convert, text)
 
 
+def _wrap_inline_html_markdown(inner: str, marker: str) -> str:
+    """Wrap non-empty HTML inline content in Discord Markdown `marker` per line.
+
+    Preserves leading/trailing spaces outside `marker` (so `<strong>Title </strong>`
+    becomes `**Title** ` instead of broken `**Title **`), splits cleanly across
+    any embedded `<br>`/newlines so multi-page boundaries never inherit unclosed
+    markers, avoids double-wrapping (`<strong>**Title**</strong>` -> `**Title**`),
+    and returns plain whitespace when the tag contains no visible text.
+    """
+    if not inner:
+        return ""
+    normalized = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", inner)
+    lines = normalized.split("\n")
+    out = []
+    for ln in lines:
+        visible = re.sub(r"<[^>]+>", "", ln).strip()
+        if not visible:
+            out.append(ln)
+            continue
+        m = re.match(r"^([ \t]*)(.*?)([ \t]*)$", ln, flags=re.S)
+        lead, core, trail = (m.group(1), m.group(2), m.group(3)) if m else ("", ln.strip(), "")
+        if core.startswith(marker) and core.endswith(marker) and len(core) > 2 * len(marker):
+            out.append(f"{lead}{core}{trail}")
+        else:
+            out.append(f"{lead}{marker}{core}{marker}{trail}")
+    return "\n".join(out)
+
+
+def _format_html_heading(inner: str) -> str:
+    """Convert `<h1>..<h6>` HTML headings into standalone `**bold**` lines."""
+    cleaned = re.sub(r"(?i)<\s*br\s*/?\s*>", " ", inner or "")
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return "\n"
+    while cleaned.startswith("**") and cleaned.endswith("**") and len(cleaned) > 4:
+        inner_core = cleaned[2:-2].strip()
+        if "**" in inner_core:
+            break
+        cleaned = inner_core
+    return f"\n\n**{cleaned}**\n\n"
+
+
 def clean_rss_body(value: str | None) -> str:
     """
     Turn the RSS entry's content HTML into clean card text (Discord markdown).
@@ -3084,7 +3277,17 @@ def clean_rss_body(value: str | None) -> str:
         return ""
     text = value
     # Spoilers in HTML tags -> Discord spoiler ||...||
-    text = re.sub(r"(?is)<span\s+[^>]*\bclass=[\"\x27][^\"\x27]*\b(?:md-)?spoiler(?:-text)?\b[^\"\x27]*[\"\x27][^>]*>(.*?)</span>", r"||\1||", text)
+    text = re.sub(
+        r"(?is)<span\s+[^>]*\bclass=[\"\x27][^\"\x27]*\b(?:md-)?spoiler(?:-text)?\b[^\"\x27]*[\"\x27][^>]*>(.*?)</span>",
+        lambda m: _wrap_inline_html_markdown(m.group(1), "||"),
+        text,
+    )
+    # Inline CSS bold spans (rich-text editor pastes) -> Discord bold
+    text = re.sub(
+        r"(?is)<span\b[^>]*\bstyle=[\"\x27][^\"\x27]*font-weight\s*:\s*(?:bold|[6-9]00)\b[^\"\x27]*[\"\x27][^>]*>(.*?)</span\s*>",
+        lambda m: _wrap_inline_html_markdown(m.group(1), "**"),
+        text,
+    )
     # Round 41: ensure space before links attached directly to preceding text/punctuation
     # (a leading `>` in the class keeps tag-to-tag adjacency like <strong><a> untouched)
     text = re.sub(r"(?is)(?<=[^\s\[\(>])<a\s", " <a ", text)
@@ -3095,8 +3298,28 @@ def clean_rss_body(value: str | None) -> str:
     # round 16: blockquotes -> Discord quote markers (applied per line below)
     text = re.sub(r"(?is)<blockquote[^>]*>", "\x01", text)
     text = re.sub(r"(?i)</blockquote>", "\x02", text)
-    # round 16: bold tags -> Discord bold (only when present in the source)
-    text = re.sub(r"(?is)<(?:b|strong)\s*>(.*?)</(?:b|strong)>", r"**\1**", text)
+    # Bold / italic / strikethrough tags (with or without attributes) -> Discord markdown
+    text = re.sub(
+        r"(?is)<(b|strong)\b[^>]*>(.*?)</\1\s*>",
+        lambda m: _wrap_inline_html_markdown(m.group(2), "**"),
+        text,
+    )
+    text = re.sub(
+        r"(?is)<(i|em)\b[^>]*>(.*?)</\1\s*>",
+        lambda m: _wrap_inline_html_markdown(m.group(2), "*"),
+        text,
+    )
+    text = re.sub(
+        r"(?is)<(del|s|strike)\b[^>]*>(.*?)</\1\s*>",
+        lambda m: _wrap_inline_html_markdown(m.group(2), "~~"),
+        text,
+    )
+    # HTML headings <h1>..<h6> -> standalone bold section headings
+    text = re.sub(
+        r"(?is)<h([1-6])\b[^>]*>(.*?)</h\1\s*>",
+        lambda m: _format_html_heading(m.group(2)),
+        text,
+    )
     # Preserve cell boundaries before the generic block/tag cleanup.
     text = _preserve_html_tables(text)
     # round 16: list items -> Discord bullet lines
@@ -4912,9 +5135,9 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
         title = str(post_json.get("title") or title)[:400]
         author = str(post_json.get("author") or author)
         if post_json.get("selftext"):
-            # Round 65 audit: the JSON selftext unescapes exactly once —
-            # inside strip_html (no second pass anywhere downstream).
-            body = strip_html(post_json["selftext"]) or body
+            # Round 65 audit: JSON selftext unescapes once while keeping
+            # paragraph breaks, headings, lists, and Markdown formatting intact.
+            body = _clean_selftext(post_json["selftext"]) or body
         stats = {"comments": post_json.get("num_comments", 0),
                  "ups": post_json.get("ups", 0)}
         if INCLUDE_OP_COMMENT:
@@ -4968,9 +5191,8 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                             media.append({"kind": "gif", "url": g})
                         if orig.get("selftext"):
                             # Round 65 audit: the crosspost original's
-                            # selftext unescapes exactly once — inside
-                            # strip_html (never again downstream).
-                            orig_body = strip_html(orig["selftext"])
+                            # selftext unescapes once while preserving paragraphs/Markdown.
+                            orig_body = _clean_selftext(orig["selftext"])
                             if orig_body and len(orig_body) > len(body or ""):
                                 body = orig_body
                         logging.info(f"crosspost: fetched original {orig_id} "
@@ -5243,7 +5465,9 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                     pass
             else:
                 # no usable proxy media (a dead proxy video counts too — the
-                # native DASH chain has audio)
+                # native DASH chain has audio), including text-only posts where
+                # the proxy already observed live comment/upvote stats.
+                _use_proxy_text()
                 logging.info(f"[{label or 'proxy'}] no usable proxy media — "
                              f"falling back to the native RSS path.")
                 try:
@@ -5517,17 +5741,16 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
     stats = data["stats"]
     ts_suffix = f"   •   🕐 <t:{posted_ts}:f>"
     if stats:
-        stats_line = f"-# 💬 {stats['comments']} 👍 {stats['ups']}{ts_suffix}"
+        base_stats_line = f"-# 💬 {stats['comments']} 👍 {stats['ups']}{ts_suffix}"
         if stats.get("archived"):
-            stats_line += " · archived counts"
+            base_stats_line += " · archived counts"
     else:
-        stats_line = f"-# 🕐 <t:{posted_ts}:f>"
+        base_stats_line = f"-# 🕐 <t:{posted_ts}:f>"
 
     row = build_action_row(reddit_url, data["youtube_url"])
 
     # Char budget: Discord caps TOTAL text at 4000 across all components.
     op_line = op_comment_text(data["op_comment"]) if data.get("op_comment") else ""
-    body_budget = max(300, 3800 - len(header) - len(op_line) - len(stats_line))
     # Round 62: an inline-image link that is ALSO a gallery item never
     # renders twice — the raw-URL body line is scrubbed (live 1wx9c77)
     # Round 66: markdown tables get Discord-safe rendering (Discord renders
@@ -5540,7 +5763,25 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
     # receives the identical readable form.
     body_src = _format_markdown_tables(
         _drop_gallery_media_lines(data["body"], media))
-    body_out, body_rest = split_card_body(body_src, body_budget)
+    single_budget = max(300, 3800 - len(header) - len(op_line) - len(base_stats_line))
+    if len(body_src) <= single_budget:
+        stats_line = base_stats_line
+        body_out, body_rest = body_src, ""
+    else:
+        total_pages = 2
+        stats_line = f"{base_stats_line} • 📜 Page 1/{total_pages}"
+        body_out, body_rest = "", ""
+        for _ in range(3):
+            stats_line = f"{base_stats_line} • 📜 Page 1/{total_pages}"
+            body_budget = max(300, 3800 - len(header) - len(op_line) - len(stats_line))
+            body_out, body_rest = split_card_body(body_src, body_budget)
+            if not body_rest:
+                stats_line = base_stats_line
+                break
+            next_total = 1 + len(_split_continuation_chunks(body_rest))
+            if next_total == total_pages:
+                break
+            total_pages = max(2, next_total)
 
     def gallery(items: list) -> dict:
         return {"type": 12, "items": [{"media": {"url": m["url"]}} for m in items]}
@@ -6438,7 +6679,7 @@ async def main():
                             "author": _clean_author_name(post_json.get("author")),
                             "content_html": st,
                             "thumb": None,
-                            "body": strip_html(st),
+                            "body": _clean_selftext(st),
                             "crosspost_orig_path": normalize_reddit_path(
                                 str(post_json.get("crosspost_post_link") or "")),
                             "vred_id": extract_vreddit_id(st) or extract_vreddit_id(str(post_json.get("url") or "")),

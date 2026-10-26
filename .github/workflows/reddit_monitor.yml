@@ -52,8 +52,11 @@ jobs:
     # Round 57: hard cap — a hung network call otherwise blocks the concurrency queue for GitHub's 6 h default.
     timeout-minutes: 15
     steps:
+      # Round 57: SHA-pinned (immutable supply chain); v7 runs on Node 24.
+      # Round 89: the trailing version comment stays a bare `# vX.Y.Z` so
+      # zizmor can verify the pin (see ci.yml).
       - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7 — SHA-pinned (round 57, immutable supply chain); v7 = Node 24 runtime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       # Round 61 (2026-10-04): workflow_dispatch pins GITHUB_SHA at dispatch
       # time, so a run queued behind another starts on a STALE tip — without
@@ -69,7 +72,7 @@ jobs:
           echo "Now at $(git log -1 --format=%H) (live ${CACHE_BRANCH:-main} tip)."
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7 — SHA-pinned (round 57)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           # Exact stable CPython pin; update deliberately after CI validates it.
           python-version: '3.14.8'

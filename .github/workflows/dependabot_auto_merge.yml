@@ -38,7 +38,7 @@ jobs:
       # Deliberately no checkout: pull_request_target runs this trusted file
       # from the default branch, and no PR code is ever executed.
       - name: Evaluate + squash-merge eligible Dependabot PR
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9 — SHA-pinned
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         env:
           AUTO_MERGE_DEPENDABOT: ${{ vars.AUTO_MERGE_DEPENDABOT }}
         with:
