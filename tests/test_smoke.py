@@ -2770,8 +2770,8 @@ for _r39_wf in (".github/workflows/ci.yml", ".github/workflows/reddit_monitor.ym
                 ".github/workflows/twitter_monitor.yml"):
     with open(os.path.join(ROOT, _r39_wf), encoding="utf-8") as _fh:
         _r39_source = _fh.read()
-    check(f"r39 runtime: {_r39_wf} pins CPython 3.14.8 exactly once",
-          _r39_source.count("python-version: '3.14.8'") == 1
+    check(f"r39 runtime: {_r39_wf} pins CPython 3.14.9 exactly once",
+          _r39_source.count("python-version: '3.14.9'") == 1
           and "python-version: '3.11'" not in _r39_source)
 
 for _r39_wf in (".github/workflows/reddit_monitor.yml", ".github/workflows/twitter_monitor.yml"):
@@ -3315,7 +3315,7 @@ check("r89a: every workflow was inspected (no vacuous pass)", _r89_uses_total >=
       f"uses: entries seen = {_r89_uses_total}")
 
 
-def _r89_bump_rewrite(files):
+def _r89_bump_rewrite(files, synthetic=()):
     """Run the REAL 'Rewrite the allowlisted current-runtime files' shell.
 
     Round 89: `.github/workflows/sync_prod.yml` is a dev-only surface, so the
@@ -3324,11 +3324,14 @@ def _r89_bump_rewrite(files):
     The current pin is read from ci.yml, so this guard never hardcodes a
     runtime version that the bump would rewrite underneath it.
 
-    A standalone production checkout receives `tests/` and the workflows from
-    `sync_prod.py` but no README or `docs/`, so a required path that is missing
-    here is materialised as a one-line fixture holding the current pin. That
-    keeps every scenario exercised in both layouts instead of silently
-    skipping the check in production; where the real file exists it is used.
+    Round 91: this helper copies exactly the files it is given and NEVER
+    invents a stand-in on its own. Round 89 filled every missing dev-only file
+    with a fixture, which is precisely why it could not see the production
+    failure that was live in both production repos (`::error::Expected runtime
+    file missing: README.md`): the fixture made a dev-only file look present,
+    and a genuinely missing REQUIRED surface would have been hidden the same
+    way. Absence is part of the test now; a caller that deliberately wants to
+    model "this optional surface exists" must name it in `synthetic`.
     """
     import subprocess
     import textwrap
@@ -3341,16 +3344,15 @@ def _r89_bump_rewrite(files):
     body = body.split("        run: |\n", 1)[1]
     body = body.split("\n      # The rewrite touches the test suite itself", 1)[0]
     body = textwrap.dedent(body)
-    fixtures = []
     with tempfile.TemporaryDirectory() as directory:
         for relative in files:
-            target = os.path.join(directory, relative)
-            os.makedirs(os.path.dirname(target), exist_ok=True)
             real = os.path.join(ROOT, relative)
+            target = os.path.join(directory, relative)
+            os.makedirs(os.path.dirname(target) or directory, exist_ok=True)
             if os.path.isfile(real):
                 shutil.copy(real, target)
             else:
-                fixtures.append(relative)
+                assert relative in synthetic, f"r89c setup: {relative} does not exist"
                 with open(target, "w", encoding="utf-8") as stream:
                     stream.write(f"python-version: '{current}'\n")
         environment = {
@@ -3370,7 +3372,18 @@ def _r89_bump_rewrite(files):
         for relative in files:
             with open(os.path.join(directory, relative), encoding="utf-8") as stream:
                 rewritten[relative] = stream.read()
-        return completed, rewritten, current, latest, fixtures
+        return completed, rewritten, current, latest
+
+
+def _r89_log_tail(completed, limit=400):
+    """Quiet a captured shell's tail for diagnostics.
+
+    The r89d guard fails the suite if a workflow command reaches this suite's
+    stdout, so a FAILING r89c/r91 check must never echo the captured
+    `::error::` line verbatim — that would turn one real failure into two.
+    """
+    raw = (completed.stdout or "")[-limit:] + (completed.stderr or "")[-limit:]
+    return re.sub(r"::(error|warning|notice|group|endgroup)::", r"[\1] ", raw)
 
 
 _R89_REQUIRED = (
@@ -3378,35 +3391,53 @@ _R89_REQUIRED = (
     ".github/workflows/reddit_monitor.yml",
     ".github/workflows/twitter_monitor.yml",
     ".github/workflows/python_version_bump.yml",
+    "tests/test_smoke.py",
+)
+# Dev-only surfaces: present in this repository, absent from BOTH production
+# repositories (sync_prod.py excludes docs/, README.md and sync_prod.yml).
+_R89_OPTIONAL_DEV = (
+    ".github/workflows/sync_prod.yml",
     "README.md",
     "docs/PYTHON_RUNTIME.md",
     "docs/CI_SMOKE.md",
     "docs/DEPENDABOT.md",
-    "tests/test_smoke.py",
 )
-_r89_done, _r89_files, _r89_current, _r89_latest, _r89_fixtures = _r89_bump_rewrite(
-    _R89_REQUIRED + (".github/workflows/sync_prod.yml",)
+# This repository has every dev-only surface; a production checkout has none.
+# Either way the optional branch is exercised: real files in dev, explicitly
+# declared synthetic ones in a production-shaped checkout (r91a proves which
+# optional paths really are absent there).
+_r89_dev_layout = all(os.path.isfile(os.path.join(ROOT, _rel))
+                      for _rel in _R89_REQUIRED + _R89_OPTIONAL_DEV)
+_r89_done, _r89_files, _r89_current, _r89_latest = _r89_bump_rewrite(
+    _R89_REQUIRED + _R89_OPTIONAL_DEV, synthetic=_R89_OPTIONAL_DEV
 )
-check("r89c: runtime bump rewrites the dev-only sync_prod.yml pin when that surface is present",
+_r89_slug = "python-" + _r89_latest.replace(".", "")
+_r89_docs_real = os.path.isfile(os.path.join(ROOT, "docs/PYTHON_RUNTIME.md"))
+check("r89c: runtime bump rewrites present README/docs/sync_prod.yml pins "
+      "(real dev surfaces, or declared synthetic ones in a prod checkout)",
       _r89_done.returncode == 0
+      and f"python-version: '{_r89_latest}'" in _r89_files[".github/workflows/ci.yml"]
       and f"python-version: '{_r89_latest}'" in _r89_files[".github/workflows/sync_prod.yml"]
-      and f"python-version: '{_r89_latest}'" in _r89_files[".github/workflows/ci.yml"],
-      _r89_done.stdout[-400:] + _r89_done.stderr[-400:])
-_r89_absent_done, _r89_absent_files, _, _, _ = _r89_bump_rewrite(_R89_REQUIRED)
-check("r89c: runtime bump succeeds without sync_prod.yml (production checkout) and reports the skip",
+      and _r89_latest in _r89_files["README.md"]
+      and _r89_latest in _r89_files["docs/PYTHON_RUNTIME.md"]
+      and (not _r89_docs_real or _r89_slug in _r89_files["docs/PYTHON_RUNTIME.md"]),
+      _r89_log_tail(_r89_done))
+_r89_absent_done, _r89_absent_files, _, _ = _r89_bump_rewrite(_R89_REQUIRED)
+check("r89c: runtime bump succeeds in a production checkout (no sync_prod.yml, README.md, or docs/*) and reports every skip",
       _r89_absent_done.returncode == 0
-      and "Optional runtime file absent in this repository; skipping: .github/workflows/sync_prod.yml"
-      in _r89_absent_done.stdout
-      and f"python-version: '{_r89_latest}'" in _r89_absent_files[".github/workflows/ci.yml"],
-      _r89_absent_done.stdout[-400:] + _r89_absent_done.stderr[-400:])
-_r89_missing_done, _r89_missing_files, _, _, _ = _r89_bump_rewrite(
-    tuple(f for f in _R89_REQUIRED if f != "README.md")
+      and all(f"Optional runtime file absent in this repository; skipping: {_rel}"
+              in _r89_absent_done.stdout for _rel in _R89_OPTIONAL_DEV)
+      and f"python-version: '{_r89_latest}'" in _r89_absent_files[".github/workflows/ci.yml"]
+      and f"python-version: '{_r89_latest}'" in _r89_absent_files[".github/workflows/python_version_bump.yml"],
+      _r89_log_tail(_r89_absent_done, 500))
+_r89_missing_done, _r89_missing_files, _, _ = _r89_bump_rewrite(
+    tuple(_rel for _rel in _R89_REQUIRED if _rel != ".github/workflows/reddit_monitor.yml")
 )
 check("r89c: a missing REQUIRED runtime surface still fails the rewrite closed",
       _r89_missing_done.returncode != 0
-      and "Expected runtime file missing: README.md" in _r89_missing_done.stdout
+      and "Expected runtime file missing: .github/workflows/reddit_monitor.yml" in _r89_missing_done.stdout
       and f"python-version: '{_r89_current}'" in _r89_missing_files[".github/workflows/ci.yml"],
-      _r89_missing_done.stdout[-400:] + _r89_missing_done.stderr[-400:])
+      _r89_log_tail(_r89_missing_done))
 
 
 class _R47Resp:
@@ -9374,6 +9405,98 @@ if _sync_wf_path.is_file():
           and "python tests/test_reddit_signals.py" in _sync_wf_src
           and "python tests/test_twitter_media.py" in _sync_wf_src
           and "python .github/scripts/sync_prod.py" in _sync_wf_src)
+
+# ===========================================================================
+# ROUND 91 (2026-10-26): production-sync hardening.
+# 91a — every MANDATORY runtime-bump allowlist entry must exist in a real
+#       production checkout. Both production repos were red on
+#       "Python version bump (auto)" because README.md (dev-only) sat in the
+#       mandatory list; this invariant makes that class of bug impossible to
+#       reintroduce from dev.
+# 91b — a dev-side sync must never downgrade a pin production already merged
+#       (workflow files are merged monotonically, not overwritten), and the
+#       deployed r39 CPython guard is re-aligned to the deployed ci.yml pin.
+# 91c — dev-only root markdown (privacy/terms) is excluded, never synced.
+# ===========================================================================
+_bump_wf_path = _SyncPath(ROOT) / ".github" / "workflows" / "python_version_bump.yml"
+_bump_wf_src = _bump_wf_path.read_text(encoding="utf-8")
+
+
+def _r91_bash_array(name):
+    """Read a bash `NAME=( ... )` array out of the real bump workflow."""
+    marker = f"          {name}=("
+    assert marker in _bump_wf_src, name
+    body = _bump_wf_src.split(marker, 1)[1].split("\n          )", 1)[0]
+    return [line.strip() for line in body.splitlines() if line.strip()]
+
+
+_r91_required = _r91_bash_array("ALLOWLIST")
+_r91_optional = _r91_bash_array("OPTIONAL_ALLOWLIST")
+check("r91a: the bump workflow declares a mandatory and an optional allowlist",
+      len(_r91_required) >= 4 and len(_r91_optional) >= 4, (_r91_required, _r91_optional))
+
+with _sync_tempfile.TemporaryDirectory(prefix="ne-r91-prod-") as _r91_tmp:
+    _r91_prod = _SyncPath(_r91_tmp) / "prod"
+    _r91_prod.mkdir(parents=True)
+    _sync_mod.sync_tree(_SyncPath(ROOT), _r91_prod, include_workflows=True)
+    _r91_absent_required = [_rel for _rel in _r91_required if not (_r91_prod / _rel).is_file()]
+    check("r91a: every MANDATORY runtime-bump allowlist path exists in a production checkout",
+          _r91_absent_required == [], _r91_absent_required)
+    _r91_present_optional = [_rel for _rel in _r91_optional if (_r91_prod / _rel).exists()]
+    check("r91a: every OPTIONAL allowlist path is genuinely absent from a production checkout",
+          _r91_present_optional == [], _r91_present_optional)
+
+    # Production merged a newer Python bump and a newer Dependabot action pin first.
+    _r91_newer_sha = "b" * 40
+    (_r91_prod / ".github" / "workflows" / "ci.yml").write_text(
+        "# production-local edits must still be replaced by the dev workflow\n"
+        "jobs:\n"
+        "  smoke:\n"
+        "    steps:\n"
+        f"      - uses: actions/setup-python@{_r91_newer_sha}  # v7.2.0\n"
+        "        with:\n"
+        "          python-version: '3.14.99'\n",
+        encoding="utf-8",
+    )
+    _r91_res = _sync_mod.sync_tree(_SyncPath(ROOT), _r91_prod, include_workflows=True)
+    _r91_ci = (_r91_prod / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    _r91_smoke = (_r91_prod / "tests" / "test_smoke.py").read_text(encoding="utf-8")
+    _r91_dev_ci = (_SyncPath(ROOT) / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    _r91_dev_pin = re.search(r"python-version:\s*'(\d+\.\d+\.\d+)'", _r91_dev_ci).group(1)
+    check("r91b: a newer production python-version survives a dev-side sync (no downgrade)",
+          "python-version: '3.14.99'" in _r91_ci
+          and f"python-version: '{_r91_dev_pin}'" not in _r91_ci,
+          _r91_ci[:400])
+    check("r91b: a newer production SHA-pinned uses: survives a dev-side sync (no downgrade)",
+          f"actions/setup-python@{_r91_newer_sha}  # v7.2.0" in _r91_ci,
+          [ln for ln in _r91_ci.splitlines() if "setup-python@" in ln])
+    check("r91b: dev-side workflow content still lands alongside the preserved pins",
+          "name: CI — syntax + offline smoke test" in _r91_ci
+          and "production-local edits must still be replaced" not in _r91_ci)
+    check("r91b: the deployed r39 CPython guard is re-aligned to the deployed ci.yml pin",
+          "pins CPython 3.14.99 exactly once" in _r91_smoke
+          and "python-version: '3.14.99'" in _r91_smoke
+          and f"pins CPython {_r91_dev_pin} exactly once" not in _r91_smoke,
+          [ln for ln in _r91_smoke.splitlines() if "r39 runtime" in ln])
+
+    _r91_res2 = _sync_mod.sync_tree(_SyncPath(ROOT), _r91_prod, include_workflows=True)
+    check("r91b: the merged production tree is idempotent (no pin oscillation between syncs)",
+          _r91_res2["updated"] == [] and _r91_res2["removed"] == [],
+          _r91_res2["updated"][:5])
+
+    _r91_dev_root_md = [_name for _name in ("PRIVACY_POLICY.md", "TERMS_OF_SERVICE.md")
+                        if (_SyncPath(ROOT) / _name).is_file()]
+    check("r91c: dev-only root markdown is excluded from production and never synced",
+          {"PRIVACY_POLICY.md", "TERMS_OF_SERVICE.md"} <= set(_sync_mod.EXCLUDED_DEV_PATHS)
+          and not (_r91_prod / "PRIVACY_POLICY.md").exists()
+          and not (_r91_prod / "TERMS_OF_SERVICE.md").exists(),
+          _r91_dev_root_md)
+
+_r91_sync_src = (_SyncPath(ROOT) / ".github" / "scripts" / "sync_prod.py").read_text(encoding="utf-8")
+check("r91c: sync_prod.py no longer carries the unused json import",
+      not re.search(r"^import json$", _r91_sync_src, re.MULTILINE)
+      and "json." not in _r91_sync_src)
+
 
 # ---- Round 90 (2026-10-26): multi-page `📜 Page X/Y` indicator, text-only proxy
 # stats retention, and cross-page formatting preservation. The sibling patch was

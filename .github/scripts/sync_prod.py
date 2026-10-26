@@ -19,11 +19,15 @@ Safety guarantees:
   5. Workflow-scope fallback: if `.github/workflows/*` changed and the configured token lacks
      `workflow` permission, the script automatically falls back to pushing all non-workflow code
      and test updates and emits a clear warning naming the skipped workflow files.
+  6. Monotonic pin merge (round 91): workflow files are no longer overwritten byte-for-byte. A
+     `python-version:` pin or SHA-pinned `uses:` that a production repository already merged at a
+     NEWER version is preserved, so a dev-side sync can never downgrade a prod-side Python or
+     Dependabot bump. `tests/test_smoke.py`'s r39 CPython pin is re-aligned to the destination
+     `ci.yml` afterwards, so the deployed suite keeps matching the deployed workflow.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import subprocess
@@ -76,9 +80,21 @@ EXCLUDED_DEV_PATHS = (
     "docs",
     "README.md",
     "AGENTS.md",
+    "PRIVACY_POLICY.md",
+    "TERMS_OF_SERVICE.md",
     ".env.example",
     ".github/workflows/sync_prod.yml",
 )
+
+# Round 91: never let a dev-side sync downgrade a pin production already merged.
+WORKFLOW_PY_PIN_RE = re.compile(r"(python-version:\s*')(\d+\.\d+\.\d+)(')")
+WORKFLOW_USES_PIN_RE = re.compile(
+    r"(uses:\s*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?)@)"
+    r"([0-9a-f]{40})"
+    r"([ \t]+#[ \t]*v(\d+(?:\.\d+){1,2}))"
+    r"(?=[ \t]*(?:—|--|$|\r|\n))"
+)
+SMOKE_PY_PIN_RE = re.compile(r"(CPython |python-version: ')(\d+\.\d+\.\d+)")
 
 IGNORED_NAMES = frozenset({"__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".DS_Store"})
 IGNORED_SUFFIXES = (".pyc", ".pyo")
@@ -109,6 +125,95 @@ def _should_ignore(rel_parts: tuple[str, ...]) -> bool:
     return bool(rel_parts and rel_parts[-1].endswith(IGNORED_SUFFIXES))
 
 
+def _semver_tuple(raw: str) -> tuple[int, ...]:
+    """Compare `7`, `7.1`, and `7.1.0` as the same version."""
+    parts = [int(part) for part in raw.split(".")]
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+def merge_workflow_pins_bytes(src_bytes: bytes, dst_bytes: bytes | None) -> bytes:
+    """Return `src_bytes` without downgrading pins `dst_bytes` already advanced.
+
+    Only two things are merged, both monotonically: the `python-version:` pin
+    (a Python bump merged in production first) and SHA-pinned `uses:` lines
+    (a Dependabot bump merged in production first). Everything else in the
+    source file wins, so a dev-side workflow fix still lands.
+    """
+    if not dst_bytes:
+        return src_bytes
+    try:
+        src_text = src_bytes.decode("utf-8")
+        dst_text = dst_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return src_bytes
+
+    dst_py_pins = [_semver_tuple(m.group(2)) for m in WORKFLOW_PY_PIN_RE.finditer(dst_text)]
+    best_dst_py = max(dst_py_pins) if dst_py_pins else None
+
+    dst_uses: dict[str, tuple[tuple[int, ...], str, str]] = {}
+    for match in WORKFLOW_USES_PIN_RE.finditer(dst_text):
+        action = match.group(2).lower()
+        version = _semver_tuple(match.group(5))
+        sha, comment = match.group(3), match.group(4)
+        current = dst_uses.get(action)
+        if current is None or version > current[0]:
+            dst_uses[action] = (version, sha, comment)
+
+    out_text = src_text
+    if best_dst_py is not None:
+        best_py = ".".join(str(part) for part in best_dst_py)
+
+        def _up_py(match: re.Match[str]) -> str:
+            if _semver_tuple(match.group(2)) < best_dst_py:
+                return f"{match.group(1)}{best_py}{match.group(3)}"
+            return match.group(0)
+
+        out_text = WORKFLOW_PY_PIN_RE.sub(_up_py, out_text)
+
+    if dst_uses:
+        def _up_uses(match: re.Match[str]) -> str:
+            candidate = dst_uses.get(match.group(2).lower())
+            if candidate is not None and _semver_tuple(match.group(5)) < candidate[0]:
+                return f"{match.group(1)}{candidate[1]}{candidate[2]}"
+            return match.group(0)
+
+        out_text = WORKFLOW_USES_PIN_RE.sub(_up_uses, out_text)
+
+    return out_text.encode("utf-8") if out_text != src_text else src_bytes
+
+
+def merge_smoke_python_pin_bytes(src_smoke_bytes: bytes, dst_ci_bytes: bytes | None) -> bytes:
+    """Keep the deployed `tests/test_smoke.py` r39 CPython pin matching `ci.yml`.
+
+    `sync_prod.py` ships the dev suite as-is. If production merged a Python
+    bump first, the merged `ci.yml` pin is newer than the suite's r39
+    expectation, and the r39 guard would fail the production check on a
+    perfectly healthy tree. This raises only the suite's literal pin.
+    """
+    if not dst_ci_bytes:
+        return src_smoke_bytes
+    try:
+        smoke_text = src_smoke_bytes.decode("utf-8")
+        ci_text = dst_ci_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return src_smoke_bytes
+    ci_match = WORKFLOW_PY_PIN_RE.search(ci_text)
+    if not ci_match:
+        return src_smoke_bytes
+    dst_version_str = ci_match.group(2)
+    dst_version = _semver_tuple(dst_version_str)
+
+    def _up_smoke(match: re.Match[str]) -> str:
+        if dst_version > _semver_tuple(match.group(2)):
+            return f"{match.group(1)}{dst_version_str}"
+        return match.group(0)
+
+    merged = SMOKE_PY_PIN_RE.sub(_up_smoke, smoke_text)
+    return merged.encode("utf-8") if merged != smoke_text else src_smoke_bytes
+
+
 def sync_tree(
     src_root: Path,
     dst_root: Path,
@@ -125,6 +230,11 @@ def sync_tree(
     for rel in PROTECTED_PROD_FILES:
         target = dst_root / rel
         protected_before[rel] = target.read_bytes() if target.is_file() else None
+
+    # Round 91: remember the pre-sync suite so the report below stays truthful
+    # when the copied dev file is re-aligned back to the pin production merged.
+    smoke_path = dst_root / "tests" / "test_smoke.py"
+    smoke_pristine = smoke_path.read_bytes() if smoke_path.is_file() else None
 
     updated: list[str] = []
     removed: list[str] = []
@@ -184,15 +294,35 @@ def sync_tree(
             if not spath.is_file():
                 continue
             sbytes = spath.read_bytes()
-            if not dpath.is_file() or dpath.read_bytes() != sbytes:
+            dbytes = dpath.read_bytes() if dpath.is_file() else None
+            merged = merge_workflow_pins_bytes(sbytes, dbytes)
+            if dbytes != merged:
                 dpath.parent.mkdir(parents=True, exist_ok=True)
-                dpath.write_bytes(sbytes)
+                dpath.write_bytes(merged)
                 updated.append(rel_wf)
         for dev_wf in DEV_ONLY_WORKFLOW_FILES:
             dpath = dst_root / dev_wf
             if dpath.is_file():
                 dpath.unlink()
                 removed.append(dev_wf)
+
+    # Round 91: the deployed suite must agree with the deployed ci.yml pin even
+    # when production merged a Python bump first (see merge_smoke_python_pin_bytes).
+    dst_ci = dst_root / ".github" / "workflows" / "ci.yml"
+    if smoke_path.is_file():
+        smoke_before = smoke_path.read_bytes()
+        aligned = merge_smoke_python_pin_bytes(
+            smoke_before, dst_ci.read_bytes() if dst_ci.is_file() else None
+        )
+        if aligned != smoke_before:
+            smoke_path.write_bytes(aligned)
+        # Report the NET result only: a re-alignment that restores the exact
+        # pre-sync file must not claim an update (and must not look like churn
+        # on the next, idempotent run).
+        if smoke_path.read_bytes() == smoke_pristine:
+            updated = [rel for rel in updated if rel != "tests/test_smoke.py"]
+        elif "tests/test_smoke.py" not in updated:
+            updated.append("tests/test_smoke.py")
 
     for rel, before_bytes in protected_before.items():
         target = dst_root / rel

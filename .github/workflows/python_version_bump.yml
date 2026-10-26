@@ -1,15 +1,21 @@
-#  Automatic CPython version bump (round 46, revised 2026-10-06)
+#  Automatic CPython version bump (round 46, revised 2026-10-26)
 #
 #  WHY THIS EXISTS
-#  Dependabot cannot update `python-version: '3.14.8'` because that value is
-#  repository workflow configuration, not a dependency manifest entry. New
+#  Dependabot cannot update the `python-version:` pin below because that value
+#  is repository workflow configuration, not a dependency manifest entry. New
 #  CPython releases therefore need a dedicated, validated PR path.
 #
-#  VERSION TERMINOLOGY
+#  RUNTIME PIN THIS WORKFLOW SHIPS
+#  The pin is read from ci.yml at run time; this line is the single literal
+#  copy kept current by the rewrite itself (round 91):
+#      python-version: '3.14.9'
+#
+#  VERSION TERMINOLOGY (deliberately version-agnostic: the rewrite replaces the
+#  literal pin everywhere in the allowlist, so hard-coded examples would drift)
 #    MAJOR.MINOR.PATCH
-#    3.14.7 -> 3.14.8  = PATCH update inside the current series
-#    3.14.8 -> 3.15.0  = new MINOR series
-#    3.x    -> 4.x     = MAJOR update
+#    x.y.z -> x.y.(z+1)  = PATCH update inside the current series
+#    x.y.z -> x.(y+1).0  = new MINOR series
+#    x     -> (x+1)      = MAJOR update
 #
 #  SCOPE: PATCH PROPOSALS, AND NEXT-MINOR PRS AFTER REVIEW GATES
 #  The workflow first looks for the newest stable patch of the current series.
@@ -261,23 +267,27 @@ jobs:
           # Deliberate scope: these files are maintained current-runtime
           # surfaces. Historical records and unrelated source/configuration
           # files are never eligible for an automatic replacement.
+          # Round 91: split by where the file actually exists. `sync_prod.py`
+          # copies this workflow into BOTH production repositories
+          # (uesu/7jkxmy9nvbc, uesu/wvkhabh2s22) but never copies README.md,
+          # docs/*, or sync_prod.yml. A dev-only surface in the mandatory list
+          # made every production run fail red with
+          # `::error::Expected runtime file missing: README.md` before any pin
+          # was rewritten. REQUIRED = surfaces every checkout has; OPTIONAL =
+          # rewritten where present, skipped with a notice where absent.
           ALLOWLIST=(
             .github/workflows/ci.yml
             .github/workflows/reddit_monitor.yml
             .github/workflows/twitter_monitor.yml
+            .github/workflows/python_version_bump.yml
+            tests/test_smoke.py
+          )
+          OPTIONAL_ALLOWLIST=(
+            .github/workflows/sync_prod.yml
             README.md
             docs/PYTHON_RUNTIME.md
             docs/CI_SMOKE.md
             docs/DEPENDABOT.md
-            tests/test_smoke.py
-          )
-          # Round 89: this workflow is copied into both production repositories
-          # by sync_prod.py, and neither production repository carries the
-          # dev-only sync_prod.yml. Cover that pin where it exists (development
-          # lockstep) and skip it with a notice where it does not — absence of
-          # one optional surface must not fail the runtime bump closed.
-          OPTIONAL_ALLOWLIST=(
-            .github/workflows/sync_prod.yml
           )
           TARGETS=("${ALLOWLIST[@]}")
           printf 'Allowlisted files to update:\n'
@@ -300,7 +310,12 @@ jobs:
           done
           OLD_SLUG="python-$(echo "$CURRENT" | tr -d '.')"
           NEW_SLUG="python-$(echo "$LATEST" | tr -d '.')"
-          sed -i "s/${OLD_SLUG}/${NEW_SLUG}/g" docs/PYTHON_RUNTIME.md
+          # Round 91: docs/ is dev-only, so this rewrite must be guarded too.
+          # An unguarded `sed -i` on a missing file aborts the step under
+          # `set -euo pipefail` — the second half of the same production bug.
+          if [ -f docs/PYTHON_RUNTIME.md ]; then
+            sed -i "s/${OLD_SLUG}/${NEW_SLUG}/g" docs/PYTHON_RUNTIME.md
+          fi
           for file in "${TARGETS[@]}"; do
             grep -Fq "$LATEST" "$file" || { echo "::error::$file was not updated"; exit 1; }
           done
