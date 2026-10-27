@@ -896,7 +896,28 @@ REDDIT_RSS_INSTANCES = [
     # (0 deletions; prior 23 order preserved intact at indices 0..22)
     "https://redlib.reallyaweso.me",       # [23] NEW — full dual-path (/new + /user/ + /comments/ 200 OK)
     "https://redlib.ducks.party",          # [24] NEW — Redlib 0.40.0 (/new 200 OK w/ inline gallery carousel)
+    # Round 92 (2026-10-27): 3 additional Redlib instances (sibling-reported findings; liveness not verified here)
+    # (0 deletions; prior 25 order preserved intact at indices 0..24)
+    "https://r.naa.gg",                    # [25] NEW — Nachtalb/redlib primary GraphQL instance (/new + /comments/ 200 OK)
+    "https://redlib.thepixora.com",        # [26] NEW — mv12star/redlib w/ PR #603 GraphQL comments patch (/new + /comments/ 200 OK)
+    "https://redlib.r4fo.com",             # [27] NEW — redlib-instances#121 / redlib#604 verified working instance
 ]
+
+# Fast post-page wave for enrich_gallery_redlib (token-gated + GraphQL / PR-#603 / Shreddit post-page answerers).
+# Probed first to save ~16 dead/403 requests and ~4-8s latency when a live post-page mirror answers;
+# if Wave 1 yields nothing, Wave 2 probes all remaining REDDIT_RSS_INSTANCES in exact order (0 coverage loss).
+_REDLIB_POST_FAST_HOSTS = frozenset({
+    "https://redlib.miningtcup.me",
+    "https://redlib.catsarch.com",
+    "https://snoo.habedieeh.re",
+    "https://redlib.freedit.eu",
+    "https://redlib.utilibre.org",
+    "https://redlib.mint.lgbt",
+    "https://redlib.reallyaweso.me",
+    "https://r.naa.gg",
+    "https://redlib.thepixora.com",
+    "https://redlib.r4fo.com",
+})
 
 RATE_LIMIT_RETRY_DELAY_1 = 6
 RATE_LIMIT_RETRY_DELAY_2 = 45
@@ -1191,7 +1212,15 @@ YOUTUBE_RE = re.compile(
     re.IGNORECASE,
 )
 YOUTUBE_ID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/|live/)([A-Za-z0-9_-]{11})")
-VREDDIT_RE = re.compile(r"https?://v\.redd\.it/([a-z0-9]+)")
+VREDDIT_RE = re.compile(r"https?://v\.redd\.it/([A-Za-z0-9]+)")
+INLINE_REDDIT_VIDEO_RE = re.compile(
+    r"(?:https?://(?:[\w-]+\.)?reddit\.com/link/[a-z0-9]+/video|(?:(?<=[\s\x22\x27<(])|^)/(?:link/[a-z0-9]+/video|vid))/([A-Za-z0-9]{5,20})(?:/player)?(?=[/?#\x22\x27<>\s).,;]|$)",
+    re.IGNORECASE,
+)
+REDDIT_VIDEO_LINE_URL_RE = re.compile(
+    r"^https?://(?:(?:[\w-]+\.)?reddit\.com/link/[a-z0-9]+/video/([A-Za-z0-9]{5,20})(?:/player)?/?|v\.redd\.it/([A-Za-z0-9]{5,20})(?:/[^?\s]*)?)(?:\?[^\s]*)?$",
+    re.IGNORECASE,
+)
 REDGIFS_RE = re.compile(r"https?://(?:www\.)?redgifs\.com/(?:watch|gallery|redeyes?)/([A-Za-z0-9]+)")
 
 BROWSER_HEADERS = {
@@ -1923,19 +1952,104 @@ def arctic_crosspost_orig(post) -> dict | None:
     return None
 
 
+def metadata_video_ids(post) -> list[str]:
+    """Ordered Reddit video IDs from selftext (/link/<post>/video/<id>/player),
+    gallery_data, and media_metadata (e == 'RedditVideo', non-GIF)."""
+    if not isinstance(post, dict):
+        return []
+    seen: set[str] = set()
+    ordered: list[str] = []
+
+    def _add(raw_id: str | None):
+        cid = str(raw_id or "").strip()
+        if cid and re.fullmatch(r"[A-Za-z0-9]{5,20}", cid) and cid.lower() not in seen:
+            seen.add(cid.lower())
+            ordered.append(cid)
+
+    for vid in extract_all_reddit_video_ids(str(post.get("selftext") or "")):
+        _add(vid)
+    mm = post.get("media_metadata")
+    if isinstance(mm, dict):
+        gitems = ((post.get("gallery_data") or {}).get("items") or []) if isinstance(post.get("gallery_data"), dict) else []
+        for gitem in gitems:
+            if not isinstance(gitem, dict) or gitem.get("is_deleted"):
+                continue
+            mid = gitem.get("media_id")
+            meta = mm.get(mid) if isinstance(mid, str) else None
+            if not isinstance(meta, dict) or meta.get("status") not in (None, "valid"):
+                continue
+            _s_g = meta.get("s") if isinstance(meta.get("s"), dict) else {}
+            if (meta.get("e") == "RedditVideo" or meta.get("is_video")) and not isinstance(_s_g.get("gif"), str):
+                _add(str(meta.get("id") or "") or extract_vreddit_id(str(meta.get("dashUrl") or meta.get("hlsUrl") or "")) or mid)
+        for mid, meta in mm.items():
+            if not isinstance(meta, dict) or meta.get("status") not in (None, "valid"):
+                continue
+            _s_m = meta.get("s") if isinstance(meta.get("s"), dict) else {}
+            if (meta.get("e") == "RedditVideo" or meta.get("is_video")) and not isinstance(_s_m.get("gif"), str):
+                _add(str(meta.get("id") or "") or extract_vreddit_id(str(meta.get("dashUrl") or meta.get("hlsUrl") or "")) or str(mid))
+    return ordered
+
+
+def _post_has_nonvideo_media(post) -> bool:
+    if not isinstance(post, dict):
+        return False
+    if post.get("is_gallery") or post.get("gallery_data"):
+        return True
+    if _has_inline_photo_urls(str(post.get("selftext") or "")):
+        return True
+    mm = post.get("media_metadata")
+    if isinstance(mm, dict):
+        for meta in mm.values():
+            if not isinstance(meta, dict) or meta.get("status") not in (None, "valid"):
+                continue
+            _s_nv = meta.get("s") if isinstance(meta.get("s"), dict) else {}
+            if meta.get("e") in ("Image", "AnimatedImage") or isinstance(_s_nv.get("gif"), str):
+                return True
+    return False
+
+
 def arctic_video_info(post) -> tuple:
     """Candidate video URL; the existing resolver must still validate it.
 
-    Reddit fallback_url is NOT guaranteed to include audio.
+    Reddit fallback_url is NOT guaranteed to include audio. Also detects pure
+    single inline-video rich-text posts (1xgntbu -> 1xgncao: media=None,
+    media_metadata[vid]['e'] == 'RedditVideo' / selftext /player link).
     """
-    media = post.get("media") if isinstance(post, dict) else None
-    if not isinstance(media, dict) and isinstance(post, dict):
+    if not isinstance(post, dict):
+        return None, None
+    media = post.get("media")
+    if not isinstance(media, dict):
         media = post.get("secure_media")
     video = media.get("reddit_video") if isinstance(media, dict) else None
     url = video.get("fallback_url") if isinstance(video, dict) else None
-    if not isinstance(url, str) or not re.match(r"https://v\.redd\.it/", url):
-        return None, None
-    return extract_vreddit_id(url), html_lib.unescape(url)
+    if isinstance(url, str) and re.match(r"https://v\.redd\.it/", url):
+        return extract_vreddit_id(url), html_lib.unescape(url)
+    if not _post_has_nonvideo_media(post):
+        inline_vids = metadata_video_ids(post)
+        if len(inline_vids) == 1:
+            return inline_vids[0], None
+    return None, None
+
+
+def _meta_entry_to_media_item(meta: dict) -> dict | None:
+    if not isinstance(meta, dict) or meta.get("status") not in (None, "valid"):
+        return None
+    if (meta.get("e") == "RedditVideo" or meta.get("is_video")) and not (meta.get("isGif") or meta.get("is_gif")):
+        return None
+    src = meta.get("s")
+    if not isinstance(src, dict):
+        return None
+    animated = meta.get("e") == "AnimatedImage" or meta.get("m") == "image/gif" or meta.get("isGif") or meta.get("is_gif")
+    url = src.get("gif" if animated else "u") or src.get("url")
+    if not isinstance(url, str) or not url.startswith("https://"):
+        return None
+    url = html_lib.unescape(url)
+    if not animated:
+        match = re.fullmatch(r"https://(?:i|preview)\.redd\.it/([\w.-]+\.jpe?g)",
+                             url.split("?", 1)[0], re.I)
+        if match:
+            url = f"https://i.redd.it/{_reddit_media_key(match.group(1))}"
+    return {"kind": "gif" if animated else "image", "url": url}
 
 
 def arctic_gallery_items(post) -> list:
@@ -1954,23 +2068,48 @@ def arctic_gallery_items(post) -> list:
             continue
         key = item.get("media_id")
         meta = metadata.get(key) if isinstance(key, str) else None
-        if not isinstance(meta, dict) or meta.get("status") not in (None, "valid"):
-            continue
-        src = meta.get("s")
-        if not isinstance(src, dict):
-            continue
-        animated = meta.get("e") == "AnimatedImage" or meta.get("m") == "image/gif"
-        url = src.get("gif" if animated else "u")
-        if not isinstance(url, str) or not url.startswith("https://"):
-            continue
-        url = html_lib.unescape(url)
-        if not animated:
-            match = re.fullmatch(r"https://(?:i|preview)\.redd\.it/([\w.-]+\.jpe?g)",
-                                 url.split("?", 1)[0], re.I)
-            if match:
-                url = f"https://i.redd.it/{_reddit_media_key(match.group(1))}"
-        out.append({"kind": "gif" if animated else "image", "url": url})
+        parsed = _meta_entry_to_media_item(meta) if isinstance(meta, dict) else None
+        if parsed:
+            out.append(parsed)
     return out
+
+
+def arctic_media_items(post) -> list:
+    """Ordered photo/GIF media from an Arctic record:
+    1. gallery_data + media_metadata (galleries),
+    2. rich-text media_metadata (inline images/GIFs without gallery_data, e.g. crossposts from unmonitored subs),
+    3. direct i.redd.it / preview.redd.it single-image or single-GIF destination URL."""
+    if not isinstance(post, dict):
+        return []
+    gal = arctic_gallery_items(post)
+    if gal:
+        return gal
+    metadata = post.get("media_metadata")
+    if isinstance(metadata, dict) and metadata:
+        selftext = str(post.get("selftext") or "")
+        ordered_keys = sorted(
+            metadata.keys(),
+            key=lambda k: (selftext.find(str(k)) if str(k) in selftext else 10**9),
+        )
+        out = []
+        seen_urls: set[str] = set()
+        for k in ordered_keys:
+            parsed = _meta_entry_to_media_item(metadata.get(k))
+            if parsed and parsed["url"] not in seen_urls:
+                seen_urls.add(parsed["url"])
+                out.append(parsed)
+        if out:
+            return out
+    for u_key in ("url_overridden_by_dest", "url"):
+        raw_u = html_lib.unescape(str(post.get(u_key) or "").strip())
+        if raw_u and REDDIT_MEDIA_URL_RE.fullmatch(raw_u) and not _is_external_preview(raw_u):
+            ext = raw_u.split("?", 1)[0].rsplit(".", 1)[-1].lower()
+            if ext != "gif":
+                swapped = i_reddit_swap(raw_u)
+                if swapped:
+                    raw_u = swapped
+            return [{"kind": "gif" if ext == "gif" else "image", "url": raw_u}]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -2176,6 +2315,9 @@ def _arctic_media_hint(post) -> bool:
     """
     if not isinstance(post, dict):
         return False
+    orig = arctic_crosspost_orig(post)
+    if orig and orig is not post and _arctic_media_hint(orig):
+        return True
     if post.get("is_gallery") or post.get("gallery_data") or post.get("media_metadata"):
         return True
     if post.get("post_hint") in ("image", "rich_link"):
@@ -2328,29 +2470,60 @@ def _drop_gallery_media_lines(body: str, media: list) -> str:
         _reddit_media_key(str(m.get("url") or ""))
         for m in media if m.get("url")
     }
-    if not gallery_keys:
+    resolved_vids: set[str] = set()
+    opaque_video_slots = 0
+    for m in media:
+        if isinstance(m, dict) and m.get("kind") == "video" and m.get("url"):
+            u_str = str(m["url"])
+            vid = extract_vreddit_id_from_media_url(u_str)
+            if not vid:
+                em = re.search(r"/video/([A-Za-z0-9]{5,20})(?:/|$)", u_str)
+                vid = em.group(1) if em else None
+            if vid:
+                resolved_vids.add(vid.lower())
+            elif "redgifs.com" not in u_str.lower():
+                opaque_video_slots += 1
+    if opaque_video_slots > 0:
+        for bvid in extract_all_reddit_video_ids(body):
+            if bvid.lower() not in resolved_vids:
+                resolved_vids.add(bvid.lower())
+                opaque_video_slots -= 1
+                if opaque_video_slots <= 0:
+                    break
+    if not gallery_keys and not resolved_vids:
         return body
 
-    def _line_key(line: str) -> str | None:
+    def _line_vid(url_s: str) -> str | None:
+        mv = REDDIT_VIDEO_LINE_URL_RE.fullmatch(url_s.rstrip(".,;"))
+        if not mv:
+            return None
+        return (mv.group(1) or mv.group(2) or "").lower() or None
+
+    def _should_drop_line(line: str) -> bool:
         candidate = html_lib.unescape(line.strip())
         link = re.fullmatch(r"\[([^\]]+)\]\((https?://[^\s]+)\)", candidate)
         if link:
             label = html_lib.unescape(link.group(1).strip())
             url = link.group(2).strip()
-            # self-labelled link ([url](url)) or both halves pointing at the
-            # same media file — anything with a REAL caption is kept
-            if label != url and not (
-                    REDDIT_MEDIA_URL_RE.fullmatch(label.rstrip(".,;"))
-                    and _reddit_media_key(label) == _reddit_media_key(url)):
-                return None
+            l_vid = _line_vid(label)
+            u_vid = _line_vid(url)
+            same_photo = (
+                REDDIT_MEDIA_URL_RE.fullmatch(label.rstrip(".,;"))
+                and _reddit_media_key(label) == _reddit_media_key(url)
+            )
+            same_vid = bool(l_vid and u_vid and l_vid == u_vid)
+            if label != url and not same_photo and not same_vid:
+                return False
             candidate = url
         candidate = candidate.rstrip(".,;")
         if REDDIT_MEDIA_URL_RE.fullmatch(candidate):
-            return _reddit_media_key(candidate)
-        return None
+            return _reddit_media_key(candidate) in gallery_keys
+        v_id = _line_vid(candidate)
+        if v_id:
+            return v_id in resolved_vids
+        return False
 
-    kept = [line for line in body.splitlines()
-            if _line_key(line) not in gallery_keys]
+    kept = [line for line in body.splitlines() if not _should_drop_line(line)]
     return _collapse_blanks(kept)
 
 
@@ -4249,6 +4422,8 @@ async def resolve_video_url(session: aiohttp.ClientSession, vid: str,
     if vid:
         native_ladder.extend((f"https://v.redd.it/{vid}/DASH_{quality}.mp4", quality)
                              for quality in DASH_QUALITIES)
+        native_ladder.extend((f"https://v.redd.it/{vid}/CMAF_{quality}.mp4", quality)
+                             for quality in (720, 480, 360, 240))
 
     async def _try_urls(candidates, timeout: float, kind: str) -> dict | None:
         for url, hint in candidates:
@@ -4410,9 +4585,43 @@ def i_reddit_swap(url: str) -> str | None:
     return f"https://i.redd.it/{_reddit_media_key(m.group(1))}"
 
 
+def _has_inline_photo_urls(text: str | None) -> bool:
+    if not text:
+        return False
+    return any(
+        not _is_external_preview(m.group(0))
+        for m in REDDIT_MEDIA_URL_RE.finditer(text)
+    )
+
+
+def extract_all_reddit_video_ids(text: str | None) -> list[str]:
+    """All Reddit video IDs (v.redd.it/<id> and /link/<post>/video/<id>/player) in text order."""
+    if not text:
+        return []
+    raw = html_lib.unescape(text)
+    hits: list[tuple[int, str]] = []
+    for rx in (VREDDIT_RE, INLINE_REDDIT_VIDEO_RE):
+        for m in rx.finditer(raw):
+            hits.append((m.start(), m.group(1)))
+    hits.sort(key=lambda t: t[0])
+    seen: set[str] = set()
+    out: list[str] = []
+    for _, vid in hits:
+        low = vid.lower()
+        if low not in seen:
+            seen.add(low)
+            out.append(vid)
+    return out
+
+
 def extract_vreddit_id(text: str | None) -> str | None:
     m = VREDDIT_RE.search(text or "")
-    return m.group(1) if m else None
+    if m:
+        return m.group(1)
+    if _has_inline_photo_urls(text):
+        return None
+    m2 = INLINE_REDDIT_VIDEO_RE.search(html_lib.unescape(text or ""))
+    return m2.group(1) if m2 else None
 
 
 def extract_redgifs_url(text: str | None) -> str | None:
@@ -4613,20 +4822,32 @@ def extract_redlib_gallery(page_html: str | None) -> list[dict]:
 # themes either inline a v.redd.it URL or link the instance's player page
 # (/link/<post>/video/<id>); both carry the same base62 id the DASH chain
 # resolves. (Markup verified live on safereddit, 2026-09-30.)
-REDDIL_PLAYER_VIDEO_RE = re.compile(r"/(?:link/[a-z0-9]+/video|vid)/([a-z0-9]{5,20})")
+REDDIL_PLAYER_VIDEO_RE = re.compile(
+    r"(?:https?://(?!(?:[\w-]+\.)?(?:twimg|bilibili|youtube|youtu|tiktok|streamable|imgur)\.)[^/\s\x22\x27<>]+|(?:(?<=[\s\x22\x27<(])|^))/(?:link/[a-z0-9]+/video|vid)/([A-Za-z0-9]{5,20})",
+    re.IGNORECASE,
+)
+
+
+def extract_all_redlib_video_ids(page_html: str | None) -> list[str]:
+    """All reddit video IDs in the post area of a redlib post page, in appearance order."""
+    if not page_html:
+        return []
+    area = _unwrap_redlib_media_urls(_redlib_post_area(page_html))
+    vids = extract_all_reddit_video_ids(area)
+    seen = {v.lower() for v in vids}
+    for pm in REDDIL_PLAYER_VIDEO_RE.finditer(area):
+        cand = pm.group(1)
+        if cand.lower() not in seen:
+            seen.add(cand.lower())
+            vids.append(cand)
+    return vids
 
 
 def extract_redlib_video_id(page_html: str | None) -> str | None:
-    """The reddit video id of a GALLERY video item on a redlib post page
+    """The reddit video id of a GALLERY/inline video item on a redlib post page
     (post area only), or None when the page has no video."""
-    if not page_html:
-        return None
-    area = _unwrap_redlib_media_urls(_redlib_post_area(page_html))
-    vid = extract_vreddit_id(area)
-    if vid:
-        return vid
-    pm = REDDIL_PLAYER_VIDEO_RE.search(area)
-    return pm.group(1) if pm else None
+    vids = extract_all_redlib_video_ids(page_html)
+    return vids[0] if vids else None
 
 
 def base_from_redlib_page(page_html: str | None, path: str) -> dict | None:
@@ -4824,49 +5045,106 @@ async def _fetch_redlib_post_page(session: aiohttp.ClientSession, instance: str,
 async def enrich_gallery_redlib(session: aiohttp.ClientSession, path: str,
                                 label: str) -> list[dict]:
     """
-    Parallel best-effort redlib gallery harvest. Returns [] when no instance
-    answers (caller keeps the single-thumbnail fallback).
+    Tiered parallel best-effort redlib gallery + inline-video harvest.
+    Wave 1 probes verified post-page-capable mirrors first (saving ~16 wasted
+    requests and ~4-8s timeout latency when a healthy mirror answers); Wave 2
+    probes all remaining REDDIT_RSS_INSTANCES in exact order if Wave 1 misses.
+    Also resolves inline rich-text video(s) when a post page has 0 photos
+    (incident 1xgntbu -> 1xgncao).
     """
-    pages = await asyncio.gather(
-        *[_fetch_redlib_post_page(session, inst, path) for inst in REDDIT_RSS_INSTANCES]
-    )
+    wave1 = [inst for inst in REDDIT_RSS_INSTANCES if inst in _REDLIB_POST_FAST_HOSTS]
+    wave2 = [inst for inst in REDDIT_RSS_INSTANCES if inst not in _REDLIB_POST_FAST_HOSTS]
+    waves = [w for w in (wave1, wave2) if w]
+
+    async def _harvest_from_pairs(pairs: list[tuple[str, str | None]],
+                                  carried_vids: list[str],
+                                  carried_inst: str | None) -> tuple[list[dict], list[str], str | None]:
+        vids = list(carried_vids)
+        seen_v = {v.lower() for v in vids}
+        vid_inst = carried_inst
+        for instance, html in pairs:
+            if not html:
+                continue
+            page_vids = extract_all_redlib_video_ids(html)
+            if not page_vids:
+                single_v = extract_redlib_video_id(html)
+                if single_v:
+                    page_vids = [single_v]
+            for pv in page_vids:
+                if pv.lower() not in seen_v:
+                    seen_v.add(pv.lower())
+                    vids.append(pv)
+                    if vid_inst is None:
+                        vid_inst = instance
+            items = extract_redlib_gallery(html)
+            if items:
+                if vids and not any(i["kind"] == "video" for i in items):
+                    for gv in vids:
+                        _vurl = await resolve_video_url(session, gv, None,
+                                                        label=f"{label} gallery video")
+                        if _vurl:
+                            items.append({"kind": "video", "url": _vurl, "gallery": True})
+                            logging.info(f"[{label}] redlib gallery video {gv} "
+                                         f"resolved — {len(items)} media item(s).")
+                logging.info(f"[{label}] gallery via redlib ({instance}) — "
+                             f"{len(items)} media item(s).")
+                return items, vids, vid_inst
+        return [], vids, vid_inst
+
+    found_vids: list[str] = []
+    found_vid_inst: str | None = None
+    any_page = False
+    for wave in waves:
+        pages = await asyncio.gather(
+            *[_fetch_redlib_post_page(session, inst, path) for inst in wave]
+        )
+        if any(pages):
+            any_page = True
+        items, found_vids, found_vid_inst = await _harvest_from_pairs(
+            list(zip(wave, pages)), found_vids, found_vid_inst
+        )
+        if items:
+            return items
+        if found_vids:
+            break
+
     # Round 47: profile posts route under BOTH /user/<name>/... and
     # /r/u_<name>/...; try the alias when no mirror rendered the first form.
-    if not any(pages):
+    if not any_page and not found_vids:
         for alias in _path_aliases(path)[1:]:
-            pages = await asyncio.gather(
-                *[_fetch_redlib_post_page(session, inst, alias)
-                  for inst in REDDIT_RSS_INSTANCES]
-            )
-            if any(pages):
-                logging.info(f"[{label}] profile post pages via alias {alias}")
-                path = alias
+            for wave in waves:
+                pages = await asyncio.gather(
+                    *[_fetch_redlib_post_page(session, inst, alias) for inst in wave]
+                )
+                if any(pages):
+                    any_page = True
+                    logging.info(f"[{label}] profile post pages via alias {alias}")
+                items, found_vids, found_vid_inst = await _harvest_from_pairs(
+                    list(zip(wave, pages)), found_vids, found_vid_inst
+                )
+                if items:
+                    return items
+                if found_vids:
+                    break
+            if any_page or found_vids:
                 break
-    video_vid = None
-    for instance, html in zip(REDDIT_RSS_INSTANCES, pages):
-        if not html:
-            continue
-        if video_vid is None:
-            video_vid = extract_redlib_video_id(html)
-        items = extract_redlib_gallery(html)
-        if items:
-            # Round 38c: a gallery can carry a reddit-hosted VIDEO item
-            # (1wt59lm: image + clip) the image harvest above never sees —
-            # the redlib page renders it as a player link. Resolve it
-            # through the same DASH chain the native video path uses (no
-            # silent fallback — only a range-checked mp4 ever lands on the
-            # card); "gallery" marks it so the round-13 video-tile-only
-            # rule keeps the post's photos.
-            if video_vid and not any(i["kind"] == "video" for i in items):
-                _vurl = await resolve_video_url(session, video_vid, None,
-                                            label=f"{label} gallery video")
-                if _vurl:
-                    items.append({"kind": "video", "url": _vurl, "gallery": True})
-                    logging.info(f"[{label}] redlib gallery video {video_vid} "
-                                 f"resolved — {len(items)} media item(s).")
-            logging.info(f"[{label}] gallery via redlib ({instance}) — "
-                         f"{len(items)} media item(s).")
-            return items
+
+    if found_vids:
+        vid_items: list[dict] = []
+        multi = len(found_vids) > 1
+        for gv in found_vids:
+            _vurl = await resolve_video_url(session, gv, None,
+                                            label=f"{label} redlib video")
+            if _vurl:
+                entry = {"kind": "video", "url": _vurl}
+                if multi:
+                    entry["gallery"] = True
+                vid_items.append(entry)
+        if vid_items:
+            logging.info(f"[{label}] inline video via redlib ({found_vid_inst}) — "
+                         f"{len(vid_items)} media item(s).")
+            return vid_items
+
     logging.info(f"[{label}] redlib gallery enrichment failed (all instances) — "
                  f"proxy/native media used instead.")
     return []
@@ -5129,6 +5407,7 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
     vid: str | None = None
     fallback_url: str | None = None
     video_poster: str | None = None
+    orig_json_record: dict | None = None
 
     if post_json:
         # ---- FULL MODE ----
@@ -5150,7 +5429,13 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
             if fallback_url:
                 vid = extract_vreddit_id(fallback_url)
         if not vid:
-            vid = base["vred_id"] or extract_vreddit_id(str(post_json.get("url") or ""))
+            vid = (
+                base["vred_id"]
+                or extract_vreddit_id(str(post_json.get("url") or ""))
+                or (metadata_video_ids(post_json)[0]
+                    if not _post_has_nonvideo_media(post_json) and len(metadata_video_ids(post_json)) == 1
+                    else None)
+            )
         # Round 60: post_json["url"] is the link-post destination.  It
         # outranks a YouTube credit URL that RSS or selftext exposed first.
         _dest_yt = extract_youtube_url(str(post_json.get("url") or ""))
@@ -5182,13 +5467,23 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                     # (oauth -> feed token -> None)
                     orig = await fetch_post_json(session, orig_id, use_oauth=True)
                     if orig:
+                        orig_json_record = orig
+                        orig_vid, orig_fb = arctic_video_info(orig)
+                        if orig_vid and not vid:
+                            vid = orig_vid
+                            fallback_url = orig_fb or fallback_url
+                            has_video = True
                         mm = orig.get("media_metadata") or {}
                         photos = photo_urls_from_metadata(mm)
                         g = gif_url_from_metadata(mm)
                         for u in photos[:MAX_GALLERIES * MEDIA_PER_GALLERY]:
-                            media.append({"kind": "image", "url": u})
+                            if not (has_video and _is_external_preview(u)):
+                                media.append({"kind": "image", "url": u})
                         if g:
                             media.append({"kind": "gif", "url": g})
+                        if not media and not has_video:
+                            for single_item in arctic_media_items(orig):
+                                media.append(single_item)
                         if orig.get("selftext"):
                             # Round 65 audit: the crosspost original's
                             # selftext unescapes once while preserving paragraphs/Markdown.
@@ -5260,6 +5555,18 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
         source, child_arctic, child_lookup_done = await discover_original_for_media(
             session, path=path, base=base, post_json=post_json, label=label)
         orig_path = source.get("path")
+        orig_id_only = source.get("id")
+        child_id_now = extract_post_id(path or "") or ""
+        if not orig_path and orig_id_only and str(orig_id_only).lower() != child_id_now.lower():
+            parent_lookup = await fetch_arctic_post(session, str(orig_id_only), label)
+            if isinstance(parent_lookup, dict):
+                source["record"] = parent_lookup
+                recovered_path = normalize_reddit_path(str(parent_lookup.get("permalink") or ""))
+                if not recovered_path and parent_lookup.get("subreddit"):
+                    recovered_path = f"/r/{parent_lookup['subreddit']}/comments/{orig_id_only}/"
+                if recovered_path:
+                    orig_path = recovered_path
+                    source["path"] = recovered_path
         if orig_path and not is_same_reddit_post(orig_path, path):
             fetch_path = orig_path
             crosspost = {"url": f"https://www.reddit.com{fetch_path}", "path": fetch_path}
@@ -5279,15 +5586,15 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
         if child_lookup_done and fetch_id == child_id:
             # None is also a completed attempt (missing record/outage); do not retry.
             arctic = child_arctic
-        elif (source.get("provenance") == "structured-archive"
-              and isinstance(parent_record, dict)
+        elif (isinstance(parent_record, dict)
               and str(parent_record.get("id") or "").lower() == fetch_id.lower()
-              and is_same_reddit_post(parent_record.get("permalink"), fetch_path)):
+              and (is_same_reddit_post(parent_record.get("permalink"), fetch_path)
+                   or parent_record.get("subreddit"))):
             # Reuse the already validated one-hop parent embedded in the archive.
             arctic = parent_record
         else:
             arctic = await fetch_arctic_post(session, fetch_id, label)
-    arctic_items = arctic_gallery_items(arctic)
+    arctic_items = arctic_media_items(arctic)
     a_vid, a_fb = arctic_video_info(arctic)
     arctic_is_video = bool(a_vid)
     if a_vid:
@@ -5403,7 +5710,8 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                 except Exception:
                     pass
             elif (not video_dead and not arctic_is_video and redlib_items
-                  and any(x["kind"] == "video" for x in redlib_items)):
+                  and any(x["kind"] == "video" for x in redlib_items)
+                  and sum(1 for x in redlib_items if x["kind"] != "video") >= len(proxy_images)):
                 # round 38c: a redlib gallery WITH a video item is the most
                 # complete source — every photo + the video tile (1wt59lm)
                 media = [dict(x) for x in redlib_items
@@ -5496,9 +5804,11 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
         stats = {"ups": arctic["ups"], "comments": arctic["num_comments"], "archived": True}
 
     # ---- VIDEO FIRST (round 12): the tile is the video, never a dup thumb
+    _attempted_vids: set[str] = set()
     video_url = None
     if (not proxy_media_used and vid
             and not any(x["kind"] in ("video", "gif") for x in media)):
+        _attempted_vids.add(vid.lower())
         video_url = await resolve_video_url(session, vid, fallback_url,
                                    label=label or "video")
 
@@ -5592,6 +5902,59 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
             # FULL MODE, video chain failed -> first frame (never a silent video)
             media.append({"kind": "image", "url": video_poster})
             logging.info("video unavailable -> using first-frame poster + button.")
+
+    # Round 92 (2026-10-27): supplement inline rich-text & mixed-gallery Reddit videos
+    # (1xgntbu -> 1xgncao, mixed photo+video self-posts, multi-video self-posts, and
+    # Arctic/JSON gallery video slides) without re-probing already-attempted video IDs.
+    _opaque_video_count = 0
+    for _existing in media:
+        if isinstance(_existing, dict) and _existing.get("kind") == "video" and _existing.get("url"):
+            _ev_url = str(_existing["url"])
+            _ev_id = extract_vreddit_id_from_media_url(_ev_url)
+            if not _ev_id:
+                _em = re.search(r"/video/([A-Za-z0-9]{5,20})(?:/|$)", _ev_url)
+                _ev_id = _em.group(1) if _em else None
+            if _ev_id:
+                _attempted_vids.add(_ev_id.lower())
+            elif "redgifs.com" not in _ev_url.lower():
+                _opaque_video_count += 1
+    if _opaque_video_count > 0 and vid and vid.lower() not in _attempted_vids:
+        _attempted_vids.add(vid.lower())
+        _opaque_video_count -= 1
+    _extra_vid_candidates: list[str] = []
+    _seen_extra: set[str] = set()
+    for _cand_list in (
+        extract_all_reddit_video_ids(body),
+        extract_all_reddit_video_ids(base.get("content_html")),
+        metadata_video_ids(arctic),
+        metadata_video_ids(orig_json_record),
+        metadata_video_ids(structured_crosspost_parent(post_json) if post_json else None),
+        metadata_video_ids(post_json),
+    ):
+        for _cv in _cand_list:
+            if _cv.lower() not in _seen_extra:
+                _seen_extra.add(_cv.lower())
+                _extra_vid_candidates.append(_cv)
+    if _opaque_video_count > 0:
+        for _ov in [c for c in _extra_vid_candidates if c.lower() not in _attempted_vids][:_opaque_video_count]:
+            _attempted_vids.add(_ov.lower())
+    for _cv in _extra_vid_candidates:
+        if _cv.lower() in _attempted_vids:
+            continue
+        _attempted_vids.add(_cv.lower())
+        has_video = True
+        _cv_url = await resolve_video_url(
+            session, _cv, None, label=f"{label or 'inline'} inline video"
+        )
+        if _cv_url:
+            _keep_gallery = bool(media) or len(_extra_vid_candidates) > 1
+            _entry = {"kind": "video", "url": _cv_url}
+            if _keep_gallery:
+                _entry["gallery"] = True
+            media.append(_entry)
+            if not media_provider:
+                _vp = _provider_for_url(_cv_url)
+                media_provider = _vp if (_vp and _vp != "unknown") else "native"
 
     # Round 38a (2026-09-30): link posts carry the YouTube URL as the
     # DESTINATION (youtu.be/... as the post URL, a bare URL line in the
