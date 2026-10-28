@@ -10169,6 +10169,287 @@ async def _r92_end_to_end_contracts():
 
 asyncio.run(_r92_end_to_end_contracts())
 
+# ===========================================================================
+# ROUND 93 (2026-10-28): removed link-spam liveness.
+# Live 1xh7jl3 ("Daily Free PSN Codes" by u/Chef-Goat -> external spam URL) was
+# AutoModerator-removed for karma and then spam-filtered by Reddit. It reached
+# the archive fallback with NO trustable live source: vxreddit served its
+# HTTP-200 "vxReddit" shell, redditez returned "No data", and Embeddit ignores
+# `removed_by_category` on removed non-self link posts — so a media-less
+# embeddit stub alone rubber-stamped the post as live and it leaked.
+# These contracts pin the fix: a media-less embeddit answer never vouches for an
+# ARCHIVE candidate by itself, Redlib corroborates instead (removal body,
+# official removal comment, or an external post_url that contradicts the title),
+# and every healthy path keeps returning immediately with ZERO extra requests.
+# ===========================================================================
+_r93_path = "/r/Genshin_Impact_Leaks_/comments/1xh7jl3/daily_free_psn_codes/"
+_r93_spam_url = "https://freecodes-spam.example/psn"
+
+
+def _r93_page(title, author="Chef-Goat", body="Daily free codes, first come first served.",
+              extra=""):
+    """A Redlib post page shaped like the live 1xh7jl3 one."""
+    return ("<html><body><article class=\"post\">"
+            f"<h1 class=\"post_title\">{title}</h1>"
+            f"<div class=\"post_author\">u/{author}</div>"
+            f"<div class=\"post_body\">{body}</div>"
+            "<div class=\"post_score\">1 point</div></article>"
+            f"{extra}</body></html>")
+
+
+def _r93_comment(author, body, cls="comment_author"):
+    return ('<details class="comment"><summary class="comment_data">'
+            f'<a class="{cls}" href="/user/{author}">u/{author}</a>'
+            "</summary>"
+            f'<div class="comment_body text"><p>{body}</p></div>'
+            '<blockquote class="replies"></blockquote></details>')
+
+
+_r93_sticky = _r93_comment("AutoModerator",
+                          "Please reply to this comment with the source of the artwork.")
+_r93_removal_comment = _r93_comment(
+    "AutoModerator",
+    "Your submission has been automatically removed because your account does not "
+    "meet the minimum karma requirement for this community.")
+
+
+def _r93_embeddit_stub(title="Daily Free PSN Codes", body=_r93_spam_url):
+    """Exactly what upstream Embeddit returns for a removed link post."""
+    return {"service": "embeddit", "title": title, "body": body, "media": [],
+            "stats": None, "author": "Chef-Goat", "subreddit": "Genshin_Impact_Leaks_"}
+
+
+async def _r93_removed_spam_liveness_contracts():
+    _saved_proxy = v3.reddit_proxy
+    _saved_health = v3._proxy_health
+    try:
+        v3.reddit_proxy = proxy
+        v3._proxy_health = {}
+
+        # 1. Hyphenated usernames survive the redlib post-page parse (the live
+        #    post is by u/Chef-Goat; the old class truncated it to "Chef").
+        _r93_base = v3.base_from_redlib_page(_r93_page("Daily Free PSN Codes"), _r93_path)
+        check("r93: base_from_redlib_page keeps a hyphenated username (u/Chef-Goat)",
+              _r93_base is not None and _r93_base["author"] == "Chef-Goat",
+              str(_r93_base and _r93_base.get("author")))
+
+        # 2. The vxReddit HTTP-200 placeholder is still a fetch MISS (r51) but it
+        #    is now recorded, so liveness can tell "Reddit answered" from
+        #    "vxReddit failed".
+        class _R93Resp:
+            status = 200
+
+            async def text(self, **kwargs):
+                return ('<html><head><meta property="og:title" content="vxReddit">'
+                        "</head><body>shell</body></html>")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _R93Session:
+            def get(self, url, headers=None, timeout=None, allow_redirects=False):
+                return _R93Resp()
+
+        proxy.clear_vxreddit_placeholders()
+        _r93_vx = await proxy._fetch_vxreddit(_R93Session(), _r93_path, "r93-vx")
+        check("r93: _fetch_vxreddit still returns None on its generic placeholder title "
+              "while recording that vxReddit DID answer",
+              _r93_vx is None
+              and proxy.vxreddit_saw_placeholder(_r93_path) is True
+              and proxy.vxreddit_saw_placeholder("/r/other/comments/1/") is False
+              and "media" not in str(_r93_vx))
+
+        # 3. The exact 1xh7jl3 replay: archive candidate (feed_ok=False), media-less
+        #    embeddit link stub, and a Redlib page carrying the AutoModerator karma
+        #    removal comment. Must be REJECTED, and the verified fast mirrors must
+        #    be probed first.
+        _r93_probes = []
+
+        async def _r93_removal_page(session, inst, p):
+            _r93_probes.append((inst, p))
+            if inst == "https://snoo.habedieeh.re":
+                return _r93_page("Daily Free PSN Codes",
+                                 extra=_r93_sticky + _r93_removal_comment)
+            return None
+
+        with patch.object(v3, "fetch_proxy_post_memo",
+                          AsyncMock(return_value=_r93_embeddit_stub())), \
+             patch.object(v3, "_fetch_redlib_post_page", side_effect=_r93_removal_page):
+            _r93_live, _r93_why = await v3.verify_archive_post_live(
+                None, _r93_path, "r93", feed_ok=False)
+        check("r93 (1xh7jl3 replay): a media-less embeddit stub never vouches for an "
+              "archive post — the AutoModerator removal comment rejects it",
+              _r93_live is False
+              and "removal notice (removed by moderators/filters)" in _r93_why,
+              _r93_why)
+        _r93_fast_order = [i for i in v3.REDDIT_RSS_INSTANCES if i in v3._REDLIB_POST_FAST_HOSTS]
+        _r93_probed = [inst for inst, _p in _r93_probes]
+        check("r93 (1xh7jl3 replay): Redlib probing walks ONLY the verified fast "
+              "mirrors, in fleet order, and stops at the first parsed page",
+              all(inst in v3._REDLIB_POST_FAST_HOSTS for inst in _r93_probed)
+              and _r93_probed == _r93_fast_order[:_r93_fast_order.index("https://snoo.habedieeh.re") + 1]
+              and all(_p == _r93_path for _inst, _p in _r93_probes),
+              str(_r93_probes[:4]))
+
+        # 4. A LIVE RSS candidate (feed_ok=True) is untouched: a media-less embeddit
+        #    result still verifies it, with zero Redlib requests.
+        _r93_live_probes = []
+
+        async def _r93_must_not_probe(session, inst, p):
+            _r93_live_probes.append(inst)
+            return _r93_page("Daily Free PSN Codes")
+
+        with patch.object(v3, "fetch_proxy_post_memo",
+                          AsyncMock(return_value=_r93_embeddit_stub())), \
+             patch.object(v3, "_fetch_redlib_post_page", side_effect=_r93_must_not_probe):
+            _r93_live2 = await v3.verify_archive_post_live(None, _r93_path, "r93", feed_ok=True)
+        check("r93: a live RSS candidate with a media-less embeddit answer is still "
+              "verified immediately with ZERO Redlib requests",
+              _r93_live2 == (True, "live via embeddit") and _r93_live_probes == [],
+              str((_r93_live2, _r93_live_probes)))
+
+        # 5. An archive candidate WITH media from embeddit is still trusted
+        #    immediately — galleries/single images keep working, zero extra probes.
+        _r93_media_stub = dict(_r93_embeddit_stub())
+        _r93_media_stub["media"] = [{"kind": "image", "url": "https://i.redd.it/abc123.png"}]
+        _r93_media_probes = []
+
+        async def _r93_media_page(session, inst, p):
+            _r93_media_probes.append(inst)
+            return None
+
+        with patch.object(v3, "fetch_proxy_post_memo",
+                          AsyncMock(return_value=_r93_media_stub)), \
+             patch.object(v3, "_fetch_redlib_post_page", side_effect=_r93_media_page):
+            _r93_live3 = await v3.verify_archive_post_live(None, _r93_path, "r93", feed_ok=False)
+        check("r93: an archive candidate whose embeddit answer HAS media is still "
+              "verified immediately with ZERO Redlib requests",
+              _r93_live3 == (True, "live via embeddit") and _r93_media_probes == [],
+              str((_r93_live3, _r93_media_probes)))
+
+        # 6. Silent Reddit-filtered external spam: the Redlib page renders no
+        #    removal marker at all, but its <a id="post_url"> is an external link
+        #    that contradicts the title, and vxReddit answered with its shell.
+        proxy.clear_vxreddit_placeholders()
+        proxy._vxreddit_placeholder_paths.add(_r93_path)
+
+        async def _r93_silent_spam_page(session, inst, p):
+            if inst == "https://redlib.catsarch.com":
+                return _r93_page(
+                    "Daily Free PSN Codes",
+                    extra=('<a id="post_url" href="' + _r93_spam_url + '">'
+                           + _r93_spam_url + "</a>"))
+            return None
+
+        with patch.object(v3, "fetch_proxy_post_memo",
+                          AsyncMock(return_value=_r93_embeddit_stub())), \
+             patch.object(v3, "_fetch_redlib_post_page", side_effect=_r93_silent_spam_page):
+            _r93_live4, _r93_why4 = await v3.verify_archive_post_live(
+                None, _r93_path, "r93", feed_ok=False)
+        check("r93: a silently Reddit-filtered external spam link (no removal marker, "
+              "vxreddit shell, media-less embeddit) is rejected",
+              _r93_live4 is False
+              and "removal notice (removed by moderators/filters)" in _r93_why4,
+              _r93_why4)
+
+        # 7. A legitimate title-only self post with a routine AutoModerator sticky
+        #    is still verified — even while vxReddit is serving its shell.
+        async def _r93_clean_page(session, inst, p):
+            if inst == "https://redlib.catsarch.com":
+                return _r93_page("Daily Free PSN Codes", extra=_r93_sticky)
+            return None
+
+        with patch.object(v3, "fetch_proxy_post_memo",
+                          AsyncMock(return_value=_r93_embeddit_stub())), \
+             patch.object(v3, "_fetch_redlib_post_page", side_effect=_r93_clean_page):
+            _r93_live5 = await v3.verify_archive_post_live(None, _r93_path, "r93", feed_ok=False)
+        check("r93: a legitimate self post with only the routine AutoModerator sticky "
+              "still verifies (vxreddit placeholder alone is not a verdict)",
+              _r93_live5 == (True, "live via redlib"), str(_r93_live5))
+
+        # 8. A legitimate EXTERNAL LINK post during a vxReddit outage (no placeholder
+        #    recorded) must not be mistaken for filtered spam: without the
+        #    placeholder evidence the external post_url is not a removal signal.
+        proxy.clear_vxreddit_placeholders()
+
+        async def _r93_ext_link_page(session, inst, p):
+            if inst == "https://redlib.catsarch.com":
+                return _r93_page(
+                    "Great article about the new patch",
+                    extra=('<a id="post_url" href="https://example.com/article-changed">'
+                           "link</a>"))
+            return None
+
+        with patch.object(v3, "fetch_proxy_post_memo",
+                          AsyncMock(return_value=_r93_embeddit_stub(
+                              title="Great article about the new patch"))), \
+             patch.object(v3, "_fetch_redlib_post_page", side_effect=_r93_ext_link_page):
+            _r93_live6 = await v3.verify_archive_post_live(None, _r93_path, "r93", feed_ok=False)
+        check("r93: a legitimate external link post during a vxreddit outage still "
+              "verifies (no placeholder evidence -> not treated as spam-filtered)",
+              _r93_live6 == (True, "live via redlib"), str(_r93_live6))
+
+        # 9. live_removal_reason uses the same three signals and stops at the first
+        #    parsed page — the retraction path must not walk all 28 mirrors.
+        _r93_lrr_probes = []
+
+        async def _r93_lrr_page(session, inst, p):
+            _r93_lrr_probes.append(inst)
+            if inst == "https://snoo.habedieeh.re":
+                return _r93_page("Daily Free PSN Codes",
+                                 extra=_r93_sticky + _r93_removal_comment)
+            return None
+
+        with patch.object(v3, "fetch_proxy_post_memo", AsyncMock(return_value=None)), \
+             patch.object(v3, "_fetch_redlib_post_page", side_effect=_r93_lrr_page):
+            _r93_reason = await v3.live_removal_reason(None, _r93_path, "r93")
+        check("r93: live_removal_reason detects the AutoModerator removal comment "
+              "on 1xh7jl3",
+              _r93_reason == "removed by moderators/filters", str(_r93_reason))
+
+        _r93_clean_probes = []
+
+        async def _r93_lrr_clean(session, inst, p):
+            _r93_clean_probes.append(inst)
+            return _r93_page("Daily Free PSN Codes", extra=_r93_sticky)
+
+        with patch.object(v3, "fetch_proxy_post_memo", AsyncMock(return_value=None)), \
+             patch.object(v3, "_fetch_redlib_post_page", side_effect=_r93_lrr_clean):
+            _r93_reason2 = await v3.live_removal_reason(None, _r93_path, "r93")
+        check("r93: live_removal_reason stops after the first CLEAN post page "
+              "(one mirror, not all 28)",
+              _r93_reason2 is None
+              and len(_r93_clean_probes) == 1
+              and _r93_clean_probes[0] in v3._REDLIB_POST_FAST_HOSTS,
+              str(_r93_clean_probes[:3]))
+
+        # 10. The engine and the pure module must classify identically — the two
+        #     _REMOVED_NOTICE_RES tables are a documented lockstep pair.
+        _r93_cases = (
+            ("Daily Free PSN Codes", "[removed] — [view removed post](https://u.example/x)"),
+            ("Daily Free PSN Codes", "[deleted] - view removed post"),
+            ("Daily Free PSN Codes", "[ Removed by Reddit on account of violating the content policy. ]"),
+            ("Daily Free PSN Codes", "Please reply to this comment with the source."),
+            ("Fine", "ordinary body text"),
+        )
+        check("r93: engine and signals agree on every removal-notice shape "
+              "(the two tables stay in lockstep)",
+              all(v3.removed_post_reason(t, b) == signals.removed_post_reason(t, b)
+                  for t, b in _r93_cases)
+              and v3.redlib_moderator_removal_reason(_r93_sticky + _r93_removal_comment)
+              == "removed by moderators/filters",
+              str([v3.removed_post_reason(t, b) for t, b in _r93_cases]))
+    finally:
+        v3.reddit_proxy = _saved_proxy
+        v3._proxy_health = _saved_health
+        proxy.clear_vxreddit_placeholders()
+
+
+asyncio.run(_r93_removed_spam_liveness_contracts())
+
 # ---- Round 89: no GitHub Actions annotation may leak out of this suite ----
 # Restore the real stdout first, then judge what the suite actually emitted.
 sys.stdout = _stdout_guard.stream

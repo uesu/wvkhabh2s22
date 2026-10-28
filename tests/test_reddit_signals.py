@@ -434,6 +434,99 @@ check("r52 X workflow maps MAX_CACHE_SIZE_PER_ACCOUNT as a Variable",
       "MAX_CACHE_SIZE_PER_ACCOUNT: ${{ vars.MAX_CACHE_SIZE_PER_ACCOUNT }}" in _twitter_wf)
 check("ci runs this suite", "python tests/test_reddit_signals.py" in _ci)
 
+# ---- Round 93 (2026-10-28): removed link-spam liveness -------------------
+# Live 1xh7jl3 ("Daily Free PSN Codes", u/Chef-Goat -> external spam URL) was
+# AutoModerator-removed for karma and then spam-filtered by Reddit. Redlib
+# served the pre-removal shape with a moderator removal comment, so the pure
+# classifier has to read THREE shapes: a removal placeholder body, Reddit's
+# policy banner, and an official removal comment.
+check("r93: Redlib moderator-removed placeholder body classifies as removed",
+      signals.removed_post_reason(
+          "Daily Free PSN Codes",
+          "[removed] — [view removed post](https://undelete.pullpush.io/r/x/comments/1xh7jl3/)")
+      == "removed by moderator"
+      and signals.removed_post_reason("Daily Free PSN Codes", "[deleted] - view removed post")
+      == "removed by moderator")
+check("r93: Reddit policy-removal banner classifies as removed",
+      signals.removed_post_reason(
+          "Daily Free PSN Codes",
+          "[ Removed by Reddit on account of violating the content policy. ]")
+      == "removed by moderators/filters")
+
+_r93_sticky = (
+    '<details class="comment"><summary class="comment_data">'
+    '<a class="comment_author moderator" href="/user/AutoModerator">u/AutoModerator</a>'
+    '</summary><div class="comment_body text"><p>Please reply to this comment with the '
+    'source of the artwork.</p><p>I am a bot, and this action was performed '
+    'automatically.</p></div><blockquote class="replies"></blockquote></details>'
+)
+_r93_removal = (
+    '<details class="comment"><summary class="comment_data">'
+    '<a class="comment_author moderator" href="/user/AutoModerator">u/AutoModerator</a>'
+    '</summary><div class="comment_body text"><p>Your submission has been automatically '
+    'removed because your account does not meet the minimum karma requirement for '
+    'this community.</p></div><blockquote class="replies"></blockquote></details>'
+)
+check("r93: the exact 1xh7jl3 two-comment redlib page (benign sticky + AutoModerator "
+      "karma removal) classifies as removed",
+      signals.redlib_moderator_removal_reason(
+          "<html><body>" + _r93_sticky + _r93_removal + "</body></html>")
+      == "removed by moderators/filters")
+_r93_modteam = (
+    '<details class="comment"><summary class="comment_data">'
+    '<a class="comment_author" href="/user/Genshin_Impact_Leaks-ModTeam">'
+    'u/Genshin_Impact_Leaks-ModTeam</a></summary><div class="comment_body text">'
+    "<p>We've had to remove your submission for breaking rule 4.</p></div>"
+    '<blockquote class="replies"></blockquote></details>'
+)
+check("r93: a *-ModTeam removal comment classifies as removed",
+      signals.redlib_moderator_removal_reason(_r93_modteam) == "removed by moderators/filters")
+_r93_benign = (
+    _r93_sticky
+    + '<details class="comment"><summary class="comment_data">'
+      '<a class="comment_author moderator" href="/user/Genshin_Impact_Leaks-ModTeam">'
+      'u/Genshin_Impact_Leaks-ModTeam</a></summary><div class="comment_body text">'
+      "<p>Posts without a source will be removed after 24 hours.</p></div>"
+      '<blockquote class="replies"></blockquote></details>'
+    + '<details class="comment"><summary class="comment_data">'
+      '<a class="comment_author moderator" href="/user/Genshin_Impact_Leaks-ModTeam">'
+      'u/Genshin_Impact_Leaks-ModTeam</a></summary><div class="comment_body text">'
+      "<blockquote>Your post has been removed</blockquote><p>Thanks for the report.</p>"
+      '</div><blockquote class="replies"></blockquote></details>'
+    + '<details class="comment"><summary class="comment_data">'
+      '<a class="comment_author" href="/user/Theorycrafter">u/Theorycrafter</a>'
+      '</summary><div class="comment_body text"><p>The buff was removed in the new beta '
+      'build.</p></div><blockquote class="replies"></blockquote></details>'
+    + '<details class="comment"><summary class="comment_data">'
+      '<a class="comment_author" href="/user/SomeUser">u/SomeUser</a></summary>'
+      '<div class="comment_body text"><p>Post removed because the patch notes changed.</p>'
+      '</div><blockquote class="replies"></blockquote></details>'
+)
+check("r93: routine stickies, future-tense warnings, quoted removals and non-moderator "
+      "replies never classify as removed",
+      signals.redlib_moderator_removal_reason(_r93_benign) is None
+      and signals.redlib_moderator_removal_reason(None) is None
+      and signals.redlib_moderator_removal_reason("") is None)
+check("r93: external_non_reddit_url isolates a bare external link only",
+      signals.external_non_reddit_url("https://spam.example/codes") == "https://spam.example/codes"
+      and signals.external_non_reddit_url("  https://spam.example/codes?ref=1  ")
+      == "https://spam.example/codes?ref=1"
+      and signals.external_non_reddit_url("https://www.reddit.com/r/x/comments/1xh7jl3/") is None
+      and signals.external_non_reddit_url("https://i.redd.it/abc.png") is None
+      and signals.external_non_reddit_url("reddit.com/r/x") is None
+      and signals.external_non_reddit_url("https://spam.example/a https://spam.example/b") is None
+      and signals.external_non_reddit_url("") is None
+      and signals.external_non_reddit_url(None) is None)
+check("r93: redlib_external_post_url reads <a id=\"post_url\"> and rejects Reddit targets",
+      signals.redlib_external_post_url(
+          '<a href="https://spam.example/codes" id="post_url">codes</a>')
+      == "https://spam.example/codes"
+      and signals.redlib_external_post_url(
+          '<a id="post_url" href="https://www.reddit.com/r/x/comments/1xh7jl3/">self</a>')
+      is None
+      and signals.redlib_external_post_url("<div>no link</div>") is None
+      and signals.redlib_external_post_url(None) is None)
+
 
 print()
 if failures:

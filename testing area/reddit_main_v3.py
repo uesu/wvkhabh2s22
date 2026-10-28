@@ -2287,6 +2287,12 @@ _REMOVED_NOTICE_RES = (
     (re.compile(r"awaiting (?:moderator )?approval", re.I), "pending approval"),
     (re.compile(r"sorry,? (?:this|the) post (?:has been|was) (?:removed|deleted)", re.I), "removal notice"),
     (re.compile(r"\[ ?removed ?by ?moderator ?\]", re.I), "removed by moderator"),
+    # Round 93 (live 1xh7jl3): Reddit's policy-removal banner and Redlib's
+    # "[removed] — [view removed post](…)" placeholder body. Kept in lockstep
+    # with reddit_signals._REMOVED_NOTICE_RES (r93 guard).
+    (re.compile(r"\[ ?removed ?by ?reddit\b[^\]]*\]", re.I), "removed by moderators/filters"),
+    (re.compile(r"^\*{0,2}\[ ?(?:removed|deleted) ?\]\*{0,2}\s*[\u2014\u2013-]\s*(?:\[?view removed post\]?)", re.I),
+     "removed by moderator"),
     (re.compile(r"removed by (?:the )?(?:moderators?|reddit)", re.I),
      "removed by moderators/filters"),
     (re.compile(r"(?:was|has been) deleted by the person who originally posted it", re.I), "deleted by author"),
@@ -2296,6 +2302,11 @@ _REMOVED_NOTICE_RES = (
 def removed_post_reason(title: str | None, body: str | None) -> str | None:
     """Pure removal/pending classifier (implemented in reddit_signals)."""
     return reddit_signals.removed_post_reason(title, body)
+
+
+def redlib_moderator_removal_reason(page_html: str | None) -> str | None:
+    """Pure Redlib moderator/AutoModerator removal-comment classifier."""
+    return reddit_signals.redlib_moderator_removal_reason(page_html)
 
 
 def _arctic_media_hint(post) -> bool:
@@ -3148,13 +3159,13 @@ async def verify_archive_post_live(session, path: str, label: str = "",
                                    feed_ok: bool = True):
     """Verify a post is still LIVE on reddit.
     Returns (live: bool, why: str). Round 32: feed_ok=False when the
-    candidate ITSELF came from the RSS feed — the feed cannot verify the
-    feed (a queued post sits in the feed with real content, live 1wl41aj),
-    so the fallback then uses the redlib post pages only."""
+    candidate came from the Arctic archive rather than the live RSS feed,
+    so the fallback uses independent redlib post pages only."""
     health = _proxy_health or {}
     proxy_down = (reddit_proxy is None or all(
         isinstance(health.get(s), dict) and health[s].get("ok") is False
         for s in ("redditez", "vxreddit", "embeddit")))
+    embeddit_text_only = None
     if reddit_proxy is not None:
         try:
             result = await fetch_proxy_post_memo(session, path, label=label)
@@ -3169,21 +3180,46 @@ async def verify_archive_post_live(session, path: str, label: str = "",
                                    f"approval")
                 return False, (f"live source {result.get('service')} still "
                                f"shows a removal notice ({_reason})")
-            return True, f"live via {result.get('service')}"
+            # Round 93 (live 1xh7jl3): upstream Embeddit ignores removed_by_category
+            # on removed non-self link/media posts, returning HTTP 200 with the
+            # pre-removal title/URL and media=[] after vxreddit and redditez both
+            # rejected the post. For archive-only candidates (not feed_ok), require
+            # Redlib post-page corroboration instead of trusting a media-less
+            # embeddit stub alone; RSS posts (feed_ok=True) and media-bearing
+            # embeddit responses stay untouched.
+            if not feed_ok and result.get("service") == "embeddit" and not result.get("media"):
+                embeddit_text_only = result
+            else:
+                return True, f"live via {result.get('service')}"
     # redlib (the "other means"): the post page only exists while the
-    # post is live on reddit. Round 32: when the candidate itself came
-    # from the RSS feed (feed_ok=False), the feed is NOT a verification
-    # source — it is the very place the queued post sits with real
-    # content (live 1wl41aj) — so the fallback uses the redlib post
-    # pages ONLY (independent live sources).
+    # post is live on reddit (or exposes a removal body / moderator removal
+    # comment when removed). Round 32: when the candidate itself came from the
+    # RSS feed (feed_ok=False), the feed is NOT a verification source — it is
+    # the very place the queued post sits with real content (live 1wl41aj) — so
+    # the fallback uses the redlib post pages ONLY (independent live sources).
     base = None
+    _saw_vx_ph = getattr(reddit_proxy, "vxreddit_saw_placeholder", None) if reddit_proxy is not None else None
     if feed_ok:
         try:
             base = await fetch_test_post_base(session, path, label)
         except Exception:
             base = None
+        if base:
+            _r_reason = removed_post_reason(base.get("title"), base.get("body"))
+            if _r_reason:
+                if _r_reason == "pending approval":
+                    return False, ("live source redlib shows "
+                                   "the post is still awaiting moderator "
+                                   "approval")
+                return False, (f"live source redlib still "
+                               f"shows a removal notice ({_r_reason})")
     else:
-        for _inst in REDDIT_RSS_INSTANCES:
+        # Round 93: probe the verified post-page mirrors first; a clean page
+        # proves the post live, a removal body or moderator removal comment
+        # proves it dead — either way stop at the first parsed page.
+        _fast = [inst for inst in REDDIT_RSS_INSTANCES if inst in _REDLIB_POST_FAST_HOSTS]
+        _rest = [inst for inst in REDDIT_RSS_INSTANCES if inst not in _REDLIB_POST_FAST_HOSTS]
+        for _inst in _fast + _rest:
             try:
                 _page = await _fetch_redlib_post_page(session, _inst, path)
             except Exception:
@@ -3191,7 +3227,27 @@ async def verify_archive_post_live(session, path: str, label: str = "",
             if _page:
                 base = base_from_redlib_page(_page, path)
                 if base:
+                    _r_reason = (
+                        removed_post_reason(base.get("title"), base.get("body"))
+                        or redlib_moderator_removal_reason(_page)
+                    )
+                    if not _r_reason and embeddit_text_only is not None and callable(_saw_vx_ph) and _saw_vx_ph(path):
+                        _ext_url = reddit_signals.redlib_external_post_url(_page)
+                        if _ext_url and (base.get("title") or "").strip() != _ext_url.strip():
+                            _r_reason = "removed by moderators/filters"
+                    if _r_reason:
+                        if _r_reason == "pending approval":
+                            return False, ("live source redlib shows "
+                                           "the post is still awaiting moderator "
+                                           "approval")
+                        return False, (f"live source redlib still "
+                                       f"shows a removal notice ({_r_reason})")
                     break
+        if base is None and embeddit_text_only is not None and callable(_saw_vx_ph) and _saw_vx_ph(path):
+            _ext_body_url = reddit_signals.external_non_reddit_url(embeddit_text_only.get("body"))
+            if _ext_body_url and (embeddit_text_only.get("title") or "").strip() != _ext_body_url.strip():
+                return False, ("live source vxreddit still "
+                               "shows a removal notice (removed by moderators/filters)")
     if base and (base.get("title") or base.get("body")):
         return True, "live via redlib"
     if proxy_down:
@@ -4871,12 +4927,14 @@ def base_from_redlib_page(page_html: str | None, path: str) -> dict | None:
     if not title:
         return None
     author = "unknown"
-    am = re.search(r'class="post_author[^"]*"[^>]*>\s*(?:<[^>]+>\s*)?u?/?\s*([A-Za-z0-9_]{2,20})',
+    # Round 93: keep hyphens inside a username (live "u/Chef-Goat" was being
+    # truncated to "Chef" by the old [A-Za-z0-9_] class).
+    am = re.search(r'class="post_author[^"]*"[^>]*>\s*(?:<[^>]+>\s*)?u?/?\s*([A-Za-z0-9_\-]{2,25})',
                    page_html, re.I)
     if am:
         author = am.group(1)
     else:
-        am2 = re.search(r'/(?:u|user)/([A-Za-z0-9_\-]{2,20})', page_html, re.I)
+        am2 = re.search(r'/(?:u|user)/([A-Za-z0-9_\-]{2,25})', page_html, re.I)
         if am2:
             author = am2.group(1)
     og = (re.search(r'property="og:image"\s+content="([^"]+)"', page_html, re.I) or
@@ -6225,15 +6283,24 @@ async def live_removal_reason(session, path: str, label: str = "") -> str | None
             reason = removed_post_reason(result.get("title"), result.get("body"))
             if reason:
                 return reason
-    for instance in REDDIT_RSS_INSTANCES:
+    # Round 93: verified post-page mirrors first, and stop at the first parsed
+    # page — a clean page proves the post is live, so walking the remaining
+    # mirrors would only add latency.
+    _fast = [inst for inst in REDDIT_RSS_INSTANCES if inst in _REDLIB_POST_FAST_HOSTS]
+    _rest = [inst for inst in REDDIT_RSS_INSTANCES if inst not in _REDLIB_POST_FAST_HOSTS]
+    for instance in _fast + _rest:
         page = await _fetch_redlib_post_page(session, instance, path)
         if not page:
             continue
         base = base_from_redlib_page(page, path)
         if base:
-            reason = removed_post_reason(base.get("title"), base.get("body"))
+            reason = (
+                removed_post_reason(base.get("title"), base.get("body"))
+                or redlib_moderator_removal_reason(page)
+            )
             if reason:
                 return reason
+            break
     return None
 
 
@@ -6654,6 +6721,10 @@ async def main():
     _redlib_post_page_cache.clear()
     _proxy_post_cache.clear()
     _redlib_reach.clear()
+    # Round 93: placeholder state is per-run — a stale "vxreddit answered with
+    # its shell" from a previous run must never influence liveness now.
+    if reddit_proxy is not None and hasattr(reddit_proxy, "clear_vxreddit_placeholders"):
+        reddit_proxy.clear_vxreddit_placeholders()
     is_first_run = len(posted) == 0
     now = time.time()
     # Round 34: saturation warning — the pre-round-34 cap failure was

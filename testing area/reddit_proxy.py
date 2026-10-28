@@ -1225,6 +1225,12 @@ async def _fetch_vxreddit(session, path: str, label: str = ""):
         # site title. With no media, that placeholder must not become the
         # Reddit post title (for example, a profile-post crosspost).
         if not media and (title or "").strip().lower() == "vxreddit":
+            # Round 93: record that vxReddit DID answer this path with an
+            # HTTP-200 placeholder. Liveness uses it to tell "Reddit served a
+            # removed/empty post" apart from "vxReddit itself failed".
+            if len(_vxreddit_placeholder_paths) > 2048:
+                _vxreddit_placeholder_paths.clear()
+            _vxreddit_placeholder_paths.add(str(path or ""))
             logging.info(f"[{label}] vxreddit returned only its generic "
                          f"placeholder title (\"vxReddit\") and no media — "
                          f"treated as a fetch miss.")
@@ -1373,6 +1379,20 @@ _PROXY_FETCHERS = {
     "vxreddit": lambda s, p, l: _fetch_vxreddit(s, p, l),
     "embeddit": lambda s, p, l: _fetch_embeddit(s, p, l),
 }
+
+# Paths where vxReddit returned an HTTP-200 generic "vxReddit" shell with no
+# media (round 93: distinguishes a live Reddit response with removed_by_category
+# or empty self-post from a vxReddit HTTP/network failure).
+_vxreddit_placeholder_paths: set[str] = set()
+
+
+def clear_vxreddit_placeholders() -> None:
+    _vxreddit_placeholder_paths.clear()
+
+
+def vxreddit_saw_placeholder(path: str | None) -> bool:
+    return str(path or "") in _vxreddit_placeholder_paths
+
 
 # One semaphore per running event loop (tests call asyncio.run repeatedly).
 _proxy_gates: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
