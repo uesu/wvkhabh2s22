@@ -11208,6 +11208,94 @@ check("r96b: the delivered-key list is bounded (no unbounded summary growth)",
       (len(_t96b_bullets),
        [ln for ln in _t96b_many_summary.splitlines() if "more not shown" in ln][:2]))
 
+# ---- Round 96c (2026-10-30): the held/suppressed posts are NAMED in the summary ----
+# Live #11548 (07:00Z) said "Liveness not verified: 1" and "Known-rejected archive
+# candidates: 5" and nothing else — the post that was held (AnantaLeaks_1xj8et0,
+# removed by the moderators of r/AnantaLeaks) was identifiable only from the log.
+_r96c_init = v3._init_run_stats()
+check("r96c: the run record has bounded name lists for held and suppressed posts",
+      isinstance(_r96c_init.get("hold_keys"), list)
+      and isinstance(_r96c_init.get("known_pending_keys"), list))
+_r96c_bucket = []
+_r96c_stats = {"hold_keys": _r96c_bucket}
+for _i in range(15):
+    v3._note_key(_r96c_stats, "hold_keys", {"key": f"Sub_1xj{_i}"})
+check("r96c: _note_key is bounded (a flood run cannot grow the run-result file)",
+      len(_r96c_bucket) == 10 and _r96c_bucket[0]["key"] == "Sub_1xj0")
+# Observability may never break delivery: a missing field is created, junk stats
+# are ignored, and nothing raises into the loop that posts.
+_r96c_missing = {}
+v3._note_key(_r96c_missing, "hold_keys", {"key": "Sub_1xj"})
+v3._note_key(None, "hold_keys", {"key": "Sub_1xj"})
+v3._note_key({}, "hold_keys", None)
+v3._note_key({"hold_keys": "not a list"}, "hold_keys", {"key": "Sub_1xj"})
+check("r96c: _note_key can never raise into the delivery loop (missing/junk stats)",
+      _r96c_missing == {"hold_keys": [{"key": "Sub_1xj"}]})
+_r96c_src96 = open(os.path.join(ROOT, "testing area/reddit_main_v3.py"), encoding="utf-8").read()
+check("r96c: both hold gates record the key they refused",
+      '_note_key(run_stats, "hold_keys",' in _r96c_src96
+      and '_note_key(run_stats, "known_pending_keys",' in _r96c_src96
+      and _r96c_src96.count('_note_key(run_stats, "hold_keys",') == 2)
+
+# Rendered through the real workflow step with a #11548-shaped record.
+_r96c_fake = {
+    "combined_entries": 100, "combined_subreddits_covered": 5,
+    "subreddits_represented": 5, "subreddits_configured": 6,
+    "combined_fetch_status": "ok", "fallback_status": "not_attempted",
+    "arctic_candidates": 6, "arctic_subreddits_tried": 5,
+    "feed_subreddits_with_entries": {"Genshin_Impact_Leaks": 47, "HonkaiStarRail_leaks": 22,
+                                     "Zenlesszonezeroleaks_": 18, "WutheringWavesLeaks": 9,
+                                     "AnantaLeaks": 4},
+    "feed_subreddits_missing": ["HonkaiNexusAnimaLeaks"],
+    "arctic_by_sub": {"AnantaLeaks": {"posts": 5, "status": "posts"},
+                      "Genshin_Impact_Leaks": {"posts": 13, "status": "posts"},
+                      "HonkaiNexusAnimaLeaks": {"posts": 0, "status": "empty"},
+                      "HonkaiStarRail_leaks": {"posts": 3, "status": "posts"},
+                      "WutheringWavesLeaks": {"posts": 10, "status": "posts"},
+                      "Zenlesszonezeroleaks_": {"posts": 13, "status": "posts"}},
+    "json_probe_by_status": {"http_403": 1},
+    "unposted_candidates_considered": 6, "candidates_entering_processing": 1,
+    "delivered": 0, "delivered_posts": [], "failed_delivery": 0,
+    "known_pending_suppressed": 5, "known_pending_by_reason": {"removal_notice": 5},
+    "known_pending_keys": [{"key": "Genshin_Impact_Leaks_1xhnc6b", "reason": "removal_notice"},
+                           {"key": "Zenlesszonezeroleaks__1xj62lz", "reason": "removal_notice"}],
+    "hold_keys": [{"key": "AnantaLeaks_1xj8et0", "reason": "removal_notice",
+                   "detail": "live source vxreddit still shows a removal notice (whole-body marker)",
+                   "source": "arctic", "gate": "live-source"}],
+    "liveness_not_verified": 1,
+    "liveness_by_reason": {"live source vxreddit still shows a removal notice (whole-body marker)": 1},
+    "liveness_probe_enabled": True, "dedup_skipped_in_run": 138,
+    "completed": True, "dry_run": False, "persistence_status": "saved",
+}
+_r96c_summary = _app_summary_shell_with_json("reddit", None, fake_data=_r96c_fake)
+check("r96c: the summary names the held post and the evidence that held it",
+      "held: AnantaLeaks_1xj8et0 — 'removal_notice' (live-source, source=arctic)" in _r96c_summary
+      and "whole-body marker" in _r96c_summary,
+      [ln for ln in _r96c_summary.splitlines() if "held:" in ln][:2])
+check("r96c: the summary names the suppressed known-pending keys with a bounded tail",
+      "keys: Genshin_Impact_Leaks_1xhnc6b, Zenlesszonezeroleaks__1xj62lz … 3 more"
+      in _r96c_summary,
+      [ln for ln in _r96c_summary.splitlines() if "keys:" in ln][:2])
+# More held posts than the cap -> a bounded tail, never an unbounded list.
+_r96c_many = dict(_r96c_fake)
+_r96c_many["hold_keys"] = [{"key": f"Sub_1xj{i}", "reason": "liveness_removed",
+                            "detail": "removed", "source": "arctic",
+                            "gate": "liveness-probe"} for i in range(12)]
+_r96c_many["liveness_not_verified"] = 12
+_r96c_many_summary = _app_summary_shell_with_json("reddit", None, fake_data=_r96c_many)
+_r96c_held_lines = [ln for ln in _r96c_many_summary.splitlines() if ln.startswith("  - held:")]
+check("r96c: the held list is capped at 10 with an explicit remainder",
+      len(_r96c_held_lines) == 10 and "… 2 more held post(s) not shown" in _r96c_many_summary,
+      (len(_r96c_held_lines), [ln for ln in _r96c_many_summary.splitlines()
+                               if "more held" in ln][:1]))
+# An older record without the new lists must render unchanged.
+_r96c_old = {"combined_entries": 100, "completed": True, "liveness_not_verified": 1,
+             "known_pending_suppressed": 2}
+_r96c_old_summary = _app_summary_shell_with_json("reddit", None, fake_data=_r96c_old)
+check("r96c: a round-95/96 record without the name lists still renders",
+      "Liveness not verified: 1" in _r96c_old_summary
+      and "held:" not in _r96c_old_summary)
+
 # ---- Round 89: no GitHub Actions annotation may leak out of this suite ----
 # Restore the real stdout first, then judge what the suite actually emitted.
 sys.stdout = _stdout_guard.stream

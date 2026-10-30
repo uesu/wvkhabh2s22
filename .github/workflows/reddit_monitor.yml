@@ -449,6 +449,16 @@ jobs:
           print(f"- Known-rejected archive candidates: {v('known_pending_suppressed')}")
           if data.get('known_pending_by_reason'):
               print(f"  - by reason: {dict_str(data.get('known_pending_by_reason'))}")
+          # Round 96c: name the suppressed keys (bounded) — "5 known-pending"
+          # without names still forced a reader back into the Actions log.
+          _pending_keys = data.get('known_pending_keys')
+          if isinstance(_pending_keys, list) and _pending_keys:
+              _pk_names = [str(x.get('key')) for x in _pending_keys if isinstance(x, dict)][:10]
+              _pk_total = data.get('known_pending_suppressed')
+              _pk_extra = (int(_pk_total) - len(_pk_names)
+                           if isinstance(_pk_total, int) and _pk_total > len(_pk_names) else 0)
+              print("  - keys: " + ", ".join(_pk_names)
+                    + (f" … {_pk_extra} more" if _pk_extra else ""))
           print(f"- Retry backoff: {v('retry_backoff')}")
           if data.get('retry_backoff_by_reason'):
               print(f"  - by reason: {dict_str(data.get('retry_backoff_by_reason'))}")
@@ -459,6 +469,23 @@ jobs:
           print(f"- Liveness not verified: {v('liveness_not_verified')}")
           if data.get('liveness_by_reason'):
               print(f"  - by reason: {dict_str(data.get('liveness_by_reason'))}")
+          # Round 96c: name each held key with the evidence that held it, so a
+          # held post (like AnantaLeaks_1xj8et0 on 2026-10-30) is identifiable
+          # from the summary alone.
+          _held_keys = data.get('hold_keys')
+          if isinstance(_held_keys, list) and _held_keys:
+              _h_shown = 0
+              for _h in _held_keys[:10]:
+                  if not isinstance(_h, dict):
+                      continue
+                  _detail = str(_h.get('detail') or '')[:120]
+                  print(f"  - held: {_h.get('key')} — '{_h.get('reason')}' "
+                        f"({_h.get('gate')}, source={_h.get('source')})"
+                        + (f": {_detail}" if _detail else ""))
+                  _h_shown += 1
+              _h_total = data.get('liveness_not_verified')
+              if isinstance(_h_total, int) and _h_total > _h_shown:
+                  print(f"  - … {_h_total - _h_shown} more held post(s) not shown")
           print(f"- Media-wait: {v('media_wait')}")
           print(f"- Partial-gallery: {v('partial_gallery')}")
           print(f"- Flood-cap dropped: {v('flood_cap_dropped')}")

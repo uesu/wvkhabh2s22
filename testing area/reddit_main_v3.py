@@ -444,6 +444,30 @@ _RUN_RESULT_FILE = "reddit_run_result.json"
 # Global for media tracking (set per-run inside main)
 current_run_stats = None
 
+def _note_key(stats, name: str, record, limit: int = 10) -> None:
+    """Round 96c: remember WHICH key was held/suppressed, bounded.
+
+    Live #11548 (2026-10-30 07:00Z): the summary said "Liveness not verified: 1"
+    and "Known-rejected archive candidates: 5", and the only record of WHICH post
+    was `[AnantaLeaks_1xj8et0] post not verified live (...) — skipping` in the
+    Actions log. The counts already exist; this adds the names, capped so a flood
+    run cannot grow the run-result file.
+
+    Takes the stats dict + field name (not the list) on purpose: this is
+    observability, so a missing/renamed field must degrade to "no names in the
+    summary", never raise into the delivery loop. Every failure is swallowed and
+    the run posts exactly as it would without it.
+    """
+    try:
+        bucket = stats.get(name)
+        if not isinstance(bucket, list):
+            bucket = stats[name] = []
+        if len(bucket) < limit:
+            bucket.append(record)
+    except Exception:
+        pass
+
+
 def _init_run_stats():
     # Fresh per-invocation record; never reuse stale prior-run file.
     # Feed coverage is measured from the feed itself, not from deduplicated
@@ -475,6 +499,9 @@ def _init_run_stats():
         # summary lists WHAT went out rather than only how many.
         "delivered_posts": [],
         "json_probe_by_status": {},           # FULL MODE post-JSON probe outcomes
+        # Round 96c: names for the dispositions that were previously counts only.
+        "hold_keys": [],                      # posts held/not posted, with reason
+        "known_pending_keys": [],             # posts suppressed as already-rejected
         # Compatibility aliases for older readers/summaries
         "subreddits_represented": None,
         "unposted_candidates_considered": 0,
@@ -7342,6 +7369,8 @@ async def main():
                     if _pend.get("reason") in _NO_RECHECK_REASONS:
                         run_stats["known_pending_suppressed"] += 1
                         _inc_reason(run_stats["known_pending_by_reason"], _pend_reason)
+                        _note_key(run_stats, "known_pending_keys",
+                                  {"key": unique_key, "reason": _pend_reason})
                         logging.debug(f"[{unique_key}] pending ({_pend_reason}) — "
                                      f"not re-checking (removed posts re-enter via RSS "
                                      f"when restored; entry expires at the 48 h window).")
@@ -7533,6 +7562,10 @@ async def main():
                                      published_ts=published_ts)
                         run_stats["liveness_not_verified"] += 1
                         _inc_reason(run_stats["liveness_by_reason"], _why)
+                        _note_key(run_stats, "hold_keys",
+                                  {"key": unique_key, "reason": _live_reason,
+                                   "detail": _why, "source": _entry_source36,
+                                   "gate": "live-source"})
                         logging.info(f"[{unique_key}] post not verified live "
                                      f"({_why}) — skipping, not cached (will "
                                      f"post once approved/restored).")
@@ -7570,6 +7603,10 @@ async def main():
                         run_stats["liveness_not_verified"] += 1
                         _inc_reason(run_stats["liveness_by_reason"],
                                     f"round95 {'removed' if _ls == 'removed' else 'unverified'}: {_lwhy}")
+                        _note_key(run_stats, "hold_keys",
+                                  {"key": unique_key, "reason": _hold_reason,
+                                   "detail": _lwhy, "source": _lsrc,
+                                   "gate": "liveness-probe"})
                         logging.info(f"[{unique_key}] liveness probe: {_lwhy} "
                                      f"(source={_lsrc}, strict={REDDIT_LIVENESS_STRICT}) — "
                                      f"holding, not cached (posts once live).")
