@@ -11342,6 +11342,12 @@ _r97_fake = {
                            "dedup_per_sub_cap": 250, "dedup_total_cap": 10000,
                            "liveness_probe": True, "liveness_strict": False,
                            "liveness_probe_budget": 10},
+    "settings_line": v3._settings_line({"fresh_hold_seconds": 60,
+                                        "pending_recheck_seconds": 300,
+                                        "max_age_hours": 48, "max_posts_per_run": 25,
+                                        "dedup_per_sub_cap": 250, "dedup_total_cap": 10000,
+                                        "liveness_probe": True, "liveness_strict": False,
+                                        "liveness_probe_budget": 10}),
     "liveness_probe_enabled": True, "dedup_skipped_in_run": 115,
     "completed": True, "dry_run": False, "persistence_status": "saved",
 }
@@ -11359,6 +11365,7 @@ check("r97: each waiting post is named with its age and the floor that held it",
 _r97_off = dict(_r97_fake)
 _r97_off["effective_settings"] = dict(_r97_fake["effective_settings"],
                                       fresh_hold_seconds=0, liveness_probe=False)
+_r97_off["settings_line"] = v3._settings_line(_r97_off["effective_settings"])
 _r97_off_summary = _app_summary_shell_with_json("reddit", None, fake_data=_r97_off)
 check("r97: a disabled floor and probe are stated as off",
       "fresh hold off (0 s)" in _r97_off_summary
@@ -11383,6 +11390,56 @@ check("r97: a record without the new fields still renders (no Settings line)",
       "Fresh-age hold: 2" in _r97_old_summary
       and "**Settings:**" not in _r97_old_summary
       and "waiting:" not in _r97_old_summary)
+_r97_line = v3._init_run_stats().get("settings_line", "")
+check("r97: the settings line is built by the engine (workflow stays small)",
+      _r97_line.startswith("**Settings:** fresh hold ")
+      and "recheck 300 s" in _r97_line and "window 48 h" in _r97_line
+      and v3._settings_line({}) == "")
+# GitHub refuses a workflow whose step script exceeds 21,000 characters: prod
+# #11568 (2026-10-30 08:40Z) failed with "Exceeded max expression length 21000"
+# at 21,058 chars, taking the WHOLE monitor down because the summary step had
+# grown. Keep a 1,000-character margin and prove it for every workflow here.
+def _r97_run_scripts(text):
+    """[(label, script_length)] for every `run: |` block, WITHOUT PyYAML.
+
+    requirements.txt carries no YAML library (the engines do not need one), so
+    this walks the raw file the way GitHub's loader counts: the block scalar's
+    content, common indentation removed, newline-joined.
+    """
+    out, lines = [], text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() != "run: |":
+            continue
+        indent = len(line) - len(line.lstrip())
+        body, label = [], ""
+        for prev in range(i - 1, max(-1, i - 40), -1):
+            if lines[prev].strip().startswith("- name:"):
+                label = lines[prev].strip()[len("- name:"):].strip()[:40]
+                break
+        for ln in lines[i + 1:]:
+            if not ln.strip():
+                body.append("")
+                continue
+            if len(ln) - len(ln.lstrip()) <= indent:
+                break
+            body.append(ln)
+        while body and not body[-1]:
+            body.pop()
+        # YAML strips the indentation of the FIRST non-empty line (blank lines
+        # carry no indentation and must not widen the strip).
+        pad = next((len(b) - len(b.lstrip()) for b in body if b.strip()), 0)
+        out.append((label, len("\n".join(b[pad:] for b in body)) + 1))
+    return out
+
+
+_r97_worst = []
+for _wf_name in ("reddit_monitor.yml", "twitter_monitor.yml"):
+    _wf_text = open(os.path.join(ROOT, ".github/workflows", _wf_name), encoding="utf-8").read()
+    for _label, _len in _r97_run_scripts(_wf_text):
+        _r97_worst.append((_len, _wf_name, _label))
+_r97_worst.sort(key=lambda x: (-x[0], x[1]))
+check("r97: no workflow step script approaches GitHub's 21,000-character cap",
+      len(_r97_worst) >= 10 and _r97_worst[0][0] <= 20000, _r97_worst[:3])
 _r97_src = open(os.path.join(ROOT, "testing area/reddit_main_v3.py"), encoding="utf-8").read()
 check("r97: the fresh-age gate records the key it deferred",
       '_note_key(run_stats, "fresh_hold_keys",' in _r97_src

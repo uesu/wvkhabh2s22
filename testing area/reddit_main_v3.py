@@ -509,6 +509,47 @@ def _effective_settings() -> dict:
     }
 
 
+def _settings_line(settings: dict) -> str:
+    """Round 97: ONE plain line summarising the settings actually in force.
+
+    Formatted here (not in the workflow) because the summary step's `run:`
+    script has a hard GitHub limit of 21,000 characters — round 97 pushed it to
+    21,058 and prod run #11568 failed to load the whole workflow with
+    "Exceeded max expression length 21000" (2026-10-30 08:40Z). Keeping text
+    assembly in the engine keeps the workflow small.
+    """
+    try:
+        def num(key, unit=""):
+            val = settings.get(key)
+            return f"{int(val)}{unit}" if isinstance(val, (int, float)) else None
+
+        parts = []
+        floor = settings.get("fresh_hold_seconds")
+        if isinstance(floor, (int, float)):
+            parts.append("fresh hold off (0 s)" if floor == 0
+                         else f"fresh hold {int(floor)} s")
+        for label, val in (("recheck", num("pending_recheck_seconds", " s")),
+                           ("window", num("max_age_hours", " h")),
+                           ("flood cap", num("max_posts_per_run"))):
+            if val:
+                parts.append(f"{label} {val}")
+        per_sub = num("dedup_per_sub_cap")
+        if per_sub:
+            total = num("dedup_total_cap")
+            parts.append(f"dedup {per_sub}/sub" + (f" ({total} total)" if total else ""))
+        probe = settings.get("liveness_probe")
+        if probe is False:
+            parts.append("liveness probe off")
+        elif probe is True:
+            budget = num("liveness_probe_budget")
+            parts.append("liveness probe on ("
+                         + ("strict" if settings.get("liveness_strict") else "lenient")
+                         + (f", budget {budget}" if budget else "") + ")")
+        return ("**Settings:** " + " · ".join(parts)) if parts else ""
+    except Exception:
+        return ""
+
+
 def _init_run_stats():
     # Fresh per-invocation record; never reuse stale prior-run file.
     # Feed coverage is measured from the feed itself, not from deduplicated
@@ -557,6 +598,7 @@ def _init_run_stats():
         "fresh_hold": 0,
         # Round 97: the settings this run actually used (see _effective_settings).
         "effective_settings": _effective_settings(),
+        "settings_line": _settings_line(_effective_settings()),
         # Round 97: WHICH posts waited on the fresh-age floor (bounded), so
         # "Fresh-age hold: 2" is verifiable without the Actions log.
         "fresh_hold_keys": [],
