@@ -364,6 +364,44 @@ jobs:
                   print(f"**Error:** {data.get('error')}")
           else:
               print(f"**Run status:** unavailable")
+          # Round 97: state the settings the engine actually ran with. Live #11563
+          # (2026-10-30 08:15Z) had FRESH_HOLD_SECONDS=60 in the env and "2
+          # fresh-hold" in the log, but nothing said the effective floor was 60 s
+          # (the code default is 30 s) without reading the runner's env dump.
+          _set = data.get("effective_settings")
+          if isinstance(_set, dict) and _set:
+              def _num(key, unit=""):
+                  val = _set.get(key)
+                  return (f"{val}{unit}" if isinstance(val, (int, float)) else None)
+              _parts = []
+              _fh = _set.get("fresh_hold_seconds")
+              if isinstance(_fh, (int, float)):
+                  _parts.append("fresh hold off (0 s)" if _fh == 0
+                                else f"fresh hold {int(_fh)} s")
+              _rr = _num("pending_recheck_seconds", " s")
+              if _rr:
+                  _parts.append(f"recheck {_rr}")
+              _wa = _num("max_age_hours", " h")
+              if _wa:
+                  _parts.append(f"window {_wa}")
+              _cap = _num("max_posts_per_run")
+              if _cap:
+                  _parts.append(f"flood cap {_cap}")
+              _pcs = _num("dedup_per_sub_cap")
+              if _pcs:
+                  _tot = _num("dedup_total_cap")
+                  _parts.append(f"dedup {_pcs}/sub" + (f" ({_tot} total)" if _tot else ""))
+              _probe = _set.get("liveness_probe")
+              if _probe is False:
+                  _parts.append("liveness probe off")
+              elif _probe is True:
+                  _strict = _set.get("liveness_strict")
+                  _budget = _num("liveness_probe_budget")
+                  _parts.append("liveness probe on ("
+                                + ("strict" if _strict else "lenient")
+                                + (f", budget {_budget}" if _budget else "") + ")")
+              if _parts:
+                  print(f"**Settings:** {' · '.join(_parts)}")
           print()
           print("### Feed")
           print(f"- Combined-feed entries: {v('combined_entries')}")
@@ -463,6 +501,25 @@ jobs:
           if data.get('retry_backoff_by_reason'):
               print(f"  - by reason: {dict_str(data.get('retry_backoff_by_reason'))}")
           print(f"- Fresh-age hold: {v('fresh_hold')}")
+          # Round 97: name the posts waiting on that floor (bounded), with their
+          # age and the floor that held them.
+          _fresh_keys = data.get('fresh_hold_keys')
+          if isinstance(_fresh_keys, list) and _fresh_keys:
+              _f_shown = 0
+              for _f in _fresh_keys[:10]:
+                  if not isinstance(_f, dict):
+                      continue
+                  _age = _f.get('age_seconds')
+                  _floor = _f.get('floor_seconds')
+                  _age_s = (f"{_age:.1f} s old" if isinstance(_age, (int, float))
+                            else "age unavailable")
+                  _floor_s = (f"floor {int(_floor)} s"
+                              if isinstance(_floor, (int, float)) else "floor unavailable")
+                  print(f"  - waiting: {_f.get('key')} — {_age_s} ({_floor_s})")
+                  _f_shown += 1
+              _f_total = data.get('fresh_hold')
+              if isinstance(_f_total, int) and _f_total > _f_shown:
+                  print(f"  - … {_f_total - _f_shown} more waiting post(s) not shown")
           print(f"- Newly rejected removed/deleted: {v('newly_rejected_removed')}")
           if data.get('newly_rejected_by_reason'):
               print(f"  - by reason: {dict_str(data.get('newly_rejected_by_reason'))}")

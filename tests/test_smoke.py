@@ -11296,6 +11296,99 @@ check("r96c: a round-95/96 record without the name lists still renders",
       "Liveness not verified: 1" in _r96c_old_summary
       and "held:" not in _r96c_old_summary)
 
+# ---- Round 97 (2026-10-30): the summary states the settings the run used ----
+# Live #11563 (08:15Z) ran with FRESH_HOLD_SECONDS=60 from the operator Variable
+# and reported "2 fresh-hold", but the only place the effective floor appeared
+# was the runner's own env dump (the code default is 30 s).
+_r97_settings = v3._effective_settings()
+check("r97: the engine records its resolved settings, not the env strings",
+      isinstance(_r97_settings, dict)
+      and _r97_settings.get("fresh_hold_seconds") == int(v3.FRESH_HOLD_SECONDS)
+      and _r97_settings.get("pending_recheck_seconds") == int(v3.PENDING_RECHECK_SECONDS)
+      and _r97_settings.get("max_age_hours") == 48
+      and _r97_settings.get("max_posts_per_run") == int(v3.MAX_POSTS_PER_RUN)
+      and _r97_settings.get("dedup_per_sub_cap") == int(v3.MAX_CACHE_SIZE_PER_SUB)
+      and _r97_settings.get("liveness_probe") is bool(v3.REDDIT_LIVENESS_PROBE)
+      and _r97_settings.get("liveness_strict") is bool(v3.REDDIT_LIVENESS_STRICT),
+      _r97_settings)
+_r97_init = v3._init_run_stats()
+check("r97: every run result carries the settings block and the fresh-hold names",
+      _r97_init.get("effective_settings") == _r97_settings
+      and _r97_init.get("fresh_hold_keys") == [])
+# A renamed/missing constant must degrade to one "unavailable" value, never raise.
+_r97_saved_age = v3.MAX_AGE_SECONDS
+try:
+    v3.MAX_AGE_SECONDS = None
+    _r97_degraded = v3._effective_settings()
+finally:
+    v3.MAX_AGE_SECONDS = _r97_saved_age
+check("r97: a missing constant degrades to unavailable instead of raising",
+      _r97_degraded.get("max_age_hours") is None
+      and _r97_degraded.get("fresh_hold_seconds") == _r97_settings.get("fresh_hold_seconds"))
+
+_r97_fake = {
+    "combined_entries": 100, "combined_subreddits_covered": 5,
+    "subreddits_represented": 5, "subreddits_configured": 6,
+    "combined_fetch_status": "ok", "fallback_status": "not_attempted",
+    "unposted_candidates_considered": 6, "candidates_entering_processing": 1,
+    "delivered": 1, "delivered_posts": [], "failed_delivery": 0,
+    "known_pending_suppressed": 3, "fresh_hold": 2,
+    "fresh_hold_keys": [{"key": "WutheringWavesLeaks_1xj9k2p", "age_seconds": 41.3,
+                         "floor_seconds": 60},
+                        {"key": "AnantaLeaks_1xj9jz1", "age_seconds": 12.0,
+                         "floor_seconds": 60}],
+    "effective_settings": {"fresh_hold_seconds": 60, "pending_recheck_seconds": 300,
+                           "max_age_hours": 48, "max_posts_per_run": 25,
+                           "dedup_per_sub_cap": 250, "dedup_total_cap": 10000,
+                           "liveness_probe": True, "liveness_strict": False,
+                           "liveness_probe_budget": 10},
+    "liveness_probe_enabled": True, "dedup_skipped_in_run": 115,
+    "completed": True, "dry_run": False, "persistence_status": "saved",
+}
+_r97_summary = _app_summary_shell_with_json("reddit", None, fake_data=_r97_fake)
+check("r97: the summary states the effective settings in one plain line",
+      "**Settings:** fresh hold 60 s · recheck 300 s · window 48 h · flood cap 25 "
+      "· dedup 250/sub (10000 total) · liveness probe on (lenient, budget 10)"
+      in _r97_summary,
+      [ln for ln in _r97_summary.splitlines() if ln.startswith("**Settings:**")][:1])
+check("r97: each waiting post is named with its age and the floor that held it",
+      "waiting: WutheringWavesLeaks_1xj9k2p — 41.3 s old (floor 60 s)" in _r97_summary
+      and "waiting: AnantaLeaks_1xj9jz1 — 12.0 s old (floor 60 s)" in _r97_summary,
+      [ln for ln in _r97_summary.splitlines() if "waiting:" in ln][:3])
+# The floor switched off must read as off, not as "fresh hold 0 s".
+_r97_off = dict(_r97_fake)
+_r97_off["effective_settings"] = dict(_r97_fake["effective_settings"],
+                                      fresh_hold_seconds=0, liveness_probe=False)
+_r97_off_summary = _app_summary_shell_with_json("reddit", None, fake_data=_r97_off)
+check("r97: a disabled floor and probe are stated as off",
+      "fresh hold off (0 s)" in _r97_off_summary
+      and "liveness probe off" in _r97_off_summary,
+      [ln for ln in _r97_off_summary.splitlines() if ln.startswith("**Settings:**")][:1])
+# More waiting posts than the cap -> explicit remainder, never an unbounded list.
+_r97_many = dict(_r97_fake)
+_r97_many["fresh_hold_keys"] = [{"key": f"Sub_1xj9k{i}", "age_seconds": 10.0 + i,
+                                 "floor_seconds": 60} for i in range(12)]
+_r97_many["fresh_hold"] = 12
+_r97_many_summary = _app_summary_shell_with_json("reddit", None, fake_data=_r97_many)
+_r97_waiting = [ln for ln in _r97_many_summary.splitlines() if ln.startswith("  - waiting:")]
+check("r97: the waiting list is capped at 10 with an explicit remainder",
+      len(_r97_waiting) == 10 and "… 2 more waiting post(s) not shown" in _r97_many_summary,
+      (len(_r97_waiting), [ln for ln in _r97_many_summary.splitlines()
+                           if "more waiting" in ln][:1]))
+# A round-96 record (no settings, no names) must render exactly as before.
+_r97_old = {"combined_entries": 100, "fresh_hold": 2, "completed": True,
+            "known_pending_suppressed": 3}
+_r97_old_summary = _app_summary_shell_with_json("reddit", None, fake_data=_r97_old)
+check("r97: a record without the new fields still renders (no Settings line)",
+      "Fresh-age hold: 2" in _r97_old_summary
+      and "**Settings:**" not in _r97_old_summary
+      and "waiting:" not in _r97_old_summary)
+_r97_src = open(os.path.join(ROOT, "testing area/reddit_main_v3.py"), encoding="utf-8").read()
+check("r97: the fresh-age gate records the key it deferred",
+      '_note_key(run_stats, "fresh_hold_keys",' in _r97_src
+      and '"effective_settings": _effective_settings()' in _r97_src
+      and 'def _effective_settings()' in _r97_src)
+
 # ---- Round 89: no GitHub Actions annotation may leak out of this suite ----
 # Restore the real stdout first, then judge what the suite actually emitted.
 sys.stdout = _stdout_guard.stream

@@ -468,6 +468,47 @@ def _note_key(stats, name: str, record, limit: int = 10) -> None:
         pass
 
 
+def _effective_settings() -> dict:
+    """Round 97: the settings this process is ACTUALLY running with.
+
+    Live #11563 (2026-10-30 08:15Z) showed `FRESH_HOLD_SECONDS: 60` in the
+    workflow env and `2 fresh-hold` in the log, but nothing anywhere stated the
+    effective value: the code default is 30 s, the operator Variable is 60 s,
+    and only the Actions log's env dump distinguishes them. The engine knows
+    its own resolved values (its `_env_int` defaults are applied), so it records
+    them and the summary prints them.
+
+    Reads module globals at call time, so every name is optional: a renamed or
+    missing constant makes one line say "unavailable" instead of raising.
+    """
+    g = globals()
+
+    def _get(name, default=None):
+        try:
+            return g.get(name, default)
+        except Exception:
+            return default
+
+    def _int(name):
+        val = _get(name)
+        return val if isinstance(val, (int, float)) and not isinstance(val, bool) else None
+
+    max_age = _int("MAX_AGE_SECONDS")
+    probe = _get("REDDIT_LIVENESS_PROBE")
+    return {
+        "fresh_hold_seconds": _int("FRESH_HOLD_SECONDS"),
+        "pending_recheck_seconds": _int("PENDING_RECHECK_SECONDS"),
+        "max_age_hours": (round(max_age / 3600) if max_age else None),
+        "max_posts_per_run": _int("MAX_POSTS_PER_RUN"),
+        "dedup_per_sub_cap": _int("MAX_CACHE_SIZE_PER_SUB"),
+        "dedup_total_cap": _int("MAX_CACHE_SIZE_TOTAL"),
+        "liveness_probe": (None if probe is None else bool(probe)),
+        "liveness_strict": (None if _get("REDDIT_LIVENESS_STRICT") is None
+                            else bool(_get("REDDIT_LIVENESS_STRICT"))),
+        "liveness_probe_budget": _int("LIVENESS_PROBE_BUDGET"),
+    }
+
+
 def _init_run_stats():
     # Fresh per-invocation record; never reuse stale prior-run file.
     # Feed coverage is measured from the feed itself, not from deduplicated
@@ -514,6 +555,11 @@ def _init_run_stats():
         "retry_backoff": 0,
         "retry_backoff_by_reason": {},
         "fresh_hold": 0,
+        # Round 97: the settings this run actually used (see _effective_settings).
+        "effective_settings": _effective_settings(),
+        # Round 97: WHICH posts waited on the fresh-age floor (bounded), so
+        # "Fresh-age hold: 2" is verifiable without the Actions log.
+        "fresh_hold_keys": [],
         "newly_rejected_removed": 0,
         "newly_rejected_by_reason": {},
         "liveness_not_verified": 0,
@@ -7387,6 +7433,10 @@ async def main():
                     _post_age = now - float(published_ts or now)
                     if _post_age < FRESH_HOLD_SECONDS:
                         run_stats["fresh_hold"] += 1
+                        _note_key(run_stats, "fresh_hold_keys",
+                                  {"key": unique_key,
+                                   "age_seconds": round(_post_age, 1),
+                                   "floor_seconds": FRESH_HOLD_SECONDS})
                         logging.debug(f"[{unique_key}] age {_post_age:.1f}s < "
                                      f"FRESH_HOLD_SECONDS ({FRESH_HOLD_SECONDS}s) — "
                                      f"skipped this tick (stateless, not cached), "
