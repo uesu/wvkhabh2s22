@@ -11531,6 +11531,11 @@ if _r98_ok:
           and "collect(arc_entries, sub)" in _r97_src)
     _r98_wf = open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"),
                    encoding="utf-8").read()
+    check("r98b: the liveness evidence-source line is NOT nested under "
+          "'Unverified (posted)' (run #11658 printed '0 unverified' above "
+          "'evidence source: 8')",
+          'print("- Evidence source (all verdicts): "' in _r98_wf
+          and '  - evidence source: {dstr(' not in _r98_wf)
     check("r98: the summary names both new decisions (no log digging)",
           'line("Stale-snapshot overrides", "stale_snapshot_overrides")' in _r98_wf
           and 'line("Held posts re-probed", "reclaim_checked")' in _r98_wf)

@@ -502,8 +502,11 @@ jobs:
               if data.get("liveness_probe_by_reason"):
                   print(f"  - by reason: {dstr(data['liveness_probe_by_reason'])}")
               line("Unverified (posted)", "liveness_probe_unverified")
+              # r98b: covers EVERY verdict; nesting it under "Unverified
+              # (posted)" printed "0" above "8" (#11658).
               if data.get("liveness_probe_by_source"):
-                  print(f"  - evidence source: {dstr(data['liveness_probe_by_source'])}")
+                  print("- Evidence source (all verdicts): "
+                        + dstr(data["liveness_probe_by_source"]))
               line("Probe skipped", "liveness_probe_skipped")
           print()
           print("### Providers and media")
