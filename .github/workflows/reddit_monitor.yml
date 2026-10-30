@@ -297,6 +297,7 @@ jobs:
           fi
       # Reporting only: stable local run-result record, no network or scraping.
       # Summary source: reddit_run_result.json -> GITHUB_STEP_SUMMARY (inline, no additional requests).
+      # Reporting only: reads reddit_run_result.json + monitor.log; no network.
       - name: Write monitor run summary
         if: always()
         run: |
@@ -304,379 +305,289 @@ jobs:
           if [ -n "${MONITOR_START_EPOCH:-}" ] && [ -n "${MONITOR_END_EPOCH:-}" ]; then
             RUNTIME="$(( MONITOR_END_EPOCH - MONITOR_START_EPOCH ))s"
           fi
-          export RUNTIME
-          export CACHE_RESULT
+          export RUNTIME CACHE_RESULT
           export JOB_STATUS="${{ job.status }}"
           python3 - << 'PY' >> "$GITHUB_STEP_SUMMARY"
           import json, os, pathlib
-          runtime = os.environ.get("RUNTIME", "unavailable")
-          # Reporting correction: entered persistence defaults to failed; never-ran is not-reached
-          cache_result = os.environ.get("CACHE_RESULT")
-          if not cache_result:
-              cache_result = "not-reached"
-          job_status = os.environ.get("JOB_STATUS", "unavailable")
-          result_path = pathlib.Path("reddit_run_result.json")
-          data = {}
-          result_status = "missing"
-          if result_path.exists():
+
+          def env(k, d):
+              return os.environ.get(k) or d
+
+          def load(name):
+              p = pathlib.Path(name)
+              if not p.exists():
+                  return {}, "missing"
               try:
-                  raw = result_path.read_text(encoding="utf-8")
-                  loaded = json.loads(raw)
-                  if isinstance(loaded, dict):
-                      data = loaded
-                      result_status = "read"
-                  else:
-                      data = {"error": "wrong_shape", "raw_type": type(loaded).__name__}
-                      result_status = "invalid shape"
-              except Exception as e:
-                  data = {"error": f"malformed_json: {type(e).__name__}"}
-                  result_status = "unreadable or malformed"
-          def v(k, default="unavailable"):
+                  d = json.loads(p.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  return {"error": f"malformed_json: {type(exc).__name__}"}, "unreadable or malformed"
+              return (d, "read") if isinstance(d, dict) else ({"error": "wrong_shape"}, "invalid shape")
+
+          def v(k, d="unavailable"):
               val = data.get(k)
-              return str(val) if val is not None else default
-          def dict_str(d):
-              if not isinstance(d, dict) or not d:
-                  return "none"
-              return ", ".join(f"{k}: {v}" for k, v in sorted(d.items()))
+              return str(val) if val is not None else d
+
+          def dstr(val):
+              return ", ".join(f"{k}: {val[k]}" for k in sorted(val)) if isinstance(val, dict) and val else "none"
+
+          def line(label, key):
+              print(f"- {label}: {v(key)}")
+
+          def num(val, tail):
+              return f"{val}{tail}" if isinstance(val, (int, float)) else "unavailable"
+
+          data, result_status = load("reddit_run_result.json")
           print("## Reddit Feed Monitor — run summary")
           print()
-          # Repository persistence (observed commit/push) vs local persistence (from run_result)
-          print(f"**Result:** {job_status}")
-          print(f"**Monitor runtime:** {runtime}")
+          print(f"**Result:** {env('JOB_STATUS', 'unavailable')}")
+          print(f"**Monitor runtime:** {env('RUNTIME', 'unavailable')}")
           print(f"**Run-result record:** {result_status}")
-          # Repo persistence is from workflow env (observed git push), local is from run_result (file saves)
-          print(f"**Repository persistence:** {cache_result}")
-          local_persist = data.get("persistence_status", "unavailable")
-          print(f"**Local persistence:** {local_persist}")
-          if local_persist == "skipped_dry_run":
-              print(f"  - Dry-run: no local cache write (as intended)")
-          # Run completion with dry-run distinction
+          print(f"**Repository persistence:** {env('CACHE_RESULT', 'not-reached')}")
+          print(f"**Local persistence:** {v('persistence_status')}")
+          if data.get("persistence_status") == "skipped_dry_run":
+              print("  - Dry-run: no local cache write (as intended)")
           if data.get("completed") is True:
-              print(f"**Run status:** completed")
-              if data.get("dry_run") is True:
-                  print(f"  - Dry-run execution (no live delivery or persistence)")
-              elif data.get("dry_run") is False:
-                  print(f"  - Live execution")
+              print("**Run status:** completed")
+              print("  - Live execution" if data.get("dry_run") is False
+                    else "  - Dry-run execution (no live delivery or persistence)")
           elif data.get("completed") is False:
-              print(f"**Run status:** incomplete")
+              print("**Run status:** incomplete")
               if data.get("error"):
-                  # Error already sanitized in engine
-                  print(f"**Error:** {data.get('error')}")
+                  print(f"**Error:** {data['error']}")
           else:
-              print(f"**Run status:** unavailable")
-          # Round 97: the settings this run actually used. Formatted by the
-          # engine: this script is capped at 21,000 characters by GitHub
-          # (2026-10-30 #11568 hit it at 21,058 and the whole workflow failed
-          # to load), so text assembly stays out of the workflow.
+              print("**Run status:** unavailable")
           if data.get("settings_line"):
               print(data["settings_line"])
           print()
           print("### Feed")
-          print(f"- Combined-feed entries: {v('combined_entries')}")
-          # Legacy phrasing for compatibility: Subreddits represented: X of Y
-          sub_rep = v('subreddits_represented')
-          comb_cov = v('combined_subreddits_covered')
-          cfg = v('subreddits_configured')
-          if sub_rep != "unavailable":
-              print(f"- Subreddits represented: {sub_rep} of {cfg}")
-              if comb_cov != "unavailable" and comb_cov != sub_rep:
-                  print(f"- Combined subreddits covered: {comb_cov} of {cfg} configured")
+          line("Combined-feed entries", "combined_entries")
+          if data.get("subreddits_represented") is not None:
+              print(f"- Subreddits represented: {v('subreddits_represented')} of {v('subreddits_configured')}")
           else:
-              print(f"- Combined subreddits covered: {comb_cov} of {cfg} configured")
-          print(f"- Combined fetch status: {v('combined_fetch_status')}")
-          # Round 96: FULL MODE availability used to be a log-only line
-          # ("post JSON HTTP 403 — native mode"); the summary now states which
-          # data path built the cards.
-          _json_probe = data.get('json_probe_by_status')
-          if isinstance(_json_probe, dict) and _json_probe:
-              print(f"- FULL MODE post-JSON probe: {dict_str(_json_probe)}")
-              if any(str(k).startswith('http_') or k == 'error' for k in _json_probe):
-                  print("  - native mode this run: cards were built from RSS + proxy "
-                        "media; no Reddit JSON body/comments were available.")
-          if data.get('fallback_status') and data.get('fallback_status') != "not_attempted":
-              print(f"- Fallback status: {v('fallback_status')}")
-              print(f"- Fallback entries: {v('fallback_entries')}")
-              print(f"- Fallback subreddits covered: {v('fallback_subreddits_covered')}")
-          if data.get('arctic_candidates') is not None:
-              print(f"- Arctic candidates: {v('arctic_candidates')}")
-          # Round 96: name the subreddits the combined feed did not cover and say
-          # what the archive returned for each. Before this, proving a quiet
-          # subreddit had really been checked meant noticing the ABSENCE of an
-          # error line in the Actions log — unreadable for a later reader.
-          _feed_subs = data.get('feed_subreddits_with_entries')
-          if isinstance(_feed_subs, dict) and _feed_subs:
-              print(f"- Feed entries by subreddit: {dict_str(_feed_subs)}")
-          _missing = data.get('feed_subreddits_missing')
-          if isinstance(_missing, list) and _missing:
-              print(f"- Subreddits missing from the combined feed: "
-                    f"{', '.join(str(x) for x in _missing)} (archive attempt below)")
-          elif isinstance(_missing, list):
-              print(f"- Subreddits missing from the combined feed: none")
-          _arc = data.get('arctic_by_sub')
-          if isinstance(_arc, dict) and _arc:
-              _status = {name: (info if isinstance(info, dict) else {})
-                         for name, info in _arc.items()}
-              _with = sum(1 for x in _status.values() if x.get('status') == 'posts')
-              _empty = sum(1 for x in _status.values() if x.get('status') == 'empty')
-              _failed = sum(1 for x in _status.values() if x.get('status') == 'failed')
-              _open = sum(1 for x in _status.values() if x.get('status') == 'circuit_open')
-              print(f"- Archive coverage: {len(_status)} subreddit(s) without RSS news "
-                    f"tried — {_with} with posts, {_empty} empty (nothing inside the "
-                    f"posting window), {_failed} failed, {_open} skipped (circuit open)")
+              print(f"- Combined subreddits covered: {v('combined_subreddits_covered')} of {v('subreddits_configured')} configured")
+          line("Combined fetch status", "combined_fetch_status")
+          probe = data.get("json_probe_by_status")
+          if isinstance(probe, dict) and probe:
+              print(f"- FULL MODE post-JSON probe: {dstr(probe)}")
+              if any(str(k).startswith("http_") or k == "error" for k in probe):
+                  print("  - native mode this run: cards came from RSS + proxy media "
+                        "(no Reddit JSON body/comments).")
+          if data.get("arctic_candidates") is not None:
+              line("Arctic candidates", "arctic_candidates")
+          subs = data.get("feed_subreddits_with_entries")
+          if isinstance(subs, dict) and subs:
+              print(f"- Feed entries by subreddit: {dstr(subs)}")
+          missing = data.get("feed_subreddits_missing")
+          if isinstance(missing, list):
+              print("- Subreddits missing from the combined feed: "
+                    + (", ".join(str(x) for x in missing) + " (archive attempt below)" if missing else "none"))
+          arc = data.get("arctic_by_sub")
+          if isinstance(arc, dict) and arc:
+              st = {k: (x if isinstance(x, dict) else {}) for k, x in arc.items()}
+              def count(status):
+                  return sum(1 for x in st.values() if x.get("status") == status)
+              print(f"- Archive coverage: {len(st)} subreddit(s) without RSS news tried — "
+                    f"{count('posts')} with posts, {count('empty')} empty (nothing inside the "
+                    f"posting window), {count('failed')} failed, {count('circuit_open')} skipped (circuit open)")
               print("  - by subreddit: " + ", ".join(
-                  f"{name}=" + (f"{x.get('posts')} post(s)" if x.get('status') == 'posts'
-                                else str(x.get('status') or 'unknown'))
-                  for name, x in sorted(_status.items())))
-              if _failed or _open:
-                  print("  - WARNING: an archive lookup did not answer, so coverage for "
-                        "that subreddit is unconfirmed this run.")
-          print(f"- Unposted candidates considered: {v('unposted_candidates_considered')}")
-          print(f"- Candidates entering processing: {v('candidates_entering_processing')}")
-          print(f"- Delivered posts: {v('delivered')}")
-          # Round 96: list WHAT went out (key, media, latency, hold), not just a
-          # count — the per-post detail used to exist only in the Actions log.
-          _delivered = data.get('delivered_posts')
-          if isinstance(_delivered, list) and _delivered:
-              for _item in _delivered:
-                  if not isinstance(_item, dict):
-                      continue
-                  _lat = _item.get('latency_seconds')
-                  _lat_s = (f"{_lat / 60:.1f} min" if isinstance(_lat, (int, float))
-                            else "unavailable")
-                  _hold = _item.get('held_reason')
-                  print(f"  - {_item.get('key')} — {_item.get('media')}/{_item.get('mode')}, "
-                        f"{_item.get('items')} item(s), LATENCY {_lat_s}"
-                        + (f", held as '{_hold}'" if _hold else ""))
-          if 'dry_run_would_deliver' in data:
-              print(f"- Dry-run would-deliver: {v('dry_run_would_deliver')}")
-          print(f"- Failed deliveries: {v('failed_delivery')}")
+                  f"{k}=" + (f"{x.get('posts')} post(s)" if x.get("status") == "posts"
+                             else str(x.get("status") or "unknown"))
+                  for k, x in sorted(st.items())))
+              if count("failed") or count("circuit_open"):
+                  print("  - WARNING: an archive lookup did not answer, so coverage for that "
+                        "subreddit is unconfirmed this run.")
+          line("Unposted candidates considered", "unposted_candidates_considered")
+          line("Candidates entering processing", "candidates_entering_processing")
+          line("Delivered posts", "delivered")
+          for item in data.get("delivered_posts") or []:
+              if not isinstance(item, dict):
+                  continue
+              latency = item.get("latency_seconds")
+              print(f"  - {item.get('key')} — {item.get('media')}/{item.get('mode')}, "
+                    f"{item.get('items')} item(s), LATENCY "
+                    + num(round(latency / 60, 1) if isinstance(latency, (int, float)) else None, " min")
+                    + (f", held as '{item.get('held_reason')}'" if item.get("held_reason") else ""))
+          if "dry_run_would_deliver" in data:
+              line("Dry-run would-deliver", "dry_run_would_deliver")
+          line("Failed deliveries", "failed_delivery")
           print()
           print("### Skipped and deferred")
-          print(f"- Known-rejected archive candidates: {v('known_pending_suppressed')}")
-          if data.get('known_pending_by_reason'):
-              print(f"  - by reason: {dict_str(data.get('known_pending_by_reason'))}")
-          # Round 96c: name the suppressed keys (bounded) — "5 known-pending"
-          # without names still forced a reader back into the Actions log.
-          _pending_keys = data.get('known_pending_keys')
-          if isinstance(_pending_keys, list) and _pending_keys:
-              _pk_names = [str(x.get('key')) for x in _pending_keys if isinstance(x, dict)][:10]
-              _pk_total = data.get('known_pending_suppressed')
-              _pk_extra = (int(_pk_total) - len(_pk_names)
-                           if isinstance(_pk_total, int) and _pk_total > len(_pk_names) else 0)
-              print("  - keys: " + ", ".join(_pk_names)
-                    + (f" … {_pk_extra} more" if _pk_extra else ""))
-          print(f"- Retry backoff: {v('retry_backoff')}")
-          if data.get('retry_backoff_by_reason'):
-              print(f"  - by reason: {dict_str(data.get('retry_backoff_by_reason'))}")
-          print(f"- Fresh-age hold: {v('fresh_hold')}")
-          # Round 97: name the posts waiting on that floor (bounded).
-          _fresh = data.get('fresh_hold_keys')
-          if isinstance(_fresh, list) and _fresh:
-              _shown = 0
-              for _f in _fresh[:10]:
-                  if not isinstance(_f, dict):
+          line("Known-rejected archive candidates", "known_pending_suppressed")
+          if data.get("known_pending_by_reason"):
+              print(f"  - by reason: {dstr(data['known_pending_by_reason'])}")
+          keys = data.get("known_pending_keys")
+          if isinstance(keys, list) and keys:
+              names = [str(k.get("key")) for k in keys if isinstance(k, dict)][:10]
+              total = data.get("known_pending_suppressed")
+              extra = int(total) - len(names) if isinstance(total, int) and total > len(names) else 0
+              print("  - keys: " + ", ".join(names) + (f" … {extra} more" if extra else ""))
+          line("Retry backoff", "retry_backoff")
+          if data.get("retry_backoff_by_reason"):
+              print(f"  - by reason: {dstr(data['retry_backoff_by_reason'])}")
+          line("Fresh-age hold", "fresh_hold")
+          fresh = data.get("fresh_hold_keys")
+          if isinstance(fresh, list) and fresh:
+              shown = 0
+              for f in fresh[:10]:
+                  if not isinstance(f, dict):
                       continue
-                  _age, _floor = _f.get('age_seconds'), _f.get('floor_seconds')
-                  print(f"  - waiting: {_f.get('key')} — "
-                        + (f"{_age:.1f} s old" if isinstance(_age, (int, float))
-                           else "age unavailable")
-                        + (f" (floor {int(_floor)} s)"
-                           if isinstance(_floor, (int, float)) else ""))
-                  _shown += 1
-              _total = data.get('fresh_hold')
-              if isinstance(_total, int) and _total > _shown:
-                  print(f"  - … {_total - _shown} more waiting post(s) not shown")
-          print(f"- Newly rejected removed/deleted: {v('newly_rejected_removed')}")
-          if data.get('newly_rejected_by_reason'):
-              print(f"  - by reason: {dict_str(data.get('newly_rejected_by_reason'))}")
-          print(f"- Liveness not verified: {v('liveness_not_verified')}")
-          if data.get('liveness_by_reason'):
-              print(f"  - by reason: {dict_str(data.get('liveness_by_reason'))}")
-          # Round 96c: name each held key with the evidence that held it, so a
-          # held post (like AnantaLeaks_1xj8et0 on 2026-10-30) is identifiable
-          # from the summary alone.
-          _held_keys = data.get('hold_keys')
-          if isinstance(_held_keys, list) and _held_keys:
-              _h_shown = 0
-              for _h in _held_keys[:10]:
-                  if not isinstance(_h, dict):
+                  floor = f.get("floor_seconds")
+                  print(f"  - waiting: {f.get('key')} — {num(f.get('age_seconds'), ' s old')}"
+                        + (f" (floor {int(floor)} s)" if isinstance(floor, (int, float)) else ""))
+                  shown += 1
+              total = data.get("fresh_hold")
+              if isinstance(total, int) and total > shown:
+                  print(f"  - … {total - shown} more waiting post(s) not shown")
+          line("Newly rejected removed/deleted", "newly_rejected_removed")
+          if data.get("newly_rejected_by_reason"):
+              print(f"  - by reason: {dstr(data['newly_rejected_by_reason'])}")
+          line("Liveness not verified", "liveness_not_verified")
+          if data.get("liveness_by_reason"):
+              print(f"  - by reason: {dstr(data['liveness_by_reason'])}")
+          held = data.get("hold_keys")
+          if isinstance(held, list) and held:
+              shown = 0
+              for h in held[:10]:
+                  if not isinstance(h, dict):
                       continue
-                  _detail = str(_h.get('detail') or '')[:120]
-                  print(f"  - held: {_h.get('key')} — '{_h.get('reason')}' "
-                        f"({_h.get('gate')}, source={_h.get('source')})"
-                        + (f": {_detail}" if _detail else ""))
-                  _h_shown += 1
-              _h_total = data.get('liveness_not_verified')
-              if isinstance(_h_total, int) and _h_total > _h_shown:
-                  print(f"  - … {_h_total - _h_shown} more held post(s) not shown")
-          print(f"- Media-wait: {v('media_wait')}")
-          print(f"- Partial-gallery: {v('partial_gallery')}")
-          print(f"- Flood-cap dropped: {v('flood_cap_dropped')}")
-          print(f"- Dedup skipped in run: {v('dedup_skipped_in_run')}")
-          print(f"- Other skipped: {v('other_skipped')}")
-          if data.get('other_by_reason'):
-              print(f"  - by reason: {dict_str(data.get('other_by_reason'))}")
-          # Round 95: dedup-cache pressure (eviction at the per-sub cap used to
-          # be a log-only warning).
-          cache_size = data.get('dedup_cache_size')
-          if cache_size is not None:
-              line = f"- Dedup cache: {cache_size} key(s)"
-              dropped = data.get('dedup_cache_dropped')
+                  detail = str(h.get("detail") or "")[:120]
+                  print(f"  - held: {h.get('key')} — '{h.get('reason')}' "
+                        f"({h.get('gate')}, source={h.get('source')})"
+                        + (f": {detail}" if detail else ""))
+                  shown += 1
+              total = data.get("liveness_not_verified")
+              if isinstance(total, int) and total > shown:
+                  print(f"  - … {total - shown} more held post(s) not shown")
+          for label, key in (("Media-wait", "media_wait"), ("Partial-gallery", "partial_gallery"),
+                             ("Flood-cap dropped", "flood_cap_dropped"),
+                             ("Dedup skipped in run", "dedup_skipped_in_run"),
+                             ("Other skipped", "other_skipped")):
+              line(label, key)
+          if data.get("other_by_reason"):
+              print(f"  - by reason: {dstr(data['other_by_reason'])}")
+          if data.get("dedup_cache_size") is not None:
+              text = f"- Dedup cache: {data['dedup_cache_size']} key(s)"
+              dropped = data.get("dedup_cache_dropped")
               if isinstance(dropped, int) and dropped > 0:
-                  line += f", {dropped} dropped at the cap this run"
-              hot = data.get('dedup_cache_hot')
+                  text += f", {dropped} dropped at the cap this run"
+              hot = data.get("dedup_cache_hot")
               if isinstance(hot, dict) and hot:
-                  line += f" (hot: {dict_str(hot)})"
-              print(line)
+                  text += f" (hot: {dstr(hot)})"
+              print(text)
           print()
-          # Round 95: independent pre-delivery liveness probe. These counters
-          # exist so a held post is explainable from the summary alone.
           print("### Liveness")
-          probe_enabled = data.get('liveness_probe_enabled')
-          strict = data.get('liveness_probe_strict')
-          if probe_enabled is None:
-              print(f"- Probe: unavailable (no run-result record)")
-          elif probe_enabled is False:
-              print(f"- Probe: disabled (REDDIT_LIVENESS_PROBE=0)")
+          enabled = data.get("liveness_probe_enabled")
+          if enabled is None:
+              print("- Probe: unavailable (no run-result record)")
+          elif enabled is False:
+              print("- Probe: disabled (REDDIT_LIVENESS_PROBE=0)")
           else:
-              print(f"- Probe: enabled ({'strict' if strict else 'lenient'}"
-                    f"{'' if strict else ' — holds only on positive evidence'})")
-              print(f"- Verified live: {v('liveness_probe_live')}")
-              print(f"- Held as removed/queued: {v('liveness_probe_removed')}")
-              if data.get('liveness_probe_by_reason'):
-                  print(f"  - by reason: {dict_str(data.get('liveness_probe_by_reason'))}")
-              print(f"- Unverified (posted): {v('liveness_probe_unverified')}")
-              if data.get('liveness_probe_by_source'):
-                  print(f"  - evidence source: {dict_str(data.get('liveness_probe_by_source'))}")
-              print(f"- Probe skipped: {v('liveness_probe_skipped')}")
+              print("- Probe: enabled (" + ("strict" if data.get("liveness_probe_strict")
+                                           else "lenient — holds only on positive evidence") + ")")
+              line("Verified live", "liveness_probe_live")
+              line("Held as removed/queued", "liveness_probe_removed")
+              if data.get("liveness_probe_by_reason"):
+                  print(f"  - by reason: {dstr(data['liveness_probe_by_reason'])}")
+              line("Unverified (posted)", "liveness_probe_unverified")
+              if data.get("liveness_probe_by_source"):
+                  print(f"  - evidence source: {dstr(data['liveness_probe_by_source'])}")
+              line("Probe skipped", "liveness_probe_skipped")
           print()
           print("### Providers and media")
-          # Warmup: locally observed, no extra network (does not prove audio)
-          warmup_status = data.get("proxy_warmup_status", "unavailable")
-          warmup_services = data.get("proxy_warmup_services")
-          if warmup_status == "ok" and isinstance(warmup_services, dict):
-              details = ", ".join(f"{k}={'ok' if v.get('ok') else 'down'}" for k, v in sorted(warmup_services.items()))
-              print(f"- Proxy warmup: {warmup_status} ({details})")
-          elif warmup_status == "ok":
-              print(f"- Proxy warmup: {warmup_status}")
-          elif warmup_status == "disabled":
-              print(f"- Proxy warmup: disabled (PROXY_MEDIA=0 or module missing)")
-          elif warmup_status in ("failed", "unavailable", "not-reached"):
-              print(f"- Proxy warmup: {warmup_status}")
+          warm = data.get("proxy_warmup_status", "unavailable")
+          services = data.get("proxy_warmup_services")
+          if warm == "ok" and isinstance(services, dict):
+              states = ", ".join(f"{k}: {'ok' if s.get('ok') else 'down'}"
+                                 for k, s in sorted(services.items()))
+              print(f"- Proxy warmup: ok ({states})")
+          elif warm == "ok":
+              print("- Proxy warmup: ok")
+          elif warm == "disabled":
+              print("- Proxy warmup: disabled (PROXY_MEDIA=0 or module missing)")
           else:
-              print(f"- Proxy warmup: {warmup_status}")
-          # Video quality mode (local config, no network)
-          vq = data.get("video_quality", "unavailable")
-          print(f"- Video quality mode: {vq}")
-          # Redlib instance reachability (REDLIB-REACH, local observation only, no extra network)
-          redlib_line = data.get("redlib_reach")
-          if not redlib_line:
-              log_path = pathlib.Path("monitor.log")
-              if log_path.exists():
+              print(f"- Proxy warmup: {warm}")
+          print(f"- Video quality mode: {data.get('video_quality', 'unavailable')}")
+          reach = data.get("redlib_reach")
+          if not reach:
+              log = pathlib.Path("monitor.log")
+              if log.exists():
                   try:
-                      for ln in reversed(log_path.read_text(encoding="utf-8", errors="ignore").splitlines()):
-                          if "REDLIB-REACH:" in ln:
-                              redlib_line = "REDLIB-REACH: " + ln.split("REDLIB-REACH:", 1)[1].strip()
+                      for entry in reversed(log.read_text(encoding="utf-8", errors="ignore").splitlines()):
+                          if "REDLIB-REACH:" in entry:
+                              reach = "REDLIB-REACH: " + entry.split("REDLIB-REACH:", 1)[1].strip()
                               break
                   except Exception:
                       pass
-          redlib_cfg = data.get("redlib_instances_configured")
-          # Round 95: the engine already stores the line WITH its prefix, so the
-          # old print rendered "Instances (REDLIB-REACH): REDLIB-REACH: 0/26".
-          def _strip_prefix(t):
-              t = t.strip()
-              if t.upper().startswith("REDLIB-REACH:"):
-                  t = t.split(":", 1)[1].strip()
-              return t
-          redlib_answered = data.get("redlib_reach_answered")
-          redlib_probed = data.get("redlib_reach_probed")
-          if isinstance(redlib_line, str) and redlib_line.strip():
-              print(f"- Instances (REDLIB-REACH): {_strip_prefix(redlib_line)}")
-          elif redlib_cfg is not None:
-              print(f"- Instances (REDLIB-REACH): not probed this run ({redlib_cfg} Redlib instance(s) configured)")
-          # Round 95: say it plainly when every mirror is down — that is the
-          # single fact that decides whether page-based checks can work at all.
-          # (2026-10-29 production: 0/26 in every run.)
-          if isinstance(redlib_probed, int) and redlib_probed > 0 and redlib_answered == 0:
-              print(f"  - WARNING: no Redlib mirror answered this run — page-based "
-                    f"checks (gallery enrichment, removal comments) were unavailable; "
-                    f"the liveness probe used the archive instead.")
-          # Required diagnostic distinctions (when actually observed, no extra network)
-          # 1. Media resolved via provider
+          if isinstance(reach, str) and reach.strip():
+              text = reach.strip()
+              if text.upper().startswith("REDLIB-REACH:"):
+                  text = text.split(":", 1)[1].strip()
+              print(f"- Instances (REDLIB-REACH): {text}")
+          elif data.get("redlib_instances_configured") is not None:
+              print(f"- Instances (REDLIB-REACH): not probed this run "
+                    f"({data['redlib_instances_configured']} Redlib instance(s) configured)")
+          probed = data.get("redlib_reach_probed")
+          if isinstance(probed, int) and probed > 0 and data.get("redlib_reach_answered") == 0:
+              print("  - WARNING: no Redlib mirror answered this run — page-based checks "
+                    "(gallery enrichment, removal comments) were unavailable; the liveness "
+                    "probe used the archive instead.")
           via = data.get("media_resolved_via_provider")
           if isinstance(via, dict) and via:
-              print(f"- Media resolved via provider: {dict_str(via)}")
+              print(f"- Media resolved via provider: {dstr(via)}")
           elif data.get("unposted_candidates_considered") == 0:
-              print(f"- Media resolved via provider: none (no candidates)")
-          # 2. Final media endpoint/hosting category
+              print("- Media resolved via provider: none (no candidates)")
           endpoint = data.get("final_media_endpoint_category")
           if isinstance(endpoint, dict) and endpoint:
-              print(f"- Final media endpoint: {dict_str(endpoint)}")
-          # 3. Final card media kind and tile count
-          kind_counts = data.get("final_card_media_kind_counts")
-          tile_total = data.get("final_card_media_tile_total")
-          if isinstance(kind_counts, dict) and kind_counts:
-              print(f"- Final card media: kind={dict_str(kind_counts)}, tiles={tile_total if tile_total is not None else 'unavailable'}")
-          elif data.get("delivered") and data.get("delivered") != 0:
-              # Fallback to legacy selected provider view for compatibility
+              print(f"- Final media endpoint: {dstr(endpoint)}")
+          kinds = data.get("final_card_media_kind_counts")
+          if isinstance(kinds, dict) and kinds:
+              print(f"- Final card media: kind={dstr(kinds)}, "
+                    f"tiles={data.get('final_card_media_tile_total', 'unavailable')}")
+          else:
               providers = data.get("selected_media_providers") or data.get("media_provider_counts")
               if isinstance(providers, dict) and providers:
-                  print(f"- Selected media provider: {dict_str(providers)}")
-          else:
-              if data.get("unposted_candidates_considered") == 0:
-                  print(f"- Final card media: none (no candidates)")
-              else:
-                  providers = data.get("selected_media_providers") or data.get("media_provider_counts")
-                  if isinstance(providers, dict) and providers:
-                      print(f"- Selected media provider: {dict_str(providers)}")
-          # 4. Optional quality candidate result + 5. Whether validated base retained
-          qa = data.get("quality_upgrades_accepted")
-          qf = data.get("quality_fallbacks", 0)
-          q_result = data.get("optional_quality_candidate_result")
-          base_retained = data.get("validated_base_retained")
-          if isinstance(q_result, dict) and q_result:
-              print(f"- Optional quality candidate: {dict_str(q_result)}")
-              if base_retained:
-                  print(f"  - Validated base retained: {base_retained}")
-          elif qa is not None or qf:
-              # Legacy compatibility
-              if qa is not None:
-                  print(f"- Quality upgrades accepted: {qa}")
-              if qf:
-                  print(f"- Quality fallbacks (base retained): {qf}")
+                  print(f"- Selected media provider: {dstr(providers)}")
+              elif data.get("unposted_candidates_considered") == 0:
+                  print("- Final card media: none (no candidates)")
+          quality = data.get("optional_quality_candidate_result")
+          if isinstance(quality, dict) and quality:
+              print(f"- Optional quality candidate: {dstr(quality)}")
+          elif data.get("quality_upgrades_accepted") is not None or data.get("quality_fallbacks"):
+              if data.get("quality_upgrades_accepted") is not None:
+                  print(f"- Quality upgrades accepted: {data['quality_upgrades_accepted']}")
+              if data.get("quality_fallbacks"):
+                  print(f"- Quality fallbacks (base retained): {data['quality_fallbacks']}")
                   if data.get("quality_fallback_reasons"):
-                      print(f"  - by reason: {dict_str(data.get('quality_fallback_reasons'))}")
-              elif qa is not None and qa == 0:
-                  print(f"- Quality fallbacks (base retained): 0")
-              if base_retained:
-                  print(f"- Validated base retained: {base_retained}")
-          # 6. Terminal media fallback (proxy -> native), distinct from feed and quality fallback
-          term_fb = data.get("terminal_media_fallbacks")
-          if term_fb:
-              print(f"- Terminal media fallback (proxy -> native): {term_fb}")
-          # 7. Heal: queued, edit performed, or edit skipped after revalidation (distinct, no audio inference)
-          heal_q = data.get("heal_queued", 0)
-          heal_edit = data.get("heal_edit_performed", 0)
-          heal_skip = data.get("heal_skipped_after_revalidation", 0)
-          if heal_q or heal_edit or heal_skip:
-              print(f"- Heal: queued={heal_q}, edit_performed={heal_edit}, skipped_after_revalidation={heal_skip}")
-          elif data.get("delivered") and data.get("delivered") != 0:
-              # Show zero vs not-reached distinction when deliveries occurred but no heal
-              if heal_q == 0 and heal_edit == 0 and heal_skip == 0:
-                  print(f"- Heal: queued=0, edit_performed=0, skipped_after_revalidation=0 (no unresolved evidence)")
-          # Distinguish feed fallback (RSS per-subreddit) from video-quality and terminal fallback
-          if data.get("fallback_status") == "not_attempted":
-              print(f"- Feed fallback: not attempted (combined succeeded)")
-          elif data.get("fallback_status") in ("ok", "partial", "all_failed"):
-              print(f"- Feed fallback: {data.get('fallback_status')} ({v('fallback_entries')} entries, {v('fallback_subreddits_covered')} subreddits)")
-          elif data.get("fallback_status") is not None:
+                      print(f"  - by reason: {dstr(data['quality_fallback_reasons'])}")
+          elif data.get("delivered"):
+              print("- Quality fallbacks (base retained): 0")
+          if data.get("validated_base_retained"):
+              print(f"- Validated base retained: {data['validated_base_retained']}")
+          if data.get("terminal_media_fallbacks"):
+              print(f"- Terminal media fallback (proxy -> native): {data['terminal_media_fallbacks']}")
+          heal = (data.get("heal_queued", 0), data.get("heal_edit_performed", 0),
+                  data.get("heal_skipped_after_revalidation", 0))
+          if any(heal):
+              print(f"- Heal: queued={heal[0]}, edit_performed={heal[1]}, "
+                    f"skipped_after_revalidation={heal[2]}")
+          elif data.get("delivered"):
+              print("- Heal: queued=0, edit_performed=0, skipped_after_revalidation=0 "
+                    "(no unresolved evidence)")
+          fallback = data.get("fallback_status")
+          if fallback == "not_attempted":
+              print("- Feed fallback: not attempted (combined succeeded)")
+          elif fallback in ("ok", "partial", "all_failed"):
+              print(f"- Feed fallback: {fallback} ({v('fallback_entries')} entries, "
+                    f"{v('fallback_subreddits_covered')} subreddits)")
+          elif fallback is not None:
               print(f"- Feed fallback: {v('fallback_status')}")
-          # Clarify: warmup and video validation do not prove audio inclusion
-          print(f"- Note: provider warmup, HTTP validation, player controls, or 'chain complete' do not prove audio inclusion")
-          print(f"- Note: per-candidate provider/quality/terminal-fallback/heal details in monitor.log; counts above are this run's local observations")
+          print("- Note: warmup/HTTP validation/'chain complete' do not prove audio "
+                "inclusion; per-candidate detail stays in monitor.log")
           print()
-          print("Counts describe this run's local observations, not an independent subreddit-visibility or end-to-end health audit.")
-          print("Summary source: reddit_run_result.json (per-run, ignored) + monitor.log for provider diagnostics; no additional network requests.")
+          print("Counts describe this run's local observations, not an independent "
+                "subreddit-visibility or end-to-end health audit.")
+          print("Summary source: reddit_run_result.json (per-run, ignored) + monitor.log; "
+                "no additional network requests.")
           PY
         env:
           CACHE_RESULT: ${{ env.CACHE_RESULT }}

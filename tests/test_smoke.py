@@ -11438,8 +11438,11 @@ for _wf_name in ("reddit_monitor.yml", "twitter_monitor.yml"):
     for _label, _len in _r97_run_scripts(_wf_text):
         _r97_worst.append((_len, _wf_name, _label))
 _r97_worst.sort(key=lambda x: (-x[0], x[1]))
+# GitHub refuses a step script over 21,000 characters and then the WHOLE
+# workflow fails to load (prod #11568, 2026-10-30 08:40Z). Keep a hard 16,000
+# ceiling: the largest script is the Reddit summary at ~14,000.
 check("r97: no workflow step script approaches GitHub's 21,000-character cap",
-      len(_r97_worst) >= 10 and _r97_worst[0][0] <= 20000, _r97_worst[:3])
+      len(_r97_worst) >= 10 and _r97_worst[0][0] <= 16000, _r97_worst[:3])
 _r97_src = open(os.path.join(ROOT, "testing area/reddit_main_v3.py"), encoding="utf-8").read()
 check("r97: the fresh-age gate records the key it deferred",
       '_note_key(run_stats, "fresh_hold_keys",' in _r97_src
