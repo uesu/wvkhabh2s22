@@ -32,6 +32,7 @@ import time
 import types
 import shutil
 import inspect
+import ast as _r95d_ast
 import tempfile
 import importlib.util
 
@@ -97,6 +98,77 @@ def check(label, cond, extra=""):
     print(("PASS " if cond else "FAIL ") + label + (f"  {extra}" if extra and not cond else ""))
     if not cond:
         failures.append(label)
+
+
+# ---- Round 95d (2026-10-30): no unguarded read of a DEV-ONLY file in this suite ----
+# The crash that reddened both production CIs (#332 / #417) was a documentation check
+# opening a file that production never receives. Rather than trust the next doc check to
+# remember, audit this file's own syntax tree: every read of README.md, AGENTS.md,
+# .env.example or docs/** must sit inside an existence guard (os.path.isfile/exists) or a
+# try/except, both of which turn "no such file in prod" into a skip instead of a red run.
+_R95D_DEV_ONLY = ("README.md", "AGENTS.md", ".env.example", "docs/")
+_R95D_READERS = {"open", "read_text", "read_bytes"}
+
+
+def _r95d_unguarded_doc_reads(source, markers=_R95D_DEV_ONLY):
+    """[(lineno, marker)] for dev-only reads that no guard protects; [] when clean."""
+    tree = _r95d_ast.parse(source)
+    # A dev-only path is often bound to a name first (`p = os.path.join(ROOT, "README.md")`)
+    # and opened later, so resolve those simple aliases too: the pre-fix bug read through
+    # exactly such a variable, and a literal-only audit would have missed it.
+    aliases = {}
+    for node in _r95d_ast.walk(tree):
+        if isinstance(node, _r95d_ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], _r95d_ast.Name):
+            value = _r95d_ast.get_source_segment(source, node.value) or ""
+            if any(m in value for m in markers):
+                aliases[node.targets[0].id] = value
+    found = []
+
+    def walk(node, guarded):
+        for child in _r95d_ast.iter_child_nodes(node):
+            child_guarded = guarded
+            if isinstance(child, _r95d_ast.If):
+                test = _r95d_ast.get_source_segment(source, child.test) or ""
+                child_guarded = guarded or "isfile(" in test or "exists(" in test or "is_file(" in test
+            elif isinstance(child, _r95d_ast.Try):
+                child_guarded = True          # an absent file is caught, not fatal
+            if isinstance(child, _r95d_ast.Call):
+                name = getattr(child.func, "id", None) or getattr(child.func, "attr", None)
+                if name in _R95D_READERS:
+                    segment = _r95d_ast.get_source_segment(source, child) or ""
+                    for arg in child.args:
+                        arg_src = _r95d_ast.get_source_segment(source, arg) or ""
+                        segment += " " + aliases.get(arg_src.strip(), "")
+                    hit = [m for m in markers if m in segment]
+                    if hit and not guarded:
+                        found.append((child.lineno, hit[0]))
+            walk(child, child_guarded)
+
+    walk(tree, False)
+    return sorted(set(found))
+
+
+_r95d_self_src = open(os.path.join(ROOT, "tests/test_smoke.py"), encoding="utf-8").read()
+_r95d_offenders = _r95d_unguarded_doc_reads(_r95d_self_src)
+check("r95d: no dev-only file (README.md, AGENTS.md, .env.example, docs/**) is opened "
+      "unguarded anywhere in this suite — a production checkout has none of them",
+      not _r95d_offenders, _r95d_offenders[:3])
+check("r95d: the audit catches the exact read that broke prod CI (self-test: literal, "
+      "guarded, variable, try/except)",
+      # the round-95c read, unguarded -> flagged on its own line ...
+      _r95d_unguarded_doc_reads('_x = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()\n')
+      == [(1, "README.md")]
+      # ... the same read behind an existence guard, or inside a try/except -> clean.
+      and _r95d_unguarded_doc_reads('if os.path.isfile(os.path.join(ROOT, "README.md")):\n'
+                                    '    _x = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()\n') == []
+      # ... and the same read THROUGH A VARIABLE is still caught (aliases are resolved).
+      and _r95d_unguarded_doc_reads('p = os.path.join(ROOT, "README.md")\n'
+                                    '_x = open(p, encoding="utf-8").read()\n') == [(2, "README.md")]
+      and _r95d_unguarded_doc_reads('try:\n'
+                                    '    _x = open(os.path.join(ROOT, "docs/A.md")).read()\n'
+                                    'except OSError:\n'
+                                    '    pass\n') == [])
 
 
 # Installed before the first check runs and removed again at the very end,
@@ -10936,16 +11008,31 @@ check("r95c: the stale floor's off-switch is actually wired (a Variable the work
 # standby V2 engine.
 _r95c_not_variables = {"ACCOUNTS", "SUBREDDITS", "DRY_RUN", "TEST_POST_ID",
                        "TEST_TWEET_ID", "EMBEDEZ_API_KEY"}
-_x95c_readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
-_x95c_documented = sorted(set(re.findall(r"^\| `([A-Z][A-Z0-9_]+)` \|", _x95c_readme, re.M)))
-_x95c_mapped = set(re.findall(r"vars\.([A-Z][A-Z0-9_]+)",
-                             _x95c_wf + open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"),
-                                             encoding="utf-8").read()))
-_x95c_unwired = [n for n in _x95c_documented
-                 if n not in _x95c_mapped and n not in _r95c_not_variables]
-check("r95c: every README-documented tuning knob is passed through by its workflow",
-      _x95c_documented and not _x95c_unwired,
-      _x95c_unwired)
+# Round 95d (2026-10-30): README.md is a DEV-ONLY file — sync_prod.py keeps it (and
+# docs/) out of both production repositories on purpose. This block used to open it
+# unconditionally, which crashed the first prod CI run after the round-95 merge
+# (uesu/7jkxmy9nvbc #332, uesu/wvkhabh2s22 #417: FileNotFoundError at this line) even
+# though every production check above and below it had passed. A documentation check
+# must therefore be skipped when the documentation is absent, never crash.
+_r95c_readme_path = os.path.join(ROOT, "README.md")
+if os.path.isfile(_r95c_readme_path):
+    _x95c_readme = open(_r95c_readme_path, encoding="utf-8").read()
+    _x95c_documented = sorted(set(re.findall(r"^\| `([A-Z][A-Z0-9_]+)` \|", _x95c_readme, re.M)))
+    _x95c_mapped = set(re.findall(r"vars\.([A-Z][A-Z0-9_]+)",
+                                 _x95c_wf + open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"),
+                                                 encoding="utf-8").read()))
+    _x95c_unwired = [n for n in _x95c_documented
+                     if n not in _x95c_mapped and n not in _r95c_not_variables]
+    check("r95c: every README-documented tuning knob is passed through by its workflow",
+          _x95c_documented and not _x95c_unwired,
+          _x95c_unwired)
+else:
+    # Production checkout: no knob table to read, so the table check cannot run. The
+    # round's own knob is still proven wired above (r95c, stale-floor off-switch), and
+    # this branch keeps that proof explicit instead of silently dropping it.
+    check("r95c: in a production checkout (no README.md) the round's knob is still mapped",
+          "TWITTER_MAX_AGE_HOURS: ${{ vars.TWITTER_MAX_AGE_HOURS }}" in _x95c_wf)
+
 check("r95c: the engine emits one machine-readable state line for the workflow summary",
       # must be INFO: the summary step greps the log, and DEBUG lines are not emitted.
       'logging.info(f"V3 SUMMARY: posted=' in _x95c_src
