@@ -255,6 +255,35 @@ jobs:
             echo "### Posts"
             echo "- new candidates: not separately measured by this log format"
             echo "- posts delivered: $(count_matches 'V3 Posted:')"
+            # Round 96b: name WHICH accounts fed and which instance answered, so a
+            # "successful feeds: 4" count never leaves the reader guessing which
+            # account was dark. Host only (no path/query), sorted, bounded.
+            per_account=$(feed_lines | sed -nE \
+              -e 's/^\[([^]]+)\] feed OK via https?:\/\/([^\/ ]+)[^—]*— ([0-9]+) entries\..*/- \1: ok via \2 — \3 entries/p' \
+              -e 's/^\[([^]]+)\] NO working nitter instance this run.*/- \1: FAILED — no working nitter instance this run/p' \
+              -e 's/^\[([^]]+)\] skipping — no feed.*/- \1: empty feed (0 entries)/p' \
+              2>/dev/null | sort -u || true)
+            if [ -n "$per_account" ]; then
+              echo "- per account:"
+              printf '%s\n' "$per_account" | head -n 12 | sed 's/^/  /'
+              per_account_lines=$(printf '%s\n' "$per_account" | wc -l | tr -d ' ')
+              if [ "$per_account_lines" -gt 12 ]; then
+                echo "  - … $((per_account_lines - 12)) more account(s) not shown"
+              fi
+            else
+              echo "- per account: unavailable (no matching feed records)"
+            fi
+            # Round 96b: list the delivered keys (bounded) instead of only a count.
+            posted_keys=$(grep -o 'V3 Posted: [^ ]*' twitter_monitor.log 2>/dev/null \
+              | sed 's/^V3 Posted: //' | head -n 10 | sed 's/^/- /' || true)
+            if [ -n "$posted_keys" ]; then
+              echo "- delivered keys:"
+              printf '%s\n' "$posted_keys" | sed 's/^/  /'
+              posted_total=$(count_matches 'V3 Posted:')
+              if [ "$posted_total" -gt 10 ]; then
+                echo "  - … $((posted_total - 10)) more not shown"
+              fi
+            fi
             echo "- skip log lines: $(count_matches 'skipping')"
             echo "- retry/fallback log lines: $(count_matches 'trying next|retry')"
             echo
@@ -276,7 +305,35 @@ jobs:
             else
               echo "- engine: unavailable (no V3 SUMMARY line — the engine did not reach the end of its run, so per-run post/skip counts are unknown)"
             fi
-            echo "- entries refused as stale backlog: $(count_matches 'STALE-SKIP:')"
+            stale_logged=$(count_matches 'STALE-SKIP:')
+            echo "- entries refused as stale backlog: ${stale_logged}"
+            # Round 96b: name the refused backlog entries (bounded), with their age,
+            # so "3 stale" is verifiable without the Actions log.
+            stale_keys=$(grep -o '\[[^]]*\] STALE-SKIP: entry is [0-9.]* h old' twitter_monitor.log 2>/dev/null \
+              | sed -E 's/^\[([^]]*)\] STALE-SKIP: entry is ([0-9.]+) h old/- \1 — \2 h old/' \
+              | head -n 5 || true)
+            if [ -n "$stale_keys" ]; then
+              echo "- refused keys (oldest-first as logged):"
+              printf '%s\n' "$stale_keys" | sed 's/^/  /'
+              stale_total=$(count_matches 'STALE-SKIP:')
+              if [ "$stale_total" -gt 5 ]; then
+                echo "  - … $((stale_total - 5)) more not shown"
+              fi
+            fi
+            # Round 96b: the engine's own line is authoritative; if the log has a
+            # different number of matching lines, the log was truncated and the
+            # reader should trust the engine values, not the line counts.
+            if [ -n "$v3_summary" ]; then
+              engine_stale=$(printf '%s' "$v3_summary" | sed -nE 's/.*stale_skipped=([0-9]+).*/\1/p')
+              engine_posted=$(printf '%s' "$v3_summary" | sed -nE 's/.*posted=([0-9]+).*/\1/p')
+              posted_logged=$(count_matches 'V3 Posted:')
+              if [ -n "$engine_stale" ] && [ "$engine_stale" != "$stale_logged" ]; then
+                echo "- note: engine reported ${engine_stale} stale-skip(s), this log has ${stale_logged} line(s) — trust the engine value (the log may be truncated)."
+              fi
+              if [ -n "$engine_posted" ] && [ "$engine_posted" != "$posted_logged" ]; then
+                echo "- note: engine reported ${engine_posted} delivered post(s), this log has ${posted_logged} 'V3 Posted' line(s) — trust the engine value (the log may be truncated)."
+              fi
+            fi
             echo "- already-posted entries skipped by cache: see dedup_skipped above"
             echo "- why this matters: the cache prevents re-posts only for keys it holds. A down/restoring nitter instance can answer with days-old entries; the stale floor refuses those BEFORE any tweet-data request, so a stale feed can never turn into a re-post or a burst of old cards."
             echo

@@ -378,15 +378,69 @@ jobs:
           else:
               print(f"- Combined subreddits covered: {comb_cov} of {cfg} configured")
           print(f"- Combined fetch status: {v('combined_fetch_status')}")
+          # Round 96: FULL MODE availability used to be a log-only line
+          # ("post JSON HTTP 403 — native mode"); the summary now states which
+          # data path built the cards.
+          _json_probe = data.get('json_probe_by_status')
+          if isinstance(_json_probe, dict) and _json_probe:
+              print(f"- FULL MODE post-JSON probe: {dict_str(_json_probe)}")
+              if any(str(k).startswith('http_') or k == 'error' for k in _json_probe):
+                  print("  - native mode this run: cards were built from RSS + proxy "
+                        "media; no Reddit JSON body/comments were available.")
           if data.get('fallback_status') and data.get('fallback_status') != "not_attempted":
               print(f"- Fallback status: {v('fallback_status')}")
               print(f"- Fallback entries: {v('fallback_entries')}")
               print(f"- Fallback subreddits covered: {v('fallback_subreddits_covered')}")
           if data.get('arctic_candidates') is not None:
               print(f"- Arctic candidates: {v('arctic_candidates')}")
+          # Round 96: name the subreddits the combined feed did not cover and say
+          # what the archive returned for each. Before this, proving a quiet
+          # subreddit had really been checked meant noticing the ABSENCE of an
+          # error line in the Actions log — unreadable for a later reader.
+          _feed_subs = data.get('feed_subreddits_with_entries')
+          if isinstance(_feed_subs, dict) and _feed_subs:
+              print(f"- Feed entries by subreddit: {dict_str(_feed_subs)}")
+          _missing = data.get('feed_subreddits_missing')
+          if isinstance(_missing, list) and _missing:
+              print(f"- Subreddits missing from the combined feed: "
+                    f"{', '.join(str(x) for x in _missing)} (archive attempt below)")
+          elif isinstance(_missing, list):
+              print(f"- Subreddits missing from the combined feed: none")
+          _arc = data.get('arctic_by_sub')
+          if isinstance(_arc, dict) and _arc:
+              _status = {name: (info if isinstance(info, dict) else {})
+                         for name, info in _arc.items()}
+              _with = sum(1 for x in _status.values() if x.get('status') == 'posts')
+              _empty = sum(1 for x in _status.values() if x.get('status') == 'empty')
+              _failed = sum(1 for x in _status.values() if x.get('status') == 'failed')
+              _open = sum(1 for x in _status.values() if x.get('status') == 'circuit_open')
+              print(f"- Archive coverage: {len(_status)} subreddit(s) without RSS news "
+                    f"tried — {_with} with posts, {_empty} empty (nothing inside the "
+                    f"posting window), {_failed} failed, {_open} skipped (circuit open)")
+              print("  - by subreddit: " + ", ".join(
+                  f"{name}=" + (f"{x.get('posts')} post(s)" if x.get('status') == 'posts'
+                                else str(x.get('status') or 'unknown'))
+                  for name, x in sorted(_status.items())))
+              if _failed or _open:
+                  print("  - WARNING: an archive lookup did not answer, so coverage for "
+                        "that subreddit is unconfirmed this run.")
           print(f"- Unposted candidates considered: {v('unposted_candidates_considered')}")
           print(f"- Candidates entering processing: {v('candidates_entering_processing')}")
           print(f"- Delivered posts: {v('delivered')}")
+          # Round 96: list WHAT went out (key, media, latency, hold), not just a
+          # count — the per-post detail used to exist only in the Actions log.
+          _delivered = data.get('delivered_posts')
+          if isinstance(_delivered, list) and _delivered:
+              for _item in _delivered:
+                  if not isinstance(_item, dict):
+                      continue
+                  _lat = _item.get('latency_seconds')
+                  _lat_s = (f"{_lat / 60:.1f} min" if isinstance(_lat, (int, float))
+                            else "unavailable")
+                  _hold = _item.get('held_reason')
+                  print(f"  - {_item.get('key')} — {_item.get('media')}/{_item.get('mode')}, "
+                        f"{_item.get('items')} item(s), LATENCY {_lat_s}"
+                        + (f", held as '{_hold}'" if _hold else ""))
           if 'dry_run_would_deliver' in data:
               print(f"- Dry-run would-deliver: {v('dry_run_would_deliver')}")
           print(f"- Failed deliveries: {v('failed_delivery')}")

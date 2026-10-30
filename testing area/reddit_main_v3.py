@@ -458,6 +458,23 @@ def _init_run_stats():
         "fallback_status": "not_attempted",
         "arctic_candidates": 0,
         "arctic_subreddits_tried": 0,
+        # Round 96: coverage detail, so a run's feed/archive coverage can be
+        # proven from the step summary ALONE. Live 2026-10-30 (#11533): one
+        # configured subreddit (HonkaiNexusAnimeLeaks) had no entry in the
+        # 100-entry combined feed and the archive legitimately returned nothing.
+        # That was provable only from the ABSENCE of an error line in the log —
+        # not something a later reader (or an agent without the log) can rely on.
+        "feed_subreddits_with_entries": {},   # sub -> entries seen in the feed
+        "feed_subreddits_missing": [],        # configured subs absent from it
+        "arctic_by_sub": {},                  # sub -> {posts, status}
+        "arctic_subreddits_with_posts": 0,
+        "arctic_subreddits_empty": 0,
+        "arctic_subreddits_failed": 0,
+        "arctic_subreddits_circuit_open": 0,
+        # Round 96: one record per delivered post (key, media, latency), so the
+        # summary lists WHAT went out rather than only how many.
+        "delivered_posts": [],
+        "json_probe_by_status": {},           # FULL MODE post-JSON probe outcomes
         # Compatibility aliases for older readers/summaries
         "subreddits_represented": None,
         "unposted_candidates_considered": 0,
@@ -4025,6 +4042,23 @@ async def get_oauth_token(session: aiohttp.ClientSession) -> str | None:
     return _oauth_token
 
 
+def _note_json_probe(status: str) -> None:
+    """Round 96: record the FULL-MODE post-JSON probe outcome in the run record.
+
+    Live 2026-10-30 (#11533): the only trace of "FULL MODE unavailable, native
+    mode used" was the log line "[1xj77do] post JSON HTTP 403 — native mode".
+    A summary reader should not have to open the log to learn that the card was
+    built from RSS + proxies because the runner's IP was refused.
+    """
+    try:
+        stats = current_run_stats
+        if isinstance(stats, dict):
+            bucket = stats.setdefault("json_probe_by_status", {})
+            bucket[status] = bucket.get(status, 0) + 1
+    except Exception:
+        pass
+
+
 async def fetch_post_json(session: aiohttp.ClientSession, post_id: str, use_oauth: bool) -> dict | None:
     """
     Fetches ONE post's JSON (the full data: all media, stats, crosspost link).
@@ -4069,6 +4103,7 @@ async def fetch_post_json(session: aiohttp.ClientSession, post_id: str, use_oaut
                                        timeout=aiohttp.ClientTimeout(total=20)) as resp2:
                     if resp2.status != 200:
                         logging.info(f"[{post_id}] post JSON retry HTTP {resp2.status} — native mode.")
+                        _note_json_probe(f"http_{resp2.status}_after_429_retry")
                         return None
                     body = await resp2.text()
             elif resp.status != 200:
@@ -4076,6 +4111,7 @@ async def fetch_post_json(session: aiohttp.ClientSession, post_id: str, use_oaut
                     _feedtoken_json_failed = True
                 logging.info(f"[{post_id}] post JSON HTTP {resp.status} — native mode "
                              f"({'feed token will not be retried this run' if 'feed=' in url else 'no JSON path'})")
+                _note_json_probe(f"http_{resp.status}")
                 return None
             else:
                 body = await resp.text()
@@ -4089,10 +4125,12 @@ async def fetch_post_json(session: aiohttp.ClientSession, post_id: str, use_oaut
         except Exception:
             post["_top_comments"] = []
         source = "oauth" if token else "feed-token"
+        _note_json_probe(f"ok_{source}")
         logging.info(f"[{post_id}] post JSON OK via {source} (FULL MODE).")
         return post
     except Exception as e:
         logging.info(f"[{post_id}] post JSON error: {_redact_url_queries(e)} — native mode.")
+        _note_json_probe("error")
         return None
 
 
@@ -7066,13 +7104,24 @@ async def main():
                     # Combined fetch succeeded (even if 0 entries => empty, distinct from failed fetch)
                     try:
                         covered = set()
+                        _per_sub_entries = {}
                         for e in combined.entries:
                             p = normalize_reddit_path(str(getattr(e, "link", "")))
                             s = _subreddit_by_name(extract_subreddit(p)) if p else None
                             if s:
                                 covered.add(s)
+                                _per_sub_entries[s] = _per_sub_entries.get(s, 0) + 1
                         combined_entries_val = len(combined.entries)
                         subreddits_represented_val = len(covered)
+                        # Round 96: name what the feed did NOT cover, and how many
+                        # entries each subreddit contributed, instead of only a
+                        # "5 of 6" count that leaves the reader guessing which.
+                        try:
+                            run_stats["feed_subreddits_with_entries"] = dict(_per_sub_entries)
+                            run_stats["feed_subreddits_missing"] = sorted(
+                                set(SUBREDDITS) - covered)
+                        except Exception:
+                            pass
                         # Empty but successful parse is distinct from failed fetch
                         combined_fetch_status = "ok" if combined_entries_val > 0 else "empty"
                     except Exception:
@@ -7142,13 +7191,44 @@ async def main():
                     if sub in _rss_covered_subs:
                         continue
                     arctic_subs_tried += 1
+                    # Round 96: record WHY a subreddit produced no archive
+                    # candidates. "empty" (nothing in the 48 h window) and
+                    # "failed" (the search itself errored) look identical in the
+                    # candidate counts, but only one of them means the run is
+                    # blind for that subreddit — the summary has to say which.
+                    _arctic_fail_before = _arctic_fail_count
+                    _circuit_open = _arctic_fail_count >= 3
                     try:
                         arc_posts = await fetch_arctic_subreddit_posts(
                             session, sub, after_epoch=now - MAX_AGE_SECONDS,
                             label=sub)
                     except Exception:
                         arc_posts = []
+                    if _circuit_open:
+                        _arctic_status = "circuit_open"
+                    elif _arctic_fail_count > _arctic_fail_before:
+                        _arctic_status = "failed"
+                    elif arc_posts:
+                        _arctic_status = "posts"
+                    else:
+                        _arctic_status = "empty"
+                    try:
+                        run_stats["arctic_by_sub"][sub] = {
+                            "posts": len(arc_posts), "status": _arctic_status}
+                        _counter = {"posts": "arctic_subreddits_with_posts",
+                                    "empty": "arctic_subreddits_empty",
+                                    "failed": "arctic_subreddits_failed",
+                                    "circuit_open": "arctic_subreddits_circuit_open"}[_arctic_status]
+                        run_stats[_counter] = run_stats.get(_counter, 0) + 1
+                    except Exception:
+                        pass
                     if not arc_posts:
+                        if _arctic_status == "empty":
+                            logging.info(
+                                f"[arctic {sub}] no posts in the last "
+                                f"{int(MAX_AGE_SECONDS / 3600)} h — nothing to recover "
+                                f"from the archive (this subreddit is covered by the "
+                                f"feed only this run).")
                         continue
                     logging.info(f"[arctic {sub}] RSS had no new posts — trying "
                                  f"{len(arc_posts)} post(s) from the archive.")
@@ -7651,6 +7731,26 @@ async def main():
                                          f"{len(data['media'])} item(s)) | LATENCY "
                                          f"{_latency / 60:.1f}min after creation{_held_note}")
                             run_stats["delivered"] += 1
+                            # Round 96: keep one structured record per delivery
+                            # so the step summary can list the post itself
+                            # (key, media, provider, latency, hold) instead of a
+                            # bare count that forces a reader back into the log.
+                            try:
+                                run_stats["delivered_posts"].append({
+                                    "key": unique_key,
+                                    "subreddit": subreddit,
+                                    "media": kinds,
+                                    "mode": mode,
+                                    "items": len(data["media"]),
+                                    "latency_seconds": round(_latency, 1),
+                                    "held_reason": (_pend_entry.get("reason")
+                                                    if isinstance(_pend_entry, dict) else None),
+                                    "message_id": (str(message_json["id"])
+                                                   if isinstance(message_json, dict)
+                                                   and message_json.get("id") else None),
+                                })
+                            except Exception:
+                                pass
                             # Round 66: a body that exceeded the card budget
                             # continues in follow-up messages — same webhook,
                             # same mechanism/ordering as the YouTube link
