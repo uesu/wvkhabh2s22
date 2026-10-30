@@ -148,6 +148,20 @@ jobs:
           RETRACT_DEAD_POSTS: ${{ vars.RETRACT_DEAD_POSTS }}
           RETRACT_MODE: ${{ vars.RETRACT_MODE }}
           RETRACT_WINDOW_SECONDS: ${{ vars.RETRACT_WINDOW_SECONDS }}
+          # Round 95 (2026-10-30): independent pre-delivery liveness probe.
+          #   REDDIT_LIVENESS_PROBE=0     disable it (restores pre-round-95
+          #                               behaviour exactly)
+          #   REDDIT_LIVENESS_STRICT=1    hold a post when NO independent
+          #                               source could confirm it (default is
+          #                               lenient: hold only on positive
+          #                               evidence, so a live post is never
+          #                               withheld)
+          #   LIVENESS_PROBE_BUDGET=N     max archive lookups per run (10)
+          #   LIVENESS_PROBE_TIMEOUT=S    per-lookup timeout in seconds (8)
+          REDDIT_LIVENESS_PROBE: ${{ vars.REDDIT_LIVENESS_PROBE }}
+          REDDIT_LIVENESS_STRICT: ${{ vars.REDDIT_LIVENESS_STRICT }}
+          LIVENESS_PROBE_BUDGET: ${{ vars.LIVENESS_PROBE_BUDGET }}
+          LIVENESS_PROBE_TIMEOUT: ${{ vars.LIVENESS_PROBE_TIMEOUT }}
           # Round 49 (2026-10-01): the three media proxies are queried
           # CONCURRENTLY instead of one after another (~1.5s -> ~0.4-0.8s per
           # post). Defaults are tuned on the prod timings of 11:55 UTC and
@@ -303,16 +317,20 @@ jobs:
           job_status = os.environ.get("JOB_STATUS", "unavailable")
           result_path = pathlib.Path("reddit_run_result.json")
           data = {}
+          result_status = "missing"
           if result_path.exists():
               try:
                   raw = result_path.read_text(encoding="utf-8")
                   loaded = json.loads(raw)
                   if isinstance(loaded, dict):
                       data = loaded
+                      result_status = "read"
                   else:
                       data = {"error": "wrong_shape", "raw_type": type(loaded).__name__}
+                      result_status = "invalid shape"
               except Exception as e:
                   data = {"error": f"malformed_json: {type(e).__name__}"}
+                  result_status = "unreadable or malformed"
           def v(k, default="unavailable"):
               val = data.get(k)
               return str(val) if val is not None else default
@@ -325,6 +343,7 @@ jobs:
           # Repository persistence (observed commit/push) vs local persistence (from run_result)
           print(f"**Result:** {job_status}")
           print(f"**Monitor runtime:** {runtime}")
+          print(f"**Run-result record:** {result_status}")
           # Repo persistence is from workflow env (observed git push), local is from run_result (file saves)
           print(f"**Repository persistence:** {cache_result}")
           local_persist = data.get("persistence_status", "unavailable")
@@ -393,6 +412,39 @@ jobs:
           print(f"- Other skipped: {v('other_skipped')}")
           if data.get('other_by_reason'):
               print(f"  - by reason: {dict_str(data.get('other_by_reason'))}")
+          # Round 95: dedup-cache pressure (eviction at the per-sub cap used to
+          # be a log-only warning).
+          cache_size = data.get('dedup_cache_size')
+          if cache_size is not None:
+              line = f"- Dedup cache: {cache_size} key(s)"
+              dropped = data.get('dedup_cache_dropped')
+              if isinstance(dropped, int) and dropped > 0:
+                  line += f", {dropped} dropped at the cap this run"
+              hot = data.get('dedup_cache_hot')
+              if isinstance(hot, dict) and hot:
+                  line += f" (hot: {dict_str(hot)})"
+              print(line)
+          print()
+          # Round 95: independent pre-delivery liveness probe. These counters
+          # exist so a held post is explainable from the summary alone.
+          print("### Liveness")
+          probe_enabled = data.get('liveness_probe_enabled')
+          strict = data.get('liveness_probe_strict')
+          if probe_enabled is None:
+              print(f"- Probe: unavailable (no run-result record)")
+          elif probe_enabled is False:
+              print(f"- Probe: disabled (REDDIT_LIVENESS_PROBE=0)")
+          else:
+              print(f"- Probe: enabled ({'strict' if strict else 'lenient'}"
+                    f"{'' if strict else ' — holds only on positive evidence'})")
+              print(f"- Verified live: {v('liveness_probe_live')}")
+              print(f"- Held as removed/queued: {v('liveness_probe_removed')}")
+              if data.get('liveness_probe_by_reason'):
+                  print(f"  - by reason: {dict_str(data.get('liveness_probe_by_reason'))}")
+              print(f"- Unverified (posted): {v('liveness_probe_unverified')}")
+              if data.get('liveness_probe_by_source'):
+                  print(f"  - evidence source: {dict_str(data.get('liveness_probe_by_source'))}")
+              print(f"- Probe skipped: {v('liveness_probe_skipped')}")
           print()
           print("### Providers and media")
           # Warmup: locally observed, no extra network (does not prove audio)
@@ -425,10 +477,26 @@ jobs:
                   except Exception:
                       pass
           redlib_cfg = data.get("redlib_instances_configured")
+          # Round 95: the engine already stores the line WITH its prefix, so the
+          # old print rendered "Instances (REDLIB-REACH): REDLIB-REACH: 0/26".
+          def _strip_prefix(t):
+              t = t.strip()
+              if t.upper().startswith("REDLIB-REACH:"):
+                  t = t.split(":", 1)[1].strip()
+              return t
+          redlib_answered = data.get("redlib_reach_answered")
+          redlib_probed = data.get("redlib_reach_probed")
           if isinstance(redlib_line, str) and redlib_line.strip():
-              print(f"- Instances (REDLIB-REACH): {redlib_line.strip()}")
+              print(f"- Instances (REDLIB-REACH): {_strip_prefix(redlib_line)}")
           elif redlib_cfg is not None:
               print(f"- Instances (REDLIB-REACH): not probed this run ({redlib_cfg} Redlib instance(s) configured)")
+          # Round 95: say it plainly when every mirror is down — that is the
+          # single fact that decides whether page-based checks can work at all.
+          # (2026-10-29 production: 0/26 in every run.)
+          if isinstance(redlib_probed, int) and redlib_probed > 0 and redlib_answered == 0:
+              print(f"  - WARNING: no Redlib mirror answered this run — page-based "
+                    f"checks (gallery enrichment, removal comments) were unavailable; "
+                    f"the liveness probe used the archive instead.")
           # Required diagnostic distinctions (when actually observed, no extra network)
           # 1. Media resolved via provider
           via = data.get("media_resolved_via_provider")

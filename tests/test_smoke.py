@@ -1801,8 +1801,8 @@ check("r51: Read Post destination unchanged on profile crosspost cards",
 # ---- round 30 (2026-09-19): pending-post recheck cache --------------------
 # The four skip gates now record the post in pending_reddit.json and a
 # pending post is re-verified at most once every PENDING_RECHECK_SECONDS.
-check("r30 defaults: 30-min recheck, 48h prune window",
-      v3.PENDING_RECHECK_SECONDS == 1800
+check("r30 defaults: 5-min recheck (round 95c; was 30 min), 48h prune window",
+      v3.PENDING_RECHECK_SECONDS == 300 and v3.PENDING_RECHECK_SECONDS == 5 * 60
       and v3.PENDING_MAX_AGE_SECONDS == 48 * 3600
       and v3.PENDING_FILE == "pending_reddit.json")
 
@@ -1885,15 +1885,17 @@ check("r30 throttle: skips with `continue` and never caches as posted",
 check("r30 throttle runs BEFORE any network work (the whole point)",
       _r30_main.index("pending-post recheck throttle")
       < _r30_main.index("post_json = await fetch_post_json"))
-check("r30/round-18/round-20/32/r63/r67 gates: all skip paths record a pending "
+check("r30/round-18/round-20/32/r63/r67/r95 gates: all skip paths record a pending "
       "entry (settle/mod-queue/dup-media/repost gates removed round 63; the "
       "content gate's call removed round 67 -- only removed-post-reason, "
-      "archive-liveness, media-wait/partial-gallery remain; ghost gates removed 2026-10-23)",
-      _r30_main.count("mark_pending(pending, unique_key") == 4
+      "archive-liveness, media-wait/partial-gallery and the round-95 liveness "
+      "probe remain; ghost gates removed 2026-10-23)",
+      _r30_main.count("mark_pending(pending, unique_key") == 5
       and "mark_pending(pending, unique_key, _removed, now" in _r30_main
       and "mark_pending(pending, unique_key,\n" in _r30_main
       and 'mark_pending(pending, unique_key, "media_wait", now)' in _r30_main
       and 'mark_pending(pending, unique_key, "partial_gallery", now)' in _r30_main
+      and "mark_pending(pending, unique_key, _hold_reason, now" in _r30_main
       and "ghost-check" not in _r30_main
       and "arctic-ghost-check" not in _r30_main,
       str(_r30_main.count("mark_pending(pending, unique_key")))
@@ -2000,15 +2002,16 @@ check("r32: title-marker (deleted) post from the Arctic backup is skipped too",
       v3._pending_throttle_skip(_r32_pend("title marker"), "k", 4600.0, _r32_arctic) is True)
 check("r32: approval-queued post (not_live) is skipped before the round-30 throttle (+60 s)",
       v3._pending_throttle_skip(_r32_pend("not_live"), "k", 1060.0, _r32_arctic) is True)
-check("r32: approval-queued post (not_live) is DUE at the round-30 throttle (+30 min)",
-      v3._pending_throttle_skip(_r32_pend("not_live"), "k", 2800.0, _r32_arctic) is False)
-check("r32: 'pending approval' (banner) re-checks on the round-30 throttle (+30 min due)",
+check("r32: approval-queued post (not_live) is DUE at the throttle (+5 min, round 95c)",
+      v3._pending_throttle_skip(_r32_pend("not_live"), "k", 2800.0, _r32_arctic) is False
+      and v3._pending_throttle_skip(_r32_pend("not_live"), "k", 1310.0, _r32_arctic) is False)
+check("r32: 'pending approval' (banner) re-checks on the same throttle (+5 min due)",
       v3._pending_throttle_skip(_r32_pend("pending approval"), "k", 2800.0, _r32_arctic) is False)
 check("r32: sources_down (transient) re-checks on the round-30 throttle (+60 s skipped)",
       v3._pending_throttle_skip(_r32_pend("sources_down"), "k", 1060.0, _r32_arctic) is True)
-check("r32: media_wait keeps the round-30 30-min throttle (+60 s skipped, +30 min due)",
+check("r32: media_wait keeps the shared throttle (+60 s skipped, +5 min due)",
       v3._pending_throttle_skip(_r32_pend("media_wait"), "k", 1060.0, _r32_arctic) is True
-      and v3._pending_throttle_skip(_r32_pend("media_wait"), "k", 2800.0, _r32_arctic) is False)
+      and v3._pending_throttle_skip(_r32_pend("media_wait"), "k", 1310.0, _r32_arctic) is False)
 check("r32: unknown/missing reason falls back to the round-30 30-min throttle",
       v3._pending_throttle_skip(_r32_pend(None), "k", 1060.0, _r32_arctic) is True
       and v3._pending_throttle_skip(_r32_pend(None), "k", 2800.0, _r32_arctic) is False)
@@ -3122,7 +3125,7 @@ check("r64 cleanup: run-result file helpers exist (stable local record)",
       hasattr(v3, "_init_run_stats") and hasattr(v3, "_write_run_result")
       and hasattr(v3, "_RUN_RESULT_FILE"))
 check("r64 cleanup: pending/fresh dedup preserved — PENDING_RECHECK_SECONDS still parsed",
-      hasattr(v3, "PENDING_RECHECK_SECONDS") and v3.PENDING_RECHECK_SECONDS == 1800
+      hasattr(v3, "PENDING_RECHECK_SECONDS") and v3.PENDING_RECHECK_SECONDS == 300
       and hasattr(v3, "FRESH_HOLD_SECONDS"))
 check("r64 cleanup: workflow summary uses reddit_run_result.json, not log scraping",
       "reddit_run_result.json" in open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8").read()
@@ -4320,7 +4323,7 @@ try:
            _r49b_reddit.MAX_CACHE_SIZE_TOTAL) == (250, 10000))
     check("r49b: reddit_main_v3 empty scheduling Variables use defaults",
           (_r49b_reddit.MAX_POSTS_PER_RUN, _r49b_reddit.PENDING_RECHECK_SECONDS)
-          == (25, 1800))
+          == (25, 300))
     check("r49b: reddit_main_v3 empty feed stagger uses default",
           _r49b_reddit.FEEDTOKEN_JSON_STAGGER == 65)
     check("r52: empty true-by-default Variables keep their defaults",
@@ -7675,7 +7678,7 @@ class _AppArchiveLookupTests(unittest.TestCase):
                 asyncio.run(scenario(mode))
 
 
-def _app_summary_shell(kind, log_text, status="success", epochs=True):
+def _app_summary_shell(kind, log_text, status="success", epochs=True, twitter_cache="success"):
     import subprocess
     import textwrap
     workflow = open(os.path.join(ROOT, ".github/workflows", kind + "_monitor.yml"), encoding="utf-8").read()
@@ -7692,7 +7695,7 @@ def _app_summary_shell(kind, log_text, status="success", epochs=True):
                 stream.write(log_text)
         destination = os.path.join(directory, "summary.md")
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GITHUB_STEP_SUMMARY": destination,
-               "TWITTER_CACHE_RESULT": "success", "CACHE_RESULT": "success"}
+               "TWITTER_CACHE_RESULT": twitter_cache, "CACHE_RESULT": "success"}
         if epochs:
             prefix = "TWITTER" if kind == "twitter" else "MONITOR"
             env[prefix + "_START_EPOCH"] = "100"
@@ -7724,6 +7727,21 @@ _app_empty_summary = _app_summary_shell("twitter", None, epochs=False)
 check("missing Twitter output is unavailable, not a healthy no-op or fabricated runtime",
       "**Runtime:** unavailable" in _app_empty_summary and "observation coverage: unavailable" in _app_empty_summary
       and "new candidates: not separately measured" in _app_empty_summary)
+# Summary diagnostics use fixed categories and never echo the source log (which may contain secrets).
+_diag_log = ("[ERROR] Discord error 429 for account: secret-token-123456\n"
+             "[ERROR] Error fetching FxTwitter data (original) for 123: secret-token-123456\n"
+             "[ERROR] MEDIA-HEAL 123: edit HTTP 429 secret-token-123456\n"
+             "[WARNING] MEDIA-HEAL 123: media still unresolved after 4 edits\n"
+             "[ERROR] DEDUP GUARD: 1 key(s) missing\n")
+_diag_summary = _app_summary_shell("twitter", _diag_log)
+check("Twitter diagnostic summary is bounded and does not echo log contents",
+      all(x in _diag_summary for x in ("Discord delivery errors: 1", "FxTwitter fetch errors: 1",
+          "media-heal unresolved: 1", "media-heal edit errors: 1", "dedup guard errors: 1"))
+      and "secret-token-123456" not in _diag_summary)
+check("Twitter missing log does not imply healthy diagnostic coverage",
+      "diagnostic coverage: unavailable" in _app_empty_summary)
+check("Twitter missing cache outcome is not reported as failed",
+      "cache: not-reached" in _app_summary_shell("twitter", None, twitter_cache=""))
 # Updated for 2026-10-21 cleanup: summary now derives from reddit_run_result.json, not log scraping.
 # Helper to create a fake run-result JSON for the shell test helper.
 def _write_fake_reddit_result(directory, data):
@@ -7793,6 +7811,23 @@ _fake = {
     "combined_fetch_status": "ok"
 }
 _app_rd_summary = _app_summary_shell_with_json("reddit", "2026-10-17 05:50:32,826 [INFO] Combined feed OK: 100 entries covering 5 subreddit(s).\n", fake_data=_fake)
+check("Reddit summary reports run-result presence", "**Run-result record:** read" in _app_rd_summary)
+_missing_result = _app_summary_shell_with_json("reddit", None)
+check("Reddit summary reports missing run-result record", "**Run-result record:** missing" in _missing_result)
+_wrong_shape = _app_summary_shell_with_json("reddit", None, fake_data=["not a record"])
+check("Reddit summary reports wrong-shaped run-result record", "**Run-result record:** invalid shape" in _wrong_shape)
+# Malformed result files must not be confused with a clean empty run.
+import subprocess as _diag_subprocess, textwrap as _diag_textwrap
+_rd_wf = open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8").read()
+_rd_script = _diag_textwrap.dedent(_rd_wf.split("      - name: Write monitor run summary", 1)[1].split("        run: |\n", 1)[1].split("\n        env:\n", 1)[0]).replace("${{ job.status }}", "failure")
+with tempfile.TemporaryDirectory() as _diag_dir:
+    open(os.path.join(_diag_dir, "reddit_run_result.json"), "w", encoding="utf-8").write("{broken SECRET")
+    _diag_dest = os.path.join(_diag_dir, "summary.md")
+    _diag_proc = _diag_subprocess.run(["bash", "-e", "-o", "pipefail", "-c", _rd_script], cwd=_diag_dir,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GITHUB_STEP_SUMMARY": _diag_dest}, capture_output=True, text=True)
+    _diag_text = open(_diag_dest, encoding="utf-8").read()
+    check("Reddit malformed run-result has safe actionable status", _diag_proc.returncode == 0
+          and "**Run-result record:** unreadable or malformed" in _diag_text and "SECRET" not in _diag_text)
 check("existing Reddit summary retains delivery and workflow persistence facts (json-derived)",
       "Combined-feed entries: 100" in _app_rd_summary and "Unposted candidates considered: 42" in _app_rd_summary
       and "Delivered posts: 1" in _app_rd_summary and "Repository persistence" in _app_rd_summary and "success" in _app_rd_summary
@@ -9256,9 +9291,13 @@ async def _check_r86_all_fixes():
         "redlib_reach": reach_str,
         "redlib_instances_configured": 23,
     })
+    # Round 95: the engine stores the line WITH its "REDLIB-REACH:" prefix, so
+    # the summary strips it instead of printing "Instances (REDLIB-REACH):
+    # REDLIB-REACH: ...". The payload must still be present verbatim.
     check("r86: Step Summary includes Instances (REDLIB-REACH) line",
-          "Instances (REDLIB-REACH): REDLIB-REACH: 1/2 instance(s) answered this run" in s_reach
-          and "redlib.reallyaweso.me 1/1" in s_reach,
+          "Instances (REDLIB-REACH): 1/2 instance(s) answered this run" in s_reach
+          and "redlib.reallyaweso.me 1/1" in s_reach
+          and "Instances (REDLIB-REACH): REDLIB-REACH:" not in s_reach,
           s_reach[:1200])
     v3._redlib_reach.clear()
 
@@ -10368,7 +10407,7 @@ async def _r93_removed_spam_liveness_contracts():
             _r93_live5 = await v3.verify_archive_post_live(None, _r93_path, "r93", feed_ok=False)
         check("r93: a legitimate self post with only the routine AutoModerator sticky "
               "still verifies (vxreddit placeholder alone is not a verdict)",
-              _r93_live5 == (True, "live via redlib"), str(_r93_live5))
+              _r93_live5 == (True, "live via redlib/rss fallback"), str(_r93_live5))
 
         # 8. A legitimate EXTERNAL LINK post during a vxReddit outage (no placeholder
         #    recorded) must not be mistaken for filtered spam: without the
@@ -10390,7 +10429,7 @@ async def _r93_removed_spam_liveness_contracts():
             _r93_live6 = await v3.verify_archive_post_live(None, _r93_path, "r93", feed_ok=False)
         check("r93: a legitimate external link post during a vxreddit outage still "
               "verifies (no placeholder evidence -> not treated as spam-filtered)",
-              _r93_live6 == (True, "live via redlib"), str(_r93_live6))
+              _r93_live6 == (True, "live via redlib/rss fallback"), str(_r93_live6))
 
         # 9. live_removal_reason uses the same three signals and stops at the first
         #    parsed page — the retraction path must not walk all 28 mirrors.
@@ -10449,6 +10488,486 @@ async def _r93_removed_spam_liveness_contracts():
 
 
 asyncio.run(_r93_removed_spam_liveness_contracts())
+
+# ===========================================================================
+# ROUND 94 (2026-10-28): Twitter run diagnostics, run-result presence, opt-in
+# 350 MiB video cap. The summary and the state line are operator-facing, so
+# these guards pin the parts a passing suite could otherwise fake: an empty log
+# (tee creates the file before the monitor writes a line) must not look like
+# "0 errors", every diagnostic pattern must still match a REAL engine log line
+# (a silently dead category would print a permanent 0), and the opt-in cap must
+# reach the live workflow without a second hardcoded 256 MiB cap behind it.
+# ===========================================================================
+
+# 1. An EMPTY log file is the common failure shape: the workflow pipes through
+#    `tee`, so the file exists the moment the monitor starts. Absence of lines
+#    is not evidence of a clean run.
+_r94_empty_log = _app_summary_shell("twitter", "", twitter_cache="")
+check("r94: an existing but EMPTY Twitter log reports diagnostic coverage as "
+      "unavailable instead of five zero counts",
+      "diagnostic coverage: unavailable" in _r94_empty_log
+      and "Discord delivery errors:" not in _r94_empty_log
+      and "FxTwitter fetch errors:" not in _r94_empty_log,
+      _r94_empty_log)
+
+# 2. Every diagnostic category must still match the engine's actual log line.
+#    A rename in twitter_v3.py would otherwise turn the count into a permanent 0
+#    that looks healthy in the summary.
+_r94_engine_src = open(os.path.join(ROOT, "testing area", "twitter_v3.py"),
+                       encoding="utf-8").read()
+_r94_wf_src = open(os.path.join(ROOT, ".github/workflows/twitter_monitor.yml"),
+                   encoding="utf-8").read()
+_r94_pairs = (
+    ("Discord error [0-9]", 'logging.error(f"Discord error {resp.status}'),
+    ("Error fetching FxTwitter data", 'logging.error(f"Error fetching FxTwitter data'),
+    ("media still unresolved after", "media still unresolved after"),
+    ("MEDIA-HEAL .*: edit (HTTP|error)", 'logging.error(f"MEDIA-HEAL {key}: edit HTTP'),
+    ("DEDUP GUARD:", 'logging.error(f"DEDUP GUARD:'),
+)
+check("r94: every Twitter diagnostic category still matches a real engine log line",
+      all(pattern in _r94_wf_src and literal in _r94_engine_src
+          for pattern, literal in _r94_pairs)
+      and 'logging.error(f"MEDIA-HEAL {key}: edit error' in _r94_engine_src,
+      [p for p, lit in _r94_pairs if p not in _r94_wf_src or lit not in _r94_engine_src])
+
+# 3. The opt-in cap is wired to the LIVE workflow only, and nothing behind it
+#    still enforces 256 MiB.
+_r94_rd_wf = open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"),
+                  encoding="utf-8").read()
+check("r94: the optional 350 MiB cap is mapped from a repository Variable in the "
+      "Twitter workflow only (Reddit keeps its own MAX_MEDIA_BYTES)",
+      "TWITTER_HIGH_VIDEO_LIMIT: ${{ vars.TWITTER_HIGH_VIDEO_LIMIT }}" in _r94_wf_src
+      and "TWITTER_HIGH_VIDEO_LIMIT" not in _r94_rd_wf)
+_r94_v2_src = open(os.path.join(ROOT, "testing area", "twitter_v2_button_outside.py"),
+                   encoding="utf-8").read()
+check("r94: unsetting the Variable leaves the proven 256 MiB cap in both engines, "
+      "with the gallery sub-cap still off",
+      x3._video_size_limit(None) == 256 * 1024 * 1024
+      and x3._video_size_limit("") == 256 * 1024 * 1024
+      and x3.VIDEO_SIZE_LIMIT == 256 * 1024 * 1024
+      and x3.GALLERY_VIDEO_LIMIT == 0
+      and 'VIDEO_SIZE_LIMIT = _video_size_limit(os.getenv("TWITTER_HIGH_VIDEO_LIMIT"))'
+      in _r94_v2_src)
+check("r94: the cap has exactly one source of truth (no second hardcoded 256 MiB "
+      "limit left behind in either engine)",
+      all("256 * 1024 * 1024" not in src
+          and src.count("VIDEO_SIZE_LIMIT = _video_size_limit(") == 1
+          for src in (_r94_engine_src, _r94_v2_src))
+      and _r94_engine_src.count("_video_size_limit(os.getenv(\"TWITTER_HIGH_VIDEO_LIMIT\"))") == 1,
+      (_r94_engine_src.count("256 * 1024 * 1024"), _r94_v2_src.count("256 * 1024 * 1024")))
+
+# 4. The Reddit run-result line reports presence only: the four documented
+#    states, and never the record's own contents (it can carry anything).
+_r94_secret = "sk-live-SECRET-9f8e7d"
+_r94_rd_valid = _app_summary_shell_with_json(
+    "reddit", None, fake_data={"runtime": "12s", "persistence_status": "success",
+                               "unexpected_key": _r94_secret})
+# The status line is a CLOSED vocabulary: exactly one of four words, nothing
+# appended. Anything that pastes record content after the word fails here.
+_r94_status_re = re.compile(
+    r"^\*\*Run-result record:\*\* (read|missing|invalid shape|unreadable or malformed)$",
+    re.MULTILINE)
+check("r94: a valid Reddit run-result is reported as `read` and its contents are "
+      "never echoed into the summary",
+      _r94_status_re.search(_r94_rd_valid) is not None
+      and _r94_secret not in _r94_rd_valid,
+      [line for line in _r94_rd_valid.splitlines() if "Run-result" in line])
+check("r94: the Reddit run-result status is always one of the four documented words",
+      all(_r94_status_re.search(_app_summary_shell_with_json("reddit", None, fake_data=_d)) is not None
+          for _s, _d in (("read", {"runtime": "1s"}), ("missing", None),
+                         ("invalid shape", ["not a record"]))),
+      "status vocabulary")
+
+# ---- Round 95: independent pre-delivery liveness probe -------------------
+# The 2026-10-29 production logs settle the design: REDLIB-REACH was 0/26 in
+# every run (no mirror answers from Actions), while the Arctic archive answers
+# normally. So the probe reads the ARCHIVE record, not a page. These guards pin
+# the mapping, the lenient/strict rule, the request budget and the summary.
+_r95_record_cases = [
+    ({"id": "x", "removed_by_category": "automod_filtered"},
+     ("removed", "pending approval"), "queued post -> pending approval"),
+    ({"id": "x", "removed_by_category": "moderator"},
+     ("removed", "removed by moderators/filters"), "mod-removed post -> removed"),
+    ({"id": "x", "removed_by_category": "deleted"},
+     ("removed", "removed by moderators/filters"), "author-deleted post -> removed"),
+    ({"id": "x", "title": "[ Removed by moderator ]", "selftext": ""},
+     ("removed", "title marker"), "removal title marker -> removed"),
+    ({"id": "x", "title": "T", "selftext": "[removed]"},
+     ("removed", "whole-body marker"), "removal body marker -> removed"),
+    ({"id": "x", "title": "Live post", "selftext": "hello there"},
+     ("live", "archived record is clean"), "clean record -> live"),
+    (None, ("unknown", "no archived record"), "missing record -> unknown"),
+]
+for _rec, _expect, _label in _r95_record_cases:
+    check(f"r95: {_label}", v3.archived_removal_verdict(_rec) == _expect,
+          v3.archived_removal_verdict(_rec))
+check("r95: an empty removed_by_category is NOT read as a removal",
+      v3._queue_or_removal_reason("") is None and v3._queue_or_removal_reason(None) is None,
+      [v3._queue_or_removal_reason(""), v3._queue_or_removal_reason(None)])
+check("r95: only automod_filtered is the queue category",
+      v3._QUEUE_CATEGORIES == frozenset({"automod_filtered"}), sorted(v3._QUEUE_CATEGORIES))
+
+# Lenient (default) must be INCAPABLE of withholding a post on uncertainty: the
+# only holds are positive evidence, or an explicit opt-in.
+_r95_matrix = {
+    ("removed", False): True, ("removed", True): True,
+    ("unverified", False): False, ("unverified", True): True,
+    ("live", False): False, ("live", True): False,
+    ("skipped", False): False, ("skipped", True): False,
+}
+check("r95: lenient holds ONLY on positive evidence; strict also holds unverified; "
+      "a live post is never held",
+      all(v3.liveness_hold_decision(s, st) is exp for (s, st), exp in _r95_matrix.items()),
+      {f"{s}/{st}": v3.liveness_hold_decision(s, st) for s, st in _r95_matrix})
+
+
+async def _r95_probe_checks():
+    saved = {k: getattr(v3, k) for k in
+             ("REDDIT_LIVENESS_PROBE", "REDDIT_LIVENESS_STRICT", "LIVENESS_PROBE_BUDGET",
+              "DRY_RUN", "TEST_POST_ID", "_liveness_probe_budget_used")}
+    calls = []
+
+    async def fake_row(session, post_id, label=""):
+        calls.append(post_id)
+        return {"id": post_id, "removed_by_category": "automod_filtered"}
+
+    saved_row = v3._fetch_arctic_post_row
+    v3._fetch_arctic_post_row = fake_row
+    try:
+        v3.DRY_RUN = False
+        v3.TEST_POST_ID = ""
+        v3.REDDIT_LIVENESS_PROBE = True
+        v3.LIVENESS_PROBE_BUDGET = 10
+
+        # (a) off switch = pre-round-95 behaviour, no requests at all
+        v3.REDDIT_LIVENESS_PROBE = False
+        calls.clear()
+        st, _why, src = await v3.candidate_liveness_verdict(
+            None, key="k", path="/r/A/comments/aaa/slug/", post_json=None, entry=None)
+        check("r95: REDDIT_LIVENESS_PROBE=0 -> skipped with ZERO requests",
+              (st, src, calls) == ("skipped", "disabled", []), (st, src, calls))
+        v3.REDDIT_LIVENESS_PROBE = True
+
+        # (b) records already in hand cost nothing
+        calls.clear()
+        st, why, src = await v3.candidate_liveness_verdict(
+            None, key="k", path="/r/A/comments/aaa/slug/",
+            post_json={"id": "aaa", "removed_by_category": "moderator"}, entry=None)
+        check("r95: a FULL-MODE post JSON record answers the probe with no request",
+              (st, why, src, calls) == ("removed", "removed by moderators/filters", "post-json", []),
+              (st, why, src, calls))
+
+        class _Entry:
+            _arctic_post = {"id": "aaa", "removed_by_category": "automod_filtered"}
+
+        calls.clear()
+        st, why, src = await v3.candidate_liveness_verdict(
+            None, key="k", path="/r/A/comments/aaa/slug/", post_json=None, entry=_Entry())
+        check("r95: an archive-sourced candidate reuses its own record (no request)",
+              (st, why, src, calls) == ("removed", "pending approval", "arctic-entry", []),
+              (st, why, src, calls))
+
+        # (c) an RSS candidate costs exactly ONE archive lookup
+        calls.clear()
+        st, why, src = await v3.candidate_liveness_verdict(
+            None, key="k", path="/r/A/comments/aaa/slug/", post_json=None, entry=object())
+        check("r95: an RSS candidate costs exactly one archive lookup and holds on "
+              "the queue category",
+              (st, why, src, calls) == ("removed", "pending approval", "arctic-lookup", ["aaa"]),
+              (st, why, src, calls))
+
+        # (d) missing record is 'unverified' (lenient posts it, strict holds it)
+        async def no_row(session, post_id, label=""):
+            calls.append(post_id)
+            return None
+
+        v3._fetch_arctic_post_row = no_row
+        calls.clear()
+        st, why, src = await v3.candidate_liveness_verdict(
+            None, key="k", path="/r/A/comments/bbb/slug/", post_json=None, entry=object())
+        check("r95: no archive record yet -> unverified (never 'removed')",
+              (st, src) == ("unverified", "arctic-lookup"), (st, why, src))
+        check("r95: unverified posts in lenient mode and is held only in strict mode",
+              (v3.liveness_hold_decision(st, False), v3.liveness_hold_decision(st, True))
+              == (False, True), st)
+
+        # (e) the per-run budget bounds the extra latency of a flood run
+        v3._fetch_arctic_post_row = fake_row
+        v3.LIVENESS_PROBE_BUDGET = 1
+        v3._liveness_probe_budget_used = 0
+        calls.clear()
+        first = await v3.candidate_liveness_verdict(
+            None, key="k1", path="/r/A/comments/ccc/slug/", post_json=None, entry=object())
+        second = await v3.candidate_liveness_verdict(
+            None, key="k2", path="/r/A/comments/ddd/slug/", post_json=None, entry=object())
+        check("r95: LIVENESS_PROBE_BUDGET caps lookups per run (no unbounded latency)",
+              (first[0], second[0], second[2], calls) == ("removed", "unverified", "budget", ["ccc"]),
+              (first, second, calls))
+
+        # (f) a lookup failure must never disable the media/archive paths
+        v3.LIVENESS_PROBE_BUDGET = 10
+        v3._liveness_probe_budget_used = 0
+        v3._fetch_arctic_post_row = saved_row
+        before = v3._arctic_fail_count
+        v3._liveness_fail_count = 0
+
+        class _Boom:
+            def get(self, *a, **k):
+                raise RuntimeError("archive down")
+
+        failed = await v3._fetch_arctic_post_row(_Boom(), "eee", label="r95")
+        check("r95: a failed liveness lookup returns None and does NOT touch the "
+              "shared _arctic_fail_count (media/archive stay enabled)",
+              failed is None and v3._arctic_fail_count == before
+              and v3._liveness_fail_count == 1,
+              (failed, before, v3._arctic_fail_count, v3._liveness_fail_count))
+        v3._liveness_fail_count = 0
+    finally:
+        for k, val in saved.items():
+            setattr(v3, k, val)
+        v3._fetch_arctic_post_row = saved_row
+        v3._liveness_fail_count = 0
+
+
+asyncio.run(_r95_probe_checks())
+
+# A probe hold must never land on the never-re-check list: the archive record is
+# a snapshot, so a removal it reports can since have been reversed. If a
+# probe-derived reason were one of _NO_RECHECK_REASONS, a stale snapshot would
+# become a permanent hold (the round-34 "held and never posted" failure shape).
+_r95_main_src = inspect.getsource(v3.main)
+check("r95: probe holds use reasons OUTSIDE _NO_RECHECK_REASONS (a stale archive "
+      "snapshot can never become a permanent hold)",
+      '"liveness_removed"' in _r95_main_src
+      and '"liveness_unverified"' in _r95_main_src
+      and "liveness_removed" not in v3._NO_RECHECK_REASONS
+      and "liveness_unverified" not in v3._NO_RECHECK_REASONS,
+      sorted(v3._NO_RECHECK_REASONS))
+_r95_hold_now = 1_000_000.0
+_r95_hold = {}
+v3.mark_pending(_r95_hold, "Sub_h", "liveness_removed", _r95_hold_now)
+check("r95: a held post is re-probed after PENDING_RECHECK_SECONDS (no network "
+      "before that) and is not skipped forever",
+      v3._pending_throttle_skip(_r95_hold, "Sub_h", _r95_hold_now + 60, object()) is True
+      and v3._pending_throttle_skip(_r95_hold, "Sub_h",
+                                    _r95_hold_now + v3.PENDING_RECHECK_SECONDS + 1,
+                                    object()) is False,
+      _r95_hold)
+_r95_probe_block = _r95_main_src.split("round 95: independent liveness probe", 1)[1].split(
+    "resolve_post_media", 1)[0]
+check("r95: a held post is only ever a PENDING entry — the probe block never touches "
+      "the dedup cache (the round-34 'held and never posted' shape)",
+      "posted.add" not in _r95_probe_block
+      and "save_posted_messages" not in _r95_probe_block
+      and "pending.pop(unique_key" not in _r95_probe_block
+      and "mark_pending(pending, unique_key, _hold_reason, now" in _r95_probe_block,
+      _r95_probe_block[:300])
+
+# Workflow wiring + summary rendering (executes the real summary shell).
+_r95_wf = open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8").read()
+_r95_tw = open(os.path.join(ROOT, ".github/workflows/twitter_monitor.yml"), encoding="utf-8").read()
+check("r95: both probe Variables are mapped from repo Variables in the Reddit workflow",
+      "REDDIT_LIVENESS_PROBE: ${{ vars.REDDIT_LIVENESS_PROBE }}" in _r95_wf
+      and "REDDIT_LIVENESS_STRICT: ${{ vars.REDDIT_LIVENESS_STRICT }}" in _r95_wf,
+      "workflow env")
+check("r95: the probe Variables are not wired into the Twitter workflow",
+      "REDDIT_LIVENESS_PROBE" not in _r95_tw and "REDDIT_LIVENESS_STRICT" not in _r95_tw,
+      "twitter workflow")
+
+_r95_data = {
+    "completed": True, "dry_run": False, "persistence_status": "saved",
+    "combined_entries": 100, "subreddits_configured": 6, "unposted_candidates_considered": 7,
+    "delivered": 1, "known_pending_suppressed": 6,
+    "redlib_reach_probed": 26, "redlib_reach_answered": 0,
+    "liveness_probe_enabled": True, "liveness_probe_strict": False,
+    "liveness_probe_live": 3, "liveness_probe_removed": 1, "liveness_probe_unverified": 2,
+    "liveness_probe_skipped": 0,
+    "liveness_probe_by_reason": {"pending approval": 1},
+    "liveness_probe_by_source": {"arctic-lookup": 5, "post-json": 1},
+    "dedup_cache_size": 1019, "dedup_cache_dropped": 1,
+    "dedup_cache_hot": {"Genshin_Impact_Leaks": 250},
+}
+# monitor.log fallback path (the engine only records telemetry when it ran):
+# the REDLIB-REACH line arrives WITH its prefix, and must not be doubled.
+_r95_summary = _app_summary_shell_with_json(
+    "reddit", "2026-10-29 13:11:02,136 [INFO] REDLIB-REACH: 0/26 instance(s) answered "
+              "this run — redlib.catsarch.com 0/1\n",
+    fake_data={k: v for k, v in _r95_data.items()})
+check("r95: the summary reports the probe's outcome (live / held / unverified) and "
+      "the evidence source",
+      re.search(r"^### Liveness$", _r95_summary, re.MULTILINE) is not None
+      and "- Probe: enabled (lenient" in _r95_summary
+      and "- Verified live: 3" in _r95_summary
+      and "- Held as removed/queued: 1" in _r95_summary
+      and "- Unverified (posted): 2" in _r95_summary
+      and "arctic-lookup: 5" in _r95_summary,
+      [ln for ln in _r95_summary.splitlines() if "Liveness" in ln or "Probe" in ln][:4])
+check("r95: the summary shows dedup-cache pressure and cap evictions",
+      "- Dedup cache: 1019 key(s), 1 dropped at the cap this run" in _r95_summary,
+      [ln for ln in _r95_summary.splitlines() if "Dedup cache" in ln])
+check("r95: a 0/26 Redlib run is called out in the summary instead of being buried",
+      "no Redlib mirror answered this run" in _r95_summary,
+      [ln for ln in _r95_summary.splitlines() if "Redlib" in ln])
+_r95_reach_record = _app_summary_shell_with_json(
+    "reddit", "", fake_data={**_r95_data,
+                             "redlib_reach": "REDLIB-REACH: 0/26 instance(s) answered this run — x 0/1"})
+check("r95: the REDLIB-REACH line is printed ONCE, without the duplicated prefix",
+      "- Instances (REDLIB-REACH): 0/26 instance(s) answered this run — redlib.catsarch.com 0/1"
+      in _r95_summary
+      and "- Instances (REDLIB-REACH): 0/26 instance(s) answered this run — x 0/1" in _r95_reach_record
+      and "REDLIB-REACH): REDLIB-REACH:" not in _r95_summary
+      and "REDLIB-REACH): REDLIB-REACH:" not in _r95_reach_record,
+      [ln for ln in (_r95_summary + _r95_reach_record).splitlines() if "REDLIB-REACH" in ln][:2])
+check("r95: the probe block is marked disabled when the probe is off (no fake numbers)",
+      "- Probe: disabled (REDDIT_LIVENESS_PROBE=0)"
+      in _app_summary_shell_with_json("reddit", "", fake_data={**_r95_data,
+                                                              "liveness_probe_enabled": False}),
+      "off switch")
+_r95_answered = _app_summary_shell_with_json("reddit", "", fake_data={**_r95_data,
+                                                                     "redlib_reach_answered": 7})
+check("r95: the Redlib warning appears only when nothing answered",
+      "no Redlib mirror answered this run" not in _r95_answered,
+      [ln for ln in _r95_answered.splitlines() if "Redlib" in ln])
+
+# ---- Round 95c: a down/maintenance nitter instance cannot cause a re-post ----
+# Live 2026-10-30 (run #12043): every mirror answered 502/429 and the surviving
+# one served days-old entries, which were posted as if new. The cache is the
+# first line of defence; the stale floor is the second, and it costs no request.
+_x95c_now = (_r30_x.tweet_id_created_ts("2115271059188613499") + 46.35 * 3600)
+# ^ the wall clock of the real run #12043 (2026-10-30T00:55Z): the newest of
+#   the three backlog tweets was 46.35 h old at the moment it was posted.
+_x95c_max = _r30_x.TWITTER_MAX_AGE_SECONDS
+check("r95c: the pending re-check wait is exactly one 5-minute cron tick",
+      v3.PENDING_RECHECK_SECONDS == 300
+      and v3.PENDING_RECHECK_SECONDS == 5 * 60,
+      "300 s = one tick, so a hold is re-probed on the next run instead of up to 30 min later")
+check("r95c: removed/deleted holds are still never re-checked at the shorter interval",
+      v3._pending_throttle_skip({"k": {"reason": "removal notice", "last_checked": 0.0}},
+                                "k", 1e9, object()) is False
+      and v3._pending_throttle_skip(
+          {"k": {"reason": "removal notice", "last_checked": 0.0}}, "k", 1e9,
+          v3._ArcticEntry({"id": "x1", "subreddit": "AnantaLeaks"})) is True,
+      "a removed post must not be re-probed just because the interval shrank")
+check("r95c: the stale floor defaults to 24 h and is switchable",
+      _x95c_max == 24 * 3600 and _r30_x.TWITTER_MAX_AGE_HOURS == 24,
+      (_x95c_max, _r30_x.TWITTER_MAX_AGE_HOURS))
+check("r95c: the three entries posted by run #12043 are refused as stale backlog",
+      all(_r30_x.is_stale_entry(_r30_x.tweet_entry_age_seconds({}, _x95c_now, _tid))
+          for _tid in ("2115271059188613499", "2114559707734245394", "2112102702817972715")),
+      [_r30_x.tweet_entry_age_seconds({}, _x95c_now, _tid) for _tid in
+       ("2115271059188613499", "2114559707734245394", "2112102702817972715")])
+_x95c_fresh = "%d" % (((int(_x95c_now * 1000) - 4 * 60 * 1000) - _r30_x._TWITTER_SNOWFLAKE_EPOCH_MS) << 22)
+_x95c_fresh_age = _r30_x.tweet_entry_age_seconds({}, _x95c_now, _x95c_fresh)
+check("r95c: a genuinely new tweet (minutes old) is never refused",
+      _x95c_fresh_age is not None and 200 < _x95c_fresh_age < 400
+      and not _r30_x.is_stale_entry(_x95c_fresh_age),
+      _x95c_fresh_age)
+check("r95c: the guard fails OPEN — an entry it cannot date is posted, not dropped",
+      _r30_x.tweet_entry_age_seconds({}, _x95c_now, "") is None
+      and _r30_x.tweet_entry_age_seconds({}, _x95c_now, "not-an-id") is None
+      and _r30_x.tweet_entry_age_seconds({}, _x95c_now, "0") is None
+      and not _r30_x.is_stale_entry(None)
+      and not _r30_x.is_stale_entry(0.0),
+      "unknown age must still post (a strict guard would silently drop live tweets)")
+class _X95cEntry:
+    def __init__(self, link, published=None):
+        self.link = link
+        self._published = published
+
+    def get(self, key, default=None):
+        return self._published if key == "published_parsed" else default
+
+
+_x95c_own = _X95cEntry("https://x.com/TYPEII_EN/status/2112102702817972715",
+                       time.gmtime(_x95c_now - 3600))
+_x95c_own_age = _r30_x.judged_entry_age_seconds(_x95c_own, _x95c_now,
+                                                "2112102702817972715", "TYPEII_EN")
+check("r95c: an own tweet is judged by its id, so a re-stamped backlog entry cannot slip through",
+      # feed says 1 h, the immutable id says 256 h -> the id wins, entry refused.
+      _x95c_own_age is not None and _x95c_own_age > 200 * 3600
+      and _r30_x.is_stale_entry(_x95c_own_age),
+      _x95c_own_age)
+_x95c_bogus = _X95cEntry("https://x.com/TYPEII_EN/status/1", time.gmtime(0))  # a 1970 feed date
+check("r95c: a broken feed date (epoch 0) cannot hold a fresh own tweet",
+      not _r30_x.is_stale_entry(
+          _r30_x.judged_entry_age_seconds(_x95c_bogus, _x95c_now, _x95c_fresh, "TYPEII_EN")),
+      _r30_x.judged_entry_age_seconds(_x95c_bogus, _x95c_now, _x95c_fresh, "TYPEII_EN"))
+check("r95c: ages are read as UTC, so a non-UTC machine cannot shift the floor "
+      "(time.mktime would add the local offset)",
+      abs(_r30_x.feed_date_age_seconds(_X95cEntry("x", time.gmtime(_x95c_now - 3600)),
+                                       _x95c_now) - 3600) < 2
+      and "calendar.timegm(parsed)" in open(
+          os.path.join(ROOT, "testing area/twitter_v3.py"), encoding="utf-8").read())
+_x95c_rt = _X95cEntry("https://x.com/SomeoneElse/status/2112102702817972715",
+                      time.gmtime(_x95c_now - 300))
+_x95c_rt_age = _r30_x.judged_entry_age_seconds(_x95c_rt, _x95c_now,
+                                               "2112102702817972715", "TYPEII_EN")
+check("r95c: a repost is judged by its own feed date, so reposting an older tweet still posts",
+      _x95c_rt_age is not None and _x95c_rt_age < 600
+      and not _r30_x.is_stale_entry(_x95c_rt_age),
+      _x95c_rt_age)
+check("r95c: with no id an own tweet falls back to the feed date; with neither the entry posts",
+      _r30_x.judged_entry_age_seconds(_X95cEntry("https://x.com/TYPEII_EN/status/1"),
+                                      _x95c_now, "2112102702817972715", "TYPEII_EN") > 200 * 3600
+      and _r30_x.judged_entry_age_seconds(_X95cEntry("https://x.com/SomeoneElse/status/1"),
+                                          _x95c_now, "2112102702817972715", "TYPEII_EN") > 200 * 3600
+      and _r30_x.judged_entry_age_seconds(_X95cEntry("https://x.com/TYPEII_EN/status/1"),
+                                          _x95c_now, "", "TYPEII_EN") is None)
+_x95c_src = open(os.path.join(ROOT, "testing area/twitter_v3.py"), encoding="utf-8").read()
+_x95c_loop = _x95c_src.split("for entry in entries:", 1)[1]
+_x95c_i_stale = _x95c_loop.find("is_stale_entry(entry_age)")
+_x95c_i_fetch = _x95c_loop.find("fetch_tweet_details_any")
+check("r95c: the stale check runs BEFORE the tweet-data fetch, so a stale backlog costs zero requests",
+      0 <= _x95c_i_stale < _x95c_i_fetch,
+      (_x95c_i_stale, _x95c_i_fetch))
+check("r95c: TEST_TWEET_ID stays exempt (an operator explicitly asked for that tweet)",
+      "if TWITTER_MAX_AGE_SECONDS and not test_tweet_id:" in _x95c_src)
+check("r95c: the stale skip is logged as its own greppable reason",
+      "STALE-SKIP:" in _x95c_src and "not posted." in _x95c_src)
+_x95c_wf = open(os.path.join(ROOT, ".github/workflows/twitter_monitor.yml"), encoding="utf-8").read()
+check("r95c: the stale floor's off-switch is actually wired (a Variable the workflow never "
+      "passes through would be silently ignored in CI)",
+      "TWITTER_MAX_AGE_HOURS: ${{ vars.TWITTER_MAX_AGE_HOURS }}" in _x95c_wf
+      and 'TWITTER_MAX_AGE_HOURS' in _x95c_src)
+# Every tuning knob documented in the README must reach its workflow, or setting
+# it in repository settings does nothing. The six exceptions are not repository
+# Variables: ACCOUNTS/SUBREDDITS are edited in the workflow, DRY_RUN and the two
+# TEST_* switches are one-off dispatch inputs, EMBEDEZE_API_KEY belongs to the
+# standby V2 engine.
+_r95c_not_variables = {"ACCOUNTS", "SUBREDDITS", "DRY_RUN", "TEST_POST_ID",
+                       "TEST_TWEET_ID", "EMBEDEZ_API_KEY"}
+_x95c_readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
+_x95c_documented = sorted(set(re.findall(r"^\| `([A-Z][A-Z0-9_]+)` \|", _x95c_readme, re.M)))
+_x95c_mapped = set(re.findall(r"vars\.([A-Z][A-Z0-9_]+)",
+                             _x95c_wf + open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"),
+                                             encoding="utf-8").read()))
+_x95c_unwired = [n for n in _x95c_documented
+                 if n not in _x95c_mapped and n not in _r95c_not_variables]
+check("r95c: every README-documented tuning knob is passed through by its workflow",
+      _x95c_documented and not _x95c_unwired,
+      _x95c_unwired)
+check("r95c: the engine emits one machine-readable state line for the workflow summary",
+      # must be INFO: the summary step greps the log, and DEBUG lines are not emitted.
+      'logging.info(f"V3 SUMMARY: posted=' in _x95c_src
+      and "dedup_skipped=" in _x95c_src and "stale_skipped=" in _x95c_src
+      and "cache_missing=" in _x95c_src,
+      [ln.strip() for ln in _x95c_src.splitlines() if "V3 SUMMARY" in ln][:2])
+_x95c_log = ("[INFO] V3 SUMMARY: posted=0 dedup_skipped=3 stale_skipped=3 "
+             "cache_missing=0 cache_keys=294 max_age_hours=24\n"
+             "[INFO] [TYPEII_EN_2112102702817972715] STALE-SKIP: entry is 257.3 h old\n")
+_x95c_summary = _app_summary_shell_with_json("twitter", _x95c_log)
+check("r95c: the summary carries the engine's dedup/backlog state without the raw log",
+      "posted=0 dedup_skipped=3 stale_skipped=3" in _x95c_summary
+      and "- entries refused as stale backlog: 1" in _x95c_summary
+      and "### Dedup / backlog state" in _x95c_summary,
+      [ln for ln in _x95c_summary.splitlines() if "stale" in ln][:3])
+check("r95c: a run that never reached the state line says so instead of implying zero re-posts",
+      "engine: unavailable" in _app_summary_shell_with_json("twitter", _app_tw_log))
+check("r95c: an unpersisted dedup cache is called out as a re-post risk",
+      "the dedup cache was not persisted this run" in _app_summary_shell("twitter", _app_tw_log,
+                                                                        twitter_cache="failed")
+      and "not persisted this run" not in _app_summary_shell("twitter", _app_tw_log,
+                                                             twitter_cache="success"))
 
 # ---- Round 89: no GitHub Actions annotation may leak out of this suite ----
 # Restore the real stdout first, then judge what the suite actually emitted.

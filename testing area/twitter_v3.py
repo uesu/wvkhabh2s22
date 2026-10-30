@@ -99,6 +99,7 @@ import os
 import re
 import json
 import time
+import calendar
 import html as html_lib
 import asyncio
 import logging
@@ -162,6 +163,126 @@ def _env_int(name: str, default: int) -> int:
 
 MAX_CACHE_SIZE_PER_ACCOUNT = _env_int("MAX_CACHE_SIZE_PER_ACCOUNT", 250)
 MAX_CACHE_SIZE_TOTAL = _env_int("MAX_CACHE_SIZE_TOTAL", 10000)
+
+# ---------------------------------------------------------------------------
+# ■ ROUND 95c (2026-10-30): STALE-BACKLOG GUARD
+#
+# The dedup cache is the primary "never post twice" mechanism, and it works
+# whenever the key is present. It cannot help when the key is absent — a cache
+# reset, a different deployment, or per-account eviction — and a nitter instance
+# that is down / restoring / serving a backup answers with an OLD backlog
+# instead of a fresh timeline. Live 2026-10-30 (run #12043): TYPEII_EN's feed
+# answered with 20 entries whose tweets were 46 h, 4 days and 11 days old, and
+# all three were posted as if new (the same author/page had posted them days
+# earlier in the other deployment).
+#
+# So: an entry older than TWITTER_MAX_AGE_HOURS is not a new tweet, whatever the
+# cache says. The check runs BEFORE the tweet-data fetch, so a stale backlog
+# costs ZERO requests instead of a full card build.
+#   TWITTER_MAX_AGE_HOURS — 24 by default (a 5-minute cron posts real tweets
+#     within minutes; anything older than a day is a backlog, not news). Set 0
+#     to disable the guard and restore pre-95c behaviour exactly.
+# Two independent witnesses give the age: the feed's pubDate and the tweet id's
+# own snowflake. For an OWN tweet the id is authoritative — it is immutable and
+# encodes the creation instant, so a mirror that re-stamps an old backlog entry
+# with "now" (or mangles the date outright) cannot smuggle it through; the feed
+# date is only a fallback when the id is unparsable. For a REPOST (link points
+# at another author's status) the feed date wins, because that id is the
+# ORIGINAL tweet's and is old by definition.
+# A live/legit tweet is never blocked: the floor is far above the cron cadence,
+# and an entry whose age cannot be established (no published_parsed, no
+# parsable id) is posted as before — this guard only ever rejects entries whose
+# own timestamp says they are old.
+# ---------------------------------------------------------------------------
+TWITTER_MAX_AGE_HOURS = max(0, _env_int("TWITTER_MAX_AGE_HOURS", 24))
+TWITTER_MAX_AGE_SECONDS = TWITTER_MAX_AGE_HOURS * 3600
+_TWITTER_SNOWFLAKE_EPOCH_MS = 1288834974657
+
+
+def tweet_id_created_ts(tweet_id: str | None) -> float | None:
+    """Creation time (unix seconds) from a tweet id's snowflake, or None.
+
+    A tweet id is a 64-bit snowflake whose high bits are milliseconds since
+    twitter's epoch, so the age is derivable even when the feed omits a date.
+    """
+    try:
+        value = int(str(tweet_id or "").strip())
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return ((value >> 22) + _TWITTER_SNOWFLAKE_EPOCH_MS) / 1000.0
+
+
+def feed_date_age_seconds(entry, now: float) -> float | None:
+    """Age from the feed's own pubDate (None = the feed gave no usable date)."""
+    parsed = None
+    try:
+        parsed = entry.get("published_parsed") if entry is not None else None
+    except Exception:
+        parsed = None
+    if not parsed:
+        return None
+    try:
+        # feedparser yields UTC struct_time; timegm reads it as UTC. time.mktime
+        # would interpret it as LOCAL time — on a UTC+8 machine every entry
+        # would look 8 h older, so a 16 h-old tweet would hit a 24 h floor.
+        return max(0.0, float(now) - calendar.timegm(parsed))
+    except (OverflowError, ValueError, TypeError):
+        return None
+
+
+def tweet_entry_age_seconds(entry, now: float, tweet_id: str = "") -> float | None:
+    """Best-effort age of a feed entry in seconds (None = cannot establish)."""
+    age = feed_date_age_seconds(entry, now)
+    if age is not None:
+        return age
+    created = tweet_id_created_ts(tweet_id)
+    if created:
+        return max(0.0, float(now) - created)
+    return None
+
+
+def link_author(link: str) -> str | None:
+    """Screen name in a status link (`.../<author>/status/<id>`), if present."""
+    match = re.search(r"(?:x|twitter)\.com/([A-Za-z0-9_]+)/status/", str(link or ""))
+    return match.group(1) if match else None
+
+
+def judged_entry_age_seconds(entry, now: float, tweet_id: str = "",
+                             account: str = "") -> float | None:
+    """The age the stale floor should judge this entry by.
+
+    Two independent witnesses exist: the feed's pubDate and the tweet id's own
+    snowflake. They normally agree. When they disagree:
+
+    * OWN TWEET — the id is immutable and cannot be re-dated, so the OLDER of
+      the two wins. A degraded mirror that re-stamps an old backlog entry with
+      "now" therefore cannot smuggle it through (the #12043 shape).
+    * REPOST — the link points at the ORIGINAL author's status, whose id is as
+      old as the original tweet, while the entry legitimately appears now. The
+      repost's own pubDate is the truthful age, so it wins; judging by the id
+      would silently stop every repost of an older tweet.
+    """
+    feed_age = feed_date_age_seconds(entry, now)
+    created = tweet_id_created_ts(tweet_id)
+    id_age = max(0.0, float(now) - created) if created else None
+    author = link_author(getattr(entry, "link", ""))
+    is_repost = bool(author and account and author.lower() != account.lower())
+    if is_repost:
+        # the id belongs to the ORIGINAL tweet, so it is old by design
+        return feed_age if feed_age is not None else id_age
+    # Own tweet: the id is immutable and encodes the creation instant exactly,
+    # while a feed date can be re-stamped by a degraded mirror (a backlog entry
+    # labelled "now") or broken outright (epoch 0). The id wins when present.
+    return id_age if id_age is not None else feed_age
+
+
+def is_stale_entry(age_seconds: float | None) -> bool:
+    """True only when the age is KNOWN and beyond the floor (fail-open)."""
+    if not TWITTER_MAX_AGE_SECONDS or age_seconds is None:
+        return False
+    return age_seconds > TWITTER_MAX_AGE_SECONDS
 
 # ■ X RSS SOURCE FLEET — a SERIAL fallback chain: the first instance that
 # answers HTTP 200 with entries wins, so every dead member above it costs a
@@ -346,7 +467,12 @@ IS_COMPONENTS_V2 = 1 << 15  # Flag for rich card layout
 # on 2026-09-29 — but that limit governs UPLOADED ATTACHMENTS, not the media
 # proxy that renders external urls, and one manual success is not a proven
 # ceiling. The cap therefore stays at the measured, proven value.
-VIDEO_SIZE_LIMIT = 256 * 1024 * 1024          # 256 MiB
+def _video_size_limit(value: str | None) -> int:
+    """Explicit opt-in only; unset and malformed values retain the 256 MiB default."""
+    return (350 if str(value or "").strip().lower() in ("1", "true", "yes", "on") else 256) * 1024 * 1024
+
+
+VIDEO_SIZE_LIMIT = _video_size_limit(os.getenv("TWITTER_HIGH_VIDEO_LIMIT"))
 RISKY_DURATION_SECONDS = 300                   # > 5 min ...
 RISKY_MIN_PIXELS = 1920 * 1080                 # ... AND >= 1080p = risky when size unknown
 MAX_VARIANT_PROBES = 3                         # smaller mp4s to try before giving up
@@ -1662,6 +1788,10 @@ async def main():
     # Round 34: remember the pre-run cache so the save can be verified
     # (a just-posted key missing from the saved file = it WILL re-post).
     posted_urls_at_start = set(posted_urls)
+    # Round 95c: per-run counters for the machine-readable summary line at the
+    # end. Counting only — no control flow depends on them.
+    dedup_skipped = 0
+    stale_skipped = 0
     # Round 34: saturation warning — the pre-round-34 cap failure was silent
     # (lexicographic eviction logged nothing). Warn when an account is within
     # 10 keys of its per-account quota or the total is within 10% of the
@@ -1733,6 +1863,7 @@ async def main():
                 tweet_id = match.group(1)
                 unique_key = f"{account}_{tweet_id}"
                 if unique_key in posted_urls:
+                    dedup_skipped += 1
                     if (test_tweet_id and t_account and t_id
                             and account.lower() == t_account.lower()
                             and tweet_id == t_id):
@@ -1742,6 +1873,23 @@ async def main():
 
                 published_parsed = entry.get("published_parsed")
                 rss_ts = time.mktime(published_parsed) if published_parsed else now
+
+                # ROUND 95c: stale-backlog guard — runs before ANY request, so a
+                # down/restoring nitter instance that serves an old backlog costs
+                # nothing and posts nothing. TEST_TWEET_ID is exempt (an operator
+                # explicitly asked for that one tweet). Fail-open: unknown age
+                # posts as before.
+                if TWITTER_MAX_AGE_SECONDS and not test_tweet_id:
+                    entry_age = judged_entry_age_seconds(entry, now, tweet_id,
+                                                        account)
+                    if is_stale_entry(entry_age):
+                        stale_skipped += 1
+                        logging.info(
+                            f"[{unique_key}] STALE-SKIP: entry is "
+                            f"{entry_age / 3600.0:.1f} h old (> "
+                            f"{TWITTER_MAX_AGE_HOURS} h floor) — old backlog from "
+                            f"the feed, not a new tweet; not posted.")
+                        continue
 
                 # ROUND 11: 4-step tweet-data fallback chain — every result
                 # is normalized to the FxTwitter shape, so the card pipeline
@@ -1914,6 +2062,13 @@ async def main():
         logging.error(f"DEDUP GUARD: {len(missing)} key(s) posted this run are "
                       f"MISSING from the saved dedup cache — they WILL be "
                       f"re-posted next run: {sorted(missing)[:10]}")
+    # Round 95c: ONE machine-readable state line. Workflow logs are not
+    # readable by later agents; the step summary greps this line, so the
+    # dedup/backlog state survives without the raw log.
+    logging.info(f"V3 SUMMARY: posted={len(posted_urls - posted_urls_at_start)} "
+                 f"dedup_skipped={dedup_skipped} stale_skipped={stale_skipped} "
+                 f"cache_missing={len(missing)} cache_keys={len(posted_urls)} "
+                 f"max_age_hours={TWITTER_MAX_AGE_HOURS}")
     logging.info("Twitter V3 Monitor execution finished.")
 
 

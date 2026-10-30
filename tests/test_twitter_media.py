@@ -651,6 +651,28 @@ check("r73 config: media-heal defaults are untouched by this round",
       f"{x3.MEDIA_HEAL_DELAY_SECONDS} {x3.MEDIA_HEAL_ATTEMPTS} {x3.MEDIA_HEAL_SCOPE}")
 check("r73 config: the proven 256 MiB gallery cap is unchanged",
       x3.VIDEO_SIZE_LIMIT == 256 * 1024 * 1024)
+# Optional 350 MiB setting is explicit and malformed/unset inputs stay at 256 MiB.
+x2 = load_module("twitter_media_v2_limit", "testing area/twitter_v2_button_outside.py")
+for _module in (x3, x2):
+    for _input in (None, "", "0", "false", "off", "350", "garbage"):
+        check(f"high video cap defaults to 256 MiB for {_module.__name__} {_input!r}",
+              _module._video_size_limit(_input) == 256 * 1024 * 1024)
+    for _input in ("1", "true", "YES", " on "):
+        check(f"high video cap opts in to 350 MiB for {_module.__name__} {_input!r}",
+              _module._video_size_limit(_input) == 350 * 1024 * 1024)
+
+# Exercise actual selection, not just config parsing, at both limits and their edges.
+from unittest.mock import AsyncMock, patch
+for _module in (x3, x2):
+    for _limit, _size, _expected in ((256, 256, True), (256, 257, False),
+                                     (350, 350, True), (350, 351, False)):
+        with patch.object(_module, "VIDEO_SIZE_LIMIT", _limit * _MB), \
+             patch.object(_module, "probe_video_size", new=AsyncMock(return_value=_size * _MB)):
+            _items, _notes = asyncio.run(_module.collect_media(None, _legacy_media([_video()])))
+        check(f"video limit selection {_module.__name__}: {_size}/{_limit} MiB",
+              bool(_items) and (_items[0]["media"]["url"] == _CLIP) is _expected,
+              str((_items, _notes)))
+
 check("r73 config: the animated/AVIF content-type tiers are explicit constants",
       x3.ANIMATED_IMAGE_TYPES == ("image/webp", "image/gif")
       and x3.AVIF_IMAGE_TYPES == ("image/avif", "image/heic", "image/heif"))

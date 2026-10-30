@@ -154,7 +154,12 @@ IS_COMPONENTS_V2 = 1 << 15  # Flag for rich card layout
 # 191 MB confirmed plays, 405 MB confirmed fails -> 256 MiB sits safely
 # between them. Tune here if Discord changes its behaviour.
 # ---------------------------------------------------------------------------
-VIDEO_SIZE_LIMIT = 256 * 1024 * 1024          # 256 MiB
+def _video_size_limit(value: str | None) -> int:
+    """Explicit opt-in only; unset and malformed values retain the 256 MiB default."""
+    return (350 if str(value or "").strip().lower() in ("1", "true", "yes", "on") else 256) * 1024 * 1024
+
+
+VIDEO_SIZE_LIMIT = _video_size_limit(os.getenv("TWITTER_HIGH_VIDEO_LIMIT"))
 RISKY_DURATION_SECONDS = 300                   # > 5 min ...
 RISKY_MIN_PIXELS = 1920 * 1080                 # ... AND >= 1080p = risky when size unknown
 MAX_VARIANT_PROBES = 3                         # smaller mp4s to try before giving up

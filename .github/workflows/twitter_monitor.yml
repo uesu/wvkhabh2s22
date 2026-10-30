@@ -109,6 +109,15 @@ jobs:
           #   MEDIA_HEAL_SCOPE=on (/all)  also heal photos/gif/webp (full
           #                               round-47 scope)
           #   MEDIA_HEAL_SCOPE=off        never re-edit any media
+          # Optional high video limit: unset/false keeps the 256 MiB default.
+          TWITTER_HIGH_VIDEO_LIMIT: ${{ vars.TWITTER_HIGH_VIDEO_LIMIT }}
+          # Round 95c: stale-backlog floor. An entry older than this many
+          # hours is refused (STALE-SKIP) before any tweet-data request, so a
+          # degraded nitter mirror that answers `feed OK` with a days-old
+          # backlog cannot post old tweets as news. Unset/empty keeps 24 h.
+          #   TWITTER_MAX_AGE_HOURS=0     switch the guard off entirely
+          #   TWITTER_MAX_AGE_HOURS=48    keep a two-day catch-up window
+          TWITTER_MAX_AGE_HOURS: ${{ vars.TWITTER_MAX_AGE_HOURS }}
           MEDIA_HEAL: ${{ vars.MEDIA_HEAL }}
           MEDIA_HEAL_DELAY_SECONDS: ${{ vars.MEDIA_HEAL_DELAY_SECONDS }}
           MEDIA_HEAL_ATTEMPTS: ${{ vars.MEDIA_HEAL_ATTEMPTS }}
@@ -211,6 +220,7 @@ jobs:
       - name: Write Twitter monitor run summary
         if: always()
         run: |
+          if [ -s twitter_monitor.log ]; then log_coverage=available; else log_coverage=unavailable; fi
           [ -f twitter_monitor.log ] || : > twitter_monitor.log
           count_matches() { local pattern="$1"; grep -Ec "$pattern" twitter_monitor.log 2>/dev/null || true; }
           total_feed_entries() { local total; total=$(grep 'feed OK via' twitter_monitor.log 2>/dev/null | grep -Eo '[0-9]+ entries' | grep -Eo '[0-9]+' | awk '{ total += $1 } END { print total + 0 }' || true); printf '%s\n' "${total:-0}"; }
@@ -248,7 +258,32 @@ jobs:
             echo "- skip log lines: $(count_matches 'skipping')"
             echo "- retry/fallback log lines: $(count_matches 'trying next|retry')"
             echo
+            echo "### Diagnostics (matching log lines, not unique posts)"
+            if [ "$log_coverage" = available ]; then
+              echo "- Discord delivery errors: $(count_matches 'Discord error [0-9]')"
+              echo "- FxTwitter fetch errors: $(count_matches 'Error fetching FxTwitter data')"
+              echo "- media-heal unresolved: $(count_matches 'media still unresolved after')"
+              echo "- media-heal edit errors: $(count_matches 'MEDIA-HEAL .*: edit (HTTP|error)')"
+              echo "- dedup guard errors: $(count_matches 'DEDUP GUARD:')"
+            else
+              echo "- diagnostic coverage: unavailable (empty or missing log)"
+            fi
+            echo
+            echo "### Dedup / backlog state (round 95c)"
+            v3_summary=$(grep -o 'V3 SUMMARY:.*' twitter_monitor.log 2>/dev/null | tail -n 1 || true)
+            if [ -n "$v3_summary" ]; then
+              echo "- engine: ${v3_summary#V3 SUMMARY: }"
+            else
+              echo "- engine: unavailable (no V3 SUMMARY line — the engine did not reach the end of its run, so per-run post/skip counts are unknown)"
+            fi
+            echo "- entries refused as stale backlog: $(count_matches 'STALE-SKIP:')"
+            echo "- already-posted entries skipped by cache: see dedup_skipped above"
+            echo "- why this matters: the cache prevents re-posts only for keys it holds. A down/restoring nitter instance can answer with days-old entries; the stale floor refuses those BEFORE any tweet-data request, so a stale feed can never turn into a re-post or a burst of old cards."
+            echo
             echo "### State"
-            echo "- cache: ${TWITTER_CACHE_RESULT:-failed}"
+            echo "- cache: ${TWITTER_CACHE_RESULT:-not-reached}"
+            if [ "${TWITTER_CACHE_RESULT:-not-reached}" = "failed" ]; then
+              echo "- WARNING: the dedup cache was not persisted this run — keys posted this run may be re-posted next run if the feed still lists them. Re-run the monitor once GitHub is healthy."
+            fi
             echo "- summary source: local twitter_monitor.log only; no additional requests"
           } >> "$GITHUB_STEP_SUMMARY"

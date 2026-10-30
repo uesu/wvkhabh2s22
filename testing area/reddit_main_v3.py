@@ -373,7 +373,20 @@ MAX_AGE_SECONDS = 48 * 3600
 # (2.5-3.5 min) and the window in which overlapping runs could double-post.
 # ---------------------------------------------------------------------------
 PENDING_FILE = "pending_reddit.json"
-PENDING_RECHECK_SECONDS = _env_int("PENDING_RECHECK_SECONDS", 1800)  # 30 min
+PENDING_RECHECK_SECONDS = _env_int("PENDING_RECHECK_SECONDS", 300)  # 5 min
+# Round 95c (2026-10-30): 30 min was the old default and it is too slow for the
+# one thing this throttle now gates — the round-95 liveness hold. A post that
+# was briefly unverified (archive snapshot stale, media still filling in, a mod
+# approval landing) waited up to half an hour for a re-check even though the
+# workflow fires every 5 minutes, so the operator saw an approved post sit
+# missing for 25 extra minutes. 300 s = exactly one cron tick: the hold is
+# re-probed on the NEXT run and posts within ~5 min of the condition clearing,
+# worst case one run later. Cost is bounded — the re-check goes through the
+# same round-95 probe budget (LIVENESS_PROBE_BUDGET per run) and one Arctic
+# lookup per due post (~0.8 s typical, 8 s timeout, fail-open), and removed /
+# deleted posts are still NEVER re-checked (the _NO_RECHECK_REASONS set), so
+# this raises the cadence for the small held set only. Override with the
+# PENDING_RECHECK_SECONDS Variable (set 1800 to restore the old behaviour).
 PENDING_MAX_AGE_SECONDS = 48 * 3600  # matches the 48h posting window
 
 # Round 44: delivered-post retraction/tombstone. Disabled by default; when on
@@ -461,6 +474,23 @@ def _init_run_stats():
         "newly_rejected_by_reason": {},
         "liveness_not_verified": 0,
         "liveness_by_reason": {},
+        # Round 95: independent pre-delivery liveness probe (see the ROUND 95
+        # block). Counts only — the probe adds no requests on runs with nothing
+        # to post, and these counters are what makes its coverage visible in
+        # the run summary without reading the Actions log.
+        "liveness_probe_enabled": bool(REDDIT_LIVENESS_PROBE),
+        "liveness_probe_strict": bool(REDDIT_LIVENESS_STRICT),
+        "liveness_probe_live": 0,
+        "liveness_probe_removed": 0,
+        "liveness_probe_unverified": 0,
+        "liveness_probe_skipped": 0,
+        "liveness_probe_by_reason": {},
+        "liveness_probe_by_source": {},
+        # Round 95: dedup-cache pressure, so the summary shows eviction without
+        # the log ("dedup cache near cap" was log-only before).
+        "dedup_cache_size": 0,
+        "dedup_cache_hot": {},
+        "dedup_cache_dropped": 0,
         "media_wait": 0,
         "partial_gallery": 0,
         "other_skipped": 0,
@@ -3249,13 +3279,206 @@ async def verify_archive_post_live(session, path: str, label: str = "",
                 return False, ("live source vxreddit still "
                                "shows a removal notice (removed by moderators/filters)")
     if base and (base.get("title") or base.get("body")):
-        return True, "live via redlib"
+        # Round 95: this branch is reached with feed_ok=True via
+        # fetch_test_post_base(), which answers from the COMBINED RSS FEED
+        # first and only then from a redlib post page. Both call it "redlib",
+        # which made every run log "live via redlib" while REDLIB-REACH said
+        # 0/26 instances answered. Name the fallback, not the fantasy.
+        return True, "live via redlib/rss fallback"
     if proxy_down:
         return False, ("all live sources are down this run — cannot "
                        "verify; skipped for safety")
     return False, ("no live source (redditez/vxreddit/embeddit/redlib) "
                    "can retrieve the post — appears removed, deleted or "
                    "still pending approval")
+
+
+# ---------------------------------------------------------------------------
+# ■ ROUND 95 (2026-10-30): INDEPENDENT LIVENESS PROBE BEFORE DELIVERY
+#
+# WHY. Round 20/32/93 verify a post is still live, but on the RSS path that
+# verification is satisfied by ANY proxy answer — and a proxy happily serves a
+# removed post's pre-removal title, body and media. Live 2026-10-29:
+#   Zenlesszonezeroleaks_/1xijfzb  auto-removed 6 SECONDS after submission
+#                                  ("likely being a question post"), delivered
+#                                  4.6 min later via vxreddit media.
+#   Genshin_Impact_Leaks/1xifykm   removed by AutoModerator (karma rule),
+#                                  delivered while locked + removed.
+#   WutheringWavesLeaks/1xifc1c    "awaiting moderator approval" at delivery,
+#                                  removed by a moderator hours later.
+# FRESH_HOLD_SECONDS cannot help: the removal state does not expire, and the
+# holds were 4.6 / 5.1 / 13 minutes old when delivered.
+#
+# WHY ARCTIC, NOT REDLIB. The 2026-10-29 production logs show
+# "REDLIB-REACH: 0/26 instance(s) answered" in EVERY run — all 26 mirrors are
+# dead from the Actions runner, and "redlib gallery enrichment failed (all
+# instances)" fires on every post. A redlib-page probe would therefore be
+# dormant exactly when it is needed. Arctic Shift answers in the same runs
+# ("[arctic <sub>] RSS had no new posts — trying N post(s) from the archive"),
+# and its records carry the two fields that decide this:
+#   removed_by_category == "automod_filtered"  -> in the mod queue
+#   removed_by_category == <anything else>     -> removed
+#   removed_by_category absent/empty           -> not removed
+# It also carries the same title/body markers rounds 18/23 already classify.
+#
+# COST. Zero requests for archive-sourced candidates and for FULL-MODE JSON
+# (both records are already in hand), and ONE 8 s-capped archive lookup for an
+# RSS candidate that has no record yet. Nothing runs when there is nothing to
+# post, in DRY RUN, or in TEST POST mode. The probe has its own failure counter
+# so an archive hiccup here can never disable the media/archive paths.
+#
+# DEFAULTS. Lenient: a post is held ONLY on positive evidence (an archived
+# removal/queue state, or a source that reports a removal). "No record yet" and
+# "archive unreachable" post exactly as before, so this can never withhold a
+# live post. REDDIT_LIVENESS_STRICT=1 turns those two into holds instead (the
+# post waits in pending_reddit.json and retries — it is never cached).
+# ---------------------------------------------------------------------------
+REDDIT_LIVENESS_PROBE = (os.getenv("REDDIT_LIVENESS_PROBE") or "1").strip().lower() not in (
+    "0", "false", "no", "off")
+REDDIT_LIVENESS_STRICT = (os.getenv("REDDIT_LIVENESS_STRICT") or "").strip().lower() in (
+    "1", "true", "yes", "on")
+# Bound the extra latency of a flood run (each lookup is ~0.3-0.9 s).
+LIVENESS_PROBE_BUDGET = max(0, _env_int("LIVENESS_PROBE_BUDGET", 10))
+LIVENESS_PROBE_TIMEOUT = max(2, min(15, _env_int("LIVENESS_PROBE_TIMEOUT", 8)))
+
+# removed_by_category values that mean "not decided yet" rather than "removed".
+_QUEUE_CATEGORIES = frozenset({"automod_filtered"})
+_liveness_fail_count = 0          # isolated from _arctic_fail_count on purpose
+_liveness_probe_budget_used = 0
+
+
+def _queue_or_removal_reason(category: str | None) -> str | None:
+    """Map a Reddit `removed_by_category` value to a pending reason.
+
+    Returns None when the field is empty (not removed). Uses the EXISTING
+    pending-reason vocabulary so pending_reddit.json keeps its meaning:
+    "pending approval" is a retryable queue reason, "removed by
+    moderators/filters" is one of the never-re-checked removal reasons.
+    """
+    cat = str(category or "").strip().lower()
+    if not cat:
+        return None
+    if cat in _QUEUE_CATEGORIES:
+        return "pending approval"
+    return "removed by moderators/filters"
+
+
+def archived_removal_verdict(record: dict | None) -> tuple[str, str]:
+    """Pure verdict from an archive/JSON post record. ("state", "why").
+
+    state is one of "removed" (hold), "live" (post), "unknown" (no record).
+    A record that exists and carries no removal evidence is POSITIVE proof of
+    life — that is what lets the probe stay lenient without guessing.
+    """
+    if not isinstance(record, dict) or not record:
+        return "unknown", "no archived record"
+    reason = _queue_or_removal_reason(record.get("removed_by_category"))
+    if not reason:
+        reason = removed_post_reason(record.get("title"), record.get("selftext"))
+    if reason:
+        return "removed", reason
+    return "live", "archived record is clean"
+
+
+async def _fetch_arctic_post_row(session, post_id: str, label: str = "") -> dict | None:
+    """One archive lookup by id, with its OWN failure counter.
+
+    Deliberately not fetch_arctic_post(): that one shares _arctic_fail_count
+    with the media/archive paths, and a liveness lookup must never be able to
+    disable them.
+    """
+    global _liveness_fail_count
+    if not re.fullmatch(r"[a-z0-9]+", post_id or "") or _liveness_fail_count >= 3:
+        return None
+    try:
+        async with session.get(ARCTIC_POSTS_URL, params={"ids": post_id},
+                               headers=dict(BROWSER_HEADERS),
+                               timeout=aiohttp.ClientTimeout(total=LIVENESS_PROBE_TIMEOUT)) as resp:
+            if resp.status != 200:
+                raise ValueError(f"HTTP {resp.status}")
+            data = await resp.json(content_type=None)
+        posts = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(posts, list):
+            raise ValueError("invalid archive response")
+        _liveness_fail_count = 0
+        return next((p for p in posts if isinstance(p, dict) and p.get("id") == post_id), None)
+    except Exception as exc:
+        _liveness_fail_count += 1
+        logging.info(f"[{label or post_id}] liveness archive lookup unavailable: "
+                     f"{_sanitize_error_message(exc)}")
+        return None
+
+
+async def candidate_liveness_verdict(session, *, key: str, path: str,
+                                     post_json: dict | None = None,
+                                     entry=None) -> tuple[str, str, str]:
+    """Independent pre-delivery liveness verdict -> (state, why, source).
+
+    state: "live" | "removed" | "unverified" | "skipped"
+    source: post-json | arctic-entry | arctic-lookup | none | disabled | budget
+
+    Free paths first (records already fetched), then at most ONE archive
+    lookup for an RSS candidate, then give up and let the caller decide.
+    """
+    global _liveness_probe_budget_used
+    if DRY_RUN or TEST_POST_ID:
+        return "skipped", "dry run or test post", "skipped"
+    if not REDDIT_LIVENESS_PROBE or LIVENESS_PROBE_BUDGET <= 0:
+        return "skipped", "probe disabled", "disabled"
+    # 1. FULL-MODE JSON (when a Reddit app exists) — no request.
+    if isinstance(post_json, dict) and post_json:
+        state, why = archived_removal_verdict(post_json)
+        if state != "unknown":
+            return state, why, "post-json"
+    # 2. The archive record behind an archive-sourced candidate — no request.
+    entry_record = getattr(entry, "_arctic_post", None)
+    if isinstance(entry_record, dict):
+        state, why = archived_removal_verdict(entry_record)
+        if state != "unknown":
+            return state, why, "arctic-entry"
+    # 3. One archive lookup by id.
+    if _liveness_probe_budget_used >= LIVENESS_PROBE_BUDGET:
+        return "unverified", "probe budget exhausted", "budget"
+    post_id = extract_post_id(path)
+    if not post_id:
+        return "unverified", "no post id", "none"
+    _liveness_probe_budget_used += 1
+    record = await _fetch_arctic_post_row(session, post_id, label=key)
+    state, why = archived_removal_verdict(record)
+    if state == "unknown":
+        return "unverified", why, "arctic-lookup"
+    return state, why, "arctic-lookup"
+
+
+def liveness_hold_decision(state: str, strict: bool) -> bool:
+    """Should this candidate be held (not posted, not cached)?
+
+    Lenient (default): ONLY positive evidence holds a post. "unverified" — no
+    archive record yet, or the archive was unreachable — posts exactly as it
+    does today, so this change can never withhold a live post.
+    Strict: also hold "unverified" (the post waits in pending and retries).
+    """
+    if state == "removed":
+        return True
+    return bool(strict) and state == "unverified"
+
+
+def _note_liveness(state: str, why: str, source: str, stats: dict) -> None:
+    """Record one verdict in the run summary counters (never raises)."""
+    try:
+        if state == "removed":
+            stats["liveness_probe_removed"] = stats.get("liveness_probe_removed", 0) + 1
+            _inc_reason(stats["liveness_probe_by_reason"], why)
+        elif state == "live":
+            stats["liveness_probe_live"] = stats.get("liveness_probe_live", 0) + 1
+        elif state == "unverified":
+            stats["liveness_probe_unverified"] = stats.get("liveness_probe_unverified", 0) + 1
+        else:
+            stats["liveness_probe_skipped"] = stats.get("liveness_probe_skipped", 0) + 1
+        if state in ("live", "removed", "unverified"):
+            _inc_reason(stats["liveness_probe_by_source"], source)
+    except Exception:
+        pass
 
 
 def repair_mangled_link_lines(lines: list) -> list:
@@ -6721,6 +6944,11 @@ async def main():
     _redlib_post_page_cache.clear()
     _proxy_post_cache.clear()
     _redlib_reach.clear()
+    # Round 95: the liveness probe's failure counter and per-run budget are
+    # per-run state too — a bad archive minute must not leak into the next run.
+    global _liveness_fail_count, _liveness_probe_budget_used
+    _liveness_fail_count = 0
+    _liveness_probe_budget_used = 0
     # Round 93: placeholder state is per-run — a stale "vxreddit answered with
     # its shell" from a previous run must never influence liveness now.
     if reddit_proxy is not None and hasattr(reddit_proxy, "clear_vxreddit_placeholders"):
@@ -6736,6 +6964,13 @@ async def main():
         _pfx = _k.rsplit("_", 1)[0] if "_" in _k else _k
         _sub_counts[_pfx] = _sub_counts.get(_pfx, 0) + 1
     _hot = {s: n for s, n in _sub_counts.items() if n >= MAX_CACHE_SIZE_PER_SUB - 10}
+    # Round 95: cache pressure belongs in the run summary, not only in the log.
+    try:
+        if current_run_stats is not None:
+            current_run_stats["dedup_cache_size"] = len(posted)
+            current_run_stats["dedup_cache_hot"] = dict(sorted(_hot.items()))
+    except Exception:
+        pass
     if _hot or len(posted) >= MAX_CACHE_SIZE_TOTAL * 9 // 10:
         logging.warning(f"dedup cache near cap: {len(posted)} key(s) (per-sub "
                         f"quota {MAX_CACHE_SIZE_PER_SUB}, backstop "
@@ -6971,6 +7206,9 @@ async def main():
                     try:
                         saved = save_posted(posted, frozenset(posted - posted_at_start))
                         _verify_dedup_save(posted_at_start, posted, saved)
+                        # Round 95: cap evictions, so the summary can show them.
+                        run_stats["dedup_cache_dropped"] = max(0, len(posted) - len(saved))
+                        run_stats["dedup_cache_size"] = len(saved)
                         save_pending(pending)
                         save_posted_messages(posted_messages)
                         # Determine local persistence outcome: unchanged vs saved
@@ -7013,8 +7251,9 @@ async def main():
             for subreddit, post_path, unique_key, published_ts, activity_ts, entry in new_posts:
                 # Round 30/32: pending-post recheck throttle — previously
                 # rejected/held posts are only re-checked once every
-                # PENDING_RECHECK_SECONDS (default 30 min), and removed/deleted
-                # posts are not re-checked unless restored via RSS.
+                # PENDING_RECHECK_SECONDS (round 95c: default 5 min = one cron
+                # tick), and removed/deleted posts are not re-checked unless
+                # restored via RSS.
                 if (not TEST_POST_ID and not DRY_RUN
                         and unique_key in pending
                         and _pending_throttle_skip(pending, unique_key, now, entry)):
@@ -7218,6 +7457,46 @@ async def main():
                                      f"({_why}) — skipping, not cached (will "
                                      f"post once approved/restored).")
                         continue
+
+                # ---- round 95: independent liveness probe ----------------
+                # The gate above is satisfied by ANY proxy answer on the RSS
+                # path, and a proxy serves a removed post's pre-removal title,
+                # body and media (live 1xijfzb / 1xifykm / 1xifc1c). Ask an
+                # INDEPENDENT record instead — free when we already hold one
+                # (FULL-MODE JSON or the archive record), else ONE archive
+                # lookup. Held only on positive evidence; "no record yet" and
+                # "archive unreachable" post exactly as before unless
+                # REDDIT_LIVENESS_STRICT=1. See the ROUND 95 block.
+                if not TEST_POST_ID:
+                    _ls, _lwhy, _lsrc = await candidate_liveness_verdict(
+                        session, key=unique_key, path=path,
+                        post_json=post_json, entry=entry)
+                    _note_liveness(_ls, _lwhy, _lsrc, run_stats)
+                    if liveness_hold_decision(_ls, REDDIT_LIVENESS_STRICT):
+                        # Deliberately NOT `_lwhy`: the archive record is a
+                        # SNAPSHOT, so a removal it reports may since have been
+                        # reversed. The existing never-re-check reasons are for
+                        # evidence read from a live page; using one here would
+                        # turn a stale snapshot into a permanent hold. These two
+                        # reasons are outside `_NO_RECHECK_REASONS`, so the post
+                        # is re-probed after PENDING_RECHECK_SECONDS and posts as
+                        # soon as the record is clean (or the post is approved).
+                        _hold_reason = ("liveness_removed" if _ls == "removed"
+                                        else "liveness_unverified")
+                        mark_pending(pending, unique_key, _hold_reason, now,
+                                     source=_entry_source36,
+                                     title=str(base.get("title") or "")[:200],
+                                     published_ts=published_ts)
+                        run_stats["liveness_not_verified"] += 1
+                        _inc_reason(run_stats["liveness_by_reason"],
+                                    f"round95 {'removed' if _ls == 'removed' else 'unverified'}: {_lwhy}")
+                        logging.info(f"[{unique_key}] liveness probe: {_lwhy} "
+                                     f"(source={_lsrc}, strict={REDDIT_LIVENESS_STRICT}) — "
+                                     f"holding, not cached (posts once live).")
+                        continue
+                    if _ls == "live":
+                        logging.debug(f"[{unique_key}] liveness probe: {_lwhy} "
+                                      f"(source={_lsrc}).")
 
                 try:
                     data = await resolve_post_media(session, base, post_json,
@@ -7528,6 +7807,9 @@ async def main():
             try:
                 saved = save_posted(posted, frozenset(posted - posted_at_start))
                 _verify_dedup_save(posted_at_start, posted, saved)
+                # Round 95: cap evictions, so the summary can show them.
+                run_stats["dedup_cache_dropped"] = max(0, len(posted) - len(saved))
+                run_stats["dedup_cache_size"] = len(saved)
                 save_pending(pending)
                 save_posted_messages(posted_messages)
                 if (posted == posted_at_start
