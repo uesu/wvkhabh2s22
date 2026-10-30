@@ -11449,6 +11449,302 @@ check("r97: the fresh-age gate records the key it deferred",
       and '"effective_settings": _effective_settings()' in _r97_src
       and 'def _effective_settings()' in _r97_src)
 
+# ---- Round 98 (2026-10-30): stale-snapshot override + held-post reclaim ----
+# Live evidence: six r/HonkaiStarRail_leaks "Official" posts and one Genshin post
+# were held as `liveness_removed` for hours WHILE reddit.com's own listing showed
+# them, and HSR 1xjdkwf froze because it had dropped out of every source. Both
+# fixes are pure functions, so they are executed here, not just grepped.
+def _r98_extract(name):
+    m = re.search(rf"^def {name}\(.*?(?=\n\ndef |\n\nasync def |\n\n# ---)", _r97_src,
+                  re.S | re.M)
+    return m.group(0) if m else ""
+
+
+_r98_ns = {"STALE_SNAPSHOT_TICKS": 3, "RECLAIM_MAX_PER_RUN": 5,
+           "PENDING_RECHECK_SECONDS": 300, "MAX_AGE_SECONDS": 172800,
+           "_NATIVE_FEED_STREAK_CAP": 99,
+           "_SNAPSHOT_SOURCES": frozenset({"arctic-entry", "arctic-lookup"})}
+_r98_ok = True
+try:
+    for _n in ("_bump_native_streak", "_stale_snapshot_override", "_reclaim_due"):
+        exec(compile(_r98_extract(_n), "<r98>", "exec"), _r98_ns)
+    exec(compile(re.search(r"^_RECLAIMABLE_REASONS = frozenset\(\{.*?\}\)",
+                           _r97_src, re.S | re.M).group(0), "<r98>", "exec"), _r98_ns)
+except Exception as _exc:                                   # pragma: no cover
+    _r98_ok = False
+    _r98_err = repr(_exc)
+check("r98: the two new decisions are extractable and self-contained",
+      _r98_ok, _r98_err if not _r98_ok else None)
+
+if _r98_ok:
+    _streak = {"Sub_1abc": {"first_seen": 1.0, "last_checked": 0.0,
+                            "reason": "liveness_removed"}}
+    _bump, _ov, _due = (_r98_ns["_bump_native_streak"],
+                        _r98_ns["_stale_snapshot_override"],
+                        _r98_ns["_reclaim_due"])
+    _bump(_streak, {"Sub_1abc"})
+    _one = _streak["Sub_1abc"]["rss_seen"] == 1 and not _ov(
+        "removed", "Sub_1abc", {"Sub_1abc"}, _streak, "arctic-lookup")
+    _bump(_streak, {"Sub_1abc"})
+    _bump(_streak, {"Sub_1abc"})
+    check("r98: an archive 'removed' verdict is overridden only after 3 consecutive "
+          "runs in Reddit's own feed (1 run is not enough)",
+          _one and _ov("removed", "Sub_1abc", {"Sub_1abc"}, _streak,
+                       "arctic-lookup") is True, _streak)
+    _bump(_streak, set())
+    check("r98: one run without the post in the feed resets the streak, so only "
+          "CONTINUOUS listing counts",
+          _streak["Sub_1abc"]["rss_seen"] == 0
+          and not _ov("removed", "Sub_1abc", {"Sub_1abc"}, _streak,
+                      "arctic-lookup"), _streak)
+    check("r98: the override never fires for a proxy/archive sighting, for an "
+          "'unverified' verdict, or for LIVE post-JSON evidence",
+          not _ov("removed", "Sub_1abc", set(), _streak, "arctic-lookup")
+          and not _ov("unverified", "Sub_1abc", {"Sub_1abc"}, _streak,
+                      "arctic-lookup")
+          and not _ov("removed", "Sub_1abc", {"Sub_1abc"}, _streak, "post-json"))
+    _now = 1_000_000.0
+    _pend = {
+        "A_1": {"first_seen": 5, "last_checked": 0, "reason": "liveness_removed",
+                "published_ts": int(_now) - 3600},
+        "B_2": {"first_seen": 1, "last_checked": 0, "reason": "removal_notice",
+                "published_ts": int(_now) - 3600},
+        "C_3": {"first_seen": 3, "last_checked": _now - 10, "reason": "not_live",
+                "published_ts": int(_now) - 3600},
+        "D_4": {"first_seen": 2, "last_checked": 0, "reason": "not_live",
+                "published_ts": int(_now) - 200000},
+        "E_5": {"first_seen": 4, "last_checked": 0, "reason": "not_live",
+                "published_ts": int(_now) - 3600},
+    }
+    check("r98: reclaim ignores removal_notice holds, recently re-probed holds, "
+          "posts outside the 48 h window, and keys already in this run's feed",
+          _due(_pend, {"E_5"}, _now, 5) == ["A_1"], _due(_pend, {"E_5"}, _now, 5))
+    check("r98: reclaim is bounded (one batched archive lookup per run at most)",
+          len(_due(_pend, set(), _now, 1)) == 1
+          and _r98_ns["RECLAIM_MAX_PER_RUN"] <= 5)
+    check("r98: the reclaim cost is ONE archive request for all probed ids",
+          'params={"ids": ",".join(ids)}' in _r97_src
+          and "fetch_arctic_posts_by_ids(" in _r97_src)
+    check("r98: only Reddit's own feed counts as a listing (proxies and the "
+          "archive are never 'reddit-native')",
+          'provenance="reddit-native"' in _r97_src
+          and "collect(arc_entries, sub)" in _r97_src)
+    _r98_wf = open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"),
+                   encoding="utf-8").read()
+    check("r98: the summary names both new decisions (no log digging)",
+          'line("Stale-snapshot overrides", "stale_snapshot_overrides")' in _r98_wf
+          and 'line("Held posts re-probed", "reclaim_checked")' in _r98_wf)
+
+# ---- Round 98: the delivery path itself (real main(), mocked network) -------
+# The pure functions above are necessary but not sufficient: the reclaim pass
+# lives in main(), AFTER the feed/archive candidates are assembled and BEFORE
+# the "no candidates" early return — a placement a grep cannot verify. These
+# cases run the REAL v3.main() with the network mocked and read the run-result
+# record back. Live equivalent: pending 1xjdkwf (frozen), six HSR keys (stale
+# snapshots), and every removal_notice hold (must stay untouched).
+async def _r98_main_cases():
+    from unittest.mock import AsyncMock, patch
+    from contextlib import ExitStack
+
+    class _Resp:
+        def __init__(self, status=200, body=None):
+            self.status, self._body = status, body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def json(self, **kw):
+            return self._body if self._body is not None else {}
+
+        async def text(self):
+            return ""
+
+    class _Session:
+        last = None
+
+        def __init__(self):
+            type(self).last = self
+            self.posts = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def post(self, url, json=None, **kw):
+            self.posts.append((url, json))
+            return _Resp(200, {"id": "msg1"})
+
+        def get(self, url, **kw):
+            return _Resp(200, None)
+
+        def patch(self, url, json=None, **kw):
+            return _Resp(204, None)
+
+    class _Entry:
+        def __init__(self, link):
+            self.link, self.title, self.author = link, "Title", "Author"
+            self._d = {"content": [{"value": "<p>hi</p>"}], "summary": "",
+                       "media_thumbnail": [], "published_parsed": None,
+                       "updated_parsed": None}
+
+        def get(self, k, d=None):
+            return self._d.get(k, d)
+
+    post = {"id": "1xdkwf", "subreddit": "TestSub", "title": "Clean held post",
+            "author": "someone", "body": "<p>hi</p>", "selftext": "<p>hi</p>",
+            "permalink": "/r/TestSub/comments/1xdkwf/clean_held_post/",
+            "created_utc": time.time() - 3600}
+    link = "/r/TestSub/comments/1xdkwf/clean_held_post/"
+
+    async def _case(entries, pending, verdict, reclaim_posts):
+        stats, saved_pending, calls = {}, [], []
+
+        async def _by_ids(session, ids, label=""):
+            calls.append(list(ids))
+            return reclaim_posts
+
+        class _Aio:
+            ClientSession = _Session
+            ClientTimeout = staticmethod(lambda total=None: None)
+
+        with ExitStack() as stack:
+            for target, name, value in (
+                    (v3, "SUBREDDITS", ["TestSub"]),
+                    (v3, "TEST_POST_ID", ""), (v3, "DRY_RUN", False),
+                    (v3, "PROXY_MEDIA", False), (v3, "FRESH_HOLD_SECONDS", 0),
+                    (v3, "aiohttp", _Aio),
+                    (v3, "fetch_combined_feed",
+                     AsyncMock(return_value=types.SimpleNamespace(entries=entries))),
+                    (v3, "fetch_arctic_subreddit_posts", AsyncMock(return_value=[])),
+                    (v3, "fetch_arctic_posts_by_ids", _by_ids),
+                    (v3, "fetch_post_json", AsyncMock(return_value=None)),
+                    (v3, "verify_archive_post_live", AsyncMock(return_value=(True, "ok"))),
+                    (v3, "candidate_liveness_verdict", AsyncMock(return_value=verdict)),
+                    (v3, "resolve_post_media", AsyncMock(return_value={
+                        "title": "Title", "author": "Author", "body": "hi", "media": [],
+                        "stats": None, "crosspost": None, "op_comment": None,
+                        "youtube_url": None, "full_mode": False})),
+                    (v3, "create_discohook_share", AsyncMock()),
+                    (v3, "retract_dead_posts", AsyncMock()),
+                    (v3, "load_posted", lambda: {"OtherSub_zzz"}),
+                    (v3, "load_pending", lambda: copy.deepcopy(pending)),
+                    (v3, "load_posted_messages", lambda: {}),
+                    (v3, "save_posted", lambda keys, fresh: set(keys)),
+                    (v3, "save_pending", lambda p: saved_pending.append(copy.deepcopy(p))),
+                    (v3, "save_posted_messages", lambda rec: None),
+                    (v3, "get_webhook_for_subreddit",
+                     lambda sub: "https://discord.test/webhook"),
+                    (v3, "_write_run_result",
+                     lambda stats_, extra=None: stats.update(stats_)),
+                    (v3.asyncio, "sleep", AsyncMock())):
+                stack.enter_context(patch.object(target, name, value))
+            await v3.main()
+        return {"stats": stats,
+                "pending": saved_pending[-1] if saved_pending else {},
+                "posts": len(_Session.last.posts) if _Session.last else 0,
+                "calls": calls}
+
+    def _held(reason="liveness_removed", streak=None):
+        rec = {"first_seen": time.time() - 4000, "last_checked": time.time() - 3600,
+               "reason": reason, "source": "arctic",
+               "published_ts": int(time.time() - 3600)}
+        if streak is not None:
+            rec["rss_seen"] = streak
+        return {"TestSub_1xdkwf": rec}
+
+    live = ("live", "fresh", "arctic-entry")
+    removed = ("removed", "removal by moderators", "arctic-lookup")
+    out = {}
+    out["reclaim"] = await _case([], _held(), live, {"1xdkwf": post})
+    out["override"] = await _case([_Entry(link)], _held(streak=3), removed, {})
+    out["no_override"] = await _case([_Entry(link)], _held(streak=1), removed, {})
+    dead = dict(post, title="[removed]", selftext="[removed]")
+    out["still_dead"] = await _case([], _held(), live, {"1xdkwf": dead})
+    out["notice"] = await _case([], _held(reason="removal_notice"), live,
+                                {"1xdkwf": post})
+    # Edge cases: no usable timestamp anywhere (must never be posted), a record
+    # with a future timestamp (must be clamped, not held forever by the floor),
+    # and a held key whose subreddit is no longer tracked (no webhook error).
+    _no_ts = {k: {kk: vv for kk, vv in v.items() if kk != "published_ts"}
+              for k, v in _held().items()}
+    out["no_timestamp"] = await _case([], _no_ts, live,
+                                      {"1xdkwf": {k: v for k, v in post.items()
+                                                  if k != "created_utc"}})
+    out["future_ts"] = await _case([], _held(), live,
+                                   {"1xdkwf": dict(post, created_utc=time.time() + 900)})
+    out["sub_mismatch"] = await _case([], _held(), live,
+                                      {"1xdkwf": dict(post, subreddit="OtherSub")})
+    out["unknown_sub"] = await _case([], {"OtherSub_9zzz": {
+        "first_seen": time.time() - 4000, "last_checked": time.time() - 3600,
+        "reason": "liveness_removed", "source": "arctic",
+        "published_ts": int(time.time() - 3600)}}, live, {"9zzz": post})
+    return out
+
+
+import copy
+try:
+    _r98_cases = asyncio.run(_r98_main_cases())
+    _r98_run_err = None
+except Exception as _exc:                                   # pragma: no cover
+    _r98_cases, _r98_run_err = {}, repr(_exc)
+check("r98: main() completes in every reclaim/override case",
+      _r98_run_err is None and len(_r98_cases) == 9, _r98_run_err or _r98_cases)
+if _r98_cases:
+    _c = _r98_cases
+    check("r98: a held post NOTHING lists is re-read from the archive and "
+          "delivered (this is 1xjdkwf's freeze)",
+          _c["reclaim"]["stats"].get("delivered") == 1
+          and _c["reclaim"]["stats"].get("reclaim_clean") == 1
+          and _c["reclaim"]["posts"] == 1
+          and "TestSub_1xdkwf" not in _c["reclaim"]["pending"],
+          {k: _c["reclaim"]["stats"].get(k) for k in ("delivered", "reclaim_clean")})
+    check("r98: a feed-listed post with a stale 'removed' snapshot is delivered "
+          "once the streak is met",
+          _c["override"]["stats"].get("delivered") == 1
+          and _c["override"]["stats"].get("stale_snapshot_overrides") == 1,
+          _c["override"]["stats"].get("stale_snapshot_overrides"))
+    check("r98: …and is still held before the streak is met (2 runs so far)",
+          _c["no_override"]["stats"].get("delivered") == 0
+          and _c["no_override"]["stats"].get("liveness_not_verified") == 1)
+    check("r98: a reclaim that still reads as removed keeps the hold, keeps its "
+          "reason, and refreshes last_checked",
+          _c["still_dead"]["stats"].get("delivered") == 0
+          and _c["still_dead"]["stats"].get("reclaim_held") == 1
+          and _c["still_dead"]["pending"]["TestSub_1xdkwf"]["reason"]
+          == "liveness_removed"
+          and time.time() - _c["still_dead"]["pending"]["TestSub_1xdkwf"]["last_checked"]
+          < 60)
+    check("r98: a removal_notice hold is never reclaimed (no archive request)",
+          _c["notice"]["stats"].get("reclaim_checked") in (0, None)
+          and not _c["notice"]["calls"]
+          and _c["notice"]["stats"].get("delivered") == 0)
+    check("r98: a record with NO usable timestamp is never re-admitted "
+          "(no guessing, no bogus published_ts written)",
+          _c["no_timestamp"]["stats"].get("delivered") == 0
+          and _c["no_timestamp"]["stats"].get("reclaim_clean") in (0, None)
+          and _c["no_timestamp"]["pending"]["TestSub_1xdkwf"]
+          .get("published_ts") is None,
+          _c["no_timestamp"]["stats"].get("reclaim_keys"))
+    check("r98: a future timestamp is clamped, so the fresh-age floor cannot "
+          "hold the post forever",
+          _c["future_ts"]["stats"].get("delivered") == 1
+          and _c["future_ts"]["stats"].get("reclaim_clean") == 1)
+    check("r98: a record whose own subreddit disagrees with the key is never "
+          "re-admitted (no wrong-channel post)",
+          _c["sub_mismatch"]["stats"].get("delivered") == 0
+          and _c["sub_mismatch"]["stats"].get("reclaim_clean") in (0, None)
+          and _c["sub_mismatch"]["stats"].get("reclaim_held") in (0, None))
+    check("r98: a held key from an untracked subreddit is skipped (no webhook "
+          "error, no archive request)",
+          _c["unknown_sub"]["stats"].get("delivered") == 0
+          and not _c["unknown_sub"]["calls"]
+          and _c["unknown_sub"]["stats"].get("reclaim_skipped_unknown_sub") == 1)
+
 # ---- Round 89: no GitHub Actions annotation may leak out of this suite ----
 # Restore the real stdout first, then judge what the suite actually emitted.
 sys.stdout = _stdout_guard.stream

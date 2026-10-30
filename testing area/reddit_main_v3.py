@@ -506,7 +506,119 @@ def _effective_settings() -> dict:
         "liveness_strict": (None if _get("REDDIT_LIVENESS_STRICT") is None
                             else bool(_get("REDDIT_LIVENESS_STRICT"))),
         "liveness_probe_budget": _int("LIVENESS_PROBE_BUDGET"),
+        # Round 98: the two new decisions, so the summary can state them.
+        "stale_snapshot_ticks": _int("STALE_SNAPSHOT_TICKS"),
+        "reclaim_max_per_run": _int("RECLAIM_MAX_PER_RUN"),
     }
+
+
+# ---------------------------------------------------------------------------
+# ■ ROUND 98 (2026-10-30): STALE-SNAPSHOT OVERRIDE + HELD-POST RECLAIM
+# Live evidence, 2026-10-30 12:00-15:20Z:
+#   * six r/HonkaiStarRail_leaks "Official" posts and one Genshin post sat in
+#     pending as `liveness_removed` for hours WHILE being publicly listed (the
+#     user's screenshots show them live, with votes and comments). They entered
+#     via the COMBINED feed — reddit.com's own listing — so they were live; the
+#     archive row simply still carried `removed_by_category` from the moment it
+#     was captured (an automod/queue state that was later approved).
+#   * one entry (HonkaiStarRail_leaks_1xjdkwf) was never re-probed at all: its
+#     `last_checked` froze at 12:10Z because it had dropped out of both the
+#     feed and the archive sweep, and the archive's `removal_notice` set is
+#     never re-checked by design.
+# Both are fixed here WITHOUT weakening the removed-post guarantee:
+#   - the override needs Reddit's OWN feed (never a proxy/redlib/archive entry)
+#     and the same post listed for STALE_SNAPSHOT_TICKS consecutive ticks. A
+#     removed post disappears from reddit's own listing within minutes, so it
+#     cannot reach that streak; a proxy-served ghost never counts at all.
+#   - the reclaim only acts on a FRESH archive read that comes back clean, and
+#     only for the retryable hold reasons (never `removal_notice`).
+# ---------------------------------------------------------------------------
+STALE_SNAPSHOT_TICKS = max(1, _env_int("STALE_SNAPSHOT_TICKS", 3))
+RECLAIM_MAX_PER_RUN = max(0, _env_int("RECLAIM_MAX_PER_RUN", 5))
+# Reasons that mean "we do not know yet", not "this post is gone". `removal_notice`
+# and its whole family are deliberately absent: those return only via RSS.
+_RECLAIMABLE_REASONS = frozenset({
+    "liveness_removed", "liveness_unverified", "not_live",
+    "pending approval", "sources_down",
+})
+_NATIVE_FEED_STREAK_CAP = 99
+# Only a SNAPSHOT may be overruled. `post-json` is a live read (FULL MODE with a
+# Reddit app) and stays authoritative even while the feed lists the post.
+_SNAPSHOT_SOURCES = frozenset({"arctic-entry", "arctic-lookup"})
+
+
+def _bump_native_streak(pending: dict, native_keys) -> None:
+    """Round 98: count CONSECUTIVE runs in which a held key was listed by
+    Reddit's own feed. A run in which the post is missing resets the count, so
+    only continuous presence can unlock the stale-snapshot override. Bounded;
+    never raises (bookkeeping only)."""
+    try:
+        for key, rec in pending.items():
+            if not isinstance(rec, dict) or not rec.get("rss_seen"):
+                continue
+            if key not in native_keys:
+                rec["rss_seen"] = 0
+        for key in native_keys:
+            rec = pending.get(key)
+            if isinstance(rec, dict):
+                rec["rss_seen"] = min(int(rec.get("rss_seen") or 0) + 1,
+                                      _NATIVE_FEED_STREAK_CAP)
+    except Exception:
+        pass
+
+
+def _stale_snapshot_override(state: str, key: str, native_keys, pending: dict,
+                             source: str | None = None) -> bool:
+    """Round 98: may an archive `removed` verdict be overridden for this post?
+
+    Only when BOTH hold:
+      1. the post is in Reddit's own combined/per-sub feed RIGHT NOW (a proxy or
+         archive sighting never qualifies — see `collect(..., provenance=)`), and
+      2. it has been listed there for at least STALE_SNAPSHOT_TICKS consecutive
+         runs (default 3 = ~15 min at the 5-minute cron).
+    A removed post drops out of reddit's own listing within minutes, so a live
+    post is the only thing that can build that streak.
+    """
+    if state != "removed" or key not in native_keys:
+        return False
+    if source not in _SNAPSHOT_SOURCES:
+        return False
+    rec = pending.get(key)
+    try:
+        return isinstance(rec, dict) and int(rec.get("rss_seen") or 0) >= STALE_SNAPSHOT_TICKS
+    except (TypeError, ValueError):
+        return False
+
+
+def _reclaim_due(pending: dict, seen_keys, now: float, limit: int) -> list:
+    """Round 98: held posts that are no longer candidates, so nothing refreshes
+    them — oldest first, bounded, and only inside the posting window."""
+    out = []
+    if limit <= 0:
+        return out
+    try:
+        items = sorted(pending.items(),
+                       key=lambda kv: float(kv[1].get("first_seen") or 0)
+                       if isinstance(kv[1], dict) else 0.0)
+    except Exception:
+        return out
+    for key, rec in items:
+        if len(out) >= limit:
+            break
+        if not isinstance(rec, dict) or key in seen_keys:
+            continue
+        if str(rec.get("reason") or "") not in _RECLAIMABLE_REASONS:
+            continue
+        pub = rec.get("published_ts")
+        if isinstance(pub, (int, float)) and now - float(pub) > MAX_AGE_SECONDS:
+            continue
+        try:
+            if now - float(rec.get("last_checked") or 0) < PENDING_RECHECK_SECONDS:
+                continue
+        except (TypeError, ValueError):
+            pass
+        out.append(key)
+    return out
 
 
 def _settings_line(settings: dict) -> str:
@@ -537,6 +649,11 @@ def _settings_line(settings: dict) -> str:
         if per_sub:
             total = num("dedup_total_cap")
             parts.append(f"dedup {per_sub}/sub" + (f" ({total} total)" if total else ""))
+        reclaim = num("reclaim_max_per_run")
+        if reclaim and settings.get("reclaim_max_per_run"):
+            ticks = num("stale_snapshot_ticks")
+            parts.append(f"reclaim {reclaim}/run"
+                         + (f", snapshot override after {ticks} feeds" if ticks else ""))
         probe = settings.get("liveness_probe")
         if probe is False:
             parts.append("liveness probe off")
@@ -602,6 +719,15 @@ def _init_run_stats():
         # Round 97: WHICH posts waited on the fresh-age floor (bounded), so
         # "Fresh-age hold: 2" is verifiable without the Actions log.
         "fresh_hold_keys": [],
+        # Round 98: stale archive snapshots overridden by continuous listing in
+        # Reddit's own feed, and held posts re-probed while off-feed.
+        "stale_snapshot_overrides": 0,
+        "stale_snapshot_keys": [],
+        "reclaim_checked": 0,
+        "reclaim_clean": 0,
+        "reclaim_held": 0,
+        "reclaim_keys": [],
+        "reclaim_skipped_unknown_sub": 0,
         "newly_rejected_removed": 0,
         "newly_rejected_by_reason": {},
         "liveness_not_verified": 0,
@@ -2105,6 +2231,39 @@ async def fetch_arctic_post(session, post_id: str, label: str = "") -> dict | No
         _arctic_fail_count += 1
         logging.info(f"[{label or post_id}] Arctic Shift unavailable: {exc}")
         return None
+
+
+async def fetch_arctic_posts_by_ids(session, post_ids, label: str = "") -> dict:
+    """Round 98: ONE batched archive lookup for several post IDs.
+
+    Arctic Shift's /posts/ids endpoint takes a comma-separated `ids` value, so a
+    reclaim pass costs one request no matter how many held posts it probes.
+    Returns {id: post}; an empty dict means "no record" or the archive is
+    unreachable — both are treated the same by the caller (fail-open: the post
+    stays held and is re-probed next tick, never posted on a guess).
+    """
+    global _arctic_fail_count
+    ids = [str(i) for i in (post_ids or []) if re.fullmatch(r"[a-z0-9]+", str(i) or "")]
+    if not ids or _arctic_fail_count >= 3:
+        return {}
+    try:
+        async with session.get(ARCTIC_POSTS_URL, params={"ids": ",".join(ids)},
+                               headers=dict(BROWSER_HEADERS),
+                               timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                raise ValueError(f"HTTP {resp.status}")
+            data = await resp.json(content_type=None)
+        posts = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(posts, list):
+            raise ValueError("invalid archive response")
+        _arctic_fail_count = 0
+        wanted = set(ids)
+        return {str(post.get("id")): post for post in posts
+                if isinstance(post, dict) and str(post.get("id")) in wanted}
+    except Exception as exc:
+        _arctic_fail_count += 1
+        logging.info(f"[{label or 'reclaim'}] Arctic Shift unavailable: {exc}")
+        return {}
 
 
 def arctic_crosspost_orig(post) -> dict | None:
@@ -4014,6 +4173,12 @@ async def fetch_combined_feed(session: aiohttp.ClientSession):
     return feed
 
 
+# Round 98: which source actually served each subreddit's feed this run.
+# "reddit.com" means Reddit's own listing — the only provenance allowed to
+# override a stale archive `removed` verdict (see _stale_snapshot_override).
+FEED_SOURCE_BY_SUB: dict[str, str] = {}
+
+
 async def fetch_working_reddit_feed(session: aiohttp.ClientSession, subreddit: str):
     """Fallback mode: tries each RSS source in order for one subreddit."""
     for instance in REDDIT_RSS_INSTANCES:
@@ -4024,6 +4189,7 @@ async def fetch_working_reddit_feed(session: aiohttp.ClientSession, subreddit: s
         feed = await _fetch_feed(session, feed_url, instance)
         if feed:
             logging.info(f"Successfully fetched r/{subreddit} from {instance}")
+            FEED_SOURCE_BY_SUB[subreddit] = instance
             return feed
         # round 15 (2026-09-20): eddrit.com — token-free RSS fallback.
         # Sits AFTER redlib.miningtcup.me (token-gated, tried first) and
@@ -4041,6 +4207,7 @@ async def fetch_working_reddit_feed(session: aiohttp.ClientSession, subreddit: s
                         f"eddrit feed OK: r/{subreddit} -> "
                         f"{len(eddrit_feed.entries)} entries")
                     logging.info(f"Successfully fetched r/{subreddit} from {EDDRIT_BASE}")
+                    FEED_SOURCE_BY_SUB[subreddit] = EDDRIT_BASE
                     return eddrit_feed
             except Exception as e:
                 logging.error(
@@ -7173,6 +7340,11 @@ async def main():
             except Exception:
                 pass
 
+            # Round 98: keys Reddit's OWN feed listed this run. Initialised here,
+            # not inside the feed branch, because TEST POST mode bypasses the
+            # feed entirely and still runs the delivery loop below.
+            native_keys = set()
+
             # ---- TEST POST mode (round 12): rebuild one specific post --------
             if TEST_POST_ID:
                 logging.info(f"TEST POST mode: {TEST_POST_ID} (dry_run={DRY_RUN}) — "
@@ -7187,7 +7359,13 @@ async def main():
                 combined = await fetch_combined_feed(session)
                 new_posts = []  # (subreddit, path, unique_key, published_ts, activity_ts, entry)
 
-                def collect(entries, known_subreddit: str | None):
+                # Round 98: `provenance` records WHERE the entries came from so the
+                # stale-snapshot override can insist on Reddit's OWN feed. Only the
+                # combined feed and reddit.com's per-subreddit feed are
+                # "reddit-native"; proxies (redlib/eddrit) and the archive can never
+                # build the listing streak that unlocks the override.
+                def collect(entries, known_subreddit: str | None,
+                            provenance: str = "proxy"):
                     for entry in entries:
                         raw_link = str(getattr(entry, "link", ""))
                         path = normalize_reddit_path(raw_link)
@@ -7213,6 +7391,8 @@ async def main():
                         activity_ts = max(published_ts, updated_ts)
                         if not is_first_run and (now - activity_ts > MAX_AGE_SECONDS):
                             continue
+                        if provenance == "reddit-native":
+                            native_keys.add(unique_key)
                         new_posts.append((sub, path, unique_key, published_ts, activity_ts, entry))
 
                 if combined and combined.entries is not None:
@@ -7248,7 +7428,8 @@ async def main():
                         entries = combined.entries or []
                     # Only collect from combined feed (RSS) here; archive is separate
                     if entries:
-                        collect(entries, None)
+                        # Reddit's own listing → trustworthy "this post is live".
+                        collect(entries, None, provenance="reddit-native")
                     # Fallback not attempted when combined succeeded (even if empty)
                     run_stats["fallback_status"] = "not_attempted"
                     run_stats["fallback_entries"] = None
@@ -7281,7 +7462,11 @@ async def main():
                                 fallback_covered.add(subreddit)
                                 fallback_entries_total += len(feed.entries)
                                 entries = [feed.entries[0]] if is_first_run else feed.entries
-                                collect(entries, subreddit)
+                                collect(entries, subreddit,
+                                        provenance=("reddit-native"
+                                                    if "reddit.com" in
+                                                    str(FEED_SOURCE_BY_SUB.get(subreddit, ""))
+                                                    else "proxy"))
                             else:
                                 # empty feed: no candidates, but subreddit was successfully read (coverage)
                                 fallback_covered.add(subreddit)
@@ -7371,6 +7556,100 @@ async def main():
                     run_stats["combined_subreddits_covered"] = subreddits_represented_val
                     run_stats["subreddits_represented"] = subreddits_represented_val
                 run_stats["combined_fetch_status"] = combined_fetch_status
+
+            # Round 98: keep the "listed by Reddit's own feed" streak current.
+            # Runs before the pipeline so the stale-snapshot override sees THIS
+            # run's evidence, and before the reclaim scan so a key the feed
+            # listed is never reclaimed (the normal path handles it).
+            _bump_native_streak(pending, native_keys)
+
+            # ---- round 98: reclaim held posts that no source lists any more ----
+            # A held key is only re-probed while SOME source still returns it.
+            # Once it drops out of both the feed and the archive sweep its
+            # `last_checked` freezes and it is never examined again (live:
+            # HonkaiStarRail_leaks_1xjdkwf sat frozen for 3 h while the post was
+            # fine). One batched archive lookup (<= RECLAIM_MAX_PER_RUN ids)
+            # re-reads the record: clean -> re-admitted into the normal pipeline
+            # below (dedup, both live gates, fresh hold, flood cap); still
+            # removed -> `last_checked` refreshed and it stays held. Selection is
+            # `_reclaim_due`; any archive error is a no-op (fail-open).
+            reclaim_sources = {}
+            if not is_first_run and not TEST_POST_ID:
+                _seen_keys = {p[2] for p in new_posts}
+                _reclaim_keys = _reclaim_due(pending, _seen_keys, now,
+                                             RECLAIM_MAX_PER_RUN)
+                # A key left behind by a subreddit that is no longer tracked would
+                # reach a missing webhook (an ERROR log line every tick). Drop it
+                # here, before it costs an archive request.
+                _unknown_subs = {k for k in _reclaim_keys
+                                 if k.rpartition("_")[0] not in SUBREDDITS}
+                if _unknown_subs:
+                    _reclaim_keys = [k for k in _reclaim_keys
+                                     if k not in _unknown_subs]
+                    run_stats["reclaim_skipped_unknown_sub"] = len(_unknown_subs)
+                    logging.info(f"reclaim: {len(_unknown_subs)} held key(s) belong to "
+                                 f"subreddits no longer tracked — left alone.")
+                if _reclaim_keys:
+                    _reclaim_posts = await fetch_arctic_posts_by_ids(
+                        session, [k.rpartition("_")[2] for k in _reclaim_keys],
+                        label="reclaim")
+                    run_stats["reclaim_checked"] = len(_reclaim_keys)
+                    for _rkey in _reclaim_keys:
+                        _rsub, _, _rpid = _rkey.rpartition("_")
+                        _raw_rec = pending.get(_rkey)
+                        _rrec = _raw_rec if isinstance(_raw_rec, dict) else {}
+                        _rpost = _reclaim_posts.get(_rpid)
+                        _outcome = "no_record"
+                        _rpost_sub = str((_rpost or {}).get("subreddit") or "") \
+                            if isinstance(_rpost, dict) else ""
+                        if isinstance(_rpost, dict) and _rpost_sub and _rpost_sub != _rsub:
+                            # The record's own subreddit disagrees with the key:
+                            # never risk posting into the wrong channel.
+                            _outcome = "sub_mismatch"
+                        elif isinstance(_rpost, dict):
+                            _rtitle = str(_rpost.get("title") or "")
+                            _rbody = str(_rpost.get("selftext") or "")
+                            try:
+                                _rpub = (float(_rpost.get("created_utc") or 0)
+                                         or float(_rrec.get("published_ts") or 0))
+                            except (TypeError, ValueError):
+                                _rpub = 0.0
+                            if _rpub > 0 and _rpub > now:
+                                # Clock skew in the record: never post a "future"
+                                # post (the fresh-age floor would hold it forever).
+                                _rpub = now
+                            _rremoved = removed_post_reason(_rtitle, _rbody)
+                            _rpath = normalize_reddit_path(
+                                str(_rpost.get("permalink") or ""))
+                            if _rpub <= 0:
+                                # No usable timestamp: do not guess. The hold
+                                # stands and the 48 h window still governs it.
+                                _outcome = "no_timestamp"
+                            elif _rremoved:
+                                # Still not live: refresh the clock but KEEP the
+                                # original reason, so a `removal_notice` hold is
+                                # never silently downgraded into a retry loop.
+                                mark_pending(pending, _rkey,
+                                             str(_rrec.get("reason") or "not_live"),
+                                             now,
+                                             title=_rtitle[:200] or None,
+                                             published_ts=_rpub)
+                                run_stats["reclaim_held"] += 1
+                                _outcome = f"still_removed:{_rremoved}"
+                            elif not _rpath or now - _rpub > MAX_AGE_SECONDS:
+                                _outcome = "outside_window"
+                            else:
+                                _rsrc = str(_rrec.get("source") or "arctic")
+                                reclaim_sources[_rkey] = ("rss" if _rsrc == "rss"
+                                                          else "arctic")
+                                new_posts.append((_rsub, _rpath, _rkey, _rpub,
+                                                  _rpub, _ArcticEntry(_rpost)))
+                                run_stats["reclaim_clean"] += 1
+                                _outcome = "re_admitted"
+                        _note_key(run_stats, "reclaim_keys",
+                                  {"key": _rkey, "outcome": _outcome})
+                        logging.info(f"[{_rkey}] reclaim probe: {_outcome} "
+                                     f"(held as {_rrec.get('reason') or 'unknown'}).")
 
             total_found = len(new_posts)
             run_stats["unposted_candidates_considered"] = total_found
@@ -7523,6 +7802,10 @@ async def main():
                 reddit_url = f"https://www.reddit.com{path}"
                 _entry_source36 = ("arctic" if isinstance(entry, _ArcticEntry)
                                    else "rss")
+                # Round 98: a reclaimed post keeps the provenance it was held
+                # under (the archive record is only the re-read, not the origin).
+                if unique_key in reclaim_sources:
+                    _entry_source36 = reclaim_sources[unique_key]
 
                 # pending with RSS re-appearance: eligible for reconsideration via RSS
                 if (unique_key in pending
@@ -7677,7 +7960,25 @@ async def main():
                         session, key=unique_key, path=path,
                         post_json=post_json, entry=entry)
                     _note_liveness(_ls, _lwhy, _lsrc, run_stats)
-                    if liveness_hold_decision(_ls, REDDIT_LIVENESS_STRICT):
+                    # Round 98: a SNAPSHOT that says "removed" is overruled when
+                    # Reddit's own listing has carried the post for
+                    # STALE_SNAPSHOT_TICKS runs in a row — the record was captured
+                    # while the post sat in the mod queue and was approved since.
+                    _stale_override = (_ls == "removed" and _stale_snapshot_override(
+                        _ls, unique_key, native_keys, pending, source=_lsrc))
+                    if _stale_override:
+                        run_stats["stale_snapshot_overrides"] += 1
+                        _note_key(run_stats, "stale_snapshot_keys",
+                                  {"key": unique_key,
+                                   "archive_reason": _lwhy,
+                                   "rss_seen": int((pending.get(unique_key) or {})
+                                                   .get("rss_seen") or 0)})
+                        logging.info(f"[{unique_key}] archive snapshot says removed "
+                                     f"({_lwhy}) but Reddit's own feed has listed it "
+                                     f"{(pending.get(unique_key) or {}).get('rss_seen')} "
+                                     f"run(s) in a row — snapshot treated as stale.")
+                    if (liveness_hold_decision(_ls, REDDIT_LIVENESS_STRICT)
+                            and not _stale_override):
                         # Deliberately NOT `_lwhy`: the archive record is a
                         # SNAPSHOT, so a removal it reports may since have been
                         # reversed. The existing never-re-check reasons are for

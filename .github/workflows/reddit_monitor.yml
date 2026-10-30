@@ -458,6 +458,19 @@ jobs:
               total = data.get("liveness_not_verified")
               if isinstance(total, int) and total > shown:
                   print(f"  - … {total - shown} more held post(s) not shown")
+          line("Stale-snapshot overrides", "stale_snapshot_overrides")
+          for s in (data.get("stale_snapshot_keys") or [])[:10]:
+              if isinstance(s, dict) and s.get("key"):
+                  print(f"  - overridden: {s.get('key')} — archive said "
+                        f"'{str(s.get('archive_reason') or '')[:60]}', listed "
+                        f"{num(s.get('rss_seen'), '')} run(s) in Reddit's own feed")
+          line("Held posts re-probed", "reclaim_checked")
+          if data.get("reclaim_checked"):
+              print(f"  - re-admitted: {num(data.get('reclaim_clean'), '')} | "
+                    f"still removed: {num(data.get('reclaim_held'), '')}")
+          for r in (data.get("reclaim_keys") or [])[:10]:
+              if isinstance(r, dict) and r.get("key"):
+                  print(f"  - probe: {r.get('key')} — {str(r.get('outcome') or '?')[:60]}")
           for label, key in (("Media-wait", "media_wait"), ("Partial-gallery", "partial_gallery"),
                              ("Flood-cap dropped", "flood_cap_dropped"),
                              ("Dedup skipped in run", "dedup_skipped_in_run"),
