@@ -8,6 +8,8 @@ posted_tweets.json
 posted_reddit.json
 proxy_health.json
 pending_reddit.json
+# Round 100: X media-heal carry-over records; force-added by the Twitter workflow.
+media_heal_carry.json
 # Reddit retraction and durable long-body delivery state; force-added by the workflow.
 posted_messages.json
 # Same-directory atomic-save scratch files (may remain after process termination).

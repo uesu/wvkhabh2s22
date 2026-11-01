@@ -122,6 +122,10 @@ jobs:
           MEDIA_HEAL_DELAY_SECONDS: ${{ vars.MEDIA_HEAL_DELAY_SECONDS }}
           MEDIA_HEAL_ATTEMPTS: ${{ vars.MEDIA_HEAL_ATTEMPTS }}
           MEDIA_HEAL_SCOPE: ${{ vars.MEDIA_HEAL_SCOPE }}
+          # Round 100 (2026-11-01): a tile still unresolved after the in-run
+          # edits is carried over (media_heal_carry.json) and re-edited once
+          # per run until it renders or this many hours pass. 0 = off.
+          MEDIA_HEAL_CARRY_HOURS: ${{ vars.MEDIA_HEAL_CARRY_HOURS }}
         # ───────────────────────────────────────────────────────────────────
         # TESTING AREA (how updates ship):
         # • A new/changed script lives in "testing area/" FIRST (e.g.
@@ -155,6 +159,7 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add -f posted_tweets.json
+          if [ -f media_heal_carry.json ]; then git add -f media_heal_carry.json; fi
 
           if git diff --cached --quiet; then
             echo "No cache changes to push."
@@ -173,6 +178,7 @@ jobs:
             # 2026-10-03 Reddit collision into a fatal conflict instead).
             ours_dir="$(mktemp -d)"
             if [ -f posted_tweets.json ]; then cp posted_tweets.json "$ours_dir/posted_tweets.json"; fi
+            if [ -f media_heal_carry.json ]; then cp media_heal_carry.json "$ours_dir/media_heal_carry.json"; fi
             pushed=0
             attempts=0
             for attempt in 1 2 3; do
@@ -192,11 +198,12 @@ jobs:
                   break
                 fi
                 git reset --hard FETCH_HEAD
-                if ! python .github/scripts/merge_monitor_caches.py "$ours_dir" . posted_tweets.json; then
+                if ! python .github/scripts/merge_monitor_caches.py "$ours_dir" . posted_tweets.json media_heal_carry.json; then
                   echo "::error::CACHE PUSH RECOVERY FAILED — semantic merge failed; dedup cache was not persisted."
                   break
                 fi
                 git add -f posted_tweets.json
+                if [ -f media_heal_carry.json ]; then git add -f media_heal_carry.json; fi
                 if git diff --cached --quiet; then
                   echo "Live tip already contains our cache state — nothing left to push."
                   pushed=1

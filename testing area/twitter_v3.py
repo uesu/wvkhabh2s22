@@ -94,6 +94,17 @@
 #         (probe_gif_candidates) and the remembered AVIF is reused, so the
 #         last-resort path adds at most the 2 AVIF-route HEADs. Healthy
 #         FxTwitter media costs no extra request and no delay.
+#   • ROUND 100 (2026-11-01): MEDIA-HEAL CARRY-OVER. Live #12739: an 813 MB
+#     4K clip was correctly downgraded to its 235 MB 1080p rendition, but the
+#     four in-run identical edits (~3 min) could not make Discord's proxy
+#     resolve the tile — the SAME identical edit, made by hand ~45 min later,
+#     made it play. heal_unresolved_media() now returns what it could not
+#     heal; carry_over_media_heal() records it in media_heal_carry.json
+#     (account + message id + identical payload, never a webhook URL; the
+#     workflow commits it beside posted_tweets.json) and every later run
+#     gives each carried message one GET and at most ONE identical edit until
+#     it resolves or MEDIA_HEAL_CARRY_HOURS (default 6, 0 = off) have passed.
+#     Video size caps, the in-run heal bounds and the card are unchanged.
 # ---------------------------------------------------------------------------
 import os
 import re
@@ -529,6 +540,25 @@ MEDIA_HEAL_DELAY_SECONDS = _env_int("MEDIA_HEAL_DELAY_SECONDS", 45)
 # this is a maximum, not a fixed wait. The hard cap keeps a mis-set Variable
 # from creating an unbounded workflow run.
 MEDIA_HEAL_ATTEMPTS = min(4, max(1, _env_int("MEDIA_HEAL_ATTEMPTS", 4)))
+# ---------------------------------------------------------------------------
+# ■ ROUND 100 (2026-11-01): MEDIA-HEAL CARRY-OVER — THE HEAL OUTLIVES THE RUN
+# Live #12739 (Wuthering_Waves/2116847734669873623, 813 MB 4K clip correctly
+# downgraded to its 235 MB 1080p rendition): the four in-run edits (~3 min)
+# were not enough — Discord's proxy had still not resolved the tile — yet the
+# SAME identical edit, made by hand ~45 min later, made the video play. The
+# proxy was merely cold for longer than one run can wait. So a message that
+# is still unresolved when the in-run heal gives up is recorded in
+# MEDIA_HEAL_PENDING_FILE (media_heal_carry.json — committed with the dedup
+# cache; the name deliberately avoids "pending" so merge_monitor_caches.py's
+# hygiene rule never drops its keys, which ARE dedup keys) and every later
+# run re-checks it: one GET (resolved on its own? dropped), else ONE
+# identical edit, until it resolves or MEDIA_HEAL_CARRY_HOURS have passed.
+# Only the ACCOUNT is stored (the webhook is re-read from the environment on
+# the next run), the message id and the identical payload — never a webhook
+# URL. 0 = off (pre-round-100 behaviour: warn and forget).
+MEDIA_HEAL_CARRY_HOURS = max(0, _env_int("MEDIA_HEAL_CARRY_HOURS", 6))
+MEDIA_HEAL_PENDING_FILE = "media_heal_carry.json"
+MEDIA_HEAL_CARRY_MAX_PER_RUN = 20   # sanity bound on carried messages per run
 # ---------------------------------------------------------------------------
 # ■ ROUND 56 (2026-10-02): MEDIA-HEAL SCOPE — VIDEOS ONLY BY DEFAULT
 # The only confirmed broken tile in production was a VIDEO (round 47,
@@ -1178,7 +1208,7 @@ def heal_eligible_items(message: dict | None) -> list:
     return [u for u in items if is_video_media_url(u)]
 
 
-async def heal_unresolved_media(session: aiohttp.ClientSession, pending: list) -> None:
+async def heal_unresolved_media(session: aiohttp.ClientSession, pending: list) -> list:
     """Round 47: re-edit messages whose media Discord left unresolved.
 
     `pending` is a list of (webhook_url, message_id, payload, key) tuples
@@ -1189,9 +1219,14 @@ async def heal_unresolved_media(session: aiohttp.ClientSession, pending: list) -
 
     Every message is healed CONCURRENTLY and only after the posting loop has
     finished, so this never delays a post.
+
+    ROUND 100: returns the tuples whose media was STILL unresolved when the
+    bounded edits ran out (empty when everything resolved, was skipped or
+    stopped for a terminal reason) — carry_over_media_heal() records them so
+    the next runs keep trying.
     """
     if not (MEDIA_HEAL and MEDIA_HEAL_SCOPE != "off" and pending):
-        return
+        return []
 
     async def heal_one(webhook_url, message_id, payload, key):
         url = f"{webhook_url}/messages/{message_id}?with_components=true"
@@ -1233,12 +1268,171 @@ async def heal_unresolved_media(session: aiohttp.ClientSession, pending: list) -
             logging.info(f"MEDIA-HEAL {key}: still unresolved after edit "
                          f"#{attempt} ({len(still_bad)} item(s)).")
         logging.warning(f"MEDIA-HEAL {key}: media still unresolved after "
-                        f"{MEDIA_HEAL_ATTEMPTS} edit(s); playback remains unverified.")
+                        f"{MEDIA_HEAL_ATTEMPTS} edit(s); playback remains unverified"
+                        + (" — carried over to the next runs." if MEDIA_HEAL_CARRY_HOURS
+                           else "."))
+        return (webhook_url, message_id, payload, key)
 
     logging.info(f"MEDIA-HEAL: {len(pending)} message(s) posted with unresolved "
                  f"media — re-editing each in {MEDIA_HEAL_DELAY_SECONDS}s.")
-    await asyncio.gather(*[heal_one(*item) for item in pending],
-                         return_exceptions=True)
+    results = await asyncio.gather(*[heal_one(*item) for item in pending],
+                                   return_exceptions=True)
+    return [r for r in results if isinstance(r, tuple)]
+
+
+# ---------------------------------------------------------------------------
+# ■ ROUND 100: MEDIA-HEAL CARRY-OVER (state file + per-run pass)
+# ---------------------------------------------------------------------------
+def load_media_heal_pending(path: str | None = None) -> dict:
+    """The carried-over heal records: {key: record}. {} when absent/invalid."""
+    path = path or MEDIA_HEAL_PENDING_FILE
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logging.warning(f"MEDIA-HEAL CARRY: {path} unreadable ({e}); starting empty.")
+        return {}
+
+
+def save_media_heal_pending(records: dict, path: str | None = None) -> bool:
+    """Write the records sorted and indented (byte-stable: a quiet run creates
+    no cache commit). The file is written even when empty so the workflow's
+    `git add` always finds it."""
+    path = path or MEDIA_HEAL_PENDING_FILE
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(records, f, indent=2, sort_keys=True, ensure_ascii=False)
+            f.write("\n")
+        return True
+    except Exception as e:
+        logging.error(f"MEDIA-HEAL CARRY: could not save {path}: {e}")
+        return False
+
+
+def media_heal_record(message_id, payload, key: str, now: int) -> dict:
+    """A carry-over record. Holds the ACCOUNT (the webhook is re-read from the
+    environment next run via get_webhook_for_account), never a webhook URL.
+    `first_seen`/`last_checked` are what merge_monitor_caches.py keys on."""
+    account = key.rsplit("_", 1)[0] if "_" in key else key
+    return {"account": account, "message_id": str(message_id), "payload": payload,
+            "first_seen": int(now), "last_checked": int(now), "runs": 0}
+
+
+def _record_is_sane(record) -> bool:
+    return (isinstance(record, dict) and isinstance(record.get("payload"), dict)
+            and bool(record.get("message_id")) and bool(record.get("account")))
+
+
+async def carry_over_media_heal(session: aiohttp.ClientSession, records: dict,
+                                leftovers: list, now: int | None = None) -> dict:
+    """ROUND 100: one carry-over pass. Returns the records to persist.
+
+    For every record from EARLIER runs (oldest first, at most
+    MEDIA_HEAL_CARRY_MAX_PER_RUN):
+      • older than MEDIA_HEAL_CARRY_HOURS          -> dropped (warning)
+      • no webhook for its account any more        -> dropped
+      • GET 200 and no unresolved eligible media   -> resolved on its own, dropped
+      • GET 401/403/404 (deleted, token changed)   -> dropped
+      • otherwise ONE identical edit; resolved?    -> dropped (logged with the age)
+        still unresolved / transient error         -> kept for the next run
+    Then this run's `leftovers` (from heal_unresolved_media) are added as new
+    records. With MEDIA_HEAL_CARRY_HOURS=0 nothing is added or processed and
+    the existing records are returned untouched. `records` is not mutated.
+    """
+    now = int(now if now is not None else time.time())
+    kept = {k: v for k, v in (records or {}).items() if _record_is_sane(v)}
+    if MEDIA_HEAL_CARRY_HOURS <= 0 or not (MEDIA_HEAL and MEDIA_HEAL_SCOPE != "off"):
+        return kept
+    window = MEDIA_HEAL_CARRY_HOURS * 3600
+    queue = sorted(kept.items(), key=lambda kv: kv[1].get("first_seen", 0))
+    outcome: dict = {"resolved": 0, "healed": 0, "gave_up": 0, "dropped": 0, "kept": 0}
+
+    async def carry_one(key, record):
+        age_min = (now - int(record.get("first_seen") or now)) / 60
+        if now - int(record.get("first_seen") or now) > window:
+            logging.warning(f"MEDIA-HEAL CARRY {key}: still unresolved after "
+                            f"{record.get('runs', 0)} carried run(s) / {age_min:.0f} min — "
+                            f"giving up (MEDIA_HEAL_CARRY_HOURS={MEDIA_HEAL_CARRY_HOURS}).")
+            outcome["gave_up"] += 1
+            return None
+        webhook_url = get_webhook_for_account(record["account"])
+        if not webhook_url:
+            logging.warning(f"MEDIA-HEAL CARRY {key}: no webhook for {record['account']} — dropped.")
+            outcome["dropped"] += 1
+            return None
+        url = f"{webhook_url}/messages/{record['message_id']}?with_components=true"
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as current:
+                if current.status == 200:
+                    message = await current.json()
+                    if (isinstance(message, dict) and isinstance(message.get("components"), list)
+                            and not heal_eligible_items(message)):
+                        logging.info(f"MEDIA-HEAL CARRY {key}: resolved on its own "
+                                     f"({age_min:.0f} min after posting) — done.")
+                        outcome["resolved"] += 1
+                        return None
+                elif current.status in (401, 403, 404):
+                    logging.info(f"MEDIA-HEAL CARRY {key}: message GET HTTP {current.status} "
+                                 f"(deleted or webhook changed) — dropped.")
+                    outcome["dropped"] += 1
+                    return None
+        except Exception as e:
+            logging.info(f"MEDIA-HEAL CARRY {key}: revalidation unavailable ({e}); editing anyway.")
+        updated = dict(record, last_checked=now, runs=int(record.get("runs") or 0) + 1)
+        try:
+            async with session.patch(url, json=record["payload"]) as resp:
+                if resp.status in (401, 403, 404):
+                    logging.info(f"MEDIA-HEAL CARRY {key}: edit HTTP {resp.status} — dropped.")
+                    outcome["dropped"] += 1
+                    return None
+                if resp.status != 200:
+                    body = await resp.text()
+                    logging.error(f"MEDIA-HEAL CARRY {key}: edit HTTP {resp.status} "
+                                  f"({body[:200]}); will retry next run.")
+                    outcome["kept"] += 1
+                    return updated
+                edited = await resp.json()
+        except Exception as e:
+            logging.error(f"MEDIA-HEAL CARRY {key}: edit error {e}; will retry next run.")
+            outcome["kept"] += 1
+            return updated
+        if not heal_eligible_items(edited):
+            logging.info(f"MEDIA-HEAL CARRY {key}: media resolved after carried edit "
+                         f"#{updated['runs']} ({age_min:.0f} min after posting) — the media now renders.")
+            outcome["healed"] += 1
+            return None
+        logging.info(f"MEDIA-HEAL CARRY {key}: still unresolved after carried edit "
+                     f"#{updated['runs']} ({age_min:.0f} min); next run tries again.")
+        outcome["kept"] += 1
+        return updated
+
+    result: dict = {}
+    if queue:
+        active = queue[:MEDIA_HEAL_CARRY_MAX_PER_RUN]
+        for key, record in queue[MEDIA_HEAL_CARRY_MAX_PER_RUN:]:
+            result[key] = record  # beyond this run's bound: untouched, next run
+        answers = await asyncio.gather(*[carry_one(k, r) for k, r in active],
+                                       return_exceptions=True)
+        for (key, record), answer in zip(active, answers):
+            if isinstance(answer, dict):
+                result[key] = answer
+            elif isinstance(answer, BaseException):
+                logging.error(f"MEDIA-HEAL CARRY {key}: {answer!r}; kept for the next run.")
+                result[key] = record
+        logging.info(f"MEDIA-HEAL CARRY: {len(active)} carried message(s) checked — "
+                     f"{outcome['resolved']} resolved on their own, {outcome['healed']} healed "
+                     f"by this run's edit, {outcome['kept']} still pending, "
+                     f"{outcome['gave_up']} given up, {outcome['dropped']} dropped.")
+    for webhook_url, message_id, payload, key in leftovers or []:
+        if key in result:
+            continue
+        result[key] = media_heal_record(message_id, payload, key, now)
+        logging.info(f"MEDIA-HEAL CARRY {key}: recorded for the next runs "
+                     f"(up to {MEDIA_HEAL_CARRY_HOURS} h).")
+    return result
 
 
 async def collect_media(session: aiohttp.ClientSession, tweet_like: dict) -> tuple[list, list]:
@@ -2054,7 +2248,13 @@ async def main():
                         logging.error(f"Discord error {resp.status} for {unique_key}: {body}")
 
         # Round 47: self-heal AFTER every post of this run — never before.
-        await heal_unresolved_media(session, heal_queue)
+        heal_leftovers = await heal_unresolved_media(session, heal_queue)
+        # Round 100: messages still unresolved are carried to the next runs
+        # (and messages carried from earlier runs get their one edit now).
+        carried = load_media_heal_pending()
+        if carried or heal_leftovers:
+            carried = await carry_over_media_heal(session, carried, heal_leftovers)
+        save_media_heal_pending(carried)
 
     saved = save_posted_urls(posted_urls, frozenset(posted_urls - posted_urls_at_start))
     missing = (posted_urls - posted_urls_at_start) - saved

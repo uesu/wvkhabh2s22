@@ -638,6 +638,216 @@ check("r73 heal: the POST still asks for the created message (wait=true)",
 
 
 # ===========================================================================
+# 4b. ROUND 100 — the heal outlives the run (carry-over, 2026-11-01)
+# ===========================================================================
+print("\n--- 4b. media-heal carry-over (round 100) ---")
+import tempfile  # noqa: E402
+
+# Live #12739: the 235 MB 1080p rendition of an 813 MB clip never resolved
+# within the four in-run edits, but the SAME identical edit made by hand
+# ~45 minutes later made it play. The carry-over keeps editing across runs.
+_U1080 = ("https://video.twimg.com/amplify_video/2116341933144698881/vid/avc1/1920x1080/"
+          "KQTNFf7vricoapOP.mp4?tag=29")
+_WEBHOOK = "https://discord.com/api/webhooks/1/abc"
+_KEY = "Wuthering_Waves_2116847734669873623"
+_CARD = {"flags": 32768, "components": [{"type": 17, "components": [
+    {"type": 10, "content": "### [Wuthering Waves](https://x.com/Wuthering_Waves) just tweeted:"},
+    {"type": 12, "items": [{"media": {"url": _U1080}}]},
+    {"type": 10, "content": "🔽 Original video is ~813 MB — showing a smaller version (~235 MB) "
+                            "so it plays in Discord."}]}]}
+_COLD_1080 = {"id": "999", "components": [{"type": 17, "components": [{"type": 12, "items": [
+    {"media": {"url": _U1080, "width": 0, "height": 0, "content_type": ""}}]}]}]}
+_WARM_1080 = {"id": "999", "components": [{"type": 17, "components": [{"type": 12, "items": [
+    {"media": {"url": _U1080, "proxy_url": "https://images-ext-1.discordapp.net/external/y",
+               "width": 1920, "height": 1080, "content_type": "video/mp4"}}]}]}]}
+_NOW = 1_800_000_000
+
+
+def _carry(session, records, leftovers, now=_NOW):
+    return asyncio.run(x3.carry_over_media_heal(session, records, leftovers, now=now))
+
+
+check("r100 config: carry-over defaults to 6 h, the state file is media_heal_carry.json, "
+      "at most 20 carried messages per run",
+      (x3.MEDIA_HEAL_CARRY_HOURS, x3.MEDIA_HEAL_PENDING_FILE, x3.MEDIA_HEAL_CARRY_MAX_PER_RUN)
+      == (6, "media_heal_carry.json", 20))
+check("r100 config: the state file name avoids 'pending' — merge_monitor_caches.py drops "
+      "pending-dict keys that the posted list covers, and these keys ARE dedup keys",
+      "pending" not in x3.MEDIA_HEAL_PENDING_FILE)
+check("r100 config: in-run heal defaults are untouched (45 s x 4, video scope)",
+      (x3.MEDIA_HEAL_DELAY_SECONDS, x3.MEDIA_HEAL_ATTEMPTS, x3.MEDIA_HEAL_SCOPE) == (45, 4, "video"))
+
+_real_delay, _real_hook = x3.MEDIA_HEAL_DELAY_SECONDS, x3.DEFAULT_WEBHOOK_URL
+try:
+    x3.MEDIA_HEAL_DELAY_SECONDS = 0
+    x3.DEFAULT_WEBHOOK_URL = _WEBHOOK
+
+    # --- heal_unresolved_media now reports what it could not heal ---
+    _s = _Session(patch_replies=[_COLD_1080] * 10)
+    _left = asyncio.run(x3.heal_unresolved_media(_s, [(_WEBHOOK, "999", _CARD, _KEY)]))
+    check("r100 heal: the bounded in-run edits are unchanged (4 identical PATCHes) and the "
+          "still-unresolved message is RETURNED instead of forgotten",
+          len(_s.patches) == 4 and _left == [(_WEBHOOK, "999", _CARD, _KEY)], str(_left))
+    _s = _Session(patch_replies=[_COLD_1080, _WARM_1080])
+    check("r100 heal: a message that resolves on an identical edit is not returned",
+          asyncio.run(x3.heal_unresolved_media(_s, [(_WEBHOOK, "999", _CARD, _KEY)])) == []
+          and len(_s.patches) == 2)
+    _s = _Session(message_reply=_WARM_1080, message_status=200)
+    check("r100 heal: resolved during the wait -> nothing returned, nothing edited",
+          asyncio.run(x3.heal_unresolved_media(_s, [(_WEBHOOK, "999", _CARD, _KEY)])) == []
+          and _s.patches == [])
+    _s = _Session(message_status=404)
+    check("r100 heal: a deleted message (GET 404) is not carried over",
+          asyncio.run(x3.heal_unresolved_media(_s, [(_WEBHOOK, "999", _CARD, _KEY)])) == [])
+    check("r100 heal: an empty queue returns an empty list",
+          asyncio.run(x3.heal_unresolved_media(_Session(), [])) == [])
+
+    # --- recording this run's leftovers ---
+    _s = _Session()
+    _recs = _carry(_s, {}, [(_WEBHOOK, "999", _CARD, _KEY)])
+    check("r100 carry: a leftover becomes a record holding the ACCOUNT, message id, identical "
+          "payload and timestamps — and no request is made for it this run",
+          _recs == {_KEY: {"account": "Wuthering_Waves", "message_id": "999", "payload": _CARD,
+                           "first_seen": _NOW, "last_checked": _NOW, "runs": 0}}
+          and _s.requests == [] and _s.patches == [], str(_recs))
+    check("r100 carry: the record never contains the webhook URL (the file is committed to the repo)",
+          "discord.com/api/webhooks" not in json.dumps(_recs) and _WEBHOOK not in json.dumps(_recs))
+    check("r100 carry: the account is the key minus the numeric tweet id (underscored names survive)",
+          x3.media_heal_record("1", {}, "Wuthering_Waves_2116847734669873623", _NOW)["account"]
+          == "Wuthering_Waves"
+          and x3.media_heal_record("1", {}, "Ananta_EN_1", _NOW)["account"] == "Ananta_EN")
+
+    # --- the next run: the carried message gets ONE identical edit ---
+    _later = _NOW + 10 * 60
+    _s = _Session(message_reply=_COLD_1080, message_status=200, patch_replies=[_WARM_1080])
+    _out = _carry(_s, _recs, [], now=_later)
+    check("r100 carry: next run = one GET, still cold -> one IDENTICAL edit -> resolved -> record dropped",
+          _out == {} and len(_s.urls("GET")) == 1
+          and _s.patches == [(f"{_WEBHOOK}/messages/999?with_components=true", _CARD)],
+          str((_out, _s.requests, _s.patches)))
+    _s = _Session(message_reply=_COLD_1080, message_status=200, patch_replies=[_COLD_1080])
+    _out = _carry(_s, _recs, [], now=_later)
+    check("r100 carry: still cold after the carried edit -> kept with runs=1 and a fresh last_checked "
+          "(first_seen untouched) — exactly one edit this run",
+          _out == {_KEY: dict(_recs[_KEY], runs=1, last_checked=_later)} and len(_s.patches) == 1,
+          str(_out))
+    _s = _Session(message_reply=_WARM_1080, message_status=200)
+    _out = _carry(_s, _recs, [], now=_later)
+    check("r100 carry: resolved on its own by the next run -> dropped after the GET, no edit",
+          _out == {} and len(_s.urls("GET")) == 1 and _s.patches == [])
+    for _status in (401, 403, 404):
+        _s = _Session(message_status=_status)
+        check(f"r100 carry: GET {_status} (deleted message / changed webhook) -> dropped, no edit",
+              _carry(_s, _recs, [], now=_later) == {} and _s.patches == [])
+    _s = _Session(message_reply=_COLD_1080, message_status=200, patch_replies=[_COLD_1080],
+                  patch_status=500)
+    _out = _carry(_s, _recs, [], now=_later)
+    check("r100 carry: a failed edit (HTTP 500) keeps the record for the next run",
+          _out == {_KEY: dict(_recs[_KEY], runs=1, last_checked=_later)}, str(_out))
+    _s = _Session(message_reply=_COLD_1080, message_status=200, patch_replies=[_COLD_1080])
+    _expired = _NOW + x3.MEDIA_HEAL_CARRY_HOURS * 3600 + 1
+    check("r100 carry: past MEDIA_HEAL_CARRY_HOURS the record is dropped without any request",
+          _carry(_s, _recs, [], now=_expired) == {} and _s.requests == [] and _s.patches == [])
+    _s = _Session(message_reply=_COLD_1080, message_status=200, patch_replies=[_COLD_1080])
+    _edge = _NOW + x3.MEDIA_HEAL_CARRY_HOURS * 3600
+    check("r100 carry: exactly at the window edge it still gets its edit",
+          len(_s.patches) == 0 and _carry(_s, _recs, [], now=_edge) != {} and len(_s.patches) == 1)
+    x3.DEFAULT_WEBHOOK_URL = None
+    _s = _Session(message_reply=_COLD_1080, message_status=200)
+    check("r100 carry: no webhook for the account any more -> dropped, no request",
+          _carry(_s, _recs, [], now=_later) == {} and _s.requests == [])
+    x3.DEFAULT_WEBHOOK_URL = _WEBHOOK
+    check("r100 carry: malformed records are discarded, sane ones kept",
+          _carry(_Session(message_status=404), {"bad": {"payload": "x"}, "worse": 5,
+                                                 _KEY: _recs[_KEY]}, [], now=_later) == {})
+    check("r100 carry: a key already carried is not re-recorded by the same run's leftovers",
+          _carry(_Session(message_reply=_COLD_1080, message_status=200, patch_replies=[_COLD_1080]),
+                 _recs, [(_WEBHOOK, "999", _CARD, _KEY)], now=_later)[_KEY]["first_seen"] == _NOW)
+    _many = {f"Acc_{i}": dict(_recs[_KEY], first_seen=_NOW + i, last_checked=_NOW + i)
+             for i in range(25)}
+    _s = _Session(message_reply=_COLD_1080, message_status=200, patch_replies=[_COLD_1080] * 25)
+    _out = _carry(_s, _many, [], now=_later)
+    check("r100 carry: at most 20 carried messages are touched per run (oldest first); the rest "
+          "wait untouched",
+          len(_s.patches) == 20 and len(_out) == 25
+          and all(_out[f"Acc_{i}"]["runs"] == 1 for i in range(20))
+          and all(_out[f"Acc_{i}"]["runs"] == 0 for i in range(20, 25)), str(len(_s.patches)))
+
+    # --- the switch ---
+    _real_hours = x3.MEDIA_HEAL_CARRY_HOURS
+    x3.MEDIA_HEAL_CARRY_HOURS = 0
+    _s = _Session(message_reply=_COLD_1080, message_status=200, patch_replies=[_COLD_1080])
+    check("r100 carry: MEDIA_HEAL_CARRY_HOURS=0 -> nothing recorded, nothing touched, existing "
+          "records returned as they are",
+          _carry(_s, {}, [(_WEBHOOK, "999", _CARD, _KEY)]) == {}
+          and _carry(_s, _recs, []) == _recs and _s.requests == [] and _s.patches == [])
+    x3.MEDIA_HEAL_CARRY_HOURS = _real_hours
+
+    # --- the state file ---
+    with tempfile.TemporaryDirectory() as _tmp:
+        _path = os.path.join(_tmp, "media_heal_carry.json")
+        check("r100 file: a missing file loads as {}", x3.load_media_heal_pending(_path) == {})
+        check("r100 file: records round-trip", x3.save_media_heal_pending(_recs, _path)
+              and x3.load_media_heal_pending(_path) == _recs)
+        _first = open(_path, "rb").read()
+        x3.save_media_heal_pending(x3.load_media_heal_pending(_path), _path)
+        check("r100 file: re-saving the same state is byte-identical (a quiet run makes no cache commit)",
+              open(_path, "rb").read() == _first)
+        x3.save_media_heal_pending({}, _path)
+        check("r100 file: an empty state is written as '{}' (the workflow's git add always finds it)",
+              open(_path, "rb").read() == b"{}\n")
+        open(_path, "w").write("not json")
+        check("r100 file: an unreadable file loads as {} instead of crashing the run",
+              x3.load_media_heal_pending(_path) == {})
+        open(_path, "w").write("[1, 2]")
+        check("r100 file: a non-dict file loads as {}", x3.load_media_heal_pending(_path) == {})
+        # The workflow's recovery merge must keep these records even though
+        # their keys are present in posted_tweets.json.
+        import subprocess  # noqa: E402
+        _ours, _repo = os.path.join(_tmp, "ours"), os.path.join(_tmp, "repo")
+        os.makedirs(_ours), os.makedirs(_repo)
+        json.dump([_KEY], open(os.path.join(_ours, "posted_tweets.json"), "w"))
+        json.dump([_KEY, "Other_1"], open(os.path.join(_repo, "posted_tweets.json"), "w"))
+        x3.save_media_heal_pending(_recs, os.path.join(_ours, "media_heal_carry.json"))
+        _older = {_KEY: dict(_recs[_KEY], runs=0, last_checked=_NOW - 600, first_seen=_NOW - 600)}
+        x3.save_media_heal_pending(_older, os.path.join(_repo, "media_heal_carry.json"))
+        _merge = subprocess.run([sys.executable,
+                                 os.path.join(ROOT, ".github", "scripts", "merge_monitor_caches.py"),
+                                 _ours, _repo, "posted_tweets.json", "media_heal_carry.json"],
+                                capture_output=True, text=True)
+        _merged = x3.load_media_heal_pending(os.path.join(_repo, "media_heal_carry.json"))
+        check("r100 file: merge_monitor_caches.py keeps the carried record (newest last_checked wins) "
+              "although its key is in posted_tweets.json",
+              _merge.returncode == 0 and _merged == _recs, f"{_merge.stderr} {_merged}")
+        check("r100 file: the merged file is byte-identical to what the engine writes (no churn)",
+              open(os.path.join(_repo, "media_heal_carry.json"), "rb").read() == _first)
+finally:
+    x3.MEDIA_HEAL_DELAY_SECONDS, x3.DEFAULT_WEBHOOK_URL = _real_delay, _real_hook
+
+_src_r100 = open(os.path.join(ROOT, "testing area", "twitter_v3.py"), encoding="utf-8").read()
+check("r100 wiring: main() heals, then carries over, then saves — after the posting loop",
+      _src_r100.index("heal_leftovers = await heal_unresolved_media(session, heal_queue)")
+      < _src_r100.index("carried = await carry_over_media_heal(session, carried, heal_leftovers)")
+      < _src_r100.index("save_media_heal_pending(carried)")
+      and _src_r100.index("heal_queue.append(")
+      < _src_r100.index("heal_leftovers = await heal_unresolved_media(session, heal_queue)"))
+check("r100 wiring: the state is loaded from the file every run (never only from memory)",
+      "carried = load_media_heal_pending()" in _src_r100)
+check("r100 config: MEDIA_HEAL_CARRY_HOURS is empty-string safe and never negative",
+      'MEDIA_HEAL_CARRY_HOURS = max(0, _env_int("MEDIA_HEAL_CARRY_HOURS", 6))' in _src_r100)
+_wf = open(os.path.join(ROOT, ".github", "workflows", "twitter_monitor.yml"), encoding="utf-8").read()
+check("r100 workflow: MEDIA_HEAL_CARRY_HOURS is wired as a repository Variable",
+      "MEDIA_HEAL_CARRY_HOURS: ${{ vars.MEDIA_HEAL_CARRY_HOURS }}" in _wf)
+check("r100 workflow: the carry file is staged (when present) in the persist step AND its recovery "
+      "path, copied aside before the reset, and merged semantically",
+      _wf.count("if [ -f media_heal_carry.json ]; then git add -f media_heal_carry.json; fi") == 2
+      and 'cp media_heal_carry.json "$ours_dir/media_heal_carry.json"' in _wf
+      and "merge_monitor_caches.py \"$ours_dir\" . posted_tweets.json media_heal_carry.json" in _wf)
+check("r100 workflow: the carry file is git-ignored like the other caches (force-added only)",
+      "media_heal_carry.json" in open(os.path.join(ROOT, ".gitignore"), encoding="utf-8").read())
+
+
+# ===========================================================================
 # 5. NO NEW CONFIGURATION, NO NEW DEPENDENCY ON A VARIABLE
 # ===========================================================================
 print("\n--- 5. configuration and CI wiring ---")

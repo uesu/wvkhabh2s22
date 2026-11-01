@@ -4363,7 +4363,7 @@ _r49b_files = [
 _r49b_names = (
     "PROXY_WAVE_DELAY", "PROXY_GALLERY_GRACE", "PROXY_MAX_CONCURRENCY",
     "MAX_CACHE_SIZE_PER_ACCOUNT", "MAX_CACHE_SIZE_TOTAL",
-    "MEDIA_HEAL_DELAY_SECONDS", "MEDIA_HEAL_ATTEMPTS",
+    "MEDIA_HEAL_DELAY_SECONDS", "MEDIA_HEAL_ATTEMPTS", "MEDIA_HEAL_CARRY_HOURS",
     "MAX_CACHE_SIZE_PER_SUB", "MAX_POSTS_PER_RUN",
     "PENDING_RECHECK_SECONDS",
     "FEEDTOKEN_JSON_STAGGER", "PROXY_MEDIA", "YOUTUBE_LINK_MESSAGE",
@@ -4388,6 +4388,8 @@ try:
     check("r49b: twitter_v3 empty media-heal Variables use defaults",
           (_r49b_twitter.MEDIA_HEAL_DELAY_SECONDS,
            _r49b_twitter.MEDIA_HEAL_ATTEMPTS) == (45, 4))
+    check("r100: twitter_v3 empty MEDIA_HEAL_CARRY_HOURS keeps the 6 h default",
+          _r49b_twitter.MEDIA_HEAL_CARRY_HOURS == 6)
     _r49b_reddit = load_module("smoke_reddit_v3_empty_env", _r49b_files[2])
     check("r49b: reddit_main_v3 imports with empty numeric Variables", True)
     check("r49b: reddit_main_v3 empty cache Variables use defaults",
@@ -11945,6 +11947,53 @@ check("r99: the miss tally is per-run state (cleared with the reach counters) an
       and v3._is_redlib_error_page("Failed to parse page JSON data")
       and v3._redlib_error_marker("<p>Reddit is rate limiting this instance</p>") == "reddit is rate limiting this instance"
       and v3._redlib_error_marker("<article class=\"post_title\">fine</article>") is None)
+
+# ---- Round 100 (2026-11-01): the X media heal outlives the run ----
+# Live #12739: four in-run identical edits (~3 min) could not make Discord
+# resolve a 235 MB 1080p tile; the same identical edit by hand ~45 min later
+# did. Behavioural proofs: tests/test_twitter_media.py section 4b. These
+# guards pin the wiring that production inherits through sync_prod.
+_r100_x = load_module("smoke_x_v3_r100", "testing area/twitter_v3.py")
+_r100_src = open(os.path.join(ROOT, "testing area", "twitter_v3.py"), encoding="utf-8").read()
+_r100_wf = open(os.path.join(ROOT, ".github", "workflows", "twitter_monitor.yml"),
+                encoding="utf-8").read()
+check("r100: carry-over is on by default (6 h), capped at 20 messages/run, state in "
+      "media_heal_carry.json; in-run heal (45 s x 4, video scope) and the 256 MiB cap unchanged",
+      (_r100_x.MEDIA_HEAL_CARRY_HOURS, _r100_x.MEDIA_HEAL_CARRY_MAX_PER_RUN,
+       _r100_x.MEDIA_HEAL_PENDING_FILE) == (6, 20, "media_heal_carry.json")
+      and (_r100_x.MEDIA_HEAL_DELAY_SECONDS, _r100_x.MEDIA_HEAL_ATTEMPTS,
+           _r100_x.MEDIA_HEAL_SCOPE) == (45, 4, "video")
+      and _r100_x.VIDEO_SIZE_LIMIT == 256 * 1024 * 1024)
+check("r100: the Variable is wired in twitter_monitor.yml (round-42 pattern) and the engine "
+      "reads it through _env_int (empty-string safe)",
+      "MEDIA_HEAL_CARRY_HOURS: ${{ vars.MEDIA_HEAL_CARRY_HOURS }}" in _r100_wf
+      and 'MEDIA_HEAL_CARRY_HOURS = max(0, _env_int("MEDIA_HEAL_CARRY_HOURS", 6))' in _r100_src)
+check("r100: the persist step stages, copies aside and semantically merges media_heal_carry.json "
+      "next to posted_tweets.json (both the normal and the recovery path)",
+      _r100_wf.count("if [ -f media_heal_carry.json ]; then git add -f media_heal_carry.json; fi") == 2
+      and _r100_wf.count('cp media_heal_carry.json "$ours_dir/media_heal_carry.json"') == 1
+      and 'merge_monitor_caches.py "$ours_dir" . posted_tweets.json media_heal_carry.json' in _r100_wf
+      and _r100_wf.count("git add -f posted_tweets.json") == 2)
+check("r100: the carry file is git-ignored (force-added by the workflow only) and the ignore "
+      "file reaches production through sync_prod",
+      "media_heal_carry.json" in open(os.path.join(ROOT, ".gitignore"), encoding="utf-8").read()
+      and ".gitignore" in open(os.path.join(ROOT, ".github", "scripts", "sync_prod.py"),
+                               encoding="utf-8").read())
+check("r100: a carry record stores the account, never a webhook URL (the file is committed)",
+      "webhook" not in json.dumps(_r100_x.media_heal_record("1", {"c": 1}, "Ananta_EN_2116000000000000000", 0))
+      and _r100_x.media_heal_record("1", {"c": 1}, "Ananta_EN_2116000000000000000", 0)["account"] == "Ananta_EN"
+      and "get_webhook_for_account(record[\"account\"])" in _r100_src)
+check("r100: the file name avoids merge_monitor_caches.py's 'pending' hygiene rule (its keys are "
+      "dedup keys and would be dropped on every recovery merge)",
+      "pending" not in _r100_x.MEDIA_HEAL_PENDING_FILE
+      and 'isinstance(value, dict) and "pending" in name' in open(
+          os.path.join(ROOT, ".github", "scripts", "merge_monitor_caches.py"), encoding="utf-8").read())
+check("r100: heal_unresolved_media returns the still-unresolved tuples and main() carries them "
+      "over AFTER the in-run heal, then saves the state every run",
+      "return (webhook_url, message_id, payload, key)" in _r100_src
+      and _r100_src.index("heal_leftovers = await heal_unresolved_media(session, heal_queue)")
+      < _r100_src.index("carried = await carry_over_media_heal(session, carried, heal_leftovers)")
+      < _r100_src.index("save_media_heal_pending(carried)"))
 
 # ---- Round 89: no GitHub Actions annotation may leak out of this suite ----
 # Restore the real stdout first, then judge what the suite actually emitted.
