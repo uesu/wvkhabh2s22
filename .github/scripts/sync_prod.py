@@ -24,6 +24,10 @@ Safety guarantees:
      NEWER version is preserved, so a dev-side sync can never downgrade a prod-side Python or
      Dependabot bump. `tests/test_smoke.py`'s r39 CPython pin is re-aligned to the destination
      `ci.yml` afterwards, so the deployed suite keeps matching the deployed workflow.
+  7. Dependabot scope filter (2026-11-01): `.github/dependabot.yml` is copied minus every
+     `updates:` entry whose `directory` does not exist in the destination checkout. The dev
+     repo carries an `npm` entry for `devvit/gaming-express/`, a folder that is deliberately
+     never synced, so production must not inherit a Dependabot job that can only fail.
 """
 
 from __future__ import annotations
@@ -85,6 +89,44 @@ EXCLUDED_DEV_PATHS = (
     ".env.example",
     ".github/workflows/sync_prod.yml",
 )
+
+DEPENDABOT_CONFIG = ".github/dependabot.yml"
+_DEPENDABOT_ENTRY_RE = re.compile(r"^[ \t]+-[ \t]+package-ecosystem:")
+_DEPENDABOT_DIRECTORY_RE = re.compile(r"""^[ \t]+directory:[ \t]*["']?([^"'\s#]+)""")
+
+
+def filter_dependabot_bytes(src: bytes, dst_root: Path) -> bytes:
+    """Return `src` (a dependabot.yml) without `updates:` entries for missing directories.
+
+    Dependabot has no per-entry condition, and production repositories receive only the
+    runtime subset (`SYNC_DIRS`), so an entry such as the dev-only
+    `directory: "/devvit/gaming-express"` npm block would surface in every production
+    repository as a permanently failing Dependabot job. Entries whose `directory` exists
+    under `dst_root` (including `/`) are kept byte-for-byte; the header and the order of
+    the surviving entries are unchanged, and the result is stable across repeated runs.
+    """
+    text = src.decode("utf-8")
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if _DEPENDABOT_ENTRY_RE.match(line)]
+    if not starts:
+        return src
+    out: list[str] = lines[: starts[0]]
+    for begin, end in zip(starts, [*starts[1:], len(lines)]):
+        block = lines[begin:end]
+        keep = True
+        for line in block:
+            match = _DEPENDABOT_DIRECTORY_RE.match(line)
+            if match:
+                rel = match.group(1).strip("/")
+                keep = rel == "" or (dst_root / rel).is_dir()
+                break
+        if keep:
+            out.extend(block)
+    result = "".join(out)
+    if result == text:
+        return src
+    return (result.rstrip("\n") + "\n").encode("utf-8")
+
 
 # Round 91: never let a dev-side sync downgrade a pin production already merged.
 WORKFLOW_PY_PIN_RE = re.compile(r"(python-version:\s*')(\d+\.\d+\.\d+)(')")
@@ -282,6 +324,8 @@ def sync_tree(
         if not spath.is_file():
             continue
         sbytes = spath.read_bytes()
+        if rel_file == DEPENDABOT_CONFIG:
+            sbytes = filter_dependabot_bytes(sbytes, dst_root)
         if not dpath.is_file() or dpath.read_bytes() != sbytes:
             dpath.parent.mkdir(parents=True, exist_ok=True)
             dpath.write_bytes(sbytes)

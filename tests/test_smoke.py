@@ -9492,6 +9492,28 @@ with _sync_tempfile.TemporaryDirectory(prefix="ne-sync-test-") as _sync_tmp:
           and (_prod_dir / "tests" / "test_smoke.py").is_file()
           and (_prod_dir / ".github" / "scripts" / "sync_prod.py").is_file())
 
+    # 2026-11-01 (Devvit relay 0.0.3 follow-up): the dev-only npm Dependabot entry for
+    # devvit/gaming-express must never reach a production checkout (no such folder there),
+    # while the pip + github-actions entries are copied unchanged. The CI `devvit` job is
+    # repository-guarded for the same reason (skipped, not red, in production).
+    _dep_src = (_SyncPath(ROOT) / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+    _dep_prod = (_prod_dir / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+    check("r87 sync_prod: dev dependabot.yml carries the npm entry for /devvit/gaming-express",
+          'package-ecosystem: "npm"' in _dep_src and 'directory: "/devvit/gaming-express"' in _dep_src)
+    check("r87 sync_prod: production dependabot.yml drops the npm entry (folder absent) and keeps pip + actions",
+          'package-ecosystem: "npm"' not in _dep_prod
+          and 'directory: "/devvit/gaming-express"' not in _dep_prod
+          and 'package-ecosystem: "pip"' in _dep_prod
+          and 'package-ecosystem: "github-actions"' in _dep_prod
+          and _dep_prod.endswith('patterns: ["*"]\n'))
+    check("r87 sync_prod: filter_dependabot_bytes keeps the file byte-for-byte when every directory exists",
+          _sync_mod.filter_dependabot_bytes(_dep_src.encode("utf-8"), _SyncPath(ROOT)) == _dep_src.encode("utf-8"))
+    _ci_prod = (_prod_dir / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    check("r87 sync_prod: ci.yml devvit job is guarded to the dev repository (never red in prod)",
+          "  devvit:\n" in _ci_prod
+          and _ci_prod.index("if: github.repository == 'uesu/News-Express'") > _ci_prod.index("  devvit:\n")
+          and "working-directory: devvit/gaming-express" in _ci_prod)
+
     _sync_res2 = _sync_mod.sync_tree(_SyncPath(ROOT), _prod_dir, include_workflows=True)
     check("r87 sync_prod: second sync_tree run is idempotent with zero updates",
           _sync_res2["updated"] == [] and _sync_res2["removed"] == [])

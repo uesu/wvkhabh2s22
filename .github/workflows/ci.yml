@@ -58,6 +58,10 @@ jobs:
   # and bundles before it can be merged — the same gate the owner runs locally
   # (`npm test`) before `npx devvit upload`.
   devvit:
+    # sync_prod.py copies this workflow into both production repositories, which
+    # never receive devvit/ — the job would fail there on every cache commit.
+    # Same guard as sync_prod.yml: dev repository only (skipped, not red, in prod).
+    if: github.repository == 'uesu/News-Express'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
