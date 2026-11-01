@@ -2,8 +2,10 @@
 # analysis > Dependabot alerts & security updates must be ON for security PRs;
 # version updates below work regardless).
 #
-# Weekly check for the pip dependencies (feedparser, aiohttp, python-dotenv)
-# and the GitHub Actions used in the workflows. Each update opens a PULL
+# Weekly check for the pip dependencies (feedparser, aiohttp, python-dotenv),
+# the GitHub Actions used in the workflows, and the npm devDependencies of the
+# Devvit relay app under devvit/gaming-express (devvit CLI, @devvit/web,
+# typescript, esbuild, biome). Each update opens a PULL
 # REQUEST — nothing touches main until you review + merge it (or you enable
 # the opt-in auto-merge workflow — see docs/DEPENDABOT.md). The Actions job
 # reinstalls deps every run, so a merged PR changes behavior on the next
@@ -45,4 +47,19 @@ updates:
       prefix: "deps(actions)"
     groups:
       actions:
+        patterns: ["*"]
+
+  - package-ecosystem: "npm"
+    directory: "/devvit/gaming-express"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "devvit"
+    commit-message:
+      prefix: "deps(devvit)"
+    groups:
+      devvit-deps:              # one PR for all relay devDependency bumps
         patterns: ["*"]
