@@ -11750,6 +11750,170 @@ if _r98_cases:
           and not _c["unknown_sub"]["calls"]
           and _c["unknown_sub"]["stats"].get("reclaim_skipped_unknown_sub") == 1)
 
+# ---- Round 99 (2026-10-31, live 1xkgd9m): megathread format corrections ----
+# The HonkaiStarRail_leaks megathread card showed the spoiler-format example as
+# ">Spoiler Topic" / ">\||spoiler tagged text here||" (an author-ESCAPED
+# `\>!…!<` turned into a broken Discord spoiler, quote lines without the space
+# Discord needs) and the "Previous Megathreads" one-column table as raw
+# "|…|" / "|:-|" lines. The operator-approved card is the reference below.
+print()
+print("=== Round 99: escaped spoilers, Reddit quote spacing, one-column tables ===")
+_r99_md = (
+    "**Make sure any story spoilers are properly tagged using the following format:**\n\n"
+    ">Spoiler Topic\n\n"
+    ">\\>!spoiler tagged text here!<\n\n"
+    ">\\>!separate paragraph of spoiler tagged text!<\n\n"
+    "**Wiki:**\n\n"
+    "* [Honkai Star Rail Fandom Wiki](https://honkai-star-rail.fandom.com/wiki/Honkai:_Star_Rail_Wiki)\n\n"
+    "---\n\n"
+    "|Previous Megathreads|\n"
+    "|:-|\n"
+    "|[Latest Megathread](https://www.reddit.com/r/HonkaiStarRail\\_leaks/comments/1wquywn/x/) - September 27- *October 31*|\n"
+    "| [All Previous Megathreads](https://www.reddit.com/r/HonkaiStarRail_leaks/?f=flair_name%3A%22Megathread%22)|\n"
+)
+_r99_expected = (
+    "**Make sure any story spoilers are properly tagged using the following format:**\n\n"
+    "> Spoiler Topic\n"
+    "> >!spoiler tagged text here!<\n"
+    "> >!separate paragraph of spoiler tagged text!<\n\n"
+    "**Wiki:**\n\n"
+    "* [Honkai Star Rail Fandom Wiki](https://honkai-star-rail.fandom.com/wiki/Honkai:_Star_Rail_Wiki)\n\n"
+    "---\n\n"
+    "Previous Megathreads\n\n"
+    "[Latest Megathread](https://www.reddit.com/r/HonkaiStarRail\\_leaks/comments/1wquywn/x/) - September 27- *October 31*\n\n"
+    "[All Previous Megathreads](https://www.reddit.com/r/HonkaiStarRail_leaks/?f=flair_name%3A%22Megathread%22)"
+)
+
+
+def _r99_card_body(markdown):
+    """The plain-Markdown path (Arctic / JSON selftext) followed by the card-build
+    choke point — exactly the two steps a live body goes through."""
+    return v3._format_markdown_tables(v3._format_quote_blocks(v3._clean_plain_body(markdown)))
+
+
+check("r99: the live 1xkgd9m megathread body renders as the operator-approved card "
+      "(literal escaped spoilers, one quote block, one-column table as a titled list)",
+      _r99_card_body(_r99_md) == _r99_expected, repr(_r99_card_body(_r99_md)))
+# Reddit's rich-text editor exports blank lines between table rows (as it does
+# between list items); the same table with gaps must read as the same table.
+_r99_gapped = _r99_md.replace("|\n|:-|\n|", "|\n\n|:-|\n\n|").replace("*|\n| [All", "*|\n\n| [All")
+check("r99: a boundary-piped table whose rows are separated by blank lines renders identically",
+      _r99_card_body(_r99_gapped) == _r99_expected, repr(_r99_card_body(_r99_gapped)))
+check("r99: an escaped `\\>!x!<` stays literal while a real `>!x!<` on the same line still becomes ||x||",
+      v3._normalize_reddit_markdown(">!real!< and \\>!shown!<") == "||real|| and >!shown!<"
+      and v3._normalize_reddit_markdown(">\\>!a!<") == "> >!a!<"
+      and v3._normalize_reddit_markdown("`>!code!<` and \\>!x!<") == "`>!code!<` and >!x!<")
+check("r99: Reddit `>text` gains the space Discord needs; spaced quotes, `>!` openers, prose "
+      "and fenced code are untouched; `>>nested` flattens like the HTML path",
+      v3._normalize_reddit_markdown(">Spoiler Topic") == "> Spoiler Topic"
+      and v3._normalize_reddit_markdown("> already") == "> already"
+      and v3._normalize_reddit_markdown(">!open only") == ">!open only"
+      and v3._normalize_reddit_markdown("plain >not quote") == "plain >not quote"
+      and v3._normalize_reddit_markdown(">>nested") == "> nested"
+      and v3._normalize_reddit_markdown(">#### Quoted head") == "> **Quoted head**"
+      and v3._normalize_reddit_markdown("```\n>raw\n```") == "```\n>raw\n```")
+check("r99: _format_quote_blocks joins only blank lines BETWEEN quote lines",
+      v3._format_quote_blocks("> a\n\n> b\n\nprose\n\n> c") == "> a\n> b\n\nprose\n\n> c"
+      and v3._format_quote_blocks("> a\n\nprose") == "> a\n\nprose"
+      and v3._format_quote_blocks("intro\n\n> a\n\n\n> b\n\nafter") == "intro\n\n> a\n> b\n\nafter"
+      and v3._format_quote_blocks("```\n> a\n\n> b\n```") == "```\n> a\n\n> b\n```"
+      and v3._format_quote_blocks("") == "" and v3._format_quote_blocks(None) == "",
+      repr(v3._format_quote_blocks("> a\n\n> b\n\nprose\n\n> c")))
+check("r99: one-column detection needs BOTH boundary pipes — prose with a pipe, a lone "
+      "`|x|` line, and the round-71 malformed shapes stay byte-identical",
+      v3._split_markdown_table_row("only") is None
+      and v3._split_markdown_table_row("|only") is None
+      and v3._split_markdown_table_row("|only|") == ["only"]
+      and v3._format_markdown_tables("Suoming | 5* Electro Sword") == "Suoming | 5* Electro Sword"
+      and v3._split_markdown_table_row("|a \\|") is None
+      and v3._format_markdown_tables("|only|\nprose") == "|only|\nprose"
+      and v3._format_markdown_tables("|H|\n|:-|") == "|H|\n|:-|"
+      and v3._format_markdown_tables("|H|\n|:-|\n|row|\n| x | y |") == "|H|\n|:-|\n|row|\n| x | y |"
+      and all(v3._format_markdown_tables(_b) == _b for _b in _r66_bad_tbls)
+      and v3._format_markdown_tables(_r71_tbl) == _r71_expected,
+      repr(v3._format_markdown_tables("|H|\n|:-|\n|row|\n| x | y |")))
+check("r99: a blank line never bridges a table to PROSE or to an unbounded pipe line",
+      v3._format_markdown_tables("|H|\n\n|:-|\n\ntext | not a row") == "|H|\n\n|:-|\n\ntext | not a row"
+      and v3._format_markdown_tables("| a | b |\n|---|---|\n| x | y |\n\nplain") == "**a x**\n- b: y\n\nplain")
+check("r99: the card build runs _format_quote_blocks at the single table choke point",
+      "_format_markdown_tables(_format_quote_blocks(" in inspect.getsource(v3.build_v3_payload))
+
+# ---- Round 99: REDLIB-REACH says WHY (the 0/26 of #11934 / #11982) ----
+class _R99Resp:
+    def __init__(self, status, body="", ctype="text/html"):
+        self.status = status
+        self._body = body
+        self.headers = {"Content-Type": ctype}
+
+    async def text(self):
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _R99Session:
+    """One scripted answer per instance host."""
+
+    def __init__(self, script):
+        self.script = script
+
+    def get(self, url, headers=None, timeout=None, allow_redirects=True):
+        for host, answer in self.script.items():
+            if url.startswith(host):
+                if isinstance(answer, BaseException):
+                    raise answer
+                return answer
+        raise AssertionError(f"unexpected probe {url}")
+
+
+async def _r99_probe_all():
+    v3._redlib_reach.clear()
+    v3._redlib_reach_why.clear()
+    v3._redlib_post_page_cache.clear()
+    script = {
+        "https://a.example": _R99Resp(200, "<html>Error: Failed to parse page JSON data: expected value</html>"),
+        "https://b.example": _R99Resp(200, "<html>Error: Failed to parse page JSON data</html>"),
+        "https://c.example": _R99Resp(403, "<html>blocked</html>"),
+        "https://d.example": _R99Resp(200, "<html><body>checking your browser</body></html>"),
+        "https://e.example": asyncio.TimeoutError(),
+        "https://f.example": _R99Resp(200, '<html><article class="post_title">ok</article></html>'),
+        "https://g.example": _R99Resp(200, "{}", "application/json"),
+    }
+    sess = _R99Session(script)
+    out = {}
+    for host in script:
+        out[host] = await v3._fetch_redlib_post_page(sess, host, "/r/x/comments/1/")
+    return out
+
+
+_r99_pages = asyncio.run(_r99_probe_all())
+_r99_reach = v3.log_redlib_reachability()
+_r99_why = v3.log_redlib_reach_why()
+check("r99: REDLIB-REACH counting is unchanged (only the real post page counts 1/1)",
+      _r99_reach.startswith("REDLIB-REACH: 1/7 instance(s) answered this run")
+      and _r99_pages["https://f.example"] is not None
+      and all(_r99_pages[h] is None for h in _r99_pages if h != "https://f.example"),
+      _r99_reach)
+check("r99: REDLIB-REACH-WHY tallies every miss class, most frequent first, zero extra requests",
+      _r99_why == ("REDLIB-REACH-WHY: error-page:failed to parse page json data ×2, "
+                   "http-403 ×1, no-post-dom ×1, non-html ×1, timeout ×1"),
+      _r99_why)
+check("r99: the WHY line is log-only — the returned REDLIB-REACH line (run record/summary) carries no reasons",
+      "REDLIB-REACH-WHY" not in _r99_reach and "error-page" not in _r99_reach)
+v3._redlib_reach.clear()
+v3._redlib_reach_why.clear()
+check("r99: the miss tally is per-run state (cleared with the reach counters) and silent when nothing missed",
+      v3.log_redlib_reach_why() == ""
+      and "_redlib_reach_why.clear()" in open(
+          os.path.join(ROOT, "testing area/reddit_main_v3.py"), encoding="utf-8").read()
+      and v3._is_redlib_error_page("Failed to parse page JSON data")
+      and v3._redlib_error_marker("<p>Reddit is rate limiting this instance</p>") == "reddit is rate limiting this instance"
+      and v3._redlib_error_marker("<article class=\"post_title\">fine</article>") is None)
+
 # ---- Round 89: no GitHub Actions annotation may leak out of this suite ----
 # Restore the real stdout first, then judge what the suite actually emitted.
 sys.stdout = _stdout_guard.stream

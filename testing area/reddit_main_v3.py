@@ -934,10 +934,25 @@ _redlib_post_page_cache: dict = {}
 # run; zero extra requests, zero latency.
 # ---------------------------------------------------------------------------
 _redlib_reach: dict = {}
+# Round 99 (2026-10-31): WHY a probe missed, tallied per run — the 0/26 lines
+# of #11934/#11982 could not say whether mirrors were blocking the runner,
+# serving Redlib error pages or timing out. Keys are short reason classes
+# (``http-403``, ``error-page:failed to parse page json data``, ``no-post-dom``,
+# ``timeout``, ``exc:ClientConnectorError``). Zero extra requests.
+_redlib_reach_why: dict = {}
+
+
+def _note_redlib_miss(reason: str) -> None:
+    _redlib_reach_why[reason] = _redlib_reach_why.get(reason, 0) + 1
 
 
 def log_redlib_reachability() -> str:
-    """One REDLIB-REACH line per run: ok/total per instance, worst first."""
+    """One REDLIB-REACH line per run: ok/total per instance, worst first.
+
+    Round 99: when at least one probe missed, a second ``REDLIB-REACH-WHY:``
+    line lists the miss reasons (most frequent first). The returned value is
+    still ONLY the REDLIB-REACH line, so the run record and the workflow
+    summary are unchanged."""
     if not _redlib_reach:
         return ""
     parts = []
@@ -949,7 +964,18 @@ def log_redlib_reachability() -> str:
     line = (f"REDLIB-REACH: {alive}/{len(_redlib_reach)} instance(s) answered "
             f"this run — " + ", ".join(parts))
     logging.info(line)
+    if _redlib_reach_why:
+        logging.info(log_redlib_reach_why())
     return line
+
+
+def log_redlib_reach_why() -> str:
+    """The ``REDLIB-REACH-WHY:`` line: ``reason ×count`` pairs, most frequent
+    first, or "" when nothing missed. Pure; shares the per-run tally."""
+    if not _redlib_reach_why:
+        return ""
+    ranked = sorted(_redlib_reach_why.items(), key=lambda kv: (-kv[1], kv[0]))
+    return "REDLIB-REACH-WHY: " + ", ".join(f"{reason} ×{count}" for reason, count in ranked)
 
 
 _proxy_post_cache: dict = {}
@@ -2678,16 +2704,33 @@ def _arctic_media_count(post) -> int:
 _FENCED_CODE_LINE_RE = re.compile(r"^\s*(`{3,}|~{3,})([^\n`~]*)$")
 _MD_SUBHEADING_RE = re.compile(r"^(\s*(?:>\s*)*)#{4,6}[ \t]+(.+?)[ \t]*#*$")
 _REDDIT_SPOILER_RE = re.compile(r"(?<!`)>!\s*(.+?)\s*!<(?!`)")
+# Round 99 (2026-10-31, live 1xkgd9m): an author-escaped spoiler opener
+# (``\>!text!<`` — Reddit's way of SHOWING the spoiler syntax instead of
+# applying it) is literal text, never a spoiler. The backslash is swapped for
+# a private marker before the spoiler pass and restored as a bare ``>!``
+# afterwards (Discord has no ``>!`` syntax, so the literal is safe there).
+_ESCAPED_SPOILER_OPEN = "\\>!"
+_ESCAPED_SPOILER_MARK = "\x03"
+# Round 99: Reddit renders ``>text`` (no space) as a blockquote; Discord needs
+# ``> text``. Matches the leading ``>`` run of a quote line whose first content
+# character is not a space, another ``>`` or ``!`` (an unconverted ``>!``
+# spoiler opener is left exactly as it is).
+_REDDIT_QUOTE_NO_SPACE_RE = re.compile(r"^(\s*)(>+)(?=[^\s>!])")
 
 
 def _normalize_reddit_markdown(text: str) -> str:
     """Normalize Reddit-specific Markdown constructs that Discord renders raw.
 
     - Converts native Reddit spoilers (`>!text!<`) outside code spans/fences
-      into Discord spoilers (`||text||`).
+      into Discord spoilers (`||text||`). An escaped opener (`\\>!text!<`)
+      is the author showing the syntax: it stays literal `>!text!<` (round 99).
     - Converts level 4–6 Markdown headings (`####`–`######`, which Discord
       Components V2 renders as literal `#` characters) into `**bold**` lines
       without double-wrapping headings that are already bolded.
+    - Gives a Reddit blockquote written without the space (`>text`, which
+      Discord shows as a literal `>`) the `> text` form Discord renders as a
+      quote; nested `>>text` flattens to one level like the HTML path does
+      (round 99, live 1xkgd9m).
     Never forces formatting onto plain prose lines and never raises.
     """
     if not text:
@@ -2721,10 +2764,14 @@ def _normalize_reddit_markdown(text: str) -> str:
         if ">!" in line and "!<" in line:
             parts = re.split(r"(`+[^`\n]*`+)", line)
             line = "".join(
-                part if idx % 2 == 1 else _REDDIT_SPOILER_RE.sub(r"||\1||", part)
+                part if idx % 2 == 1 else _REDDIT_SPOILER_RE.sub(
+                    r"||\1||", part.replace(_ESCAPED_SPOILER_OPEN, _ESCAPED_SPOILER_MARK))
                 for idx, part in enumerate(parts)
             )
-        out_lines.append(line)
+        # Quote spacing runs while the escaped opener is still the marker, so
+        # ``>\>!x!<`` becomes ``> >!x!<`` (quote + literal), never ``>>!x!<``.
+        line = _REDDIT_QUOTE_NO_SPACE_RE.sub(r"\1> ", line, count=1)
+        out_lines.append(line.replace(_ESCAPED_SPOILER_MARK, ">!"))
     return "\n".join(out_lines)
 
 
@@ -3024,12 +3071,57 @@ def _split_markdown_table_row(line: str) -> "list | None":
     raw = (line or "").strip()
     if not raw or "|" not in raw:
         return None
+    # Round 99 (2026-10-31, live 1xkgd9m): a ONE-column table row is only
+    # recognisable by its boundary pipes (``|cell|``); a prose line that merely
+    # contains a pipe never has both, so the round-71 "never guess" rule holds.
+    bounded = _is_bounded_table_row(raw)
     if raw.startswith("|"):
         raw = raw[1:]
     if raw.endswith("|") and not raw.endswith("\\|"):
         raw = raw[:-1]
     cells = [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", raw)]
-    return cells if len(cells) >= 2 else None
+    if len(cells) >= 2:
+        return cells
+    return cells if bounded and cells[0] else None
+
+
+def _is_bounded_table_row(line: str) -> bool:
+    """True when a line is wrapped in table boundary pipes: ``|…|`` with an
+    opening pipe and an unescaped closing pipe (``|a \\|`` does not count)."""
+    raw = (line or "").strip()
+    return (len(raw) >= 3 and raw.startswith("|") and raw.endswith("|")
+            and not raw.endswith("\\|"))
+
+
+def _table_row_indices(lines: list, start: int) -> list:
+    """Round 99: indices of the consecutive table rows beginning at ``start``
+    (``[]`` when that line is not a row). Blank lines are stepped over ONLY
+    between two boundary-piped rows (``|…|`` on both sides) — the shape
+    Reddit's rich-text editor exports when it puts a blank line between the
+    rows of a table, as it does between list items (live 1xkgd9m). Non-blank
+    text is never skipped, and a bare ``a | b`` prose line never bridges a gap.
+    """
+    n = len(lines)
+    if start >= n or _split_markdown_table_row(lines[start]) is None:
+        return []
+    seq = [start]
+    j = start + 1
+    while j < n:
+        if not lines[j].strip():
+            k = j
+            while k < n and not lines[k].strip():
+                k += 1
+            if (k < n and _is_bounded_table_row(lines[seq[-1]])
+                    and _is_bounded_table_row(lines[k])
+                    and _split_markdown_table_row(lines[k]) is not None):
+                j = k
+                continue
+            break
+        if _split_markdown_table_row(lines[j]) is None:
+            break
+        seq.append(j)
+        j += 1
+    return seq
 
 
 def _format_markdown_tables(body: str | None) -> str:
@@ -3074,8 +3166,12 @@ def _format_markdown_tables(body: str | None) -> str:
     out = []
     i, n = 0, len(lines)
     while i < n:
-        headers = _split_markdown_table_row(lines[i])
-        separator = _split_markdown_table_row(lines[i + 1]) if i + 1 < n else None
+        # Round 99: the candidate run is a row-index sequence so that a
+        # boundary-piped table whose rows are separated by blank lines is
+        # read as ONE table; a contiguous table yields exactly i, i+1, …
+        seq = _table_row_indices(lines, i)
+        headers = _split_markdown_table_row(lines[seq[0]]) if seq else None
+        separator = _split_markdown_table_row(lines[seq[1]]) if len(seq) > 1 else None
         valid_separator = (
             headers and separator and len(headers) == len(separator)
             and all(_TABLE_SEPARATOR_CELL_RE.fullmatch(cell.replace(" ", ""))
@@ -3085,19 +3181,20 @@ def _format_markdown_tables(body: str | None) -> str:
             i += 1
             continue
         rows = []
-        j = i + 2
-        while j < n:
-            cells = _split_markdown_table_row(lines[j])
+        k = 2
+        while k < len(seq):
+            cells = _split_markdown_table_row(lines[seq[k]])
             if not cells or len(cells) != len(headers):
                 break
             rows.append(cells)
-            j += 1
+            k += 1
         if not rows:
             # a header + separator with no data rows at all (or a first
             # data row of the wrong width): not a table — never guess
             out.append(lines[i])
             i += 1
             continue
+        j = seq[k - 1] + 1          # first line after the last consumed row
         # Round 66 robustness, kept: a separator-shaped row INSIDE the data
         # rows means two tables were glued together, and a pipe run that
         # ends on a row with a different cell count is malformed — leave
@@ -3109,16 +3206,35 @@ def _format_markdown_tables(body: str | None) -> str:
         # pipe — may mark the run malformed. A prose line that merely
         # contains a pipe (the live "Suoming | 5\* Electro Sword" shape)
         # must never disable a valid table above it.
-        next_line = lines[j].strip() if j < n else ""
+        if k < len(seq):
+            next_line = lines[seq[k]].strip()      # the wrong-width row itself
+        else:
+            next_line = lines[j].strip() if j < n else ""
         malformed = (
             _split_markdown_table_row(next_line) is not None
             and (next_line.startswith("|") or next_line.endswith("|")))
         if glued or malformed:
-            run_end = j
+            run_end = seq[-1] + 1
             while run_end < n and _split_markdown_table_row(lines[run_end]) is not None:
                 run_end += 1
             out.extend(lines[i:run_end])
             i = run_end
+            continue
+        if len(headers) == 1:
+            # Round 99 (live 1xkgd9m, "Previous Megathreads"): a one-column
+            # table is a titled list, not a key/value grid — the column
+            # heading becomes its own line and every row is its cell, one per
+            # line with a blank line between (the shape the operator approved
+            # for the live card). No "- heading: value" bullets: there is no
+            # second column to label.
+            out.append(html_lib.unescape(headers[0]).strip())
+            out.append("")
+            for row in rows:
+                value = html_lib.unescape(row[0]).strip()
+                if value:
+                    out.append(value)
+                    out.append("")
+            i = j
             continue
         for row in rows:
             label = html_lib.unescape(row[0]).strip() or "Entry"
@@ -3143,6 +3259,55 @@ def _format_markdown_tables(body: str | None) -> str:
             spaced.append("")
         spaced.append(line)
     return _collapse_blanks(spaced)
+
+
+_QUOTE_LINE_RE = re.compile(r"^>(?:\s|$)")
+
+
+def _format_quote_blocks(body: str | None) -> str:
+    """Round 99 (2026-10-31, live 1xkgd9m): consecutive quote paragraphs
+    render as ONE Discord quote block.
+
+    Reddit shows ``>a`` / blank / ``>b`` as two quote boxes; Discord shows
+    ``> a`` / blank / ``> b`` as two quote bars with an unquoted gap between
+    them. The operator-approved card keeps the lines together::
+
+        > Spoiler Topic
+        > >!spoiler tagged text here!<
+        > >!separate paragraph of spoiler tagged text!<
+
+    so blank lines that sit between two ``> `` lines are dropped. Everything
+    else — quote text, non-quote lines, blank lines next to prose, fenced
+    code — is byte-identical. Runs at the card-build choke point, after every
+    body source (RSS, FULL MODE, Arctic, proxy) has produced ``> `` lines.
+    """
+    if not body:
+        return ""
+    lines = str(body).splitlines()
+    out = []
+    in_fence = False
+    fence_marker = ""
+    for idx, line in enumerate(lines):
+        fm = _FENCED_CODE_LINE_RE.match(line)
+        if fm:
+            marker = fm.group(1)
+            if not in_fence:
+                in_fence, fence_marker = True, marker[0] * len(marker)
+            elif marker[0] == fence_marker[0] and len(marker) >= len(fence_marker):
+                in_fence, fence_marker = False, ""
+            out.append(line)
+            continue
+        if in_fence or line.strip():
+            out.append(line)
+            continue
+        # blank line: drop it only when the previous kept line and the next
+        # non-blank line are both quote lines
+        prev_quote = bool(out) and _QUOTE_LINE_RE.match(out[-1]) is not None
+        nxt = next((ln for ln in lines[idx + 1:] if ln.strip()), "")
+        if prev_quote and _QUOTE_LINE_RE.match(nxt):
+            continue
+        out.append(line)
+    return "\n".join(out)
 
 
 def _split_continuation_chunks(rest: str) -> list:
@@ -5580,22 +5745,36 @@ def _is_redlib_error_page(html: str | None) -> bool:
     verify_archive_post_live passes unapproved stubs and gallery enrichment
     fails. Verified live: Failed to parse page JSON data / Reddit is rate
     limiting / Reddit blocked this request / 502 Bad Gateway."""
+    return _redlib_error_marker(html) is not None
+
+
+_REDLIB_ERROR_MARKERS = (
+    "failed to parse page json data",
+    "reddit is rate limiting this instance",
+    "reddit blocked this request",
+    "502 bad gateway",
+    "error: reddit is rate limiting",
+    "error: failed to parse",
+    "error: reddit error",
+    "the backend server is having issues",
+    "redlib on the clearnet is no longer available",
+    "__goaway_challenge",
+    "rate limit exceeded",
+)
+
+
+def _redlib_error_marker(html: str | None) -> str | None:
+    """Round 99: the FIRST round-83c error marker found in a 200 page (lower
+    case), or None for a page that is not a Redlib error page. The marker
+    text is what the REDLIB-REACH-WHY tally reports."""
     if not html:
-        return False
+        return None
     low = html.lower()
-    return any(s in low for s in (
-        "failed to parse page json data",
-        "reddit is rate limiting this instance",
-        "reddit blocked this request",
-        "502 bad gateway",
-        "error: reddit is rate limiting",
-        "error: failed to parse",
-        "error: reddit error",
-        "the backend server is having issues",
-        "redlib on the clearnet is no longer available",
-        "__goaway_challenge",
-        "rate limit exceeded",
-    ))
+    for marker in _REDLIB_ERROR_MARKERS:
+        if marker in low:
+            return marker
+    return None
+
 
 async def _fetch_redlib_post_page(session: aiohttp.ClientSession, instance: str,
                                   path: str, timeout: int = 10) -> str | None:
@@ -5623,23 +5802,33 @@ async def _fetch_redlib_post_page(session: aiohttp.ClientSession, instance: str,
                 has_post_dom = text and any(m in text for m in (
                     'class="post_title', 'class="post_content', '<article', 'class="post-content'
                 ))
-                if text and has_post_dom and not _is_redlib_error_page(text):
+                error_marker = _redlib_error_marker(text)
+                if text and has_post_dom and error_marker is None:
                     _redlib_post_page_cache[key] = text
                     _redlib_reach.setdefault(str(instance or ""), [0, 0])[0] += 1
                     return text
                 # Error page or challenge splash: count as 0/1 (do not cache, do not count as 1/1)
-                if text and (_is_redlib_error_page(text) or not has_post_dom):
-                    if _is_redlib_error_page(text):
+                if text and (error_marker is not None or not has_post_dom):
+                    if error_marker is not None:
+                        _note_redlib_miss(f"error-page:{error_marker}")
                         logging.debug(f"[{instance}{path}] Redlib error page rejected (not counted as 1/1)")
                     else:
+                        _note_redlib_miss("no-post-dom")
                         logging.debug(f"[{instance}{path}] Redlib challenge/splash page rejected (no post DOM, not counted as 1/1)")
                     return None
                 if text:
                     _redlib_post_page_cache[key] = text
                     _redlib_reach.setdefault(str(instance or ""), [0, 0])[0] += 1
+                else:
+                    _note_redlib_miss("empty-body")
                 return text
-    except Exception:
-        pass
+            # Round 99: a non-200 (403 datacenter block, 429, 5xx) or a non-HTML
+            # 200 used to vanish silently — record the class for REDLIB-REACH-WHY.
+            _note_redlib_miss(f"http-{resp.status}" if resp.status != 200 else "non-html")
+    except asyncio.TimeoutError:
+        _note_redlib_miss("timeout")
+    except Exception as exc:  # noqa: BLE001 — best-effort probe, never raises
+        _note_redlib_miss(f"exc:{type(exc).__name__}")
     return None
 
 
@@ -6725,8 +6914,11 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
     # + "- Column: value" bullets, entities decoded, FAQ spacing) — one
     # choke point, so every body source (RSS, FULL MODE, Arctic, proxy)
     # receives the identical readable form.
-    body_src = _format_markdown_tables(
-        _drop_gallery_media_lines(data["body"], media))
+    # Round 99: consecutive quote paragraphs join into one Discord quote
+    # block at the same choke point (live 1xkgd9m, the megathread spoiler
+    # format example) — same single call site, same every-source parity.
+    body_src = _format_markdown_tables(_format_quote_blocks(
+        _drop_gallery_media_lines(data["body"], media)))
     single_budget = max(300, 3800 - len(header) - len(op_line) - len(base_stats_line))
     if len(body_src) <= single_budget:
         stats_line = base_stats_line
@@ -7264,6 +7456,7 @@ async def main():
     _redlib_post_page_cache.clear()
     _proxy_post_cache.clear()
     _redlib_reach.clear()
+    _redlib_reach_why.clear()   # round 99: the miss-reason tally is per run too
     # Round 95: the liveness probe's failure counter and per-run budget are
     # per-run state too — a bad archive minute must not leak into the next run.
     global _liveness_fail_count, _liveness_probe_budget_used
