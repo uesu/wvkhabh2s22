@@ -9496,10 +9496,20 @@ with _sync_tempfile.TemporaryDirectory(prefix="ne-sync-test-") as _sync_tmp:
     # devvit/gaming-express must never reach a production checkout (no such folder there),
     # while the pip + github-actions entries are copied unchanged. The CI `devvit` job is
     # repository-guarded for the same reason (skipped, not red, in production).
+    # The suite also runs inside the production checkouts (sync copies tests/), where the
+    # devvit/ folder does not exist and the synced dependabot.yml must therefore carry no
+    # npm entry: assert the invariant that holds in BOTH places — every Dependabot
+    # `directory:` exists in this checkout — and the dev-only expectation only in dev.
     _dep_src = (_SyncPath(ROOT) / ".github" / "dependabot.yml").read_text(encoding="utf-8")
     _dep_prod = (_prod_dir / ".github" / "dependabot.yml").read_text(encoding="utf-8")
-    check("r87 sync_prod: dev dependabot.yml carries the npm entry for /devvit/gaming-express",
-          'package-ecosystem: "npm"' in _dep_src and 'directory: "/devvit/gaming-express"' in _dep_src)
+    _dep_dirs = re.findall(r'^[ \t]+directory:[ \t]*["\']?([^"\'\s#]+)', _dep_src, re.M)
+    _is_dev_checkout = (_SyncPath(ROOT) / "devvit" / "gaming-express" / "package.json").is_file()
+    check("r87 sync_prod: every Dependabot directory in this checkout's dependabot.yml exists here "
+          "(dev: incl. /devvit/gaming-express; prod: the synced copy carries no entry for a missing folder)",
+          len(_dep_dirs) >= 2
+          and all(_d.strip("/") == "" or (_SyncPath(ROOT) / _d.strip("/")).is_dir() for _d in _dep_dirs)
+          and (('package-ecosystem: "npm"' in _dep_src and 'directory: "/devvit/gaming-express"' in _dep_src)
+               if _is_dev_checkout else 'package-ecosystem: "npm"' not in _dep_src))
     check("r87 sync_prod: production dependabot.yml drops the npm entry (folder absent) and keeps pip + actions",
           'package-ecosystem: "npm"' not in _dep_prod
           and 'directory: "/devvit/gaming-express"' not in _dep_prod
