@@ -12099,7 +12099,7 @@ check("r101: a replayed relay record of a never-re-check hold is skipped like an
                                     "k", _r101_now, types.SimpleNamespace()) is False)
 
 # ---- Round 107: a held post that Reddit lists again through the relay is a restore ----
-# Live 1xlrj90 (2026-11-02): archive hold `removal_notice` at 07:40Z, mods approved
+# Live 1xlrj90 (2026-11-02): archive hold `removal_notice` at 08:20Z, mods approved
 # ~12:35Z, relay record 12:36Z -> suppressed as known-pending by the round-101 rule.
 _r107_hold = {"first_seen": _r101_now - 5 * 3600, "last_checked": _r101_now - 5 * 3600,
               "reason": "removal_notice", "source": "arctic"}
@@ -12672,13 +12672,13 @@ _r107_fake = dict(_r105_fake, relay_restores=1, known_pending_suppressed=1,
                   known_pending_by_reason={"removal_notice": 1},
                   known_pending_keys=[{"key": "Zenlesszonezeroleaks__1xlrj90", "reason": "removal_notice"}],
                   relay_restore_keys=[{"key": "Zenlesszonezeroleaks__1xlrj90", "held_reason": "removal_notice",
-                                       "held_minutes": 296.4}])
+                                       "held_minutes": 255.6}])
 _r107_summary = _app_summary_shell_with_json("reddit", None, fake_data=_r107_fake)
 check("r107b: a relay-mode summary prints the restore with the held reason and duration, labels the "
       "remaining suppressions as 'held earlier; no newer listing' (not 'archive candidates'), and the "
       "RSS-mode wording stays",
       "- Held posts Reddit listed again (relay restore): 1" in _r107_summary
-      and "  - restored: Zenlesszonezeroleaks__1xlrj90 — held as 'removal_notice' for 296.4 min" in _r107_summary
+      and "  - restored: Zenlesszonezeroleaks__1xlrj90 — held as 'removal_notice' for 255.6 min" in _r107_summary
       and "- Known-rejected candidates (held earlier; no newer listing): 1" in _r107_summary
       and "Known-rejected archive candidates" not in _r107_summary
       and "- Known-rejected archive candidates:" in _r96_summary

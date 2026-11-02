@@ -1846,8 +1846,8 @@ def relay_listed_after_hold(pend, entry) -> float | None:
     """Round 107 (live 1xlrj90, 2026-11-02): the moment Reddit's own listing
     vouched for a HELD post again, or None.
 
-    r/Zenlesszonezeroleaks_ 1xlrj90 was created 07:31Z, sat in the mod queue,
-    and the archive sweep of the old chain held it at 07:40Z as
+    r/Zenlesszonezeroleaks_ 1xlrj90 was created 08:11Z, sat in the mod queue,
+    and the archive sweep of the old chain held it at 08:20Z as
     `removal_notice` (a never-re-check reason: "returns only via RSS"). The
     mods approved it at ~12:35Z; the relay — which lists a post only while
     Reddit's /new lists it — sent a complete record (`removed: null`) at
