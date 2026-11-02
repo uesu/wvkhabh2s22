@@ -122,7 +122,6 @@ jobs:
           # YOUTUBE_LINK_MESSAGE='0' disables the second bare YouTube message.
           YOUTUBE_LINK_MESSAGE: ${{ vars.YOUTUBE_LINK_MESSAGE }}
           DISCOHOOK_PREVIEW: ${{ vars.DISCOHOOK_PREVIEW }}
-          REDDIT_OP_COMMENT: ${{ vars.REDDIT_OP_COMMENT }}
           YOUTUBE_MEDIA_EMBED: ${{ vars.YOUTUBE_MEDIA_EMBED }}
           FEEDTOKEN_JSON_STAGGER: ${{ vars.FEEDTOKEN_JSON_STAGGER }}
           # Media-waiting entries are re-checked every PENDING_RECHECK_SECONDS
@@ -166,9 +165,9 @@ jobs:
           # discovery path (docs/DEVVIT_SETUP.md §9). Both of these are needed:
           #   DISCORD_BOT_TOKEN (secret)   a bot in the Citlali News server with
           #                                View Channel + Read Message History on
-          #                                #reddit-intake and the Message Content
+          #                                the intake channel and the Message Content
           #                                intent enabled in the developer portal
-          #   INTAKE_CHANNEL_ID (Variable) the #reddit-intake channel id
+          #   INTAKE_CHANNEL_ID (Variable) the intake channel id
           # Optional: INTAKE_READER=primary (default) | shadow | off;
           # INTAKE_STALE_SECONDS (1800) — older newest message => old chain;
           # INTAKE_LOOKBACK_SECONDS (21600) — channel window read each run.
