@@ -375,7 +375,8 @@ jobs:
               print(data["settings_line"])
           print()
           print("### Feed")
-          line("Combined-feed entries", "combined_entries")
+          relay = data.get("combined_fetch_status") == "relay"
+          line("Relay records for this engine (6 h window)" if relay else "Combined-feed entries", "combined_entries")
           if data.get("subreddits_represented") is not None:
               print(f"- Subreddits represented: {v('subreddits_represented')} of {v('subreddits_configured')}")
           else:
@@ -393,7 +394,10 @@ jobs:
           if isinstance(subs, dict) and subs:
               print(f"- Feed entries by subreddit: {dstr(subs)}")
           missing = data.get("feed_subreddits_missing")
-          if isinstance(missing, list):
+          if isinstance(missing, list) and relay:
+              print("- Subreddits with no new post in the relay window: "
+                    + (", ".join(str(x) for x in missing) if missing else "none") + " (quiet, not missing; no archive attempt)")
+          elif isinstance(missing, list):
               print("- Subreddits missing from the combined feed: "
                     + (", ".join(str(x) for x in missing) + " (archive attempt below)" if missing else "none"))
           arc = data.get("arctic_by_sub")
@@ -606,7 +610,7 @@ jobs:
                     "(no unresolved evidence)")
           fallback = data.get("fallback_status")
           if fallback == "not_attempted":
-              print("- Feed fallback: not attempted (combined succeeded)")
+              print("- Feed fallback: not attempted (" + ("relay is the listing" if relay else "combined succeeded") + ")")
           elif fallback in ("ok", "partial", "all_failed"):
               print(f"- Feed fallback: {fallback} ({v('fallback_entries')} entries, "
                     f"{v('fallback_subreddits_covered')} subreddits)")

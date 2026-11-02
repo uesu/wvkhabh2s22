@@ -12593,6 +12593,29 @@ check("r101: the media-wait and partial-gallery gates understand relay media lis
       'if isinstance(entry, _IntakeEntry) and entry.record.get("media"):' in _r101_main
       and "isinstance(entry, (_ArcticEntry, _IntakeEntry))" in _r101_main)
 
+# ---- Round 105: the run summary speaks relay when the relay was the listing (live run #12256) ----
+_r105_fake = dict(_r96_fake, combined_entries=0, subreddits_represented=0,
+                  combined_fetch_status="relay", arctic_candidates=0,
+                  feed_subreddits_with_entries={}, arctic_by_sub={}, json_probe_by_status={},
+                  feed_subreddits_missing=["AnantaLeaks", "Genshin_Impact_Leaks", "HonkaiNexusAnimaLeaks",
+                                           "HonkaiStarRail_leaks", "WutheringWavesLeaks", "Zenlesszonezeroleaks_"],
+                  unposted_candidates_considered=0, candidates_entering_processing=0, delivered=0,
+                  delivered_posts=[], known_pending_suppressed=0, known_pending_by_reason={},
+                  dedup_skipped_in_run=0)
+_r105_summary = _app_summary_shell_with_json("reddit", None, fake_data=_r105_fake)
+check("r105: a relay-served run is not described in old-chain words — quiet subreddits are "
+      "'no new post in the relay window', no 'archive attempt below', fallback 'relay is the listing', "
+      "entries labelled as relay records; the old-chain wording is untouched for RSS runs",
+      "Subreddits with no new post in the relay window: AnantaLeaks, Genshin_Impact_Leaks" in _r105_summary
+      and "(quiet, not missing; no archive attempt)" in _r105_summary
+      and "archive attempt below" not in _r105_summary
+      and "Feed fallback: not attempted (relay is the listing)" in _r105_summary
+      and "Relay records for this engine (6 h window): 0" in _r105_summary
+      and "Combined-feed entries" not in _r105_summary
+      and "Subreddits missing from the combined feed: HonkaiNexusAnimaLeaks (archive attempt below)" in _r96_summary
+      and "Feed fallback: not attempted (combined succeeded)" in _r96_summary,
+      [ln for ln in _r105_summary.splitlines() if "relay" in ln.lower()][:4])
+
 # ---- Round 89: no GitHub Actions annotation may leak out of this suite ----
 # Restore the real stdout first, then judge what the suite actually emitted.
 sys.stdout = _stdout_guard.stream
