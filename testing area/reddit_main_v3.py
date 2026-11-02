@@ -509,6 +509,11 @@ def _effective_settings() -> dict:
         # Round 98: the two new decisions, so the summary can state them.
         "stale_snapshot_ticks": _int("STALE_SNAPSHOT_TICKS"),
         "reclaim_max_per_run": _int("RECLAIM_MAX_PER_RUN"),
+        # Round 101: relay intake reader.
+        "intake_reader": _get("INTAKE_READER"),
+        "intake_configured": bool(_get("INTAKE_CHANNEL_ID") and _get("DISCORD_BOT_TOKEN")),
+        "intake_stale_seconds": _int("INTAKE_STALE_SECONDS"),
+        "intake_lookback_seconds": _int("INTAKE_LOOKBACK_SECONDS"),
     }
 
 
@@ -621,8 +626,10 @@ def _reclaim_due(pending: dict, seen_keys, now: float, limit: int) -> list:
     return out
 
 
-def _settings_line(settings: dict) -> str:
+def _settings_line(settings: dict, intake: dict | None = None) -> str:
     """Round 97: ONE plain line summarising the settings actually in force.
+    Round 101: the intake-relay outcome is appended to the same line (the
+    summary step prints this line verbatim, so no workflow growth).
 
     Formatted here (not in the workflow) because the summary step's `run:`
     script has a hard GitHub limit of 21,000 characters — round 97 pushed it to
@@ -662,6 +669,12 @@ def _settings_line(settings: dict) -> str:
             parts.append("liveness probe on ("
                          + ("strict" if settings.get("liveness_strict") else "lenient")
                          + (f", budget {budget}" if budget else "") + ")")
+        try:
+            intake_part = _intake_line(intake) if intake else ""
+        except Exception:
+            intake_part = ""
+        if intake_part:
+            parts.append(intake_part)
         return ("**Settings:** " + " · ".join(parts)) if parts else ""
     except Exception:
         return ""
@@ -698,6 +711,8 @@ def _init_run_stats():
         # summary lists WHAT went out rather than only how many.
         "delivered_posts": [],
         "json_probe_by_status": {},           # FULL MODE post-JSON probe outcomes
+        # Round 101: the Devvit relay read (status/mode/counts; never ids).
+        "intake": {"status": "not_read", "mode": INTAKE_READER},
         # Round 96c: names for the dispositions that were previously counts only.
         "hold_keys": [],                      # posts held/not posted, with reason
         "known_pending_keys": [],             # posts suppressed as already-rejected
@@ -1841,7 +1856,9 @@ def _pending_throttle_skip(pending: dict, key: str, now: float, entry) -> bool:
     if reason in _NO_RECHECK_REASONS:
         # Arctic resurface -> skip (never re-verified); RSS re-appearance
         # (a restore, fresh "updated" stamp) -> run the full pipeline.
-        return isinstance(entry, _ArcticEntry)
+        # Round 101: a relay record is replayed from the channel window, so
+        # seeing it again is not a restore either -> skip.
+        return isinstance(entry, (_ArcticEntry, _IntakeEntry))
     try:
         last = float(pend.get("last_checked") or 0) if isinstance(pend, dict) else 0.0
     except (TypeError, ValueError):
@@ -2102,6 +2119,11 @@ def resolve_crosspost_source(*, own_path: str | None, base: dict | None,
     known = (base or {}).get("crosspost_orig_path")
     if isinstance(known, str) and known.strip():
         ordered.append((known, "known-orig-path", None))
+    # Round 101: the relay names the parent by fullname only (no path); the
+    # id-only source is resolved to a path by the media resolver's archive hop.
+    known_id = parent_fullname_id((base or {}).get("crosspost_parent_id"))
+    if known_id:
+        ordered.append((None, "relay-parent-id", {"id": known_id}))
     for record, provenance in (
         (post_json, "structured-json"),
         (arctic, "structured-archive"),
@@ -2546,6 +2568,328 @@ class _ArcticEntry:
         return self._d.get(k, d)
 
 
+# ---------------------------------------------------------------------------
+# ■ ROUND 101 (2026-11-02): DEVVIT RELAY INTAKE — PRIMARY DISCOVERY PATH
+# Reddit retires RSS on 2026-11-13 and anonymous JSON already answers 403
+# (since 2026-10-20). The Devvit app "Gaming Express" (devvit/gaming-express)
+# runs INSIDE Reddit, polls every configured subreddit's /new each minute and
+# relays one fenced-JSON record per post to the private Discord channel
+# #reddit-intake. This block reads that channel back and turns each record
+# into a feed-like entry, so the rest of the engine (dedup, holds, liveness,
+# media resolution, Components v2 card) runs UNCHANGED.
+#
+# Contract with the relay (RelayRecord v1, devvit/gaming-express/src/server/
+# relay.ts): `v,id,sub,title,permalink,url,created,author,flair,distinguished,
+# spoiler,<age flag>,score,comments,removed,xpost,media[],body,bodyTruncated`.
+#
+# Behaviour:
+#   * INTAKE_READER=primary (default): when the channel answers AND its newest
+#     message is younger than INTAKE_STALE_SECONDS, the relay IS the listing:
+#     the combined feed, the per-subreddit fallback and the archive sweep are
+#     skipped for this run (`combined_fetch_status=relay`). A stale/failed/
+#     unconfigured relay logs ONE `INTAKE-FALLBACK` line and the pre-round-101
+#     chain runs exactly as before — the relay is additive, never a new way
+#     to go blind.
+#   * INTAKE_READER=shadow: the old chain runs as before; the relay is read
+#     and compared, and the difference is logged (`INTAKE-SHADOW`). Nothing
+#     else changes. INTAKE_READER=off: the channel is not read at all.
+#   * Relay entries are Reddit's OWN listing (the app reads /new with the
+#     platform's credentials), so they carry provenance "reddit-native" and
+#     count for the round-98 stale-snapshot override, like the combined feed.
+#   * A held post (media_wait, liveness, pending approval …) re-enters each
+#     run for as long as its record sits inside the INTAKE_LOOKBACK_SECONDS
+#     window — the same "listed again, re-probed again" behaviour the 100-entry
+#     RSS window gave. Older holds are reclaimed by the round-98 archive path.
+#   * The reader is credentials-light: ONE bot token (DISCORD_BOT_TOKEN, repo
+#     secret) with View Channel + Read Message History on #reddit-intake and
+#     the Message Content intent enabled. The token travels only in the
+#     Authorization header; it is never logged or written anywhere.
+# ---------------------------------------------------------------------------
+INTAKE_READER = ((os.getenv("INTAKE_READER") or "").strip().lower() or "primary")
+if INTAKE_READER not in ("primary", "shadow", "off"):
+    INTAKE_READER = "primary"
+INTAKE_CHANNEL_ID = (os.getenv("INTAKE_CHANNEL_ID") or "").strip()
+DISCORD_BOT_TOKEN = (os.getenv("DISCORD_BOT_TOKEN") or "").strip()
+# Newest relay message older than this => relay considered paused/broken.
+INTAKE_STALE_SECONDS = max(120, _env_int("INTAKE_STALE_SECONDS", 1800))
+# How far back the channel is read each run (bounds the re-listing window
+# for held posts; one HTTP page per 100 messages, INTAKE_MAX_PAGES cap).
+INTAKE_LOOKBACK_SECONDS = max(600, _env_int("INTAKE_LOOKBACK_SECONDS", 6 * 3600))
+INTAKE_MAX_PAGES = 8
+_DISCORD_EPOCH_MS = 1420070400000
+_INTAKE_FENCE_RE = re.compile(r"```json\s*\n(.*?)\n\s*```", re.DOTALL)
+
+
+def _snowflake_from_epoch(epoch_s: float) -> int:
+    return max(0, int(epoch_s * 1000) - _DISCORD_EPOCH_MS) << 22
+
+
+def _epoch_from_snowflake(snowflake) -> float | None:
+    try:
+        return ((int(snowflake) >> 22) + _DISCORD_EPOCH_MS) / 1000.0
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_intake_record(content: str | None) -> dict | None:
+    """One relay record from one Discord message body, or None.
+
+    Accepts only the fenced ```json block the relay writes, with the v1
+    shape. Anything else in the channel (a human note, a different relay
+    version, a malformed message) is ignored, never raised on.
+    """
+    m = _INTAKE_FENCE_RE.search(content or "")
+    if not m:
+        return None
+    try:
+        rec = json.loads(m.group(1))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(rec, dict) or rec.get("v") != 1:
+        return None
+    pid = str(rec.get("id") or "").strip().lower()
+    sub = str(rec.get("sub") or "").strip()
+    permalink = str(rec.get("permalink") or "").strip()
+    created = rec.get("created")
+    if (not re.fullmatch(r"[a-z0-9]{4,12}", pid) or not sub
+            or not permalink.startswith("/r/")
+            or not isinstance(created, (int, float)) or isinstance(created, bool)
+            or created <= 0):
+        return None
+    out = dict(rec)
+    out["id"] = pid
+    out["sub"] = sub
+    out["permalink"] = permalink
+    out["created"] = int(created)
+    out["media"] = [str(u) for u in (rec.get("media") or []) if isinstance(u, str) and u]
+    out["body"] = str(rec.get("body") or "")
+    return out
+
+
+def intake_content_html(rec: dict) -> str:
+    """RSS-shaped HTML for the extractors that still read `content_html`.
+
+    Only anchors: the media URLs (so extract_native_media / the v.redd.it
+    detector see them), then the post destination as the trailing
+    ``[link]`` anchor exactly like reddit's feed (extract_outbound_url,
+    gallery hint). The body is NOT included — it is markdown and goes
+    through _clean_selftext in intake_base_data instead.
+    """
+    parts = []
+    seen = set()
+    urls = list(rec.get("media") or [])
+    # Inline rich-text images live in the markdown body as bare preview.redd.it
+    # / i.redd.it URLs (live records 1xlgs9j, 1xlh3fw). Reddit's RSS content
+    # carried them as anchors, so the native extractor must still see them.
+    try:
+        urls += [m.group(0) for m in REDDIT_MEDIA_URL_RE.finditer(
+            str(rec.get("body") or "").replace("\\_", "_"))]
+    except Exception:
+        pass
+    for u in urls:
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        esc = html_lib.escape(u, quote=True)
+        parts.append(f'<a href="{esc}">{esc}</a>')
+    url = str(rec.get("url") or "").strip()
+    if url:
+        esc = html_lib.escape(url, quote=True)
+        parts.append(f'<a href="{esc}">[link]</a>')
+    permalink = html_lib.escape(f"https://www.reddit.com{rec.get('permalink') or ''}", quote=True)
+    parts.append(f'<span><a href="{permalink}">[comments]</a></span>')
+    return "".join(parts)
+
+
+class _IntakeEntry:
+    """Feed-like entry for one relay record (same duck type as _ArcticEntry
+    and feedparser entries, so collect() and the pipeline need no new branch).
+    Deliberately NOT an _ArcticEntry: relay entries are Reddit's own listing,
+    so the archive-only gates (feed_ok=False, snapshot sources, the Arctic
+    pending throttle) must not apply to them."""
+
+    def __init__(self, rec: dict, message_id: str | None = None):
+        self.record = rec
+        self.message_id = message_id
+        self.link = f"https://www.reddit.com{rec['permalink']}"
+        self.title = rec.get("title") or ""
+        self.author = rec.get("author") or ""
+        created = rec.get("created")
+        self.published_parsed = time.localtime(created) if created else None
+        self.updated_parsed = self.published_parsed
+        self.body_truncated = bool(rec.get("bodyTruncated"))
+        self._d = {
+            "content": [{"value": intake_content_html(rec)}],
+            "summary": "",
+            "media_thumbnail": [],
+            "published_parsed": self.published_parsed,
+            "updated_parsed": self.updated_parsed,
+        }
+
+    def get(self, k, d=None):
+        return self._d.get(k, d)
+
+
+def intake_base_data(entry) -> dict:
+    """Native-mode base from a relay record (the entry_to_base_data twin).
+
+    The body is Reddit's raw markdown (Devvit `post.body`), so it takes the
+    same `_clean_selftext` path the post-JSON selftext takes — not the RSS
+    HTML cleaner. A truncated body (relay budget) is left EMPTY here so the
+    existing archive/proxy fill-in recovers the full text; the truncated
+    text is kept on the entry as the last-resort fallback (see main).
+    """
+    rec = entry.record
+    content_html = intake_content_html(rec)
+    own_path = normalize_reddit_path(entry.link)
+    url = str(rec.get("url") or "")
+    media_blob = " ".join(rec.get("media") or [])
+    body = "" if entry.body_truncated else _clean_selftext(rec.get("body") or "")
+    outbound = extract_outbound_url(content_html)
+    return {
+        # Reddit's API escapes titles once (`&amp;`), like selftext; the
+        # relay forwards them as-is, so one unescape restores the text.
+        "title": _clean_post_title(html_lib.unescape(str(rec.get("title") or ""))),
+        "author": _clean_author_name(rec.get("author") or ""),
+        "content_html": content_html,
+        "thumb": None,
+        "body": body,
+        "crosspost_orig_path": find_crosspost_original_path(
+            "\n".join([url, rec.get("body") or ""]), own_path),
+        # Round 101: the relay names the crosspost parent by fullname; the
+        # media resolver turns the id into a path via the archive.
+        "crosspost_parent_id": parent_fullname_id(rec.get("xpost")),
+        "vred_id": extract_vreddit_id(" ".join([url, media_blob, rec.get("body") or ""])),
+        "redgifs_url": extract_redgifs_url(" ".join([url, rec.get("body") or ""])),
+        "youtube_url": select_youtube_url(outbound, rec.get("body") or ""),
+    }
+
+
+async def fetch_intake_records(session: aiohttp.ClientSession, now: float) -> dict:
+    """Read #reddit-intake back. Never raises.
+
+    Returns {"status": ok|stale|empty|unconfigured|http_<n>|error,
+             "records": [rec…] (newest first, this engine's subreddits only),
+             "seen": <all v1 records in the window>, "newest_age": s|None,
+             "pages": n, "detail": str}.
+    `ok` is the ONLY status that makes the relay the primary listing.
+    """
+    out = {"status": "unconfigured", "records": [], "seen": 0,
+           "newest_age": None, "pages": 0, "detail": ""}
+    if INTAKE_READER == "off":
+        out["status"] = "off"
+        return out
+    if not INTAKE_CHANNEL_ID or not DISCORD_BOT_TOKEN:
+        out["detail"] = ("INTAKE_CHANNEL_ID Variable and DISCORD_BOT_TOKEN secret "
+                         "are both required")
+        return out
+    if not re.fullmatch(r"\d{15,22}", INTAKE_CHANNEL_ID):
+        out["detail"] = "INTAKE_CHANNEL_ID is not a Discord snowflake"
+        return out
+    url = f"https://discord.com/api/v10/channels/{INTAKE_CHANNEL_ID}/messages"
+    headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+               "User-Agent": "News-Express intake reader (+https://github.com)"}
+    after = _snowflake_from_epoch(now - INTAKE_LOOKBACK_SECONDS)
+    messages = []
+    try:
+        for _page in range(INTAKE_MAX_PAGES):
+            params = {"limit": "100", "after": str(after)}
+            async with session.get(url, params=params, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                out["pages"] += 1
+                if resp.status != 200:
+                    out["status"] = f"http_{resp.status}"
+                    out["detail"] = {
+                        401: "bot token rejected",
+                        403: "bot lacks View Channel / Read Message History on the channel",
+                        404: "channel id unknown to this bot (wrong id, or bot not in the server)",
+                        429: "rate limited",
+                    }.get(resp.status, "unexpected status")
+                    return out
+                page = await resp.json(content_type=None)
+            if not isinstance(page, list):
+                out["status"] = "error"
+                out["detail"] = "non-list response"
+                return out
+            page = [m for m in page if isinstance(m, dict) and str(m.get("id") or "").isdigit()]
+            messages.extend(page)
+            if len(page) < 100:
+                break
+            after = max(int(m["id"]) for m in page)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # network/timeout/json — fall back, never fail the run
+        out["status"] = "error"
+        out["detail"] = _sanitize_error_message(e, 200)
+        return out
+
+    messages.sort(key=lambda m: int(m["id"]), reverse=True)
+    if messages:
+        newest = _epoch_from_snowflake(messages[0]["id"])
+        if newest is not None:
+            out["newest_age"] = max(0, int(now - newest))
+    records, by_id = [], {}
+    for m in messages:
+        rec = parse_intake_record(m.get("content"))
+        if not rec:
+            continue
+        out["seen"] += 1
+        sub = _subreddit_by_name(rec["sub"])
+        if not sub or rec["id"] in by_id:
+            continue
+        rec["sub"] = sub
+        rec["_message_id"] = str(m["id"])
+        by_id[rec["id"]] = rec
+        records.append(rec)
+    out["records"] = records
+    if not messages:
+        out["status"] = "empty"
+        out["detail"] = f"no messages in the last {INTAKE_LOOKBACK_SECONDS // 60} min"
+    elif out["newest_age"] is not None and out["newest_age"] > INTAKE_STALE_SECONDS:
+        out["status"] = "stale"
+        out["detail"] = (f"newest relay message is {out['newest_age']} s old "
+                         f"(limit {INTAKE_STALE_SECONDS} s)")
+    else:
+        out["status"] = "ok"
+    return out
+
+
+def _intake_summary(intake: dict) -> dict:
+    """The run-result view of the intake read (no records, no ids)."""
+    return {
+        "status": intake.get("status"),
+        "mode": INTAKE_READER,
+        "records_in_window": intake.get("seen"),
+        "records_for_this_engine": len(intake.get("records") or []),
+        "newest_age_seconds": intake.get("newest_age"),
+        "pages": intake.get("pages"),
+        "detail": intake.get("detail") or "",
+    }
+
+
+def _intake_line(intake: dict | None) -> str:
+    """One plain summary fragment, appended to the settings line."""
+    if not intake:
+        return ""
+    status = str(intake.get("status") or "")
+    if status == "off":
+        return "intake off"
+    n = intake.get("records_for_this_engine")
+    age = intake.get("newest_age_seconds")
+    tail = []
+    if isinstance(n, int):
+        tail.append(f"{n} record(s)")
+    if isinstance(age, int):
+        tail.append(f"newest {age} s")
+    inner = (", ".join(tail)) if tail else (intake.get("detail") or "")
+    label = {"ok": "relay ok", "stale": "relay STALE → old chain",
+             "empty": "relay EMPTY → old chain",
+             "unconfigured": "relay unconfigured → old chain",
+             "error": "relay ERROR → old chain"}.get(
+        status, f"relay {status} → old chain")
+    return f"intake {intake.get('mode')} ({label}" + (f"; {inner}" if inner else "") + ")"
+
+
 def _clean_author_name(value) -> str:
     for line in reversed(str(value or "").splitlines()):
         candidate = re.sub(r"\]\(.*$", "", line).strip(" []*")
@@ -2788,7 +3132,28 @@ def _clean_plain_body(text) -> str:
     if text in ("[removed]", "[deleted]"):
         return ""
     text = _normalize_reddit_markdown(html_lib.unescape(str(text or "")))
+    text = _unescape_markdown_in_urls(text)
     return _collapse_blanks(_line_stage([line.strip() for line in text.splitlines()]))
+
+
+# Bare autolinked URLs only: a `[label](url)` target is left as written (the
+# round-99 operator-approved megathread card keeps `HonkaiStarRail\_leaks` there).
+_BARE_URL_TOKEN_RE = re.compile(r"(?<!\()https?://[^\s<>()]+")
+_MD_ESCAPED_PUNCT_RE = re.compile(r"\\([_*~#\-\[\]])")
+
+
+def _unescape_markdown_in_urls(text: str) -> str:
+    """Round 101: raw Reddit markdown escapes punctuation inside bare URLs
+    (`https://x.com/minmyouk\_xx/status/…`, live record 1xlhem9). Reddit's
+    renderer resolves `\_` to `_` before anyone sees it (the RSS HTML never
+    carried the backslash); Discord does not, and the autolink breaks at the
+    backslash. Only bare URL tokens are touched — prose escapes (incl. the
+    round-99 literal `\>!…!<`) and markdown link targets stay as written."""
+    try:
+        return _BARE_URL_TOKEN_RE.sub(
+            lambda m: _MD_ESCAPED_PUNCT_RE.sub(r"\1", m.group(0)), text or "")
+    except Exception:
+        return text or ""
 
 
 _HTML_TAG_RE = re.compile(r"(?i)</?[a-z][a-z0-9]*(?:\s[^<>]*)?/?>")
@@ -3892,6 +4257,13 @@ async def candidate_liveness_verdict(session, *, key: str, path: str,
         state, why = archived_removal_verdict(entry_record)
         if state != "unknown":
             return state, why, "arctic-entry"
+    # 2b. Round 101: the relay record carries Reddit's own removal state at
+    # the moment the app listed the post — positive evidence, no request.
+    relay_record = getattr(entry, "record", None) if isinstance(entry, _IntakeEntry) else None
+    if isinstance(relay_record, dict):
+        relay_reason = _queue_or_removal_reason(relay_record.get("removed"))
+        if relay_reason:
+            return "removed", f"relay record: {relay_reason}", "relay-record"
     # 3. One archive lookup by id.
     if _liveness_probe_budget_used >= LIVENESS_PROBE_BUDGET:
         return "unverified", "probe budget exhausted", "budget"
@@ -3903,7 +4275,32 @@ async def candidate_liveness_verdict(session, *, key: str, path: str,
     state, why = archived_removal_verdict(record)
     if state == "unknown":
         return "unverified", why, "arctic-lookup"
+    # Round 101: an archive `removed` row is a SNAPSHOT (`retrieved_on`, ~10 s
+    # after creation). When Reddit's own /new listed the post LATER than that
+    # snapshot (the relay message time), the post was visible after the
+    # archive looked — the queue state was lifted. Stateless replacement for
+    # the round-98 feed streak, which a replayed relay record cannot build.
+    if state == "removed" and isinstance(entry, _IntakeEntry):
+        fresher = relay_listing_is_fresher(entry, record)
+        if fresher is not None:
+            return ("live", f"listed on Reddit's /new {fresher} s after the archive "
+                            f"snapshot that said '{why}'", "relay-listing")
     return state, why, "arctic-lookup"
+
+
+def relay_listing_is_fresher(entry, record: dict | None,
+                             margin_seconds: int = 20) -> int | None:
+    """Round 101: seconds by which the relay sighting post-dates the archive
+    row's `retrieved_on`, or None when it does not (or cannot be known)."""
+    try:
+        listed_at = _epoch_from_snowflake(getattr(entry, "message_id", None))
+        retrieved = (record or {}).get("retrieved_on")
+        if listed_at is None or not isinstance(retrieved, (int, float)) or isinstance(retrieved, bool):
+            return None
+        delta = int(listed_at - float(retrieved))
+        return delta if delta > margin_seconds else None
+    except Exception:
+        return None
 
 
 def liveness_hold_decision(state: str, strict: bool) -> bool:
@@ -7548,8 +7945,39 @@ async def main():
                 run_stats["combined_entries"] = 0
                 run_stats["subreddits_represented"] = 0
             else:
+                # ---- Round 101: the Devvit relay is read FIRST ------------------
+                # `ok` makes it the listing for this run; anything else falls
+                # through to the pre-round-101 chain below, unchanged.
+                intake = await fetch_intake_records(session, now)
+                run_stats["intake"] = _intake_summary(intake)
+                relay_primary = (INTAKE_READER == "primary" and intake["status"] == "ok")
+                if intake["status"] == "off":
+                    logging.info("INTAKE: reader off (INTAKE_READER=off) — old chain.")
+                elif relay_primary:
+                    logging.info(
+                        f"INTAKE: relay ok — {len(intake['records'])} record(s) for this "
+                        f"engine ({intake['seen']} in window, {intake['pages']} page(s), "
+                        f"newest {intake['newest_age']} s) — relay is the listing; "
+                        f"combined feed / fallback / archive sweep skipped.")
+                elif INTAKE_READER == "shadow":
+                    logging.info(
+                        f"INTAKE-SHADOW: relay {intake['status']} — "
+                        f"{len(intake['records'])} record(s) for this engine; "
+                        f"old chain decides this run.")
+                else:
+                    logging.warning(
+                        f"INTAKE-FALLBACK: relay {intake['status']}"
+                        + (f" ({intake['detail']})" if intake.get("detail") else "")
+                        + " — running the old chain (combined feed → per-sub → archive).")
+                # Refresh the settings line so the summary states the outcome.
+                try:
+                    run_stats["settings_line"] = _settings_line(_effective_settings(),
+                                                                run_stats["intake"])
+                except Exception:
+                    pass
+
                 # ---- PRIMARY: one combined request for all subreddits ---------
-                combined = await fetch_combined_feed(session)
+                combined = None if relay_primary else await fetch_combined_feed(session)
                 new_posts = []  # (subreddit, path, unique_key, published_ts, activity_ts, entry)
 
                 # Round 98: `provenance` records WHERE the entries came from so the
@@ -7588,7 +8016,31 @@ async def main():
                             native_keys.add(unique_key)
                         new_posts.append((sub, path, unique_key, published_ts, activity_ts, entry))
 
-                if combined and combined.entries is not None:
+                relay_entries = [_IntakeEntry(r, r.get("_message_id"))
+                                 for r in intake.get("records") or []]
+                if relay_primary:
+                    # Relay entries are Reddit's own listing, but each record is
+                    # a one-time sighting replayed from the channel — it must
+                    # NOT build the round-98 feed streak (a removed post would
+                    # stay "listed" by replay). Provenance "relay": the
+                    # fresher-listing rule in candidate_liveness_verdict covers
+                    # the stale-archive case statelessly instead.
+                    _per_sub_entries = {}
+                    for _e in relay_entries:
+                        _per_sub_entries[_e.record["sub"]] = _per_sub_entries.get(_e.record["sub"], 0) + 1
+                    run_stats["feed_subreddits_with_entries"] = dict(_per_sub_entries)
+                    run_stats["feed_subreddits_missing"] = sorted(set(SUBREDDITS) - set(_per_sub_entries))
+                    combined_entries_val = len(relay_entries)
+                    subreddits_represented_val = len(_per_sub_entries)
+                    combined_fetch_status = "relay"
+                    entries = relay_entries[:1] if is_first_run else relay_entries
+                    if entries:
+                        collect(entries, None, provenance="relay")
+                    run_stats["intake"]["candidates"] = len(new_posts)
+                    run_stats["fallback_status"] = "not_attempted"
+                    run_stats["fallback_entries"] = None
+                    run_stats["fallback_subreddits_covered"] = None
+                elif combined and combined.entries is not None:
                     # Combined fetch succeeded (even if 0 entries => empty, distinct from failed fetch)
                     try:
                         covered = set()
@@ -7680,7 +8132,7 @@ async def main():
                 _rss_covered_subs = {p[0] for p in new_posts}
                 arctic_candidates_total = 0
                 arctic_subs_tried = 0
-                for sub in SUBREDDITS:
+                for sub in ([] if relay_primary else SUBREDDITS):
                     if sub in _rss_covered_subs:
                         continue
                     arctic_subs_tried += 1
@@ -7734,6 +8186,35 @@ async def main():
 
                 run_stats["arctic_candidates"] = arctic_candidates_total
                 run_stats["arctic_subreddits_tried"] = arctic_subs_tried
+
+                # ---- Round 101: relay records when the relay is NOT the listing
+                # shadow: compare only (log the difference, change nothing).
+                # primary-but-degraded (stale/empty/error): whatever the relay
+                # DID deliver is still Reddit's own sighting — add the records
+                # the old chain missed, so a late-arriving fallback never loses
+                # a post the relay already saw.
+                if relay_entries and not relay_primary:
+                    _old_keys = {p[2] for p in new_posts}
+                    _before = len(new_posts)
+                    _relay_only = [e for e in relay_entries
+                                   if f"{e.record['sub']}_{e.record['id']}" not in _old_keys]
+                    _relay_keys = {f"{e.record['sub']}_{e.record['id']}" for e in relay_entries}
+                    _old_only = sorted(k for k in _old_keys if k not in _relay_keys)
+                    if INTAKE_READER == "shadow":
+                        _relay_only_keys = ", ".join(
+                            f"{e.record['sub']}_{e.record['id']}" for e in _relay_only[:10])
+                        logging.info(
+                            f"INTAKE-SHADOW: {len(relay_entries)} relay record(s); "
+                            f"{len(_relay_only)} not found by the old chain this run "
+                            f"({_relay_only_keys}); "
+                            f"{len(_old_only)} old-chain-only ({', '.join(_old_only[:10])}).")
+                    elif _relay_only:
+                        collect(_relay_only, None, provenance="relay")
+                        logging.info(
+                            f"INTAKE: added {len(new_posts) - _before} relay record(s) the "
+                            f"old chain did not list this run.")
+                    run_stats["intake"]["relay_only"] = len(_relay_only)
+                    run_stats["intake"]["old_chain_only"] = len(_old_only)
 
                 # Populate run_stats feed fields from feed itself, never from deduped candidates or archive
                 # Use unavailable/not applicable when metric cannot be established
@@ -7833,7 +8314,7 @@ async def main():
                                 _outcome = "outside_window"
                             else:
                                 _rsrc = str(_rrec.get("source") or "arctic")
-                                reclaim_sources[_rkey] = ("rss" if _rsrc == "rss"
+                                reclaim_sources[_rkey] = (_rsrc if _rsrc in ("rss", "relay")
                                                           else "arctic")
                                 new_posts.append((_rsub, _rpath, _rkey, _rpub,
                                                   _rpub, _ArcticEntry(_rpost)))
@@ -7994,6 +8475,7 @@ async def main():
 
                 reddit_url = f"https://www.reddit.com{path}"
                 _entry_source36 = ("arctic" if isinstance(entry, _ArcticEntry)
+                                   else "relay" if isinstance(entry, _IntakeEntry)
                                    else "rss")
                 # Round 98: a reclaimed post keeps the provenance it was held
                 # under (the archive record is only the re-read, not the origin).
@@ -8012,7 +8494,9 @@ async def main():
                 run_stats["candidates_entering_processing"] += 1
 
                 if entry is not None:
-                    base = entry_to_base_data(entry)
+                    # Round 101: a relay record carries markdown, not RSS HTML.
+                    base = (intake_base_data(entry) if isinstance(entry, _IntakeEntry)
+                            else entry_to_base_data(entry))
                     post_json = await fetch_post_json(session, extract_post_id(path) or "",
                                                       use_oauth=use_oauth)
                 else:
@@ -8204,6 +8688,18 @@ async def main():
                 try:
                     data = await resolve_post_media(session, base, post_json,
                                                     path=path, label=unique_key)
+                    # Round 101: a relay body cut by the relay's message budget
+                    # was left empty so the archive/proxy fill-in could recover
+                    # the full text; when nothing did, the cut text still beats
+                    # an empty card.
+                    if (isinstance(entry, _IntakeEntry) and entry.body_truncated
+                            and not str(data.get("body") or "").strip()):
+                        _cut = _clean_selftext(entry.record.get("body") or "")
+                        if _cut:
+                            data["body"] = _cut
+                            logging.info(f"[{unique_key}] relay body was truncated and no "
+                                         f"source served the full text — using the "
+                                         f"relayed part.")
                     # ---- round 23 (2026-09-18): Arctic media-hint gate ------
                     # Arctic fills gallery_data / media_metadata ASYNCHRONOUSLY
                     # after capture, so a brand-new media post can be archived
@@ -8226,6 +8722,9 @@ async def main():
                         _hint = False
                         if isinstance(entry, _ArcticEntry):
                             _hint = _arctic_media_hint(getattr(entry, "_arctic_post", None))
+                        # Round 101: the relay lists the post's media URLs itself.
+                        if isinstance(entry, _IntakeEntry) and entry.record.get("media"):
+                            _hint = True
                         # Also check RSS gallery links and base content (covers
                         # RSS posts linking to /gallery/ and child_arctic via
                         # resolve_post_media's internal fetch)
@@ -8245,10 +8744,17 @@ async def main():
                     # Round 25: known partial archive galleries wait without caching.
                     # Unknown counts cannot gate; video cards intentionally use one tile.
                     if (not TEST_POST_ID and not DRY_RUN and post_json is None
-                            and isinstance(entry, _ArcticEntry)
+                            and isinstance(entry, (_ArcticEntry, _IntakeEntry))
                             and data["media"]
                             and not any(m["kind"] == "video" for m in data["media"])):
-                        _arctic_n = _arctic_media_count(getattr(entry, "_arctic_post", None))
+                        if isinstance(entry, _IntakeEntry):
+                            # Round 101: the relay's media[] is the gallery list
+                            # (one URL per item) for /gallery/ posts only.
+                            _arctic_n = (len(entry.record.get("media") or [])
+                                         if "/gallery/" in str(entry.record.get("url") or "")
+                                         else 0)
+                        else:
+                            _arctic_n = _arctic_media_count(getattr(entry, "_arctic_post", None))
                         if _arctic_n > len(data["media"]):
                             mark_pending(pending, unique_key, "partial_gallery", now)
                             run_stats["partial_gallery"] += 1

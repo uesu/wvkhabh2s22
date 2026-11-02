@@ -162,6 +162,22 @@ jobs:
           REDDIT_LIVENESS_STRICT: ${{ vars.REDDIT_LIVENESS_STRICT }}
           LIVENESS_PROBE_BUDGET: ${{ vars.LIVENESS_PROBE_BUDGET }}
           LIVENESS_PROBE_TIMEOUT: ${{ vars.LIVENESS_PROBE_TIMEOUT }}
+          # Round 101 (2026-11-02): Devvit relay intake — the PRIMARY Reddit
+          # discovery path (docs/DEVVIT_SETUP.md §9). Both of these are needed:
+          #   DISCORD_BOT_TOKEN (secret)   a bot in the Citlali News server with
+          #                                View Channel + Read Message History on
+          #                                #reddit-intake and the Message Content
+          #                                intent enabled in the developer portal
+          #   INTAKE_CHANNEL_ID (Variable) the #reddit-intake channel id
+          # Optional: INTAKE_READER=primary (default) | shadow | off;
+          # INTAKE_STALE_SECONDS (1800) — older newest message => old chain;
+          # INTAKE_LOOKBACK_SECONDS (21600) — channel window read each run.
+          # Unset/unhealthy => the pre-round-101 chain runs exactly as before.
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          INTAKE_CHANNEL_ID: ${{ vars.INTAKE_CHANNEL_ID }}
+          INTAKE_READER: ${{ vars.INTAKE_READER }}
+          INTAKE_STALE_SECONDS: ${{ vars.INTAKE_STALE_SECONDS }}
+          INTAKE_LOOKBACK_SECONDS: ${{ vars.INTAKE_LOOKBACK_SECONDS }}
           # Round 49 (2026-10-01): the three media proxies are queried
           # CONCURRENTLY instead of one after another (~1.5s -> ~0.4-0.8s per
           # post). Defaults are tuned on the prod timings of 11:55 UTC and

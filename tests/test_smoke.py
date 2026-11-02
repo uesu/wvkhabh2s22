@@ -1640,6 +1640,8 @@ for label, overrides, expected in [
     scope = dict(TEST_POST_ID='', DRY_RUN=False, post_json=None,
                  entry=types.SimpleNamespace(_arctic_post=_r25_post),
                  _ArcticEntry=types.SimpleNamespace, data={'media': [{'kind': 'image'}]},
+                 # round 101: the gate also knows relay entries (never built here)
+                 _IntakeEntry=v3._IntakeEntry,
                  _arctic_media_count=v3._arctic_media_count, logging=__import__('logging'),
                  unique_key='r25-test', allowed=False,
                  # round 30 (2026-09-19): the gate now also records the post in
@@ -11994,6 +11996,257 @@ check("r100: heal_unresolved_media returns the still-unresolved tuples and main(
       and _r100_src.index("heal_leftovers = await heal_unresolved_media(session, heal_queue)")
       < _r100_src.index("carried = await carry_over_media_heal(session, carried, heal_leftovers)")
       < _r100_src.index("save_media_heal_pending(carried)"))
+
+# ---- Round 101 (2026-11-02): the Devvit relay is the primary Reddit listing ----
+# Reddit retires RSS on 2026-11-13. The relay app (devvit/gaming-express) writes
+# one fenced-JSON record per new post into #reddit-intake; the engine reads the
+# channel back with a bot token and skips the RSS/redlib/archive chain while the
+# relay is healthy. Every proof below runs offline against a fake Discord API.
+_r101_src = open(os.path.join(ROOT, "testing area", "reddit_main_v3.py"), encoding="utf-8").read()
+_r101_wf = open(os.path.join(ROOT, ".github", "workflows", "reddit_monitor.yml"),
+                encoding="utf-8").read()
+_r101_now = 1793600000.0
+_r101_rec = {"v": 1, "id": "1xlgjkw", "sub": "honkaistarrail_leaks", "title": "Boothill &amp; co",
+             "permalink": "/r/HonkaiStarRail_leaks/comments/1xlgjkw/boothill/",
+             "url": "https://i.redd.it/n9t3klsev2zh1.png", "created": int(_r101_now - 400),
+             "author": "RenFlare11", "flair": "Reliable", "distinguished": None, "spoiler": False,
+             "score": 1, "comments": 0, "removed": None, "xpost": "t3_abc123",
+             "media": ["https://preview.redd.it/n9t3klsev2zh1.png?width=1080&auto=webp&s=45a1"],
+             "body": "&gt; quote\n\nSome *leak* &amp; https://v.redd.it/qngdsh0x92zh1", "bodyTruncated": False}
+_r101_fence = lambda r: "```json\n" + json.dumps(r) + "\n```"
+_r101_parsed = v3.parse_intake_record(_r101_fence(_r101_rec))
+check("r101: the parser accepts only the relay's fenced v1 record (id/sub/permalink/created) "
+      "and ignores notes, other versions and malformed JSON",
+      _r101_parsed is not None and _r101_parsed["id"] == "1xlgjkw"
+      and v3.parse_intake_record("a human note") is None
+      and v3.parse_intake_record("```json\n{\"v\": 2, \"id\": \"abc\"}\n```") is None
+      and v3.parse_intake_record("```json\n{\"v\": 1, \"id\": \"abc\"\n```") is None
+      and v3.parse_intake_record(_r101_fence(dict(_r101_rec, permalink="https://x"))) is None
+      and v3.parse_intake_record(_r101_fence(dict(_r101_rec, created="123"))) is None)
+_r101_entry = v3._IntakeEntry(dict(_r101_parsed, sub="HonkaiStarRail_leaks"),
+                              str(v3._snowflake_from_epoch(_r101_now - 370)))
+_r101_base = v3.intake_base_data(_r101_entry)
+check("r101: a relay entry is feed-shaped (link/title/author/published) but NOT an archive entry, "
+      "so feed_ok, the Arctic throttle and the snapshot gates keep their meaning",
+      _r101_entry.link == "https://www.reddit.com/r/HonkaiStarRail_leaks/comments/1xlgjkw/boothill/"
+      and int(time.mktime(_r101_entry.published_parsed)) == int(_r101_now - 400)
+      and _r101_entry.get("content")[0]["value"]
+      and not isinstance(_r101_entry, v3._ArcticEntry)
+      and abs(v3._epoch_from_snowflake(_r101_entry.message_id) - (_r101_now - 370)) < 1)
+check("r101: the base takes the markdown body through _clean_selftext (one unescape), "
+      "unescapes the API-escaped title once, and finds video/crosspost/media evidence",
+      _r101_base["title"] == "Boothill & co"
+      and _r101_base["body"].startswith("> quote") and "&amp;" not in _r101_base["body"]
+      and _r101_base["vred_id"] == "qngdsh0x92zh1"
+      and _r101_base["crosspost_parent_id"] == "abc123"
+      and [m["url"] for m in v3.extract_native_media(_r101_base["content_html"])]
+          == ["https://i.redd.it/n9t3klsev2zh1.png"]
+      and v3.resolve_crosspost_source(
+          own_path="/r/HonkaiStarRail_leaks/comments/1xlgjkw/", base=_r101_base)["id"] == "abc123")
+_r101_cut = v3._IntakeEntry(dict(_r101_parsed, sub="HonkaiStarRail_leaks", bodyTruncated=True), "1")
+check("r101: a relay-truncated body is left empty for the archive/proxy fill-in, and main() "
+      "falls back to the relayed part only when nothing served the full text",
+      v3.intake_base_data(_r101_cut)["body"] == ""
+      and "entry.body_truncated" in inspect.getsource(v3.main)
+      and "relay body was truncated and no" in inspect.getsource(v3.main))
+
+
+async def _r101_liveness():
+    rows = {"a3": {"removed_by_category": "automod_filtered", "retrieved_on": int(_r101_now - 590)},
+            "a4": {"removed_by_category": "moderator", "retrieved_on": int(_r101_now - 100)},
+            "a5": {"removed_by_category": None, "title": "t", "selftext": "s"}}
+    saved = (v3._fetch_arctic_post_row, v3.REDDIT_LIVENESS_PROBE, v3.LIVENESS_PROBE_BUDGET,
+             v3.DRY_RUN, v3.TEST_POST_ID, v3._liveness_probe_budget_used)
+
+    async def fake_row(session, post_id, label=""):
+        return rows.get(post_id)
+
+    def entry(pid, removed=None):
+        rec = dict(_r101_parsed, id=pid, sub="HonkaiStarRail_leaks", removed=removed,
+                   permalink=f"/r/HonkaiStarRail_leaks/comments/{pid}/t/")
+        return v3._IntakeEntry(rec, str(v3._snowflake_from_epoch(_r101_now - 500)))
+
+    out = []
+    try:
+        v3._fetch_arctic_post_row = fake_row
+        v3.REDDIT_LIVENESS_PROBE, v3.LIVENESS_PROBE_BUDGET = True, 10
+        v3.DRY_RUN, v3.TEST_POST_ID, v3._liveness_probe_budget_used = False, "", 0
+        for pid, removed in (("a1", "moderator"), ("a2", "automod_filtered"), ("a3", None),
+                             ("a4", None), ("a5", None), ("a6", None)):
+            e = entry(pid, removed)
+            out.append(await v3.candidate_liveness_verdict(
+                None, key=pid, path=f"/r/HonkaiStarRail_leaks/comments/{pid}/t/", entry=e))
+        plain = types.SimpleNamespace()
+        out.append(await v3.candidate_liveness_verdict(
+            None, key="a4", path="/r/HonkaiStarRail_leaks/comments/a4/t/", entry=plain))
+    finally:
+        (v3._fetch_arctic_post_row, v3.REDDIT_LIVENESS_PROBE, v3.LIVENESS_PROBE_BUDGET,
+         v3.DRY_RUN, v3.TEST_POST_ID, v3._liveness_probe_budget_used) = saved
+    return out
+
+_r101_v = asyncio.run(_r101_liveness())
+check("r101 liveness: the relay record's own removal state holds without a request "
+      "(queue state -> 'pending approval', removal -> never-re-checked reason)",
+      _r101_v[0][0] == "removed" and _r101_v[0][2] == "relay-record"
+      and "removed by moderators/filters" in _r101_v[0][1]
+      and _r101_v[1][0] == "removed" and "pending approval" in _r101_v[1][1])
+check("r101 liveness: an archive 'removed' snapshot older than the relay sighting is stale "
+      "-> live (relay-listing); a newer archive snapshot still holds; clean/none unchanged",
+      _r101_v[2] [0] == "live" and _r101_v[2][2] == "relay-listing"
+      and _r101_v[3] == ("removed", "removed by moderators/filters", "arctic-lookup")
+      and _r101_v[4] == ("live", "archived record is clean", "arctic-lookup")
+      and _r101_v[5] == ("unverified", "no archived record", "arctic-lookup")
+      and _r101_v[6] == ("removed", "removed by moderators/filters", "arctic-lookup"))
+check("r101: relay entries never build the round-98 feed streak (provenance 'relay', not "
+      "'reddit-native'), so a replayed record cannot unlock the stale-snapshot override",
+      'collect(entries, None, provenance="relay")' in inspect.getsource(v3.main)
+      and 'collect(_relay_only, None, provenance="relay")' in inspect.getsource(v3.main)
+      and "relay" not in v3._SNAPSHOT_SOURCES
+      and v3.relay_listing_is_fresher(_r101_entry, {"retrieved_on": _r101_now - 360}) is None
+      and v3.relay_listing_is_fresher(_r101_entry, {"retrieved_on": _r101_now - 500}) == 130)
+check("r101: a replayed relay record of a never-re-check hold is skipped like an archive "
+      "resurface (it is not a restore)",
+      v3._pending_throttle_skip({"k": {"reason": "removal notice", "last_checked": _r101_now}},
+                                "k", _r101_now, _r101_entry) is True
+      and v3._pending_throttle_skip({"k": {"reason": "removal notice", "last_checked": _r101_now}},
+                                    "k", _r101_now, types.SimpleNamespace()) is False)
+
+
+class _R101Resp:
+    def __init__(self, status, data):
+        self.status, self._data = status, data
+
+    async def json(self, content_type=None):
+        return self._data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _R101Session:
+    def __init__(self, messages=None, status=200):
+        self.messages, self.status, self.calls = messages or [], status, []
+
+    def get(self, url, **kw):
+        self.calls.append((url, dict(kw.get("params") or {}), dict(kw.get("headers") or {})))
+        if self.status != 200:
+            return _R101Resp(self.status, {"message": "Missing Access"})
+        after = int(kw["params"]["after"])
+        page = [m for m in self.messages if int(m["id"]) > after]
+        page.sort(key=lambda m: int(m["id"]))
+        return _R101Resp(200, page[:100])
+
+
+def _r101_msgs(n, newest_age, other_sub=False):
+    out = []
+    for i in range(n):
+        rec = dict(_r101_rec, id=f"1xl{i:04d}", sub=("Genshin_Impact" if other_sub else "HonkaiStarRail_leaks"),
+                   permalink=f"/r/HonkaiStarRail_leaks/comments/1xl{i:04d}/t/")
+        out.append({"id": str(v3._snowflake_from_epoch(_r101_now - newest_age - i * 60)),
+                    "content": _r101_fence(rec)})
+    return out
+
+
+async def _r101_reader(messages=None, status=200, **env):
+    saved = {k: getattr(v3, k) for k in ("INTAKE_READER", "INTAKE_CHANNEL_ID", "DISCORD_BOT_TOKEN",
+                                          "INTAKE_STALE_SECONDS", "SUBREDDITS")}
+    try:
+        v3.INTAKE_READER, v3.INTAKE_CHANNEL_ID = "primary", "1430000000000000000"
+        v3.DISCORD_BOT_TOKEN, v3.INTAKE_STALE_SECONDS = "tok", 1800
+        v3.SUBREDDITS = ["HonkaiStarRail_leaks", "Genshin_Impact_Leaks"]
+        for k, val in env.items():
+            setattr(v3, k, val)
+        session = _R101Session(messages, status)
+        return await v3.fetch_intake_records(session, _r101_now), session
+    finally:
+        for k, val in saved.items():
+            setattr(v3, k, val)
+
+_r101_ok, _r101_s = asyncio.run(_r101_reader(_r101_msgs(3, 40) + [{"id": str(v3._snowflake_from_epoch(_r101_now - 10)), "content": "note"}]))
+check("r101 reader: healthy channel -> status ok, newest age from the snowflake, only this "
+      "engine's subreddits kept, bot token only in the Authorization header",
+      _r101_ok["status"] == "ok" and _r101_ok["newest_age"] == 10
+      and len(_r101_ok["records"]) == 3 and _r101_ok["seen"] == 3
+      and _r101_s.calls[0][0] == "https://discord.com/api/v10/channels/1430000000000000000/messages"
+      and _r101_s.calls[0][2].get("Authorization") == "Bot tok"
+      and "tok" not in _r101_s.calls[0][0] and "tok" not in json.dumps(_r101_s.calls[0][1]))
+check("r101 reader: records for other subreddits (Game-Express) are counted but not candidates",
+      asyncio.run(_r101_reader(_r101_msgs(2, 40, other_sub=True)))[0]["records"] == []
+      and asyncio.run(_r101_reader(_r101_msgs(2, 40, other_sub=True)))[0]["seen"] == 2)
+check("r101 reader: stale (newest older than INTAKE_STALE_SECONDS), empty, HTTP error and "
+      "unconfigured are all non-ok statuses that never raise",
+      asyncio.run(_r101_reader(_r101_msgs(3, 5000)))[0]["status"] == "stale"
+      and asyncio.run(_r101_reader([]))[0]["status"] == "empty"
+      and asyncio.run(_r101_reader(_r101_msgs(3, 40), status=403))[0]["status"] == "http_403"
+      and asyncio.run(_r101_reader(_r101_msgs(3, 40), DISCORD_BOT_TOKEN=""))[0]["status"] == "unconfigured"
+      and asyncio.run(_r101_reader(_r101_msgs(3, 40), INTAKE_READER="off"))[0]["status"] == "off")
+_r101_many, _r101_s2 = asyncio.run(_r101_reader(_r101_msgs(230, 40)))
+check("r101 reader: pages with `after` (100 per page, bounded by INTAKE_MAX_PAGES) and dedups by id",
+      _r101_many["status"] == "ok" and len(_r101_many["records"]) == 230
+      and len(_r101_s2.calls) == 3 and v3.INTAKE_MAX_PAGES == 8
+      and int(_r101_s2.calls[1][1]["after"]) > int(_r101_s2.calls[0][1]["after"]))
+_r101_main = inspect.getsource(v3.main)
+check("r101 main: the relay is read BEFORE the combined feed; `ok` in primary mode makes it the "
+      "listing (combined request, per-sub fallback and archive sweep skipped, status 'relay'); "
+      "anything else logs INTAKE-FALLBACK/INTAKE-SHADOW and runs the old chain unchanged",
+      _r101_main.index("intake = await fetch_intake_records(session, now)")
+      < _r101_main.index("combined = None if relay_primary else await fetch_combined_feed(session)")
+      < _r101_main.index('combined_fetch_status = "relay"')
+      < _r101_main.index("for sub in ([] if relay_primary else SUBREDDITS):")
+      and 'relay_primary = (INTAKE_READER == "primary" and intake["status"] == "ok")' in _r101_main
+      and "INTAKE-FALLBACK" in _r101_main and "INTAKE-SHADOW" in _r101_main
+      and "run_stats[\"intake\"] = _intake_summary(intake)" in _r101_main)
+check("r101: defaults — primary, stale 1800 s, lookback 6 h; the three Variables and the bot "
+      "token are wired in reddit_monitor.yml (round-42 pattern)",
+      v3.INTAKE_STALE_SECONDS == 1800 and v3.INTAKE_LOOKBACK_SECONDS == 6 * 3600
+      and 'INTAKE_READER = ((os.getenv("INTAKE_READER") or "").strip().lower() or "primary")' in _r101_src
+      and all(f"{n}: ${{{{ vars.{n} }}}}" in _r101_wf for n in
+              ("INTAKE_CHANNEL_ID", "INTAKE_READER", "INTAKE_STALE_SECONDS", "INTAKE_LOOKBACK_SECONDS"))
+      and "DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}" in _r101_wf)
+# Dev-only file: production checkouts have no .env.example (round 95d), so guard the read.
+if os.path.isfile(os.path.join(ROOT, ".env.example")):
+    check("r101: the new secret and Variables are documented in .env.example",
+          all(n in open(os.path.join(ROOT, ".env.example"), encoding="utf-8").read()
+              for n in ("DISCORD_BOT_TOKEN", "INTAKE_CHANNEL_ID", "INTAKE_READER")))
+check("r101: the summary learns the outcome through the existing settings line (no workflow "
+      "run: growth) and the run result never carries ids or the token",
+      "intake primary (relay ok; 12 record(s), newest 40 s)" in v3._settings_line(
+          v3._effective_settings(), {"status": "ok", "mode": "primary",
+                                     "records_for_this_engine": 12, "newest_age_seconds": 40})
+      and "relay STALE" in v3._intake_line({"status": "stale", "mode": "primary"})
+      and set(v3._intake_summary(_r101_ok)) == {"status", "mode", "records_in_window",
+                                                 "records_for_this_engine", "newest_age_seconds",
+                                                 "pages", "detail"}
+      and "_intake_line(intake)" in inspect.getsource(v3._settings_line))
+# r101b — first live records (owner screenshots, 2026-11-02 06:27–07:15 PHT).
+_r101b_inline = dict(_r101_rec, id="1xlh3fw", media=[], url="https://www.reddit.com/r/Genshin_Impact/comments/1xlh3fw/x/",
+                     body="https://preview.redd.it/fg9aonrlz2zh1.png?width=1805&format=png&auto=webp&s=3f05\n\n"
+                          "https://preview.redd.it/d6jmman303zh1.png?width=1809&format=png&auto=webp&s=7efc\n\nhot take")
+check("r101b: inline rich-text images in a text post's markdown body (live 1xlh3fw, 1xlgs9j) reach "
+      "the native extractor like RSS anchors did; gallery records keep their media[] order",
+      [m["url"] for m in v3.extract_native_media(
+          v3.intake_base_data(v3._IntakeEntry(_r101b_inline, "1"))["content_html"])]
+      == ["https://preview.redd.it/fg9aonrlz2zh1.png?width=1805&format=png&auto=webp&s=3f05",
+          "https://preview.redd.it/d6jmman303zh1.png?width=1809&format=png&auto=webp&s=7efc"]
+      and [m["url"] for m in v3.extract_native_media(v3.intake_content_html(
+          dict(_r101_rec, url="https://www.reddit.com/gallery/1xlhem9", body="",
+               media=["https://preview.redd.it/6ymlc2ap23zh1.jpeg?width=1706&s=b",
+                      "https://preview.redd.it/a5jn0lcp23zh1.jpeg?width=1290&s=d"])))]
+      == ["https://i.redd.it/6ymlc2ap23zh1.jpeg", "https://i.redd.it/a5jn0lcp23zh1.jpeg"])
+check("r101b: markdown backslash escapes inside BARE URLs are resolved (live 1xlhem9 "
+      "`x.com/minmyouk\\_xx`); prose escapes and [label](url) targets (round-99 approved card) "
+      "untouched — the plain-body path (relay + archive)",
+      v3._clean_selftext("src https://x.com/minmyouk\\_xx/status/21?a=2R\\_Rt&s=19 and snake\\_case")
+      == "src https://x.com/minmyouk_xx/status/21?a=2R_Rt&s=19 and snake\\_case"
+      and v3._unescape_markdown_in_urls("[t](https://e.com/a\\_b) https://e.com/c\\_d")
+          == "[t](https://e.com/a\\_b) https://e.com/c_d"
+      and "_unescape_markdown_in_urls(text)" in inspect.getsource(v3._clean_plain_body))
+check("r101: the media-wait and partial-gallery gates understand relay media lists",
+      'if isinstance(entry, _IntakeEntry) and entry.record.get("media"):' in _r101_main
+      and "isinstance(entry, (_ArcticEntry, _IntakeEntry))" in _r101_main)
 
 # ---- Round 89: no GitHub Actions annotation may leak out of this suite ----
 # Restore the real stdout first, then judge what the suite actually emitted.
