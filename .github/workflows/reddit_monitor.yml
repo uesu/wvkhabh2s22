@@ -431,7 +431,14 @@ jobs:
           line("Failed deliveries", "failed_delivery")
           print()
           print("### Skipped and deferred")
-          line("Known-rejected archive candidates", "known_pending_suppressed")
+          line("Held posts Reddit listed again (relay restore)" if relay else "Held posts restored",
+               "relay_restores")
+          for r in (data.get("relay_restore_keys") or [])[:10]:
+              if isinstance(r, dict) and r.get("key"):
+                  print(f"  - restored: {r.get('key')} — held as '{str(r.get('held_reason') or '?')[:40]}' "
+                        f"for {num(r.get('held_minutes'), ' min')}")
+          line("Known-rejected candidates (held earlier; no newer listing)" if relay
+               else "Known-rejected archive candidates", "known_pending_suppressed")
           if data.get("known_pending_by_reason"):
               print(f"  - by reason: {dstr(data['known_pending_by_reason'])}")
           keys = data.get("known_pending_keys")

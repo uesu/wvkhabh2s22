@@ -741,6 +741,8 @@ def _init_run_stats():
         "reclaim_clean": 0,
         "reclaim_held": 0,
         "reclaim_keys": [],
+        "relay_restores": 0,                  # round 107: held posts Reddit listed again
+        "relay_restore_keys": [],
         "reclaim_skipped_unknown_sub": 0,
         "newly_rejected_removed": 0,
         "newly_rejected_by_reason": {},
@@ -1840,6 +1842,57 @@ _NO_RECHECK_REASONS = frozenset({
 })
 
 
+def relay_listed_after_hold(pend, entry) -> float | None:
+    """Round 107 (live 1xlrj90, 2026-11-02): the moment Reddit's own listing
+    vouched for a HELD post again, or None.
+
+    r/Zenlesszonezeroleaks_ 1xlrj90 was created 07:31Z, sat in the mod queue,
+    and the archive sweep of the old chain held it at 07:40Z as
+    `removal_notice` (a never-re-check reason: "returns only via RSS"). The
+    mods approved it at ~12:35Z; the relay — which lists a post only while
+    Reddit's /new lists it — sent a complete record (`removed: null`) at
+    12:36Z. Relay mode has no RSS, and round 101 treated every relay record
+    as a replay, so the restore was suppressed as "known-pending" run after
+    run while the post sat live with 24 votes and 10 comments.
+
+    A relay message is a restore when it is NEWER than the hold's last look
+    (`max(first_seen, last_checked)`) and the relay itself does not report
+    the post removed: the record's `removed` is empty and its latest `v: 2`
+    re-check (when there is one) says not removed / not deleted. A re-check
+    newer than the hold counts the same way (Reddit's own current state).
+    A replay of the SAME message that produced the hold is older than the
+    hold's `last_checked` by construction, so round 101 still holds for it.
+    Pure bookkeeping on data already in hand: no request, never raises."""
+    try:
+        rec = getattr(entry, "record", None)
+        if not isinstance(pend, dict) or not isinstance(rec, dict):
+            return None
+        if _queue_or_removal_reason(rec.get("removed")):
+            return None
+        hold = 0.0
+        for fld in ("first_seen", "last_checked"):
+            try:
+                hold = max(hold, float(pend.get(fld) or 0))
+            except (TypeError, ValueError):
+                pass
+        if hold <= 0:
+            return None
+        listed = _epoch_from_snowflake(getattr(entry, "message_id", None))
+        upd = rec.get("_update") if isinstance(rec.get("_update"), dict) else None
+        if upd is not None:
+            if upd.get("removed") or upd.get("deleted"):
+                return None
+            try:
+                listed = max(listed or 0.0, float(upd.get("_at") or 0))
+            except (TypeError, ValueError):
+                pass
+        if listed and listed > hold:
+            return float(listed)
+    except Exception:
+        return None
+    return None
+
+
 def _pending_throttle_skip(pending: dict, key: str, now: float, entry) -> bool:
     """Round 32: should this pending post be skipped (not re-verified) now?
 
@@ -1853,9 +1906,12 @@ def _pending_throttle_skip(pending: dict, key: str, now: float, entry) -> bool:
     if reason in _NO_RECHECK_REASONS:
         # Arctic resurface -> skip (never re-verified); RSS re-appearance
         # (a restore, fresh "updated" stamp) -> run the full pipeline.
-        # Round 101: a relay record is replayed from the channel window, so
-        # seeing it again is not a restore either -> skip.
-        return isinstance(entry, (_ArcticEntry, _IntakeEntry))
+        # Round 101: a relay record replayed from the channel window is not a
+        # restore -> skip. Round 107: a relay message NEWER than the hold IS
+        # one (Reddit listed the post again after we held it) -> full pipeline.
+        if isinstance(entry, _IntakeEntry):
+            return relay_listed_after_hold(pend, entry) is None
+        return isinstance(entry, _ArcticEntry)
     try:
         last = float(pend.get("last_checked") or 0) if isinstance(pend, dict) else 0.0
     except (TypeError, ValueError):
@@ -8589,6 +8645,22 @@ async def main():
             # items BEFORE applying the per-run flood cap (MAX_POSTS_PER_RUN).
             _eligible_for_cap = []
             for subreddit, post_path, unique_key, published_ts, activity_ts, entry in new_posts:
+                if (not TEST_POST_ID and not DRY_RUN and isinstance(entry, _IntakeEntry)
+                        and isinstance(pending.get(unique_key), dict)
+                        and pending[unique_key].get("reason") in _NO_RECHECK_REASONS
+                        and relay_listed_after_hold(pending[unique_key], entry) is not None):
+                    # Round 107: the relay listed a held post again -> restore
+                    # (the throttle below lets it through; this is the audit).
+                    _listed = relay_listed_after_hold(pending[unique_key], entry)
+                    _held_reason = str(pending[unique_key].get("reason") or "unknown")
+                    _held_since = float(pending[unique_key].get("first_seen") or now)
+                    run_stats["relay_restores"] += 1
+                    _note_key(run_stats, "relay_restore_keys",
+                              {"key": unique_key, "held_reason": _held_reason,
+                               "held_minutes": round(max(0.0, (_listed or now) - _held_since) / 60, 1)})
+                    logging.info(f"[{unique_key}] held as '{_held_reason}' since "
+                                 f"{int(max(0.0, now - _held_since) // 60)} min, but Reddit's own "
+                                 f"listing (relay) vouches for it again — restore, full pipeline.")
                 # Round 30/32: pending-post recheck throttle — previously
                 # rejected/held posts are only re-checked once every
                 # PENDING_RECHECK_SECONDS (round 95c: default 5 min = one cron

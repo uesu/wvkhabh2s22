@@ -12098,6 +12098,57 @@ check("r101: a replayed relay record of a never-re-check hold is skipped like an
       and v3._pending_throttle_skip({"k": {"reason": "removal notice", "last_checked": _r101_now}},
                                     "k", _r101_now, types.SimpleNamespace()) is False)
 
+# ---- Round 107: a held post that Reddit lists again through the relay is a restore ----
+# Live 1xlrj90 (2026-11-02): archive hold `removal_notice` at 07:40Z, mods approved
+# ~12:35Z, relay record 12:36Z -> suppressed as known-pending by the round-101 rule.
+_r107_hold = {"first_seen": _r101_now - 5 * 3600, "last_checked": _r101_now - 5 * 3600,
+              "reason": "removal_notice", "source": "arctic"}
+_r107_new = v3._IntakeEntry(dict(_r101_parsed, sub="HonkaiStarRail_leaks"),
+                            str(v3._snowflake_from_epoch(_r101_now - 240)))
+_r107_old = v3._IntakeEntry(dict(_r101_parsed, sub="HonkaiStarRail_leaks"),
+                            str(v3._snowflake_from_epoch(_r101_now - 6 * 3600)))
+_r107_removed = v3._IntakeEntry(dict(_r101_parsed, sub="HonkaiStarRail_leaks", removed="moderator"),
+                                str(v3._snowflake_from_epoch(_r101_now - 240)))
+_r107_upd_bad = v3._IntakeEntry(dict(_r101_parsed, sub="HonkaiStarRail_leaks",
+                                     _update={"removed": "moderator", "deleted": False, "_at": _r101_now - 60}),
+                                str(v3._snowflake_from_epoch(_r101_now - 240)))
+_r107_upd_good = v3._IntakeEntry(dict(_r101_parsed, sub="HonkaiStarRail_leaks",
+                                      _update={"removed": None, "deleted": False, "_at": _r101_now - 60}),
+                                 str(v3._snowflake_from_epoch(_r101_now - 6 * 3600)))
+_r107_t = v3.relay_listed_after_hold(_r107_hold, _r107_new)
+check("r107: a relay record NEWER than a never-re-check hold, with `removed` empty, is a restore "
+      "(returns the listing time) and the throttle lets it through to the full pipeline",
+      isinstance(_r107_t, float) and abs(_r107_t - (_r101_now - 240)) < 2
+      and v3._pending_throttle_skip({"k": dict(_r107_hold)}, "k", _r101_now, _r107_new) is False)
+check("r107: a relay message OLDER than the hold's last look is still the round-101 replay (skip), "
+      "and a missing/empty hold clock never unlocks anything",
+      v3.relay_listed_after_hold(_r107_hold, _r107_old) is None
+      and v3._pending_throttle_skip({"k": dict(_r107_hold)}, "k", _r101_now, _r107_old) is True
+      and v3.relay_listed_after_hold({"reason": "removal_notice"}, _r107_new) is None
+      and v3.relay_listed_after_hold(None, _r107_new) is None
+      and v3.relay_listed_after_hold(_r107_hold, types.SimpleNamespace()) is None)
+check("r107: the relay must itself vouch for the post — a record with `removed` set, or whose "
+      "latest re-check says removed/deleted, never restores; a clean re-check newer than the hold "
+      "restores even when the record message is older",
+      v3.relay_listed_after_hold(_r107_hold, _r107_removed) is None
+      and v3.relay_listed_after_hold(_r107_hold, _r107_upd_bad) is None
+      and v3._pending_throttle_skip({"k": dict(_r107_hold)}, "k", _r101_now, _r107_upd_bad) is True
+      and v3.relay_listed_after_hold(_r107_hold, _r107_upd_good) == float(_r101_now - 60))
+check("r107: archive resurfaces and retryable holds keep their round-32/98 meaning (no new "
+      "re-check loop): an Arctic entry is still skipped, a `not_live` hold still waits "
+      "PENDING_RECHECK_SECONDS",
+      v3._pending_throttle_skip({"k": dict(_r107_hold)}, "k", _r101_now, _r32_arctic) is True
+      and v3._pending_throttle_skip({"k": {"first_seen": _r101_now - 60, "last_checked": _r101_now - 60,
+                                           "reason": "not_live"}}, "k", _r101_now, _r107_new) is True)
+_r107_main = inspect.getsource(v3.main)
+check("r107: the main loop logs and counts the restore (relay_restores / relay_restore_keys) after "
+      "the throttle, and the counters exist in run_stats so the summary step can print them",
+      "relay_listed_after_hold(pending[unique_key], entry)" in _r107_main
+      and 'run_stats["relay_restores"] += 1' in _r107_main
+      and '_note_key(run_stats, "relay_restore_keys"' in _r107_main
+      and '"relay_restores": 0' in inspect.getsource(v3)
+      and 'relay_listed_after_hold(pend, entry) is None' in inspect.getsource(v3._pending_throttle_skip))
+
 
 class _R101Resp:
     def __init__(self, status, data):
@@ -12615,6 +12666,24 @@ check("r105: a relay-served run is not described in old-chain words — quiet su
       and "Subreddits missing from the combined feed: HonkaiNexusAnimaLeaks (archive attempt below)" in _r96_summary
       and "Feed fallback: not attempted (combined succeeded)" in _r96_summary,
       [ln for ln in _r105_summary.splitlines() if "relay" in ln.lower()][:4])
+
+# ---- Round 107b: the summary names a relay restore and stops calling relay holds "archive" ----
+_r107_fake = dict(_r105_fake, relay_restores=1, known_pending_suppressed=1,
+                  known_pending_by_reason={"removal_notice": 1},
+                  known_pending_keys=[{"key": "Zenlesszonezeroleaks__1xlrj90", "reason": "removal_notice"}],
+                  relay_restore_keys=[{"key": "Zenlesszonezeroleaks__1xlrj90", "held_reason": "removal_notice",
+                                       "held_minutes": 296.4}])
+_r107_summary = _app_summary_shell_with_json("reddit", None, fake_data=_r107_fake)
+check("r107b: a relay-mode summary prints the restore with the held reason and duration, labels the "
+      "remaining suppressions as 'held earlier; no newer listing' (not 'archive candidates'), and the "
+      "RSS-mode wording stays",
+      "- Held posts Reddit listed again (relay restore): 1" in _r107_summary
+      and "  - restored: Zenlesszonezeroleaks__1xlrj90 — held as 'removal_notice' for 296.4 min" in _r107_summary
+      and "- Known-rejected candidates (held earlier; no newer listing): 1" in _r107_summary
+      and "Known-rejected archive candidates" not in _r107_summary
+      and "- Known-rejected archive candidates:" in _r96_summary
+      and "- Held posts restored:" in _r96_summary,
+      [ln for ln in _r107_summary.splitlines() if "restore" in ln.lower() or "Known-rejected" in ln][:4])
 
 # ---- Round 106: no invalid escape sequence anywhere the workflows import (prod run #12262) ----
 import warnings as _r106_warnings
