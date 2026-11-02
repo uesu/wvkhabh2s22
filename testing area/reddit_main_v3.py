@@ -3342,12 +3342,14 @@ _MD_ESCAPED_PUNCT_RE = re.compile(r"\\([_*~#\-\[\]])")
 
 
 def _unescape_markdown_in_urls(text: str) -> str:
-    """Round 101: raw Reddit markdown escapes punctuation inside bare URLs
+    r"""Round 101: raw Reddit markdown escapes punctuation inside bare URLs
     (`https://x.com/minmyouk\_xx/status/…`, live record 1xlhem9). Reddit's
     renderer resolves `\_` to `_` before anyone sees it (the RSS HTML never
     carried the backslash); Discord does not, and the autolink breaks at the
     backslash. Only bare URL tokens are touched — prose escapes (incl. the
-    round-99 literal `\>!…!<`) and markdown link targets stay as written."""
+    round-99 literal `\>!…!<`) and markdown link targets stay as written.
+    (Round 106: raw docstring — production run #12262 logged a SyntaxWarning for
+    the `\_` above; a future Python makes invalid escapes an error.)"""
     try:
         return _BARE_URL_TOKEN_RE.sub(
             lambda m: _MD_ESCAPED_PUNCT_RE.sub(r"\1", m.group(0)), text or "")

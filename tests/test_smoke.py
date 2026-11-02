@@ -12616,6 +12616,31 @@ check("r105: a relay-served run is not described in old-chain words — quiet su
       and "Feed fallback: not attempted (combined succeeded)" in _r96_summary,
       [ln for ln in _r105_summary.splitlines() if "relay" in ln.lower()][:4])
 
+# ---- Round 106: no invalid escape sequence anywhere the workflows import (prod run #12262) ----
+import warnings as _r106_warnings
+_r106_bad = []
+for _r106_dir in ("testing area", "tests", os.path.join(".github", "scripts")):
+    for _r106_name in sorted(os.listdir(os.path.join(ROOT, _r106_dir))):
+        if not _r106_name.endswith(".py"):
+            continue
+        _r106_path = os.path.join(ROOT, _r106_dir, _r106_name)
+        with open(_r106_path, encoding="utf-8") as _r106_fh:
+            _r106_src = _r106_fh.read()
+        # Python 3.11 reports an invalid escape as DeprecationWarning, 3.12+ as
+        # SyntaxWarning; record everything compile() emits instead of guessing.
+        with _r106_warnings.catch_warnings(record=True) as _r106_seen:
+            _r106_warnings.simplefilter("always")
+            try:
+                compile(_r106_src, _r106_path, "exec")
+            except SyntaxError as _r106_exc:
+                _r106_bad.append(f"{_r106_dir}/{_r106_name}: {_r106_exc}")
+        for _r106_w in _r106_seen:
+            _r106_bad.append(f"{_r106_dir}/{_r106_name}:{_r106_w.lineno}: {_r106_w.message}")
+check("r106: every engine, test and script file compiles without a SyntaxWarning (the production "
+      "log of run #12262 carried `\\_ is an invalid escape sequence` from a docstring — a future "
+      "Python turns that into a SyntaxError and the monitor would not start)",
+      _r106_bad == [], _r106_bad[:3])
+
 # ---- Round 89: no GitHub Actions annotation may leak out of this suite ----
 # Restore the real stdout first, then judge what the suite actually emitted.
 sys.stdout = _stdout_guard.stream
