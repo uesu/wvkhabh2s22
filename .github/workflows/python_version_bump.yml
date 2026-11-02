@@ -8,7 +8,7 @@
 #  RUNTIME PIN THIS WORKFLOW SHIPS
 #  The pin is read from ci.yml at run time; this line is the single literal
 #  copy kept current by the rewrite itself (round 91):
-#      python-version: '3.14.9'
+#      python-version: '3.14.10'
 #
 #  VERSION TERMINOLOGY (deliberately version-agnostic: the rewrite replaces the
 #  literal pin everywhere in the allowlist, so hard-coded examples would drift)
