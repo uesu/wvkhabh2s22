@@ -2844,8 +2844,8 @@ for _r39_wf in (".github/workflows/ci.yml", ".github/workflows/reddit_monitor.ym
                 ".github/workflows/twitter_monitor.yml"):
     with open(os.path.join(ROOT, _r39_wf), encoding="utf-8") as _fh:
         _r39_source = _fh.read()
-    check(f"r39 runtime: {_r39_wf} pins CPython 3.14.9 exactly once",
-          _r39_source.count("python-version: '3.14.9'") == 1
+    check(f"r39 runtime: {_r39_wf} pins CPython 3.14.10 exactly once",
+          _r39_source.count("python-version: '3.14.10'") == 1
           and "python-version: '3.11'" not in _r39_source)
 
 for _r39_wf in (".github/workflows/reddit_monitor.yml", ".github/workflows/twitter_monitor.yml"):
@@ -9598,7 +9598,7 @@ with _sync_tempfile.TemporaryDirectory(prefix="ne-r91-prod-") as _r91_tmp:
         "    steps:\n"
         f"      - uses: actions/setup-python@{_r91_newer_sha}  # v7.2.0\n"
         "        with:\n"
-        "          python-version: '3.14.99'\n",
+        "          python-version: '3.14.109'\n",
         encoding="utf-8",
     )
     _r91_res = _sync_mod.sync_tree(_SyncPath(ROOT), _r91_prod, include_workflows=True)
@@ -9607,7 +9607,7 @@ with _sync_tempfile.TemporaryDirectory(prefix="ne-r91-prod-") as _r91_tmp:
     _r91_dev_ci = (_SyncPath(ROOT) / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     _r91_dev_pin = re.search(r"python-version:\s*'(\d+\.\d+\.\d+)'", _r91_dev_ci).group(1)
     check("r91b: a newer production python-version survives a dev-side sync (no downgrade)",
-          "python-version: '3.14.99'" in _r91_ci
+          "python-version: '3.14.109'" in _r91_ci
           and f"python-version: '{_r91_dev_pin}'" not in _r91_ci,
           _r91_ci[:400])
     check("r91b: a newer production SHA-pinned uses: survives a dev-side sync (no downgrade)",
@@ -9617,8 +9617,8 @@ with _sync_tempfile.TemporaryDirectory(prefix="ne-r91-prod-") as _r91_tmp:
           "name: CI — syntax + offline smoke test" in _r91_ci
           and "production-local edits must still be replaced" not in _r91_ci)
     check("r91b: the deployed r39 CPython guard is re-aligned to the deployed ci.yml pin",
-          "pins CPython 3.14.99 exactly once" in _r91_smoke
-          and "python-version: '3.14.99'" in _r91_smoke
+          "pins CPython 3.14.109 exactly once" in _r91_smoke
+          and "python-version: '3.14.109'" in _r91_smoke
           and f"pins CPython {_r91_dev_pin} exactly once" not in _r91_smoke,
           [ln for ln in _r91_smoke.splitlines() if "r39 runtime" in ln])
 
