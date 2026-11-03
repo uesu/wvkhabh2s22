@@ -177,6 +177,16 @@ jobs:
           INTAKE_READER: ${{ vars.INTAKE_READER }}
           INTAKE_STALE_SECONDS: ${{ vars.INTAKE_STALE_SECONDS }}
           INTAKE_LOOKBACK_SECONDS: ${{ vars.INTAKE_LOOKBACK_SECONDS }}
+          # Round 108 (2026-11-02): Arctic Shift hardening for the OLD chain
+          # (relay paused / RSS retired). Defaults need no Variables.
+          #   ARCTIC_MIN_SPACING=1.0          seconds between consecutive archive requests
+          #   ARCTIC_RETRY_BUDGET=3           single retries (timeout/429/5xx) allowed per run
+          #   ARCTIC_RESTORE_MAX_PER_RUN=5    never-re-check holds the archive may reopen per run
+          #   ARCTIC_RESTORE_MIN_SECONDS=1800 a hold must be this old before the archive may reopen it
+          ARCTIC_MIN_SPACING: ${{ vars.ARCTIC_MIN_SPACING }}
+          ARCTIC_RETRY_BUDGET: ${{ vars.ARCTIC_RETRY_BUDGET }}
+          ARCTIC_RESTORE_MAX_PER_RUN: ${{ vars.ARCTIC_RESTORE_MAX_PER_RUN }}
+          ARCTIC_RESTORE_MIN_SECONDS: ${{ vars.ARCTIC_RESTORE_MIN_SECONDS }}
           # Round 49 (2026-10-01): the three media proxies are queried
           # CONCURRENTLY instead of one after another (~1.5s -> ~0.4-0.8s per
           # post). Defaults are tuned on the prod timings of 11:55 UTC and
@@ -390,6 +400,8 @@ jobs:
                         "(no Reddit JSON body/comments).")
           if data.get("arctic_candidates") is not None:
               line("Arctic candidates", "arctic_candidates")
+          if data.get("arctic_requests"):
+              print(f"- Archive requests: {v('arctic_requests')} (retried {v('arctic_retries')}, failed {v('arctic_failures')})")
           subs = data.get("feed_subreddits_with_entries")
           if isinstance(subs, dict) and subs:
               print(f"- Feed entries by subreddit: {dstr(subs)}")
@@ -433,7 +445,8 @@ jobs:
           print("### Skipped and deferred")
           line("Held posts Reddit listed again (relay restore)" if relay else "Held posts restored",
                "relay_restores")
-          for r in (data.get("relay_restore_keys") or [])[:10]:
+          line("Held posts the archive re-read clean (archive restore)", "arctic_restores")
+          for r in ((data.get("relay_restore_keys") or []) + (data.get("arctic_restore_keys") or []))[:10]:
               if isinstance(r, dict) and r.get("key"):
                   print(f"  - restored: {r.get('key')} — held as '{str(r.get('held_reason') or '?')[:40]}' "
                         f"for {num(r.get('held_minutes'), ' min')}")

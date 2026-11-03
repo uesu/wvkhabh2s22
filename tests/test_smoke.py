@@ -6558,7 +6558,10 @@ class _R69Session:
 
 
 def _r69_arctic_log(session):
+    # Round 108 added ONE retry for timeouts/429/5xx (its own `[t] ... retrying
+    # once` line); r69 pins the FINAL failure text, so retries are off here.
     with patch.object(v3, "_arctic_fail_count", 0), \
+         patch.object(v3, "ARCTIC_RETRY_BUDGET", 0), \
          patch.object(v3.logging, "info") as _log:
         result = asyncio.run(v3.fetch_arctic_subreddit_posts(
             session, "AnantaLeaks", label="t"))
@@ -7729,7 +7732,10 @@ class _AppArchiveLookupTests(unittest.TestCase):
                  patch.object(module, "enrich_gallery_redlib", gallery), \
                  patch.object(module, "_dedupe_media_final_urls", dedupe):
                 result = await module.resolve_post_media(Session(), base, None, path=child)
-            self.assertEqual(calls, ["def456"] if mode == "known" else ["abc123"], mode)
+            # Round 108: a 5xx is retried ONCE by the shared archive helper (same id,
+            # same request) — still one lookup per post, never one per media hop.
+            self.assertEqual(calls, ["def456"] if mode == "known"
+                             else ["abc123", "abc123"] if mode == "error" else ["abc123"], mode)
             self.assertEqual(result["title"], "child title")
             self.assertEqual(result["author"], "child_author")
             self.assertEqual(result["body"], "child body")
@@ -11548,7 +11554,8 @@ if _r98_ok:
           len(_due(_pend, set(), _now, 1)) == 1
           and _r98_ns["RECLAIM_MAX_PER_RUN"] <= 5)
     check("r98: the reclaim cost is ONE archive request for all probed ids",
-          'params={"ids": ",".join(ids)}' in _r97_src
+          # round 108: the request goes through the shared archive helper
+          '{"ids": ",".join(ids)}' in _r97_src
           and "fetch_arctic_posts_by_ids(" in _r97_src)
     check("r98: only Reddit's own feed counts as a listing (proxies and the "
           "archive are never 'reddit-native')",
@@ -12149,6 +12156,304 @@ check("r107: the main loop logs and counts the restore (relay_restores / relay_r
       and '"relay_restores": 0' in inspect.getsource(v3)
       and 'relay_listed_after_hold(pend, entry) is None' in inspect.getsource(v3._pending_throttle_skip))
 
+# ---- Round 108 (2026-11-02): Arctic hardening for the OLD chain -------------
+# Reddit retires RSS on 2026-11-13; with the relay paused the backup chain leans
+# on Arctic Shift, whose known quirks (back-to-back timeouts, transient 429/5xx,
+# unbounded searches, rows later reversed by a mod approval) each cost a run.
+class _R108Resp:
+    def __init__(self, status, data, headers=None):
+        self.status, self._data, self.headers = status, data, dict(headers or {})
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def json(self, content_type=None):
+        return self._data
+
+
+class _R108Raise:
+    def __init__(self, exc):
+        self._exc = exc
+
+    async def __aenter__(self):
+        raise self._exc
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _R108Session:
+    """Answers one scripted item per request; records (url, params, monotonic)."""
+    def __init__(self, items):
+        self.items, self.calls = list(items), []
+
+    def get(self, url, params=None, **k):
+        self.calls.append((url, dict(params or {}), time.monotonic()))
+        item = self.items.pop(0)
+        return _R108Raise(item) if isinstance(item, BaseException) else item
+
+
+async def _r108_run():
+    out = {}
+    with patch.object(v3, "ARCTIC_MIN_SPACING", 0.0), patch.object(v3, "ARCTIC_RETRY_BACKOFF", 0.05), \
+         patch.object(v3, "ARCTIC_RETRY_BUDGET", 3), patch.object(v3, "_arctic_fail_count", 0), \
+         patch.object(v3, "_liveness_fail_count", 0):
+        v3._reset_arctic_run_state()
+        # (1) timeout then 200: retried once, record returned, NO strike.
+        sess = _R108Session([asyncio.TimeoutError(), _R108Resp(200, {"data": [{"id": "abc", "title": "t"}]})])
+        out["retry_ok"] = (await v3.fetch_arctic_post(sess, "abc", label="t"), v3._arctic_fail_count,
+                           dict(v3._arctic_stats))
+        # (2) 429 with Retry-After: the hint is honoured (capped), then the retry answers.
+        sess = _R108Session([_R108Resp(429, {}, {"Retry-After": "0.3"}), _R108Resp(200, {"data": []})])
+        t0 = time.monotonic()
+        res = await v3.fetch_arctic_subreddit_posts(sess, "AnantaLeaks", label="t")
+        out["retry_after"] = (res, time.monotonic() - t0, v3._arctic_fail_count, sess.calls[0][1].get("after"))
+        # (3) 404 is final: no retry, exactly one strike, one failure counted.
+        sess = _R108Session([_R108Resp(404, {})])
+        out["final_404"] = (await v3.fetch_arctic_post(sess, "abc"), len(sess.calls), v3._arctic_fail_count,
+                            dict(v3._arctic_stats))
+        # (4) strict rows: a numeric/missing id is dropped; a bare list is a failed request.
+        v3._arctic_fail_count = 0
+        sess = _R108Session([_R108Resp(200, {"data": [{"id": 123}, {"title": "x"}, {"id": "abc"}, {"id": "zzz"}]})])
+        out["rows"] = await v3.fetch_arctic_posts_by_ids(sess, ["abc", "def"])
+        sess = _R108Session([_R108Resp(200, [{"id": "abc"}])])
+        out["bare_list"] = (await v3.fetch_arctic_post(sess, "abc"), v3._arctic_fail_count, len(sess.calls))
+        # (5) the retry budget is per run: once spent, a timeout fails first time.
+        v3._reset_arctic_run_state()
+        v3._arctic_fail_count = 0
+        for _ in range(4):
+            sess = _R108Session([asyncio.TimeoutError(), _R108Resp(200, {"data": []})])
+            await v3.fetch_arctic_post(sess, "abc")
+        out["budget"] = (dict(v3._arctic_stats), v3._arctic_fail_count, len(sess.calls))
+        # (6) the liveness lookup shares the helper but keeps its OWN counter.
+        v3._reset_arctic_run_state()
+        v3._arctic_fail_count = 2
+        sess = _R108Session([_R108Resp(503, {}), _R108Resp(200, {"data": [{"id": "abc"}]})])
+        out["liveness"] = (await v3._fetch_arctic_post_row(sess, "abc"), v3._liveness_fail_count,
+                           v3._arctic_fail_count)
+    # (7) spacing: consecutive archive requests are at least ARCTIC_MIN_SPACING apart.
+    with patch.object(v3, "ARCTIC_MIN_SPACING", 0.3), patch.object(v3, "_arctic_fail_count", 0):
+        v3._reset_arctic_run_state()
+        sess = _R108Session([_R108Resp(200, {"data": []}), _R108Resp(200, {"data": []})])
+        await v3.fetch_arctic_post(sess, "abc")
+        await v3.fetch_arctic_post(sess, "abd")
+        out["spacing"] = sess.calls[1][2] - sess.calls[0][2]
+    v3._reset_arctic_run_state()
+    return out
+
+
+_r108 = asyncio.run(_r108_run())
+_r108_now = _r101_now
+check("r108: a timed-out archive request is retried ONCE and the answer is used — no strike, "
+      "the retry is counted (arctic_requests 2 / arctic_retries 1 / arctic_failures 0)",
+      isinstance(_r108["retry_ok"][0], dict) and _r108["retry_ok"][0].get("id") == "abc"
+      and _r108["retry_ok"][1] == 0
+      and _r108["retry_ok"][2] == {"requests": 2, "retries": 1, "failures": 0}, str(_r108["retry_ok"]))
+check("r108: a 429 is retried after its Retry-After (short values honoured, long ones capped at "
+      "ARCTIC_RETRY_MAX_WAIT), and the search ALWAYS carries `after=` even when the caller gave none",
+      _r108["retry_after"][0] == [] and 0.25 <= _r108["retry_after"][1] < 3.0
+      and _r108["retry_after"][2] == 0
+      and str(_r108["retry_after"][3] or "").isdigit()
+      and abs(int(_r108["retry_after"][3]) - (time.time() - v3.MAX_AGE_SECONDS)) < 120
+      and v3.ARCTIC_RETRY_MAX_WAIT <= 5.0, str(_r108["retry_after"]))
+check("r108: a 404 (or any non-retryable answer) is final — one request, one strike, one failure",
+      _r108["final_404"][0] is None and _r108["final_404"][1] == 1 and _r108["final_404"][2] == 1
+      and _r108["final_404"][3]["failures"] == 1, str(_r108["final_404"]))
+check("r108: rows without a string id are dropped (never matched to a candidate), and a bare list "
+      "is an invalid answer (strike) — a miss is still not an outage",
+      _r108["rows"] == {"abc": {"id": "abc"}}
+      and _r108["bare_list"] == (None, 1, 1), str((_r108["rows"], _r108["bare_list"])))
+check("r108: the retry budget is per run (ARCTIC_RETRY_BUDGET=3): the 4th timeout is not retried "
+      "and counts a strike; _reset_arctic_run_state() is what main() calls to start a run clean",
+      _r108["budget"][0]["retries"] == 3 and _r108["budget"][0]["failures"] == 1
+      and _r108["budget"][1] == 1 and _r108["budget"][2] == 1
+      and "_reset_arctic_run_state()" in inspect.getsource(v3.main), str(_r108["budget"]))
+check("r108: the liveness lookup goes through the same helper (5xx retried) but keeps its own "
+      "counter — the media/archive circuit is untouched by it",
+      _r108["liveness"] == ({"id": "abc"}, 0, 2), str(_r108["liveness"]))
+check("r108: consecutive archive requests are spaced ARCTIC_MIN_SPACING apart (back-to-back calls "
+      "time out) and the default spacing/budget/caps are bounded",
+      _r108["spacing"] >= 0.28 and 0.0 <= v3.ARCTIC_MIN_SPACING <= 5.0
+      and 0 <= v3.ARCTIC_RETRY_BUDGET <= 10 and v3.ARCTIC_RESTORE_MAX_PER_RUN >= 0
+      and v3.ARCTIC_RESTORE_MIN_SECONDS >= 0, str(_r108["spacing"]))
+_r108_fns = [v3.fetch_arctic_post, v3.fetch_arctic_posts_by_ids, v3.fetch_arctic_subreddit_posts,
+             v3._fetch_arctic_post_row]
+check("r108: all four archive call sites use the ONE request helper (no private session.get copies)",
+      all("_arctic_get_rows(" in inspect.getsource(f) and "session.get(" not in inspect.getsource(f)
+          for f in _r108_fns)
+      and "session.get(" in inspect.getsource(v3._arctic_get_rows))
+# Archive-driven restore (the old chain's round 107): a never-re-check hold reopens
+# only when the archive RE-READ the post AFTER the hold and the row is clean.
+_r108_hold = {"first_seen": _r108_now - 2 * 3600, "last_checked": _r108_now - 2 * 3600,
+              "reason": "removal_notice", "source": "arctic"}
+_r108_row = {"id": "1xlrj90", "subreddit": "Zenlesszonezeroleaks_", "title": "T", "selftext": "body",
+             "created_utc": _r108_now - 3 * 3600, "retrieved_on": _r108_now - 3 * 3600 + 60}
+_r108_fresh = v3._ArcticEntry(dict(_r108_row, updated_utc=_r108_now - 600))
+_r108_stale = v3._ArcticEntry(dict(_r108_row))
+_r108_removed = v3._ArcticEntry(dict(_r108_row, updated_utc=_r108_now - 600, removed_by_category="moderator"))
+_r108_marker = v3._ArcticEntry(dict(_r108_row, updated_utc=_r108_now - 600, selftext="[removed]"))
+_r108_garbage = v3._ArcticEntry(dict(_r108_row, updated_utc="soon", retrieved_on=True))
+check("r108: archive_snapshot_time = newest of retrieved_on/updated_utc, numeric only (bool/str -> 0)",
+      v3.archive_snapshot_time(_r108_fresh._arctic_post) == float(_r108_now - 600)
+      and v3.archive_snapshot_time(_r108_stale._arctic_post) == float(_r108_now - 3 * 3600 + 60)
+      and v3.archive_snapshot_time(_r108_garbage._arctic_post) == 0.0
+      and v3.archive_snapshot_time(None) == 0.0)
+check("r108: a row re-read AFTER the hold and clean is a restore (returns the snapshot time); a "
+      "row older than the hold, a removed/marked row, garbage stamps, a missing hold clock or a "
+      "non-archive entry never restore",
+      v3.archive_listed_after_hold(_r108_hold, _r108_fresh, _r108_now) == float(_r108_now - 600)
+      and v3.archive_listed_after_hold(_r108_hold, _r108_stale, _r108_now) is None
+      and v3.archive_listed_after_hold(_r108_hold, _r108_removed, _r108_now) is None
+      and v3.archive_listed_after_hold(_r108_hold, _r108_marker, _r108_now) is None
+      and v3.archive_listed_after_hold(_r108_hold, _r108_garbage, _r108_now) is None
+      and v3.archive_listed_after_hold({"reason": "removal_notice"}, _r108_fresh, _r108_now) is None
+      and v3.archive_listed_after_hold(_r108_hold, _r107_new, _r108_now) is None
+      and v3.archive_listed_after_hold(None, _r108_fresh, _r108_now) is None)
+check("r108: a hold younger than ARCTIC_RESTORE_MIN_SECONDS is left alone (no re-check loop off a "
+      "row that is simply re-served every sweep); the throttle itself still says 'skip' for archive "
+      "resurfaces — main() applies the restore and its per-run cap before consulting it",
+      v3.archive_listed_after_hold({"first_seen": _r108_now - 300, "last_checked": _r108_now - 300,
+                                    "reason": "removal_notice"}, _r108_fresh, _r108_now) is None
+      and v3.archive_listed_after_hold(_r108_hold, _r108_fresh) == float(_r108_now - 600)
+      and v3._pending_throttle_skip({"k": dict(_r108_hold)}, "k", _r108_now, _r108_fresh) is True
+      and v3._pending_throttle_skip({"k": dict(_r108_hold)}, "k", _r108_now, _r107_new) is False)
+_r108_main = inspect.getsource(v3.main)
+_r108_gate = _r108_main[_r108_main.index("_arc_listed = None"):_r108_main.index("# ---- round 64 (updated 2026-10-21)")]
+check("r108: the main loop reopens a never-re-check archive hold only via archive_listed_after_hold, "
+      "capped by ARCTIC_RESTORE_MAX_PER_RUN (overflow counted as deferred), counts/names it "
+      "(arctic_restores / arctic_restore_keys) and bypasses the throttle ONLY for that candidate",
+      "archive_listed_after_hold(pending[unique_key], entry, now)" in _r108_gate
+      and "isinstance(entry, _ArcticEntry)" in _r108_gate
+      and 'run_stats["arctic_restores"] >= ARCTIC_RESTORE_MAX_PER_RUN' in _r108_gate
+      and 'run_stats["arctic_restores_deferred"] += 1' in _r108_gate
+      and 'run_stats["arctic_restores"] += 1' in _r108_gate
+      and '_note_key(run_stats, "arctic_restore_keys"' in _r108_gate
+      and "and _arc_listed is None\n" in _r108_gate
+      and "_pending_throttle_skip(pending, unique_key, now, entry)" in _r108_gate
+      and '"arctic_restores": 0' in inspect.getsource(v3._init_run_stats)
+      and '"arctic_restore_keys": []' in inspect.getsource(v3._init_run_stats))
+check("r108: the reclaim judges the FRESH row with archived_removal_verdict (removed_by_category AND "
+      "markers) instead of markers only, and the run result carries arctic_requests/retries/failures",
+      "archived_removal_verdict(_rpost)" in _r108_main
+      and 'out[f"arctic_{_k}"] = int(_arctic_stats.get(_k, 0))' in inspect.getsource(v3._write_run_result))
+check("r108: the relay-primary path is untouched — relay restores still go through "
+      "relay_listed_after_hold, and the archive sweep still runs only when the relay is not primary",
+      "relay_listed_after_hold(pending[unique_key], entry)" in _r108_main
+      and "for sub in ([] if relay_primary else SUBREDDITS):" in _r108_main)
+_r108_v3_src = inspect.getsource(v3)
+check("r108: no bare `Arctic Shift unavailable: ` line can be blank any more (class name fallback on "
+      "every call site) and the knobs are reported in effective settings + the settings line",
+      _r108_v3_src.count("str(exc).strip() or type(exc).__name__") >= 3
+      and '"arctic_retry_budget": _int("ARCTIC_RETRY_BUDGET")' in _r108_v3_src
+      and '"arctic_restore_max_per_run": _int("ARCTIC_RESTORE_MAX_PER_RUN")' in _r108_v3_src
+      and "archive retry budget 3, restore 5/run" in v3._settings_line(
+          {"arctic_retry_budget": 3, "arctic_restore_max_per_run": 5})
+      and "archive retry budget 0, restore off" in v3._settings_line(
+          {"arctic_retry_budget": 0, "arctic_restore_max_per_run": 0}))
+with open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8") as _r108_fh:
+    _r108_wf = _r108_fh.read()
+check("r108: the four knobs are wired into the workflow env block and the summary prints archive "
+      "request health and archive restores (same restore line format as the relay)",
+      all(f"{k}: ${{{{ vars.{k} }}}}" in _r108_wf for k in
+          ("ARCTIC_MIN_SPACING", "ARCTIC_RETRY_BUDGET", "ARCTIC_RESTORE_MAX_PER_RUN", "ARCTIC_RESTORE_MIN_SECONDS"))
+      and 'line("Held posts the archive re-read clean (archive restore)", "arctic_restores")' in _r108_wf
+      and '(data.get("arctic_restore_keys") or [])' in _r108_wf
+      and "Archive requests: {v('arctic_requests')} (retried {v('arctic_retries')}, failed {v('arctic_failures')})" in _r108_wf)
+_r108_doc_hits = []
+for _r108_doc in ("README.md", ".env.example"):
+    _r108_doc_path = os.path.join(ROOT, _r108_doc)
+    if os.path.isfile(_r108_doc_path):
+        with open(_r108_doc_path, encoding="utf-8") as _r108_dfh:
+            _r108_doc_src = _r108_dfh.read()
+        _r108_doc_hits.append(all(k in _r108_doc_src for k in
+                                  ("ARCTIC_MIN_SPACING", "ARCTIC_RETRY_BUDGET",
+                                   "ARCTIC_RESTORE_MAX_PER_RUN", "ARCTIC_RESTORE_MIN_SECONDS")))
+check("r108: README and .env.example document the four knobs (dev checkout only)",
+      all(_r108_doc_hits), str(_r108_doc_hits))
+
+
+# r108c: end to end through main() in fallback mode (no relay configured): two
+# `removal_notice` holds come back from the archive sweep — one re-read clean AFTER
+# the hold (restore -> delivered), one whose row predates the hold (still suppressed).
+async def _r108c_main():
+    class _F:
+        entries = []
+    _now = time.time()
+    _keep = ["SUBREDDITS", "TEST_POST_ID", "DRY_RUN", "fetch_combined_feed", "verify_archive_post_live",
+             "fetch_post_json", "resolve_post_media", "create_discohook_share", "load_posted", "load_pending",
+             "save_posted", "save_pending", "save_posted_messages", "load_posted_messages", "RETRACT_DEAD_POSTS",
+             "aiohttp", "FRESH_HOLD_SECONDS", "fetch_arctic_subreddit_posts", "fetch_arctic_posts_by_ids",
+             "fetch_subreddit_feed", "INTAKE_CHANNEL_ID", "DISCORD_BOT_TOKEN", "ARCTIC_RESTORE_MAX_PER_RUN"]
+    old_vals = {k: getattr(v3, k) for k in _keep if hasattr(v3, k)}
+    pending = {
+        "AnantaLeaks_zzz": {"first_seen": _now - 7200, "last_checked": _now - 7200,
+                            "reason": "removal_notice", "source": "arctic", "published_ts": int(_now - 7800)},
+        "AnantaLeaks_yyy": {"first_seen": _now - 7200, "last_checked": _now - 7200,
+                            "reason": "removal_notice", "source": "arctic", "published_ts": int(_now - 7800)},
+    }
+    rows = [
+        {"id": "zzz", "subreddit": "AnantaLeaks", "title": "Restored", "author": "A", "selftext": "body",
+         "created_utc": _now - 7800, "retrieved_on": _now - 7700, "updated_utc": _now - 600},
+        {"id": "yyy", "subreddit": "AnantaLeaks", "title": "Still held", "author": "A", "selftext": "body",
+         "created_utc": _now - 7800, "retrieved_on": _now - 7700},
+    ]
+    saved = {}
+    try:
+        v3.SUBREDDITS = ["AnantaLeaks"]
+        v3.TEST_POST_ID = ""; v3.DRY_RUN = False; v3.RETRACT_DEAD_POSTS = False; v3.FRESH_HOLD_SECONDS = 0
+        v3.INTAKE_CHANNEL_ID = ""; v3.DISCORD_BOT_TOKEN = ""; v3.ARCTIC_RESTORE_MAX_PER_RUN = 5
+        v3.fetch_combined_feed = lambda s: asyncio.sleep(0, result=_F())
+        v3.fetch_subreddit_feed = lambda s, sub: asyncio.sleep(0, result=_F())
+        v3.verify_archive_post_live = lambda s, p, label="", feed_ok=True: asyncio.sleep(0, result=(True, "live"))
+        v3.fetch_post_json = lambda s, pid, use_oauth=False: asyncio.sleep(0, result=None)
+        v3.resolve_post_media = lambda s, b, p, path="", label="": asyncio.sleep(0, result={
+            "title": "T", "author": "A", "body": "b", "media": [], "stats": None, "crosspost": None,
+            "op_comment": None, "youtube_url": None, "youtube_id": None, "youtube_live": False, "full_mode": False})
+        v3.create_discohook_share = lambda s, p, l: asyncio.sleep(0, result=None)
+        v3.load_posted = lambda: {"AnantaLeaks_seed"}
+        v3.load_pending = lambda: pending
+        v3.save_posted = lambda posted, keep_newest=frozenset(): saved.setdefault("posted", set(posted)) or set(posted)
+        v3.save_pending = lambda p: saved.__setitem__("pending", dict(p))
+        v3.load_posted_messages = lambda: {}
+        v3.save_posted_messages = lambda m: None
+        v3.fetch_arctic_subreddit_posts = lambda s, sub, after_epoch=None, label="": asyncio.sleep(0, result=list(rows))
+        v3.fetch_arctic_posts_by_ids = lambda s, ids, label="": asyncio.sleep(0, result={})
+        class _Aio:
+            ClientSession = _FakeSession
+            ClientTimeout = staticmethod(lambda total=None: None)
+        v3.aiohttp = _Aio
+        os.environ["DISCORD_WEBHOOK_URL"] = "https://discord.test/webhook"
+        os.environ["WEBHOOK_REDDIT_ANANTALEAKS"] = "https://discord.test/webhook"
+        orig_result = v3._RUN_RESULT_FILE
+        with tempfile.TemporaryDirectory() as td:
+            v3._RUN_RESULT_FILE = os.path.join(td, "reddit_run_result.json")
+            await v3.main()
+            data = json.loads(open(v3._RUN_RESULT_FILE).read()) if os.path.exists(v3._RUN_RESULT_FILE) else {}
+            v3._RUN_RESULT_FILE = orig_result
+        return data, saved, pending
+    finally:
+        for k, val in old_vals.items():
+            setattr(v3, k, val)
+        os.environ.pop("DISCORD_WEBHOOK_URL", None); os.environ.pop("WEBHOOK_REDDIT_ANANTALEAKS", None)
+
+
+_r108c_data, _r108c_saved, _r108c_pending = asyncio.run(_r108c_main())
+check("r108c: end to end (fallback mode): the hold whose archive row was re-read clean AFTER the hold "
+      "is restored and delivered (arctic_restores=1, named), the hold whose row predates it stays "
+      "suppressed as known-pending, and the run result carries the archive request health keys",
+      _r108c_data.get("arctic_restores") == 1
+      and [r.get("key") for r in (_r108c_data.get("arctic_restore_keys") or [])] == ["AnantaLeaks_zzz"]
+      and _r108c_data.get("known_pending_suppressed") == 1
+      and [k.get("key") for k in (_r108c_data.get("known_pending_keys") or [])] == ["AnantaLeaks_yyy"]
+      and "AnantaLeaks_zzz" in (_r108c_saved.get("posted") or set())
+      and "AnantaLeaks_zzz" not in _r108c_pending and "AnantaLeaks_yyy" in _r108c_pending
+      and all(k in _r108c_data for k in ("arctic_requests", "arctic_retries", "arctic_failures")),
+      str({k: _r108c_data.get(k) for k in ("arctic_restores", "arctic_restore_keys", "known_pending_suppressed",
+                                            "known_pending_keys", "posted_this_run", "error")}))
+
 
 class _R101Resp:
     def __init__(self, status, data):
@@ -12684,6 +12989,20 @@ check("r107b: a relay-mode summary prints the restore with the held reason and d
       and "- Known-rejected archive candidates:" in _r96_summary
       and "- Held posts restored:" in _r96_summary,
       [ln for ln in _r107_summary.splitlines() if "restore" in ln.lower() or "Known-rejected" in ln][:4])
+
+# ---- Round 108b: the summary names an archive restore and the archive request health ----
+_r108_fake = dict(_r96_fake,
+                  arctic_restores=1, arctic_requests=7, arctic_retries=2, arctic_failures=1,
+                  arctic_restore_keys=[{"key": "Zenlesszonezeroleaks__1xlrj90", "held_reason": "removal_notice",
+                                        "held_minutes": 131.0}])
+_r108_summary = _app_summary_shell_with_json("reddit", None, fake_data=_r108_fake)
+check("r108b: the summary prints 'Archive requests: 7 (retried 2, failed 1)' and the archive restore "
+      "with the held reason and duration; a run without archive requests prints no such line",
+      "- Archive requests: 7 (retried 2, failed 1)" in _r108_summary
+      and "- Held posts the archive re-read clean (archive restore): 1" in _r108_summary
+      and "  - restored: Zenlesszonezeroleaks__1xlrj90 — held as 'removal_notice' for 131.0 min" in _r108_summary
+      and "Archive requests:" not in _r107_summary,
+      [ln for ln in _r108_summary.splitlines() if "rchive" in ln][:5])
 
 # ---- Round 106: no invalid escape sequence anywhere the workflows import (prod run #12262) ----
 import warnings as _r106_warnings

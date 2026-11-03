@@ -349,6 +349,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float((os.getenv(name) or "").strip() or str(default))
+    except ValueError:
+        return float(default)
+
+
 MAX_CACHE_SIZE_PER_SUB = _env_int("MAX_CACHE_SIZE_PER_SUB", 250)
 MAX_CACHE_SIZE_TOTAL = _env_int("MAX_CACHE_SIZE_TOTAL", 10000)
 # Round 34: per-run flood cap — one run posts at most this many NEW posts
@@ -513,6 +520,11 @@ def _effective_settings() -> dict:
         "intake_configured": bool(_get("INTAKE_CHANNEL_ID") and _get("DISCORD_BOT_TOKEN")),
         "intake_stale_seconds": _int("INTAKE_STALE_SECONDS"),
         "intake_lookback_seconds": _int("INTAKE_LOOKBACK_SECONDS"),
+        # Round 108: archive hardening knobs (old chain).
+        "arctic_min_spacing": _int("ARCTIC_MIN_SPACING"),
+        "arctic_retry_budget": _int("ARCTIC_RETRY_BUDGET"),
+        "arctic_restore_max_per_run": _int("ARCTIC_RESTORE_MAX_PER_RUN"),
+        "arctic_restore_min_seconds": _int("ARCTIC_RESTORE_MIN_SECONDS"),
     }
 
 
@@ -660,6 +672,17 @@ def _settings_line(settings: dict, intake: dict | None = None) -> str:
             ticks = num("stale_snapshot_ticks")
             parts.append(f"reclaim {reclaim}/run"
                          + (f", snapshot override after {ticks} feeds" if ticks else ""))
+        # Round 108: archive request discipline + archive-driven restore.
+        retry_budget = num("arctic_retry_budget")
+        restore_cap = num("arctic_restore_max_per_run")
+        if retry_budget is not None or restore_cap is not None:
+            arc = []
+            if retry_budget is not None:
+                arc.append(f"retry budget {retry_budget}")
+            if restore_cap is not None:
+                arc.append("restore off" if not settings.get("arctic_restore_max_per_run")
+                           else f"restore {restore_cap}/run")
+            parts.append("archive " + ", ".join(arc))
         probe = settings.get("liveness_probe")
         if probe is False:
             parts.append("liveness probe off")
@@ -743,6 +766,9 @@ def _init_run_stats():
         "reclaim_keys": [],
         "relay_restores": 0,                  # round 107: held posts Reddit listed again
         "relay_restore_keys": [],
+        "arctic_restores": 0,                 # round 108: held posts a FRESH archive row cleared
+        "arctic_restore_keys": [],
+        "arctic_restores_deferred": 0,        # restore found but ARCTIC_RESTORE_MAX_PER_RUN reached
         "reclaim_skipped_unknown_sub": 0,
         "newly_rejected_removed": 0,
         "newly_rejected_by_reason": {},
@@ -839,6 +865,13 @@ def _write_run_result(stats, extra=None):
         out = dict(stats)
         if extra:
             out.update(extra)
+        # Round 108: archive request health (requests / retries / failures) is
+        # process state, merged here so EVERY write carries the current counts.
+        try:
+            for _k in ("requests", "retries", "failures"):
+                out[f"arctic_{_k}"] = int(_arctic_stats.get(_k, 0))
+        except Exception:
+            pass
         # Sanitize error before emission (redact secrets, bound length)
         if "error" in out and out["error"] is not None:
             try:
@@ -1893,6 +1926,79 @@ def relay_listed_after_hold(pend, entry) -> float | None:
     return None
 
 
+# Round 108: archive-driven restore for the OLD chain (relay paused / RSS gone).
+ARCTIC_RESTORE_MAX_PER_RUN = max(0, _env_int("ARCTIC_RESTORE_MAX_PER_RUN", 5))
+ARCTIC_RESTORE_MIN_SECONDS = max(0, _env_int("ARCTIC_RESTORE_MIN_SECONDS", 1800))
+_ARCTIC_SNAPSHOT_FIELDS = ("retrieved_on", "retrieved_utc", "updated_utc")
+
+
+def archive_snapshot_time(post) -> float:
+    """When the archive LAST looked at this post (unix seconds), or 0.0.
+
+    Arctic Shift rows carry `retrieved_on` (first capture) and, once the
+    archive re-reads a post, `updated_utc`; the newest of them is the moment
+    the row's `removed_by_category`/title/selftext were true. Absent/garbage
+    fields -> 0.0, which can never be "newer than the hold".
+    """
+    best = 0.0
+    if not isinstance(post, dict):
+        return best
+    for fld in _ARCTIC_SNAPSHOT_FIELDS:
+        val = post.get(fld)
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            continue
+        if val > best:
+            best = float(val)
+    return best
+
+
+def archive_listed_after_hold(pend, entry, now: float | None = None) -> float | None:
+    """Round 108: the moment a FRESH archive snapshot vouched for a held post
+    again, or None.
+
+    Round 107 taught the relay path that a listing NEWER than a never-re-check
+    hold is a restore (1xlrj90: held `removal_notice` at 08:20Z, approved at
+    ~12:35Z). The old chain had no equivalent: "removed posts re-enter via RSS"
+    is a dead end once Reddit retires RSS (2026-11-13), so a post that was held
+    off a mod-queue snapshot and approved later would have stayed held until
+    the 48 h window dropped it. Here the archive's own re-read plays the part
+    the relay message plays in round 107:
+      * the row must be the archive's record of THIS post, re-read AFTER the
+        hold (`archive_snapshot_time` > max(first_seen, last_checked));
+      * the row must be clean (`archived_removal_verdict` == live: no
+        `removed_by_category`, no [removed]/[deleted]/notice markers);
+      * the hold must be at least ARCTIC_RESTORE_MIN_SECONDS old, so a row
+        that is simply re-served every sweep cannot start a re-check loop.
+    Satisfied -> the candidate re-enters the FULL pipeline, where the round-20/32
+    live-source gate and the round-95 probe decide again; a post that is still
+    removed is held again (clock refreshed), never posted on the archive's
+    word alone. Pure bookkeeping on data already in hand: no request, never
+    raises.
+    """
+    try:
+        rec = getattr(entry, "_arctic_post", None)
+        if not isinstance(pend, dict) or not isinstance(rec, dict) or not rec:
+            return None
+        if archived_removal_verdict(rec)[0] != "live":
+            return None
+        hold = 0.0
+        for fld in ("first_seen", "last_checked"):
+            try:
+                hold = max(hold, float(pend.get(fld) or 0))
+            except (TypeError, ValueError):
+                pass
+        if hold <= 0:
+            return None
+        if now is not None and now - hold < ARCTIC_RESTORE_MIN_SECONDS:
+            return None
+        snap = archive_snapshot_time(rec)
+        if snap > hold:
+            return snap
+    except Exception:
+        return None
+    return None
+
+
 def _pending_throttle_skip(pending: dict, key: str, now: float, entry) -> bool:
     """Round 32: should this pending post be skipped (not re-verified) now?
 
@@ -1900,6 +2006,10 @@ def _pending_throttle_skip(pending: dict, key: str, now: float, entry) -> bool:
     RSS (entry is not an _ArcticEntry), i.e. the post re-appeared in the
     feed with fresh content (a restore): the full pipeline runs and either
     posts it (now live) or re-queues it (still shows a notice).
+    Round 108: an archive entry whose row was re-read clean AFTER the hold is
+    let through by main() itself (`archive_listed_after_hold`, capped per run)
+    before this throttle is consulted; this function keeps saying "skip" for
+    archive resurfaces so the cap stays in one place.
     """
     pend = pending.get(key)
     reason = pend.get("reason") if isinstance(pend, dict) else None
@@ -2308,29 +2418,159 @@ def _subreddit_by_name(name: str) -> str | None:
 ARCTIC_POSTS_URL = "https://arctic-shift.photon-reddit.com/api/posts/ids"
 _arctic_fail_count = 0
 
+# ---------------------------------------------------------------------------
+# ■ ROUND 108 (2026-11-02): ARCTIC HARDENING (backup chain)
+# The Devvit relay is the primary listing; the archive is what the OLD chain
+# leans on once Reddit retires RSS (2026-11-13) and the relay is paused. Four
+# call sites talked to the archive, each with its own copy of the request and
+# parse code and none of them tolerant of the archive's known quirks:
+#   * back-to-back requests time out (one timeout per subreddit in the sweep
+#     meant three strikes and an open circuit for the rest of the run);
+#   * a single 429/5xx/timeout counted as an outage although the very next
+#     request usually answers;
+#   * rows were accepted without checking that `id` is a string and that the
+#     row really is a post record.
+# ONE request helper now serves all four call sites: it spaces consecutive
+# archive requests ARCTIC_MIN_SPACING apart, retries ONCE on a timeout / 429 /
+# 5xx (honouring a short Retry-After) within a per-run ARCTIC_RETRY_BUDGET, and
+# returns only well-formed rows. The per-call-site failure counters, their
+# 3-strike circuits and "a miss is not an outage" are unchanged; a request that
+# still fails after its retry counts exactly one strike, as before.
+# Request counts are written into the run result (`arctic_requests`,
+# `arctic_retries`, `arctic_failures`) so a run's archive health is provable
+# from the summary alone.
+# ---------------------------------------------------------------------------
+ARCTIC_MIN_SPACING = max(0.0, min(5.0, _env_float("ARCTIC_MIN_SPACING", 1.0)))
+ARCTIC_RETRY_BUDGET = max(0, min(10, _env_int("ARCTIC_RETRY_BUDGET", 3)))
+ARCTIC_RETRY_BACKOFF = 1.5     # seconds before the single retry
+ARCTIC_RETRY_MAX_WAIT = 5.0    # cap for a Retry-After header we are willing to honour
+_ARCTIC_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+_arctic_last_request = 0.0     # time.monotonic() of the previous archive request
+_arctic_retries_used = 0       # per run
+_arctic_stats = {"requests": 0, "retries": 0, "failures": 0}
+
+
+def _reset_arctic_run_state() -> None:
+    """Per-run archive bookkeeping (budget + counters); never raises."""
+    global _arctic_last_request, _arctic_retries_used, _arctic_stats
+    _arctic_last_request = 0.0
+    _arctic_retries_used = 0
+    _arctic_stats = {"requests": 0, "retries": 0, "failures": 0}
+
+
+class _ArcticHTTPError(ValueError):
+    """Non-200 archive answer; str() keeps the historical "HTTP <code>" text."""
+
+    def __init__(self, status: int, retry_after: float | None = None):
+        super().__init__(f"HTTP {status}")
+        self.status = int(status)
+        self.retry_after = retry_after
+
+
+def _arctic_retry_after(resp) -> float | None:
+    """Retry-After in seconds (delta form only), or None. Tolerates mocks."""
+    try:
+        headers = getattr(resp, "headers", None)
+        raw = headers.get("Retry-After") if hasattr(headers, "get") else None
+        if raw is None:
+            return None
+        val = float(str(raw).strip())
+        return val if val >= 0 else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _arctic_rows(data) -> list:
+    """Strict parse of an archive answer -> post rows. Raises on bad shape.
+
+    Only `{"data": [ {...}, ... ]}` is an answer; anything else (a list, a
+    string, an error object) is treated as a failed request. Rows without a
+    string `id` are dropped: they can never be matched to a candidate and must
+    never be mistaken for one.
+    """
+    posts = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(posts, list):
+        raise ValueError("invalid archive response")
+    return [p for p in posts if isinstance(p, dict)
+            and isinstance(p.get("id"), str) and p.get("id")]
+
+
+def _arctic_retryable(exc) -> bool:
+    if isinstance(exc, _ArcticHTTPError):
+        return exc.status in _ARCTIC_RETRY_STATUSES
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    try:
+        return isinstance(exc, (aiohttp.ServerDisconnectedError,
+                                aiohttp.ClientConnectorError,
+                                aiohttp.ClientPayloadError))
+    except Exception:
+        return False
+
+
+async def _arctic_get_rows(session, url: str, params: dict, *, timeout: float,
+                           label: str, what: str = "archive") -> list:
+    """ONE Arctic Shift GET -> well-formed post rows. Raises on failure.
+
+    Spacing, the single retry and the per-run retry budget live here so every
+    call site gets them. The caller still owns its failure counter and its
+    log line, exactly as before.
+    """
+    global _arctic_last_request, _arctic_retries_used
+    retried = False
+    while True:
+        try:
+            if _arctic_last_request > 0 and ARCTIC_MIN_SPACING > 0:
+                gap = ARCTIC_MIN_SPACING - (time.monotonic() - _arctic_last_request)
+                if gap > 0.01:
+                    await asyncio.sleep(gap)
+        except Exception:
+            pass
+        _arctic_last_request = time.monotonic()
+        _arctic_stats["requests"] += 1
+        try:
+            async with session.get(url, params=params,
+                                   headers=dict(BROWSER_HEADERS),
+                                   timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                if resp.status != 200:
+                    raise _ArcticHTTPError(resp.status, _arctic_retry_after(resp))
+                data = await resp.json(content_type=None)
+            return _arctic_rows(data)
+        except Exception as exc:
+            if (not retried and _arctic_retryable(exc)
+                    and _arctic_retries_used < ARCTIC_RETRY_BUDGET):
+                retried = True
+                _arctic_retries_used += 1
+                _arctic_stats["retries"] += 1
+                delay = ARCTIC_RETRY_BACKOFF
+                hinted = getattr(exc, "retry_after", None)
+                if isinstance(hinted, (int, float)) and hinted > delay:
+                    delay = min(float(hinted), ARCTIC_RETRY_MAX_WAIT)
+                reason = str(exc).strip() or type(exc).__name__
+                logging.info(f"[{label}] Arctic Shift {what} answered {reason} — "
+                             f"retrying once in {delay:.1f} s "
+                             f"({_arctic_retries_used}/{ARCTIC_RETRY_BUDGET} retries this run).")
+                await asyncio.sleep(delay)
+                continue
+            _arctic_stats["failures"] += 1
+            raise
+
 
 async def fetch_arctic_post(session, post_id: str, label: str = "") -> dict | None:
     global _arctic_fail_count
     if not re.fullmatch(r"[a-z0-9]+", post_id or "") or _arctic_fail_count >= 3:
         return None
     try:
-        async with session.get(ARCTIC_POSTS_URL, params={"ids": post_id},
-                               headers=dict(BROWSER_HEADERS),
-                               timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                raise ValueError(f"HTTP {resp.status}")
-            data = await resp.json(content_type=None)
-        posts = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(posts, list):
-            raise ValueError("invalid archive response")
+        posts = await _arctic_get_rows(session, ARCTIC_POSTS_URL, {"ids": post_id},
+                                       timeout=10, label=label or post_id)
         _arctic_fail_count = 0
         # Empty results are normal for posts not yet archived. Match the ID,
         # rather than accidentally attaching another post's media.
-        return next((post for post in posts if isinstance(post, dict)
-                     and post.get("id") == post_id), None)
+        return next((post for post in posts if post.get("id") == post_id), None)
     except Exception as exc:
         _arctic_fail_count += 1
-        logging.info(f"[{label or post_id}] Arctic Shift unavailable: {exc}")
+        logging.info(f"[{label or post_id}] Arctic Shift unavailable: "
+                     f"{str(exc).strip() or type(exc).__name__}")
         return None
 
 
@@ -2348,22 +2588,15 @@ async def fetch_arctic_posts_by_ids(session, post_ids, label: str = "") -> dict:
     if not ids or _arctic_fail_count >= 3:
         return {}
     try:
-        async with session.get(ARCTIC_POSTS_URL, params={"ids": ",".join(ids)},
-                               headers=dict(BROWSER_HEADERS),
-                               timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                raise ValueError(f"HTTP {resp.status}")
-            data = await resp.json(content_type=None)
-        posts = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(posts, list):
-            raise ValueError("invalid archive response")
+        posts = await _arctic_get_rows(session, ARCTIC_POSTS_URL, {"ids": ",".join(ids)},
+                                       timeout=10, label=label or "reclaim")
         _arctic_fail_count = 0
         wanted = set(ids)
-        return {str(post.get("id")): post for post in posts
-                if isinstance(post, dict) and str(post.get("id")) in wanted}
+        return {post["id"]: post for post in posts if post["id"] in wanted}
     except Exception as exc:
         _arctic_fail_count += 1
-        logging.info(f"[{label or 'reclaim'}] Arctic Shift unavailable: {exc}")
+        logging.info(f"[{label or 'reclaim'}] Arctic Shift unavailable: "
+                     f"{str(exc).strip() or type(exc).__name__}")
         return {}
 
 
@@ -2555,27 +2788,31 @@ async def fetch_arctic_subreddit_posts(session, subreddit: str,
 
     Returns [] on ANY failure (429/timeout/bad shape) — the RSS path has
     already run, so a search error must never block posting. `after_epoch`
-    (unix seconds) restricts the window to match MAX_AGE_SECONDS.
+    (unix seconds) restricts the window to match MAX_AGE_SECONDS; when it is
+    missing the window is applied anyway (round 108: never an unbounded search).
     """
     global _arctic_fail_count
     if not re.fullmatch(r"[A-Za-z0-9_]{2,50}", subreddit or "") or _arctic_fail_count >= 3:
         return []
     params = {"subreddit": subreddit, "limit": str(min(int(limit), 100)),
               "sort": "desc", "md2html": "true"}
-    if after_epoch:
-        params["after"] = str(int(after_epoch))
+    # Round 108: ALWAYS bound the search. An unbounded search is the archive's
+    # slowest query shape (it scans the whole subreddit history) and is what
+    # times out back-to-back; the posting window is the widest span any caller
+    # can use anyway.
     try:
-        async with session.get(ARCTIC_SEARCH_URL, params=params,
-                               headers=dict(BROWSER_HEADERS),
-                               timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                raise ValueError(f"HTTP {resp.status}")
-            data = await resp.json(content_type=None)
-        posts = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(posts, list):
-            raise ValueError("invalid search response")
+        after_val = int(after_epoch) if after_epoch else 0
+    except (TypeError, ValueError):
+        after_val = 0
+    if after_val <= 0:
+        after_val = int(time.time() - MAX_AGE_SECONDS)
+    params["after"] = str(after_val)
+    try:
+        posts = await _arctic_get_rows(session, ARCTIC_SEARCH_URL, params,
+                                       timeout=10, label=label or subreddit,
+                                       what="search")
         _arctic_fail_count = 0
-        return [p for p in posts if isinstance(p, dict) and p.get("id")]
+        return posts
     except Exception as exc:
         _arctic_fail_count += 1
         # Keep HTTP messages ("HTTP 422") and descriptive exception text; fall
@@ -4469,17 +4706,11 @@ async def _fetch_arctic_post_row(session, post_id: str, label: str = "") -> dict
     if not re.fullmatch(r"[a-z0-9]+", post_id or "") or _liveness_fail_count >= 3:
         return None
     try:
-        async with session.get(ARCTIC_POSTS_URL, params={"ids": post_id},
-                               headers=dict(BROWSER_HEADERS),
-                               timeout=aiohttp.ClientTimeout(total=LIVENESS_PROBE_TIMEOUT)) as resp:
-            if resp.status != 200:
-                raise ValueError(f"HTTP {resp.status}")
-            data = await resp.json(content_type=None)
-        posts = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(posts, list):
-            raise ValueError("invalid archive response")
+        posts = await _arctic_get_rows(session, ARCTIC_POSTS_URL, {"ids": post_id},
+                                       timeout=LIVENESS_PROBE_TIMEOUT,
+                                       label=label or post_id, what="liveness lookup")
         _liveness_fail_count = 0
-        return next((p for p in posts if isinstance(p, dict) and p.get("id") == post_id), None)
+        return next((p for p in posts if p.get("id") == post_id), None)
     except Exception as exc:
         _liveness_fail_count += 1
         logging.info(f"[{label or post_id}] liveness archive lookup unavailable: "
@@ -8105,6 +8336,8 @@ async def main():
     global _liveness_fail_count, _liveness_probe_budget_used
     _liveness_fail_count = 0
     _liveness_probe_budget_used = 0
+    # Round 108: the archive retry budget and request counters are per run too.
+    _reset_arctic_run_state()
     # Round 93: placeholder state is per-run — a stale "vxreddit answered with
     # its shell" from a previous run must never influence liveness now.
     if reddit_proxy is not None and hasattr(reddit_proxy, "clear_vxreddit_placeholders"):
@@ -8540,7 +8773,13 @@ async def main():
                                 # Clock skew in the record: never post a "future"
                                 # post (the fresh-age floor would hold it forever).
                                 _rpub = now
-                            _rremoved = removed_post_reason(_rtitle, _rbody)
+                            # Round 108: the FRESH row's own `removed_by_category`
+                            # counts too (a mod removal with an untouched title/body
+                            # used to be re-admitted, only to be held again by the
+                            # liveness probe one step later — a wasted pipeline pass).
+                            _rremoved = (archived_removal_verdict(_rpost)[1]
+                                         if archived_removal_verdict(_rpost)[0] == "removed"
+                                         else None)
                             _rpath = normalize_reddit_path(
                                 str(_rpost.get("permalink") or ""))
                             if _rpub <= 0:
@@ -8661,13 +8900,38 @@ async def main():
                     logging.info(f"[{unique_key}] held as '{_held_reason}' since "
                                  f"{int(max(0.0, now - _held_since) // 60)} min, but Reddit's own "
                                  f"listing (relay) vouches for it again — restore, full pipeline.")
+                # Round 108: the OLD chain's counterpart — the archive re-read a
+                # never-re-check hold AFTER the hold and the row is clean ->
+                # restore (full pipeline decides), at most ARCTIC_RESTORE_MAX_PER_RUN
+                # per run. Only archive entries qualify, so relay-primary runs
+                # (no archive sweep) are untouched.
+                _arc_listed = None
+                if (not TEST_POST_ID and not DRY_RUN and isinstance(entry, _ArcticEntry)
+                        and isinstance(pending.get(unique_key), dict)
+                        and pending[unique_key].get("reason") in _NO_RECHECK_REASONS):
+                    _arc_listed = archive_listed_after_hold(pending[unique_key], entry, now)
+                    if _arc_listed is not None and run_stats["arctic_restores"] >= ARCTIC_RESTORE_MAX_PER_RUN:
+                        run_stats["arctic_restores_deferred"] += 1
+                        _arc_listed = None
+                    elif _arc_listed is not None:
+                        _held_reason = str(pending[unique_key].get("reason") or "unknown")
+                        _held_since = float(pending[unique_key].get("first_seen") or now)
+                        run_stats["arctic_restores"] += 1
+                        _note_key(run_stats, "arctic_restore_keys",
+                                  {"key": unique_key, "held_reason": _held_reason,
+                                   "held_minutes": round(max(0.0, now - _held_since) / 60, 1)})
+                        logging.info(f"[{unique_key}] held as '{_held_reason}' since "
+                                     f"{int(max(0.0, now - _held_since) // 60)} min, but the "
+                                     f"archive re-read it clean afterwards — restore, full "
+                                     f"pipeline (live sources decide).")
                 # Round 30/32: pending-post recheck throttle — previously
                 # rejected/held posts are only re-checked once every
                 # PENDING_RECHECK_SECONDS (round 95c: default 5 min = one cron
                 # tick), and removed/deleted posts are not re-checked unless
-                # restored via RSS.
+                # restored via RSS (or, round 108, re-read clean by the archive).
                 if (not TEST_POST_ID and not DRY_RUN
                         and unique_key in pending
+                        and _arc_listed is None
                         and _pending_throttle_skip(pending, unique_key, now, entry)):
                     _pend = pending[unique_key]
                     _pend_reason = str(_pend.get("reason") or "unknown")
