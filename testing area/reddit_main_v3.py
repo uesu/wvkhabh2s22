@@ -3766,6 +3766,252 @@ def _drop_gallery_media_lines(body: str, media: list) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ■ ROUND 109 (2026-11-04): INLINE IMAGE INTERLEAVING (live 1xnbsam)
+# A self-post that embeds its pictures INSIDE the prose ("# 2 - Gallery
+# https://preview.redd.it/…", "[caption](https://preview.redd.it/…)") used
+# to render as one long text block with the raw preview URLs left in the
+# headings, followed by every picture in one trailing gallery in proxy
+# order. The card now follows the post's own reading order: each text
+# segment is followed by a media gallery holding the pictures that segment
+# references (body order), the inline URLs are scrubbed from the text, the
+# escaped `\/` of a Reddit caption label is restored, pictures the text
+# never references stay in a trailing gallery, and the children are packed
+# into ≤10-component containers under Discord's 40-component cap. The
+# header, stats line, divider, buttons and accent are unchanged; a body
+# without inline gallery references builds the byte-identical legacy card.
+# ---------------------------------------------------------------------------
+_INLINE_IMG_TOKEN_CH = "\u2063"   # INVISIBLE SEPARATOR — never typed in prose
+_INLINE_IMG_TOKEN_RE = re.compile(r"\u2063IMG(\d+)\u2063")
+# Old-structure (HTML) route: clean_rss_body cannot know the gallery yet, so
+# it leaves a position marker carrying the picture's file identity instead
+# of the URL (`⁣MEDIA:<_reddit_media_key>⁣`); the card builder resolves it.
+_MEDIA_MARK_RE = re.compile(r"\u2063MEDIA:([^\u2063\n]+)\u2063")
+# a marker line inside a quote block carries the "> " prefix — swallow it too
+_MEDIA_MARK_LINE_RE = re.compile(r"(?m)^[ \t>]*\u2063MEDIA:([^\u2063\n]+)\u2063[ \t]*$")
+_INLINE_IMG_STRAY_RE = re.compile(r"\u2063(?:IMG\d*|MEDIA:[^\u2063\n]*)?\u2063?")
+_INLINE_IMG_LINK_RE = re.compile(r"!?\[([^\]\n]*)\]\((https?://[^)\s]+)\)")
+_HTML_MEDIA_LINK_RE = re.compile(
+    r"\[([^\]\n]*)\]\(\s*(https?://(?:i\.|preview\.)redd\.it/[^\s)]*)\s*\)")
+_HTML_MEDIA_BARE_RE = re.compile(
+    r"(?<!\]\()https?://(?:i\.|preview\.)redd\.it/[^\s<>)\]]+(?!\))")
+_V2_COMPONENT_CAP = 40   # Discord: every component, nested ones included
+
+
+def _media_marker(url: str) -> str:
+    return f"{_INLINE_IMG_TOKEN_CH}MEDIA:{_reddit_media_key(url)}{_INLINE_IMG_TOKEN_CH}"
+
+
+def _html_media_refs_to_markers(text: str) -> str:
+    """clean_rss_body step (round 109, old-structure route): an i.redd.it /
+    preview.redd.it PICTURE reference — `[label](url)` from an anchor, or a
+    bare URL — becomes a position marker line; a caption label survives as
+    text, a label that is the picture's own URL (or empty) does not. Short
+    `redd.it/` links, external-preview thumbs and non-picture URLs are left
+    for the round-14 removal that follows."""
+    def _link(m: re.Match) -> str:
+        label, url = m.group(1), m.group(2)
+        cand = html_lib.unescape(url).rstrip(".,;")
+        if not REDDIT_MEDIA_URL_RE.fullmatch(cand):
+            return m.group(0)
+        label_out = html_lib.unescape(label).strip()
+        if (REDDIT_MEDIA_URL_RE.fullmatch(label_out.rstrip(".,;"))
+                and _reddit_media_key(label_out) == _reddit_media_key(cand)):
+            label_out = ""
+        return f"{label_out}\n{_media_marker(cand)}\n"
+
+    def _bare(m: re.Match) -> str:
+        cand = html_lib.unescape(m.group(0)).rstrip(".,;")
+        if not REDDIT_MEDIA_URL_RE.fullmatch(cand):
+            return m.group(0)
+        return f"\n{_media_marker(cand)}\n"
+
+    text = _HTML_MEDIA_LINK_RE.sub(_link, text)
+    return _HTML_MEDIA_BARE_RE.sub(_bare, text)
+
+
+def _hoist_media_markers(lines: list) -> list:
+    """Give every marker its own line: a marker that ended up inside a
+    heading/bold/italic/strike/spoiler wrapper (`**6 - Enemies ⁣MEDIA…⁣**`)
+    is lifted out and the wrapper closed cleanly; a wrapper left empty
+    disappears."""
+    out: list = []
+    for line in lines:
+        if _INLINE_IMG_TOKEN_CH not in line:
+            out.append(line)
+            continue
+        marks = _MEDIA_MARK_RE.findall(line)
+        rest = _INLINE_IMG_STRAY_RE.sub(" ", line)
+        rest = re.sub(r"(\*\*|\*|~~|\|\||__|_)\s+\1", " ", rest)
+        rest = re.sub(r"(\S)\s+(\*\*|~~|\|\|)(?=\s|$)", r"\1\2", rest)
+        rest = re.sub(r"\s{2,}", " ", rest).strip()
+        if rest and not re.fullmatch(r"(?:\*\*|\*|~~|\|\||_)+", rest):
+            out.append(rest)
+        out.extend(f"{_INLINE_IMG_TOKEN_CH}MEDIA:{k}{_INLINE_IMG_TOKEN_CH}" for k in marks)
+    return out
+
+
+def _inline_img_token(idx: int) -> str:
+    return f"{_INLINE_IMG_TOKEN_CH}IMG{idx}{_INLINE_IMG_TOKEN_CH}"
+
+
+def _strip_inline_img_tokens(text: str) -> str:
+    """Remove every round-109 token (and any split-damaged fragment)."""
+    if not text or _INLINE_IMG_TOKEN_CH not in text:
+        return text or ""
+    return _collapse_blanks(
+        [ln.rstrip() for ln in _INLINE_IMG_STRAY_RE.sub("", text).splitlines()])
+
+
+def _mark_inline_gallery_images(body: str, photo_media: list) -> str:
+    r"""Replace every in-body reference to a gallery photo with a token line.
+
+    A reference is a markdown link/image `[label](https://preview.redd.it/…)`
+    or a bare `https://(preview|i).redd.it/…` URL whose file identity
+    (_reddit_media_key) matches a gallery photo. The first reference to a
+    photo becomes `⁣IMG<n>⁣` on its own line (n = index into photo_media);
+    repeated references are simply removed. A caption label survives as
+    plain text with Reddit's `\/` escape restored; a label that is the same
+    picture (or empty) is dropped. Links to non-gallery targets and bodies
+    without any gallery reference are returned byte-identical.
+    """
+    if not body:
+        return body
+    has_marks = _INLINE_IMG_TOKEN_CH in body
+    if not photo_media and not has_marks:
+        return body
+    key_to_idx: dict[str, int] = {}
+    for idx, m in enumerate(photo_media or []):
+        u = str((m or {}).get("url") or "") if isinstance(m, dict) else ""
+        if u:
+            key_to_idx.setdefault(_reddit_media_key(u), idx)
+    if not key_to_idx:
+        return _strip_inline_img_tokens(body) if has_marks else body
+    used: set[int] = set()
+
+    def _repl_marker(m: re.Match) -> str:
+        idx = key_to_idx.get(m.group(1).strip().lower())
+        if idx is None or idx in used:
+            return ""
+        used.add(idx)
+        return f"\n{_inline_img_token(idx)}\n"
+
+    def _token_for(url: str) -> str | None:
+        cand = html_lib.unescape(url.strip()).rstrip(".,;")
+        if not REDDIT_MEDIA_URL_RE.fullmatch(cand):
+            return None
+        idx = key_to_idx.get(_reddit_media_key(cand))
+        if idx is None:
+            return None
+        if idx in used:
+            return ""
+        used.add(idx)
+        return f"\n{_inline_img_token(idx)}\n"
+
+    def _repl_link(m: re.Match) -> str:
+        label, url = m.group(1), m.group(2)
+        tok = _token_for(url)
+        if tok is None:
+            return m.group(0)
+        label_out = html_lib.unescape(label).replace("\\/", "/").strip()
+        label_out = _MD_ESCAPED_PUNCT_RE.sub(r"\1", label_out)
+        if (not label_out
+                or (REDDIT_MEDIA_URL_RE.fullmatch(label_out.rstrip(".,;"))
+                    and _reddit_media_key(label_out) == _reddit_media_key(url))):
+            label_out = ""
+        return f"{label_out}{tok}"
+
+    def _repl_bare(m: re.Match) -> str:
+        tok = _token_for(m.group(0))
+        return m.group(0) if tok is None else tok
+
+    marked = body
+    if has_marks:
+        marked = _MEDIA_MARK_RE.sub(_repl_marker, _MEDIA_MARK_LINE_RE.sub(_repl_marker, marked))
+    marked = _INLINE_IMG_LINK_RE.sub(_repl_link, marked)
+    marked = REDDIT_MEDIA_URL_RE.sub(_repl_bare, marked)
+    if not used:
+        return _strip_inline_img_tokens(body) if has_marks else body
+    return _collapse_blanks([ln.rstrip() for ln in marked.splitlines()])
+
+
+def _inline_img_segments(body_out: str) -> tuple[list, list]:
+    """Split a tokenised first-page body into [(text, [photo_idx, …]), …]
+    plus the ordered list of photo indexes it references. Returns ([], [])
+    when no token sits after some prose — the legacy layout then applies."""
+    if not body_out or _INLINE_IMG_TOKEN_CH not in body_out:
+        return [], []
+    segments: list = []
+    text_lines: list = []
+    imgs: list = []
+    order: list = []
+    seen: set[int] = set()
+
+    def _flush():
+        nonlocal text_lines, imgs
+        text = _collapse_blanks([ln.rstrip() for ln in text_lines])
+        if text or imgs:
+            segments.append((text, imgs))
+        text_lines, imgs = [], []
+
+    for line in body_out.splitlines():
+        m = _INLINE_IMG_TOKEN_RE.fullmatch(line.strip())
+        if m:
+            idx = int(m.group(1))
+            if idx in seen:
+                continue
+            seen.add(idx)
+            order.append(idx)
+            imgs.append(idx)
+            continue
+        if imgs:
+            # consecutive picture paragraphs (Reddit emits every embedded
+            # picture as its own paragraph) pool into ONE gallery — only
+            # prose closes the section
+            if not line.strip():
+                continue
+            _flush()
+        text_lines.append(_INLINE_IMG_STRAY_RE.sub("", line))
+    _flush()
+    if not order or not any(text and imgs for text, imgs in segments):
+        return [], []
+    # a trailing text-only segment stays (reading order: picture, then its
+    # caption prose); an image-only lead segment keeps its gallery first.
+    return segments, order
+
+
+def _pack_v2_containers(units: list, accent: int) -> list:
+    """Pack units (each a list of children that belong together — a section's
+    text + its gallery, or the final stats / divider / buttons trio) into
+    ≤10-component containers; a unit only splits when it alone is larger
+    than one container."""
+    containers: list = []
+    cur: list = []
+    for unit in units:
+        if cur and len(cur) + len(unit) > MEDIA_PER_GALLERY:
+            containers.append(cur)
+            cur = []
+        for child in unit:
+            if len(cur) >= MEDIA_PER_GALLERY:
+                containers.append(cur)
+                cur = []
+            cur.append(child)
+    if cur:
+        containers.append(cur)
+    return [{"type": 17, "accent_color": accent, "components": c} for c in containers]
+
+
+def _count_v2_components(containers: list) -> int:
+    total = 0
+    for c in containers:
+        total += 1
+        for child in c.get("components", []):
+            total += 1
+            if child.get("type") == 1:
+                total += len(child.get("components", []))
+    return total
+
+
+# ---------------------------------------------------------------------------
 # ■ ROUND 66 (2026-10-05): SAFE BODY SPLITTING + MARKDOWN TABLE RENDERING
 # (see the ROUND 66 notes block near the top for the full design)
 # ---------------------------------------------------------------------------
@@ -5112,6 +5358,10 @@ def clean_rss_body(value: str | None) -> str:
     text = re.sub(r"(?i)<span>\s*<a[^>]*>\[(?:link|comments)\]</a>\s*</span>", " ", text)
     # links stay clickable: <a href="U">T</a> -> [T](U)
     text = re.sub(r'(?is)<a\s[^>]*href="([^"]+)"[^>]*>(.*?)</a>', r'[\2](\1)', text)
+    # Round 109: picture references keep their PLACE as marker lines (the
+    # card builder interleaves text and gallery in reading order); the URL
+    # text itself is still gone from the body.
+    text = _html_media_refs_to_markers(text)
     # round 16: blockquotes -> Discord quote markers (applied per line below)
     text = re.sub(r"(?is)<blockquote[^>]*>", "\x01", text)
     text = re.sub(r"(?i)</blockquote>", "\x02", text)
@@ -5164,6 +5414,7 @@ def clean_rss_body(value: str | None) -> str:
     # RSS nav leftovers that survived as markdown links: [link](…) [comments](…)
     text = re.sub(r"(?i)\[(?:link|comments)\]\(\s*[^\s)]*\s*\)", " ", text)
     lines = [re.sub(r"\s{2,}", " ", ln).strip() for ln in text.splitlines()]
+    lines = _hoist_media_markers(lines)
     lines = _apply_quote_markers(lines)
     return _collapse_blanks(_line_stage(lines))
 
@@ -7787,8 +8038,13 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
     # Round 99: consecutive quote paragraphs join into one Discord quote
     # block at the same choke point (live 1xkgd9m, the megathread spoiler
     # format example) — same single call site, same every-source parity.
+    # Round 109: in-body references to gallery photos become invisible
+    # token lines first (live 1xnbsam), so the text/gallery interleave below
+    # can follow the post's reading order; a body without any such reference
+    # passes through byte-identical.
+    body_marked = _mark_inline_gallery_images(data["body"], _photo_media)
     body_src = _format_markdown_tables(_format_quote_blocks(
-        _drop_gallery_media_lines(data["body"], media)))
+        _drop_gallery_media_lines(body_marked, media)))
     single_budget = max(300, 3800 - len(header) - len(base_stats_line))
     if len(body_src) <= single_budget:
         stats_line = base_stats_line
@@ -7811,6 +8067,48 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
 
     def gallery(items: list) -> dict:
         return {"type": 12, "items": [{"media": {"url": m["url"]}} for m in items]}
+
+    # Round 109: continuation pages never carry a token — a photo referenced
+    # only on a later page joins the trailing gallery of the main card.
+    body_rest = _strip_inline_img_tokens(body_rest)
+    segments, inline_order = _inline_img_segments(body_out)
+    if segments:
+        def _chunks(items: list) -> list:
+            return [items[i:i + MEDIA_PER_GALLERY]
+                    for i in range(0, len(items), MEDIA_PER_GALLERY)]
+
+        _used_idx = set(inline_order)
+        _trailing = [m for i, m in enumerate(_photo_media) if i not in _used_idx]
+        while True:
+            units = [[{"type": 10, "content": header}]]
+            for _text, _idxs in segments:
+                _unit = []
+                if _text:
+                    _unit.append({"type": 10, "content": _text})
+                for _chunk in _chunks([_photo_media[i] for i in _idxs]):
+                    _unit.append(gallery(_chunk))
+                units.append(_unit)
+            for _chunk in _chunks(_trailing):
+                units.append([gallery(_chunk)])
+            if _vid_media:
+                # round 38c: the video tile keeps its OWN media block
+                units.append([gallery(_vid_media)])
+            units.append([{"type": 10, "content": stats_line},
+                          {"type": 14, "divider": True, "spacing": 1},
+                          row])
+            containers = _pack_v2_containers(units, 16729344)
+            if len(segments) <= 1 or _count_v2_components(containers) <= _V2_COMPONENT_CAP:
+                break
+            # over the component cap: fold the last two sections into one
+            # (their prose joined, their pictures pooled below it)
+            (_t1, _i1), (_t2, _i2) = segments[-2], segments[-1]
+            segments = segments[:-2] + [
+                ("\n\n".join(t for t in (_t1, _t2) if t), _i1 + _i2)]
+        payload = {"flags": IS_COMPONENTS_V2, "components": containers}
+        if return_remainder:
+            return payload, body_rest
+        return payload
+    body_out = _strip_inline_img_tokens(body_out)
 
     # Round 38c hardening: the split MUST key on the PHOTO count — with
     # exactly 10 photos + a gallery video, len(media)=11 would open the

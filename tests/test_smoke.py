@@ -13029,6 +13029,201 @@ check("r106: every engine, test and script file compiles without a SyntaxWarning
       "Python turns that into a SyntaxError and the monitor would not start)",
       _r106_bad == [], _r106_bad[:3])
 
+# ---- round 109 (2026-11-04): inline image interleaving (live 1xnbsam) ----
+# A self-post that embeds its pictures inside the prose ("# 2 - Gallery
+# https://preview.redd.it/…", "[caption](https://preview.redd.it/…)") used to
+# render as one text block with the raw URLs left in, followed by every
+# picture in one trailing gallery in proxy order. The card now follows the
+# post's reading order (text / its pictures / text / …), scrubs the inline
+# URLs, restores a caption's `\/`, keeps unreferenced pictures in a trailing
+# gallery, packs ≤10 children per container under the 40-component cap, and
+# builds the byte-identical legacy card when the body references nothing.
+def _r109_url(i):
+    return f"https://preview.redd.it/img{i:02d}abcde.png?width=100&format=png&auto=webp&s=ff{i}"
+
+
+def _r109_data(body, n, video=False, stats=True):
+    media = [{"kind": "image", "url": _r109_url(i)} for i in range(n)]
+    if video:
+        media.append({"kind": "video", "url": "https://v.redd.it/abcd1234/DASH_720.mp4"})
+    return {"title": "T", "author": "a", "crosspost": None, "media": media, "youtube_url": None,
+            "stats": {"comments": 1, "ups": 2} if stats else None, "body": body}
+
+
+def _r109_build(data, **kw):
+    return v3.build_v3_payload("Sub", data, "https://www.reddit.com/r/Sub/comments/x/", 1, **kw)
+
+
+def _r109_shape(payload):
+    out = []
+    for c in payload["components"]:
+        out.append([(x["type"], x["content"] if x["type"] == 10 else
+                     [it["media"]["url"] for it in x["items"]] if x["type"] == 12 else None)
+                    for x in c["components"]])
+    return out
+
+
+_r109_hdr = (10, _r109_build(_r109_data("x", 0))["components"][0]["components"][0]["content"])
+check("r109: the header line itself is the usual title link + by-line",
+      _r109_hdr[1].startswith("### [T](https://www.reddit.com/r/Sub/comments/x/)\n*by ")
+      and _r109_hdr[1].endswith(" in r/Sub*"), _r109_hdr)
+_r109_stats = (10, "-# 💬 1 👍 2   •   🕐 <t:1:f>")
+_r109_div = (14, None)
+_r109_live = ("Hey Guys! Big Update.\n\n# 1 - Revision Timeline\n\n"
+              f"[https:\\/\\/zzz.gachabase.net\\/timeline]({_r109_url(0)})\n\n"
+              "You can now view any version.\n\n"
+              f"# 2 - Gallery {_r109_url(1)}\n\n"
+              f"and the ability to compare images too {_r109_url(2)}\n\n"
+              "Check it out on any diff page\n\n"
+              f"# 3 - Item Diffing {_r109_url(3)}")
+_r109_p = _r109_build(_r109_data(_r109_live, 5))
+_r109_s = _r109_shape(_r109_p)
+check("r109: inline-image body renders in reading order — each text segment is followed by a "
+      "gallery of the pictures it references; the raw preview URLs are gone from the text and a "
+      "caption's escaped `\\/` is restored; the unreferenced picture closes in a trailing gallery; "
+      "the 10-child first container hands the stats / divider / buttons trio to a second one",
+      _r109_s == [[_r109_hdr,
+                   (10, "Hey Guys! Big Update.\n\n# 1 - Revision Timeline\n\nhttps://zzz.gachabase.net/timeline"),
+                   (12, [_r109_url(0)]),
+                   (10, "You can now view any version.\n\n# 2 - Gallery"), (12, [_r109_url(1)]),
+                   (10, "and the ability to compare images too"), (12, [_r109_url(2)]),
+                   (10, "Check it out on any diff page\n\n# 3 - Item Diffing"), (12, [_r109_url(3)]),
+                   (12, [_r109_url(4)])],
+                  [_r109_stats, _r109_div, (1, None)]], _r109_s)
+check("r109: header / stats line / divider / buttons / accent are unchanged by the interleave",
+      _r109_p["flags"] == v3.IS_COMPONENTS_V2
+      and all(c["type"] == 17 and c["accent_color"] == 16729344 for c in _r109_p["components"])
+      and _r109_p["components"][-1]["components"][-1] == v3.build_action_row(
+          "https://www.reddit.com/r/Sub/comments/x/", None))
+check("r109: no token or stray invisible separator ever leaks into the payload",
+      "\u2063" not in json.dumps(_r109_p, ensure_ascii=False) and "IMG" not in json.dumps(_r109_p))
+_r109_legacy = _r109_shape(_r109_build(_r109_data("hello world", 2)))
+check("r109: a body without any gallery reference builds the byte-identical legacy card "
+      "(header / body / divider / gallery / stats / divider / buttons)",
+      _r109_legacy == [[_r109_hdr, (10, "hello world"), _r109_div,
+                        (12, [_r109_url(0), _r109_url(1)]), _r109_stats, _r109_div, (1, None)]],
+      _r109_legacy)
+check("r109: the round-62 URL-only body (no prose before the picture) still builds the legacy "
+      "card with the text block omitted",
+      _r109_shape(_r109_build(_r109_data(_r109_url(0), 1)))
+      == [[_r109_hdr, _r109_div, (12, [_r109_url(0)]), _r109_stats, _r109_div, (1, None)]])
+check("r109: a picture-first body followed by prose keeps the legacy layout (text above gallery) "
+      "with the inline URL scrubbed",
+      _r109_shape(_r109_build(_r109_data(f"{_r109_url(0)}\n\ncaption text", 1)))
+      == [[_r109_hdr, (10, "caption text"), _r109_div, (12, [_r109_url(0)]), _r109_stats,
+           _r109_div, (1, None)]])
+check("r109: links to NON-gallery targets stay as written; repeated references to one picture "
+      "are removed without a second gallery item; an i.redd.it gallery rendition matches its "
+      "preview.redd.it body URL",
+      _r109_build(_r109_data(f"see [cap](https://preview.redd.it/zzzz.png?x=1) and {_r109_url(0)}", 1)
+                  )["components"][0]["components"][1]["content"]
+      == "see [cap](https://preview.redd.it/zzzz.png?x=1) and"
+      and _r109_shape(_r109_build(_r109_data(
+          f"a {_r109_url(0)}\n\nb {_r109_url(0)}\n\nc [{_r109_url(0)}]({_r109_url(0)})", 1)))[0][1:3]
+      == [(10, "a\n\nb\n\nc"), (12, [_r109_url(0)])]
+      and _r109_shape(_r109_build({"title": "T", "author": "a", "crosspost": None, "youtube_url": None,
+                                   "stats": None, "body": f"intro {_r109_url(0)}",
+                                   "media": [{"kind": "image", "url": "https://i.redd.it/img00abcde.png"}]}))[0][1:3]
+      == [(10, "intro"), (12, ["https://i.redd.it/img00abcde.png"])])
+_r109_pool = _r109_shape(_r109_build(_r109_data(
+    f"# 6 - Enemies {_r109_url(0)}\n\n{_r109_url(1)}\n\n{_r109_url(2)}\n\n# 7 - Tutorials {_r109_url(3)}", 4)))
+check("r109: consecutive picture paragraphs (Reddit emits every embedded picture as its own "
+      "paragraph — the live '6 - Enemies' section) pool into ONE gallery under their heading; "
+      "only prose closes a section",
+      _r109_pool == [[_r109_hdr, (10, "# 6 - Enemies"), (12, [_r109_url(0), _r109_url(1), _r109_url(2)]),
+                      (10, "# 7 - Tutorials"), (12, [_r109_url(3)]), _r109_stats, _r109_div, (1, None)]],
+      _r109_pool)
+_r109_vid = _r109_shape(_r109_build(_r109_data(f"intro {_r109_url(0)}\n\nmore {_r109_url(1)}", 2, video=True)))
+check("r109: the round-38c video tile keeps its OWN media block after the sections",
+      [t for t, _ in _r109_vid[0]] == [10, 10, 12, 10, 12, 12, 10, 14, 1]
+      and _r109_vid[0][5][1] == ["https://v.redd.it/abcd1234/DASH_720.mp4"], _r109_vid)
+_r109_many = _r109_shape(_r109_build(_r109_data(f"a {_r109_url(0)}", 14)))
+check("r109: more than 10 unreferenced pictures split into ≤10-item trailing galleries",
+      [len(v) for t, v in _r109_many[0] if t == 12] == [1, 10, 3])
+_r109_long = ("intro " + _r109_url(0) + "\n\n" + ("lorem ipsum dolor sit amet " * 160)
+              + "\n\nlast " + _r109_url(1) + "\n\nend")
+_r109_pp, _r109_rest = _r109_build(_r109_data(_r109_long, 3), return_remainder=True)
+check("r109: a picture referenced only on a continuation page joins the trailing gallery; the "
+      "continuation text carries neither the URL nor a token",
+      [len(v) for t, v in _r109_shape(_r109_pp)[0] if t == 12] == [1, 2]
+      and "\u2063" not in _r109_rest and "preview.redd.it" not in _r109_rest
+      and _r109_rest.endswith("last\n\nend"), repr(_r109_rest[-60:]))
+for _r109_n in (12, 14, 20, 30):
+    _r109_big = "\n\n".join(f"# Section {i} {_r109_url(i)}\n\ntext {i}" for i in range(_r109_n))
+    _r109_bp = _r109_build(_r109_data(_r109_big, _r109_n))
+    _r109_bs = _r109_shape(_r109_bp)
+    check(f"r109: {_r109_n} sections — every container holds ≤10 children, the whole message stays "
+          "≤40 components (sections past the cap fold into the last one), the stats / divider / "
+          "buttons trio stays together at the end, and every picture is still on the card",
+          v3._count_v2_components(_r109_bp["components"]) <= 40
+          and all(len(c["components"]) <= 10 for c in _r109_bp["components"])
+          and [t for t, _ in _r109_bs[-1][-3:]] == [10, 14, 1]
+          and all(1 <= len(v) <= 10 for c in _r109_bs for t, v in c if t == 12)
+          and sorted(u for c in _r109_bs for t, v in c if t == 12 for u in v)
+          == sorted(_r109_url(i) for i in range(_r109_n)),
+          (v3._count_v2_components(_r109_bp["components"]), [len(c["components"]) for c in _r109_bp["components"]]))
+# Old-structure (RSS / redlib HTML) route: clean_rss_body leaves a position
+# marker (`⁣MEDIA:<file key>⁣`, no URL) where a picture reference stood, the
+# builder resolves it against the gallery, and the same interleaved card comes
+# out. Markers never reach Discord, the round-14 "no redd.it URL in the body"
+# contract still holds, and a marker with no matching gallery picture vanishes.
+_r109_P = "https://preview.redd.it/abc123.png?width=1280&amp;s=x"
+_r109_P2 = "https://preview.redd.it/def456.png?width=640&amp;s=y"
+_r109_html = ('<!-- SC_OFF --><div class="md"><p>Hey Guys! Big Update.</p>'
+              f'<h1>1 - Revision Timeline</h1><p><a href="{_r109_P}">https://zzz.gachabase.net/timeline</a></p>'
+              '<p>You can now view any version.</p>'
+              f'<h1>6 - Enemies <a href="{_r109_P2}">{_r109_P2}</a></h1>'
+              f'<p><a href="{_r109_P}">{_r109_P}</a></p>'
+              '<p>Check it out.</p></div><!-- SC_ON --> submitted by <a href="https://www.reddit.com/user/x"> /u/x </a>')
+_r109_hb = v3.clean_rss_body(_r109_html)
+_r109_hm = v3.extract_native_media(_r109_html)
+check("r109b: clean_rss_body keeps a picture's PLACE as a marker line (caption kept, heading closed "
+      "cleanly as **bold**) and still carries no redd.it URL",
+      _r109_hb == ("Hey Guys! Big Update.\n\n**1 - Revision Timeline**\n\nhttps://zzz.gachabase.net/timeline\n"
+                   "\u2063MEDIA:abc123.png\u2063\n\nYou can now view any version.\n\n**6 - Enemies**\n"
+                   "\u2063MEDIA:def456.png\u2063\n\n\u2063MEDIA:abc123.png\u2063\n\nCheck it out.")
+      and "redd.it" not in _r109_hb, repr(_r109_hb))
+_r109_hp = _r109_build({"title": "T", "author": "a", "crosspost": None, "youtube_url": None, "stats": None,
+                        "media": _r109_hm, "body": _r109_hb})
+_r109_hs = _r109_shape(_r109_hp)
+check("r109b: the HTML route builds the same interleaved card — section text, its picture(s) in "
+      "reading order, a second reference to a picture already shown is dropped, no token leaks",
+      _r109_hs == [[_r109_hdr,
+                    (10, "Hey Guys! Big Update.\n\n**1 - Revision Timeline**\n\nhttps://zzz.gachabase.net/timeline"),
+                    (12, [_r109_hm[0]["url"]]),
+                    (10, "You can now view any version.\n\n**6 - Enemies**"),
+                    (12, [_r109_hm[1]["url"]]),
+                    (10, "Check it out."),
+                    (10, "-# 🕐 <t:1:f>"), _r109_div, (1, None)]]
+      and "\u2063" not in json.dumps(_r109_hp, ensure_ascii=False)
+      and "MEDIA:" not in json.dumps(_r109_hp), _r109_hs)
+check("r109b: marker lines inside a quote block keep their picture in place; wrappers left empty "
+      "by the hoist disappear; a marker without a gallery match (or no gallery) is removed",
+      _r109_shape(_r109_build({"title": "T", "author": "a", "crosspost": None, "youtube_url": None,
+                               "stats": None, "media": [{"kind": "image", "url": "https://i.redd.it/abc123.png"}],
+                               "body": v3.clean_rss_body(
+                                   f'<blockquote><p>q <a href="{_r109_P}">{_r109_P}</a></p><p>q2</p></blockquote><p>x</p>')}))[0][1:4]
+      == [(10, "> q"), (12, ["https://i.redd.it/abc123.png"]), (10, "> q2\nx")]
+      and v3.clean_rss_body(f'<p><strong><a href="{_r109_P}">{_r109_P}</a></strong></p><p>after</p>')
+      == "\u2063MEDIA:abc123.png\u2063\n\nafter"
+      and v3._mark_inline_gallery_images(_r109_hb, []) == (
+          "Hey Guys! Big Update.\n\n**1 - Revision Timeline**\n\nhttps://zzz.gachabase.net/timeline\n\n"
+          "You can now view any version.\n\n**6 - Enemies**\n\nCheck it out.")
+      and v3._mark_inline_gallery_images(
+          "**6 - Enemies**\n\u2063MEDIA:zzz.png\u2063\n\ntext",
+          [{"kind": "image", "url": "https://i.redd.it/abc123.png"}]) == "**6 - Enemies**\n\ntext")
+check("r109b: external-preview thumbs, redd.it short links and <img> tags keep the round-14 "
+      "removal (no marker)",
+      v3.clean_rss_body('<p><a href="https://external-preview.redd.it/x.png?s=1">'
+                        'https://external-preview.redd.it/x.png?s=1</a> and https://redd.it/abc12</p>'
+                        f'<p><img src="{_r109_P}"> t</p>') == "and\n\nt")
+_r109_src = inspect.getsource(v3.build_v3_payload)
+check("r109: build_v3_payload marks the body BEFORE the round-62/66/71/99 choke point and strips "
+      "tokens on both legacy branches and the continuation remainder",
+      _r109_src.index("_mark_inline_gallery_images(") < _r109_src.index("_drop_gallery_media_lines(")
+      and _r109_src.count("_strip_inline_img_tokens(") == 2
+      and "_inline_img_segments(body_out)" in _r109_src)
+
 # ---- Round 89: no GitHub Actions annotation may leak out of this suite ----
 # Restore the real stdout first, then judge what the suite actually emitted.
 sys.stdout = _stdout_guard.stream
