@@ -887,6 +887,101 @@ check("r73 config: the animated/AVIF content-type tiers are explicit constants",
       x3.ANIMATED_IMAGE_TYPES == ("image/webp", "image/gif")
       and x3.AVIF_IMAGE_TYPES == ("image/avif", "image/heic", "image/heif"))
 
+# ===========================================================================
+# 5. ROUND 110 — link / app card artwork as a thumbnail (2026-11-05)
+# ===========================================================================
+print("\n--- 5. card artwork thumbnail (round 110) ---")
+# Live HonkaiNA 2118221775108771936 (photo) / 2118191579307381245 (video):
+# FxTwitter folds the App Store card's icon (pbs.twimg.com/card_img/…) into
+# the media list, and it rode along as a second gallery tile. With native
+# media present it is now the Section thumbnail; alone it stays a tile.
+_R110_CARD = "https://pbs.twimg.com/card_img/2117885179226374144/8O4A5wKA?format=png&name=orig"
+_R110_PHOTO = "https://pbs.twimg.com/media/HWS61I-aMAcRkez.jpg?name=orig"
+_R110_VIDEO = ("https://video.twimg.com/amplify_video/2118020756831612930/vid/avc1/1280x720/"
+               "tdt7yOlAFluoT7TW.mp4?tag=14")
+_R110_TWEET = {"author": {"name": "Honkai: Nexus Anima", "screen_name": "HonkaiNA"},
+               "text": "Honkai: Nexus Anima Now Available for App Store Pre-registration\n\nDear Animaster,",
+               "replies": 0, "retweets": 3, "likes": 15, "views": 2291, "color": "#1d9bf0"}
+
+
+def _r110_card(items, **kw):
+    return x3.build_v3_payload("HonkaiNA", _R110_TWEET, "https://fxtwitter.com/HonkaiNA/status/1",
+                               gallery_items=[{"media": {"url": u}} for u in items],
+                               media_notes=[], posted_ts=1, **kw)
+
+
+def _r110_shape(payload):
+    out = []
+    for c in payload["components"][0]["components"]:
+        if c["type"] == 9:
+            out.append(("section", [t["content"] for t in c["components"]], c["accessory"]))
+        elif c["type"] == 12:
+            out.append(("gallery", [i["media"]["url"] for i in c["items"]]))
+        else:
+            out.append((c["type"], c.get("content")))
+    return out
+
+
+check("r110: is_card_image_url matches only pbs.twimg.com/card_img/ (native /media/ and video "
+      "renditions are never cards)",
+      x3.is_card_image_url(_R110_CARD) and not x3.is_card_image_url(_R110_PHOTO)
+      and not x3.is_card_image_url(_R110_VIDEO) and not x3.is_card_image_url(None)
+      and not x3.is_card_image_url("https://evil.example/pbs.twimg.com/card_img/x"))
+_r110_p = _r110_shape(_r110_card([_R110_PHOTO, _R110_CARD]))
+check("r110: photo + card → Section(header + opening text, thumbnail = card icon), gallery keeps the "
+      "photo only; divider / stats / divider / buttons unchanged",
+      _r110_p[0][0] == "section"
+      and _r110_p[0][1] == ["### [Honkai: Nexus Anima](https://x.com/HonkaiNA) just tweeted:",
+                            x3.linkify_text(_R110_TWEET["text"])]
+      and _r110_p[0][2] == {"type": 11, "media": {"url": _R110_CARD}}
+      and _r110_p[1:] == [(14, None), ("gallery", [_R110_PHOTO]),
+                          (10, "-# 💬 0 🔁 3 ❤️ 15 👁️ 2291   •   🕐 <t:1:f>"), (14, None), (1, None)],
+      _r110_p)
+_r110_v = _r110_shape(_r110_card([_R110_VIDEO, _R110_CARD]))
+check("r110: video + card → same shape with the video alone in the gallery",
+      _r110_v[0][0] == "section" and _r110_v[0][2]["media"]["url"] == _R110_CARD
+      and _r110_v[2] == ("gallery", [_R110_VIDEO]), _r110_v)
+check("r110: card-only, photo-only and media-less tweets are byte-identical to the legacy card "
+      "(no Section)",
+      _r110_shape(_r110_card([_R110_CARD]))[:4] == [
+          (10, "### [Honkai: Nexus Anima](https://x.com/HonkaiNA) just tweeted:"),
+          (10, x3.linkify_text(_R110_TWEET["text"])), (14, None), ("gallery", [_R110_CARD])]
+      and _r110_shape(_r110_card([_R110_PHOTO]))[3] == ("gallery", [_R110_PHOTO])
+      and all(k[0] != "section" for k in _r110_shape(_r110_card([]))))
+_r110_r = _r110_shape(_r110_card([_R110_PHOTO, _R110_CARD], reply_line="-# ↩ reply",
+                                 repost_account="Someone"))
+check("r110: a repost header (2 lines) + reply line fill the Section's three text slots; the body "
+      "text follows below full-width",
+      _r110_r[0][0] == "section" and len(_r110_r[0][1]) == 3
+      and _r110_r[0][1][0].startswith("### [Someone reposted]") and _r110_r[0][1][2] == "-# ↩ reply"
+      and _r110_r[1] == (10, x3.linkify_text(_R110_TWEET["text"])), _r110_r)
+check("r110: a second card image is never dropped — it stays in the gallery after the native media",
+      x3.split_card_thumbnail([{"media": {"url": _R110_PHOTO}}, {"media": {"url": _R110_CARD}},
+                               {"media": {"url": _R110_CARD.replace("8O4A5wKA", "zzzz")}}])
+      == ({"media": {"url": _R110_CARD}},
+          [{"media": {"url": _R110_PHOTO}}, {"media": {"url": _R110_CARD.replace("8O4A5wKA", "zzzz")}}]))
+_r110_a = _r110_shape(_r110_card([_R110_PHOTO, _R110_CARD],
+                                 lead_gallery_items=[{"media": {"url": "https://pbs.twimg.com/media/cover.jpg"}}]))
+check("r110: an article card already leads with its cover — no Section; the card image returns to the "
+      "gallery ahead of the native media",
+      all(k[0] != "section" for k in _r110_a)
+      and ("gallery", [_R110_CARD, _R110_PHOTO]) in _r110_a, _r110_a)
+_r110_q = x3.build_quote_components({"id": "9", "author": {"name": "Q", "screen_name": "q"}, "text": "quoted"},
+                                    [{"media": {"url": _R110_PHOTO}}, {"media": {"url": _R110_CARD}}], [])
+check("r110: a quoted post with native media + card gets the thumbnail beside its quote head",
+      [c["type"] for c in _r110_q] == [14, 9, 12]
+      and _r110_q[1]["accessory"] == {"type": 11, "media": {"url": _R110_CARD}}
+      and _r110_q[1]["components"][0]["content"].startswith(">>> [**Quote**]")
+      and [i["media"]["url"] for i in _r110_q[2]["items"]] == [_R110_PHOTO])
+check("r110: the heal walker still sees the thumbnail (round 49) and the Section never carries an "
+      "empty text display",
+      _R110_CARD in x3.unresolved_media_items(_r110_card([_R110_PHOTO, _R110_CARD]))
+      and all(t["content"] for t in x3.thumbnail_section(
+          [{"type": 10, "content": "a"}, {"type": 10, "content": ""}, None, {"type": 10, "content": "b"},
+           {"type": 10, "content": "c"}], {"media": {"url": _R110_CARD}})["components"])
+      and len(x3.thumbnail_section([{"type": 10, "content": str(i)} for i in range(5)],
+                                   {"media": {"url": _R110_CARD}})["components"]) == 3)
+
 _ci = open(os.path.join(ROOT, ".github", "workflows", "ci.yml"), encoding="utf-8").read()
 check("ci runs this suite", "python tests/test_twitter_media.py" in _ci)
 

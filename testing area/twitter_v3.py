@@ -1706,6 +1706,53 @@ def first_external_link(text: str) -> str | None:
 # ---------------------------------------------------------------------------
 # ■ QUOTED TWEETS
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ROUND 110 (2026-11-05): LINK / APP CARD ARTWORK AS A THUMBNAIL
+# Live HonkaiNA 2118221775108771936 (photo) and 2118191579307381245 (video):
+# both tweets carry an App Store app card ("Honkai: Nexus Anima · Adventure ·
+# Open") under their media, and FxTwitter folds that card's artwork into the
+# tweet's media list as one more photo (`pbs.twimg.com/card_img/…`, the 512 px
+# app icon). It rode along as a full gallery tile next to the real media.
+# A card image that accompanies NATIVE media is now the card's Section
+# thumbnail (type 9 + accessory type 11) beside the header and the opening
+# text — the shape Discord gives a link preview — and the gallery keeps the
+# tweet's own photos/videos only. A tweet whose only picture is the card
+# image is unchanged (it stays the gallery tile, as before).
+# ---------------------------------------------------------------------------
+_CARD_IMAGE_URL_RE = re.compile(r"^https?://pbs\.twimg\.com/card_img/", re.IGNORECASE)
+
+
+def is_card_image_url(url) -> bool:
+    """True for X card artwork (link / app / unified cards): only ever
+    `pbs.twimg.com/card_img/…` — native tweet photos live under `/media/`."""
+    return bool(_CARD_IMAGE_URL_RE.match(str(url or "")))
+
+
+def split_card_thumbnail(items: list | None) -> tuple:
+    """(thumbnail_item | None, gallery_items): the first card-image item
+    becomes the thumbnail ONLY when native media is present; otherwise the
+    list is returned unchanged (card-only tweets keep their gallery tile).
+    Extra card images beyond the first stay in the gallery, never dropped."""
+    items = [i for i in (items or []) if isinstance(i, dict)
+             and isinstance(i.get("media"), dict) and i["media"].get("url")]
+    cards = [i for i in items if is_card_image_url(i["media"]["url"])]
+    native = [i for i in items if not is_card_image_url(i["media"]["url"])]
+    if not cards or not native:
+        return None, items
+    thumb = cards[0]
+    return thumb, [i for i in items if i is not thumb]
+
+
+def thumbnail_section(texts: list, thumb_item: dict) -> dict:
+    """A Components v2 Section: up to three text displays with the card
+    artwork as its thumbnail accessory."""
+    return {
+        "type": 9,
+        "components": [t for t in texts if t and t.get("content")][:3],
+        "accessory": {"type": 11, "media": {"url": thumb_item["media"]["url"]}},
+    }
+
+
 def build_quote_components(quote: dict, q_gallery: list, q_notes: list) -> list:
     """
     Renders the quoted tweet like the better embed services do:
@@ -1729,10 +1776,14 @@ def build_quote_components(quote: dict, q_gallery: list, q_notes: list) -> list:
             q_text = q_text[:budget].rstrip() + " …"
         head = f"{head}\n\n{linkify_text(q_text)}"
 
-    components = [
-        {"type": 14, "divider": True, "spacing": 2},
-        {"type": 10, "content": head},
-    ]
+    # ROUND 110: the quoted post's link/app card artwork sits beside its
+    # text when the quote also has native media.
+    q_thumb, q_gallery = split_card_thumbnail(q_gallery)
+    components = [{"type": 14, "divider": True, "spacing": 2}]
+    if q_thumb:
+        components.append(thumbnail_section([{"type": 10, "content": head}], q_thumb))
+    else:
+        components.append({"type": 10, "content": head})
     if q_gallery:
         components.append({"type": 12, "items": q_gallery[:10]})
     for note in q_notes:
@@ -1937,6 +1988,20 @@ def build_v3_payload(account: str, tweet: dict, read_post_url: str,
         ]
     if reply_line:
         inner_components.append({"type": 10, "content": reply_line})
+    # ROUND 110: link/app card artwork served next to native media becomes the
+    # thumbnail of a Section holding the header line(s) and the opening text
+    # (≤3 text displays); the gallery keeps the tweet's own media only.
+    thumb_item, gallery_items = split_card_thumbnail(gallery_items)
+    if thumb_item and not lead_gallery_items:
+        section_texts = inner_components[:3]
+        if len(section_texts) < 3 and chunks:
+            section_texts = section_texts + [{"type": 10, "content": chunks[0]}]
+            chunks = chunks[1:]
+        inner_components = inner_components[len(section_texts):]
+        inner_components.insert(0, thumbnail_section(section_texts, thumb_item))
+    elif thumb_item:
+        # an article card already leads with its cover; keep the card tile
+        gallery_items = [thumb_item] + list(gallery_items)
     if lead_gallery_items:  # ROUND 10: article cover, shown right under the header
         inner_components.append({"type": 12, "items": lead_gallery_items[:10]})
     for chunk in chunks:
