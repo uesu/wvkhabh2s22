@@ -64,6 +64,7 @@ SYNC_WORKFLOW_FILES = (
 
 DEV_ONLY_WORKFLOW_FILES = (
     ".github/workflows/sync_prod.yml",
+    ".github/workflows/fleet_probe.yml",
 )
 
 SYNC_SINGLE_FILES = (
@@ -88,6 +89,7 @@ EXCLUDED_DEV_PATHS = (
     "TERMS_OF_SERVICE.md",
     ".env.example",
     ".github/workflows/sync_prod.yml",
+    ".github/workflows/fleet_probe.yml",
 )
 
 DEPENDABOT_CONFIG = ".github/dependabot.yml"
