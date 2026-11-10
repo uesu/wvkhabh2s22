@@ -66,6 +66,7 @@ DEV_ONLY_WORKFLOW_FILES = (
     ".github/workflows/sync_prod.yml",
     ".github/workflows/fleet_probe.yml",
     ".github/workflows/wiki_probe.yml",
+    ".github/workflows/kuro_probe.yml",
 )
 
 SYNC_SINGLE_FILES = (
@@ -92,6 +93,7 @@ EXCLUDED_DEV_PATHS = (
     ".github/workflows/sync_prod.yml",
     ".github/workflows/fleet_probe.yml",
     ".github/workflows/wiki_probe.yml",
+    ".github/workflows/kuro_probe.yml",
 )
 
 DEPENDABOT_CONFIG = ".github/dependabot.yml"
