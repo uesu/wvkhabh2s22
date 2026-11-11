@@ -2,7 +2,7 @@
   "Wuthering_Waves_2120343256710144205": {
     "account": "Wuthering_Waves",
     "first_seen": 1794364442,
-    "last_checked": 1794364442,
+    "last_checked": 1794364496,
     "message_id": "1569902221649248267",
     "payload": {
       "components": [
@@ -85,6 +85,6 @@
       ],
       "flags": 32768
     },
-    "runs": 0
+    "runs": 1
   }
 }
