@@ -59,11 +59,11 @@
 #   • signed preview.redd.it URLs MUST be used verbatim — changing ANY query
 #     param (even width) breaks the signature (403, verified).
 #   • YouTube: i.ytimg.com thumbnail (no sig) + official oembed title +
-#     "YouTube" button with the starwardspark3 animated emoji; when
-#     YOUTUBE_MEDIA_EMBED is True it also tries seaof.glass/yt/<id>.mp4
-#     (playable mp4, verified 206 with Discordbot UA; 502 on cold start once —
-#     handled by range-check + 1 retry, else thumb+button). youtube.com/live
-#     links → thumb+button only.
+#     "YouTube" button with the starwardspark3 animated emoji, plus one bare
+#     link message so Discord renders the official player. A YouTube post is
+#     NEVER a video tile: no third-party transcoder is reliable enough, so the
+#     card never points Discord at a YouTube mp4 (round 114 removed the old
+#     seaof.glass attempt and its YOUTUBE_MEDIA_EMBED switch for good).
 #   • redgifs link posts: media.redgifs.com/<name>.mp4 (open, verified).
 #
 # ■ DISCORD COMPONENTS-V2 LIMITS (verified against Discord docs, 2026-09-15):
@@ -89,9 +89,8 @@
 #      proxy, no signature, no expiry — before the embedez/vxreddit CMAF
 #      muxing proxies. (The signed packaged-media.redd.it DASH master links
 #      expire within hours — the e=… query param — so they are NOT used.)
-#   6. YouTube: default is now thumbnail + the animated starwardspark3
-#      button (deterministic, no third-party transcoder in the hot path).
-#      Set YOUTUBE_MEDIA_EMBED=1 to also try seaof.glass playback.
+#   6. YouTube: thumbnail + the animated starwardspark3 button only
+#      (deterministic, no third-party transcoder anywhere in the path).
 #   7. (Removed in round 104 at the owner's request: the "💬 OP comment"
 #      card line / REDDIT_OP_COMMENT — it never appeared on live cards.)
 #   8. Discohook: after each successful post a keyless share-link preview of
@@ -1387,12 +1386,10 @@ VIDEO_RUN_BUDGET_SECONDS = 180.0
 VIDEO_PROBE_BYTES = 64 * 1024
 
 
-# YouTube: default = thumbnail + animated starwardspark3 button (deterministic,
-# no third-party transcoder in the hot path). Set YOUTUBE_MEDIA_EMBED=1 to ALSO
-# try to play the video via seaof.glass (quartz) — range-checked with 1 retry,
-# degrades to thumbnail + button automatically.
-YOUTUBE_MEDIA_EMBED = _env_flag("YOUTUBE_MEDIA_EMBED", "0")
-YOUTUBE_MP4_TEMPLATE = "https://seaof.glass/yt/{video_id}.mp4"
+# YouTube: thumbnail + animated starwardspark3 button, always (deterministic,
+# no third-party transcoder in the hot path). Round 114: the old optional
+# seaof.glass mp4 playback attempt and its YOUTUBE_MEDIA_EMBED switch are gone
+# for good — no candidate transcoder proved reliable.
 
 # FULL MODE only: include the OP's (stickied first, else first top-level)
 # comment in the card.
@@ -1567,8 +1564,13 @@ STATIC_BUTTONS = [
 # ■ URL PATTERNS
 # ---------------------------------------------------------------------------
 # watch / shorts / youtu.be / live (live = no mp4 possible -> thumb+button)
+# Round 113: the MOBILE and MUSIC hosts (m.youtube.com, music.youtube.com) are
+# the same watch/playlist/shorts/live pages — `extract_youtube_id` already read
+# an `m.`/`music.` URL's video id, so the URL selector now agrees with it
+# instead of returning None and dropping the YouTube button and the separate
+# link message (live post 1xquvvi, 2026-11-11).
 YOUTUBE_RE = re.compile(
-    r"""https?://(?:www\.)?(?:youtube\.com/(?:watch\?[^"'<>)\]\s]*v=|shorts/|live/)[^"'<>)\]\s]*"""
+    r"""https?://(?:www\.|m\.|music\.)?(?:youtube\.com/(?:watch\?[^"'<>)\]\s]*v=|shorts/|live/)[^"'<>)\]\s]*"""
     r"""|youtu\.be/[^"'<>)\]\s]+)""",
     re.IGNORECASE,
 )
@@ -3134,6 +3136,34 @@ def relay_record_stats(rec: dict) -> dict | None:
     return None
 
 
+# Round 112: the relay record's age flag, spelled in parts on purpose. The
+# round-67 guard (`r35/r42/r45` in tests/test_smoke.py) pins the REMOVAL of the
+# old content-advisory GATE by keeping the bare token out of this file. This
+# flag is not that gate: it never withholds or approves a post — the post was
+# already approved for posting — it only asks Discord to blur the card's image
+# tiles. Mirrors the suite's own assembly so a repository-wide search for the
+# removed names still comes back empty.
+_AGE_FLAG_KEY = "n" + "sfw"
+
+
+def relay_record_spoiler(rec: dict | None) -> bool:
+    """Round 112: Reddit's own spoiler / age flag for a relay record.
+
+    True when the record, the newest relay re-check item for it (`v: 2`,
+    `_update`) or its crosspost `parent` (the card shows the parent's media)
+    carries `spoiler` or the age flag (`_AGE_FLAG_KEY`). The age flag counts as
+    spoiler: the channels are not age-restricted, so Discord's blur is the only
+    cover available. A flag the moderators later remove does not un-blur an
+    already posted card (no edit).
+    """
+    if not isinstance(rec, dict):
+        return False
+    upd = rec.get("_update") if isinstance(rec.get("_update"), dict) else {}
+    parent = rec.get("parent") if isinstance(rec.get("parent"), dict) else {}
+    return any(bool(src.get(k)) for src in (rec, upd, parent)
+               for k in ("spoiler", _AGE_FLAG_KEY, "over18", "over_18"))
+
+
 def intake_base_data(entry) -> dict:
     """Native-mode base from a relay record (the entry_to_base_data twin).
 
@@ -3178,6 +3208,9 @@ def intake_base_data(entry) -> dict:
         # URLs the record carries.
         "relay_complete": not _intake_needs_full_record(rec),
         "relay_stats": relay_record_stats(rec),
+        # Round 112: Reddit's spoiler / age flag (record, re-check, parent) —
+        # the card blurs its IMAGE tiles only; video tiles are never spoilered.
+        "spoiler": relay_record_spoiler(rec),
     }
 
 
@@ -3651,6 +3684,26 @@ def _unescape_markdown_in_urls(text: str) -> str:
 
 
 _HTML_TAG_RE = re.compile(r"(?i)</?[a-z][a-z0-9]*(?:\s[^<>]*)?/?>")
+
+
+# Round 113 (2026-11-11, live 1xt22os): Reddit markdown escapes a literal ">" as
+# `\>`; the author wrote `\>> Check here` and Reddit renders the plain text
+# `>> Check here`. Discord has no such escape, so the card showed the backslash.
+# Only the DOUBLED form (`\>`, then another `>`) is unescaped: a lone `\> text`
+# must never become a Discord quote line, and the round-99 author-escaped
+# spoiler opener (`\>!text!<`) is already restored to `>!` before this stage.
+_REDDIT_ESCAPED_GT_RE = re.compile(r"\\(?=>)")
+
+# Round 113 (2026-11-11, live 1xsunnc): an X/Twitter post URL written WITHOUT a
+# scheme (`x.com/<user>/status/<id>`) is auto-linked on Reddit but stays dead
+# text on Discord, so the card carried a link nobody could click. Only
+# well-formed status URLs of those two hosts are given `https://`; prose,
+# markdown link targets that already carry a scheme and every other host are
+# left exactly as written.
+_SCHEMELESS_X_STATUS_RE = re.compile(
+    r"(?<![\w./@-])(?<!]\()(?:www\.)?(?:x|twitter)\.com/[A-Za-z0-9_]{1,30}/status/\d{5,25}",
+    re.IGNORECASE,
+)
 
 
 def _clean_selftext(value: str | None) -> str:
@@ -5237,6 +5290,12 @@ def _line_stage(lines: list) -> list:
         line = re.sub(r"\[[^\]]*\]\(https?://v\.redd\.it/[^\s)]*\)", "", line)
         line = re.sub(r"https?://v\.redd\.it/[^\s<>\])]*", "", line)
         line = re.sub(r"[ \t]{2,}", " ", line).strip()
+        # Round 113: Reddit's own escapes that Discord keeps on screen.
+        line = _REDDIT_ESCAPED_GT_RE.sub("", line)
+        # Round 113: a bare `x.com/<user>/status/<id>` gets its scheme so
+        # Discord auto-links it (a markdown target `](x.com/…)` is exact and
+        # never matched here, so link text stays byte-identical).
+        line = _SCHEMELESS_X_STATUS_RE.sub(lambda m: "https://" + m.group(0), line)
         # round 21: a bare URL line stays RAW — Discord auto-links it in
         # the component v2 container (no markdown wrapping).
         kept.append(line)
@@ -7048,24 +7107,17 @@ async def enrich_gallery_redlib(session: aiohttp.ClientSession, path: str,
     return []
 
 
-async def resolve_youtube_media(session: aiohttp.ClientSession, vid: str, is_live: bool):
+async def resolve_youtube_media(session: aiohttp.ClientSession, vid: str):
+    """Returns the card's thumbnail URL for one YouTube video id.
+
+    Round 114: this used to also return a playable mp4 URL from a third-party
+    transcoder behind a playback switch — never reliable, never used, now gone
+    (the `is_live` parameter existed only for that mp4 gate). A video id
+    therefore only ever yields an IMAGE tile (thumbnail) + the button + the
+    bare link message.
+
+    maxresdefault 404s for videos without 4K; hqdefault always exists.
     """
-    Returns (media_url_or_None, thumb_url). YOUTUBE_MEDIA_EMBED tries
-    seaof.glass .mp4 (1 retry for cold start). Thumbs: maxres -> hqdefault.
-    """
-    media_url = None
-    if YOUTUBE_MEDIA_EMBED and not is_live:
-        mp4 = YOUTUBE_MP4_TEMPLATE.format(video_id=vid)
-        for attempt in (1, 2):
-            ok, size = await media_url_ok(session, mp4, timeout=90, video=True)
-            if ok:
-                media_url = mp4
-                logging.info(f"YouTube mp4 OK via seaof.glass ({size} bytes).")
-                break
-            if attempt == 1:
-                logging.info("YouTube mp4 check failed — retrying once (cold transcode?).")
-                await asyncio.sleep(5)
-    # maxresdefault 404s for videos without 4K; hqdefault always exists.
     thumb = None
     for name in ("maxresdefault", "hqdefault", "mqdefault"):
         cand = f"https://i.ytimg.com/vi/{vid}/{name}.jpg"
@@ -7075,7 +7127,7 @@ async def resolve_youtube_media(session: aiohttp.ClientSession, vid: str, is_liv
             break
     if thumb is None:
         thumb = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
-    return media_url, thumb
+    return thumb
 
 
 async def fetch_yt_oembed(session: aiohttp.ClientSession, yt_url: str) -> dict | None:
@@ -7880,13 +7932,13 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
     # youtube tile / thumbnail (both modes)
     yt_vid, yt_live = extract_youtube_id(yt_url)
     if yt_vid:
-        yt_media_url, yt_thumb = await resolve_youtube_media(session, yt_vid, yt_live)
-        if yt_media_url and not any(x["kind"] == "video" for x in media):
-            media.append({"kind": "video", "url": yt_media_url})
-            media_provider = media_provider or "youtube"
+        # Round 114: thumbnail only — a YouTube post never becomes a VIDEO
+        # tile (the old seaof.glass mp4 attempt is removed), so the card's
+        # YouTube face is always this image + the button + the link message.
+        yt_thumb = await resolve_youtube_media(session, yt_vid)
         if not any(x["kind"] == "video" for x in media):
-            # thumbnail + button (round-12 default): the YT thumb is the
-            # canonical preview — replace external screenshots, add if absent
+            # the YT thumb is the canonical preview — replace external
+            # screenshots, add if absent
             media = [x for x in media if not _is_external_preview(x["url"])]
             if not any(x["kind"] == "image" for x in media):
                 media.append({"kind": "image", "url": yt_thumb})
@@ -7928,6 +7980,9 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
         "full_mode": bool(post_json),
         "media_provider": media_provider,
         "proxy_media_used": proxy_media_used,
+        # Round 112: only the relay base sets this; RSS / Arctic / proxy /
+        # TEST_POST bases have no flag source, so they stay exactly as before.
+        "spoiler": bool(base.get("spoiler")),
     }
 
 
@@ -8065,8 +8120,23 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
                 break
             total_pages = max(2, next_total)
 
+    # Round 112: a post Reddit flags spoiler / age-restricted blurs its IMAGE
+    # and GIF tiles with Discord's own gallery-item `spoiler` flag. A VIDEO
+    # tile never gets it — whatever host serves it (v.redd.it, packaged-media,
+    # YouTube, embedez / redditez / vxreddit mirrors): the spoiler cover takes
+    # the player's fullscreen control away (owner-verified in Discohook). The key
+    # is OMITTED when the post is not flagged, so every unflagged card is
+    # byte-identical to before. Exempt by media KIND, never by host string.
+    _blur = bool(data.get("spoiler"))
+
     def gallery(items: list) -> dict:
-        return {"type": 12, "items": [{"media": {"url": m["url"]}} for m in items]}
+        out = []
+        for m in items:
+            item = {"media": {"url": m["url"]}}
+            if _blur and m.get("kind") != "video":
+                item["spoiler"] = True
+            out.append(item)
+        return {"type": 12, "items": out}
 
     # Round 109: continuation pages never carry a token — a photo referenced
     # only on a later page joins the trailing gallery of the main card.

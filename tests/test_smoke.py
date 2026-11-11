@@ -4790,8 +4790,9 @@ check("r60: native RSS base feeds the destination-first selection downstream",
 _r60_saved_resolve_youtube = v3.resolve_youtube_media
 
 
-async def _r60_resolve_youtube(_session, video_id, _is_live):
-    return None, f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+async def _r60_resolve_youtube(_session, video_id):
+    # round 114: thumbnail only — the resolver no longer returns a media URL.
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
 
 
 try:
@@ -13261,6 +13262,159 @@ check("r109: build_v3_payload marks the body BEFORE the round-62/66/71/99 choke 
       _r109_src.index("_mark_inline_gallery_images(") < _r109_src.index("_drop_gallery_media_lines(")
       and _r109_src.count("_strip_inline_img_tokens(") == 2
       and "_inline_img_segments(body_out)" in _r109_src)
+
+# ---- round 112 (2026-11-11): spoiler / NSFW relay posts blur IMAGE tiles only ----
+# A relay record Reddit flags `spoiler` or `nsfw` (own flag, newest re-check item,
+# or the crosspost parent's) sets Discord's gallery-item `spoiler: true` on every
+# image / gif tile of the card. A VIDEO tile never gets it, whatever host serves
+# it (the cover removes the player's fullscreen control). Unflagged cards are
+# byte-identical: the key is omitted, never written as false.
+_r112_age = "n" + "sfw"  # assembled like _r35_token: the engine spells its key the same way
+
+
+def _r112_items(payload):
+    return [(it["media"]["url"], it.get("spoiler"))
+            for c in payload["components"] for x in c["components"]
+            if x["type"] == 12 for it in x["items"]]
+
+
+_r112_mirror = "https://proxy.embedez.com/render/video.mp4?url=https%3A%2F%2Fv.redd.it%2Fabcd1234"
+_r112_plain = _r109_data("hello world", 2)
+_r112_flag = dict(_r112_plain, spoiler=True)
+check("r112a: a flagged post blurs every image tile (spoiler: true on each gallery item)",
+      _r112_items(_r109_build(_r112_flag)) == [(_r109_url(0), True), (_r109_url(1), True)],
+      _r112_items(_r109_build(_r112_flag)))
+check("r112b: an unflagged post is byte-identical — no spoiler key anywhere, missing key == False",
+      json.dumps(_r109_build(_r112_plain), sort_keys=True)
+      == json.dumps(_r109_build(dict(_r112_plain, spoiler=False)), sort_keys=True)
+      and "spoiler" not in json.dumps(_r109_build(_r112_plain))
+      and _r109_shape(_r109_build(_r112_plain)) == _r109_shape(_r109_build(_r112_flag)),
+      json.dumps(_r109_build(_r112_plain))[:200])
+_r112_vid = _r109_build(dict(_r109_data("intro", 1, video=True), spoiler=True))
+_r112_mir = _r109_build(dict(_r109_data("intro", 1), spoiler=True,
+                             media=[{"kind": "image", "url": _r109_url(0)},
+                                    {"kind": "video", "url": _r112_mirror}]))
+check("r112c: the video tile is never spoilered — native v.redd.it and an embedez mirror alike "
+      "(exempt by kind, not host); the photo next to it still is",
+      _r112_items(_r112_vid) == [(_r109_url(0), True), ("https://v.redd.it/abcd1234/DASH_720.mp4", None)]
+      and _r112_items(_r112_mir) == [(_r109_url(0), True), (_r112_mirror, None)],
+      (_r112_items(_r112_vid), _r112_items(_r112_mir)))
+_r112_vonly = {"title": "T", "author": "a", "crosspost": None, "youtube_url": None, "stats": None,
+               "body": "", "media": [{"kind": "video", "url": _r112_mirror}]}
+check("r112d: a flagged video-only post builds the byte-identical card of an unflagged one",
+      json.dumps(_r109_build(dict(_r112_vonly, spoiler=True)), sort_keys=True)
+      == json.dumps(_r109_build(_r112_vonly), sort_keys=True))
+_r112_gif = _r109_build(dict(_r112_plain, spoiler=True,
+                             media=[{"kind": "gif", "url": "https://i.redd.it/anim.gif"}]))
+check("r112e: a gif tile is an image tile — blurred like one",
+      _r112_items(_r112_gif) == [("https://i.redd.it/anim.gif", True)])
+_r112_two = _r109_build(dict(_r109_data("x", 14, video=True), spoiler=True))
+_r112_inl = _r109_build(dict(_r109_data(f"a {_r109_url(0)}\n\nb {_r109_url(1)}", 3, video=True), spoiler=True))
+check("r112f: the two-container (14 photos) and the interleaved (round-109) layouts blur every "
+      "photo and leave the video tile alone — one choke point covers all three branches",
+      all(s is True for u, s in _r112_items(_r112_two) if "v.redd.it" not in u)
+      and [s for u, s in _r112_items(_r112_two) if "v.redd.it" in u] == [None]
+      and len(_r112_items(_r112_two)) == 15
+      and all(s is True for u, s in _r112_items(_r112_inl) if "v.redd.it" not in u)
+      and [s for u, s in _r112_items(_r112_inl) if "v.redd.it" in u] == [None]
+      and len(_r112_items(_r112_inl)) == 4
+      and _r109_shape(_r112_two) == _r109_shape(_r109_build(_r109_data("x", 14, video=True))),
+      (_r112_items(_r112_two)[-3:], _r112_items(_r112_inl)))
+_r112_rec = {"v": 1, "id": "1xt23rm", "sub": "Sub", "permalink": "/r/Sub/comments/1xt23rm/t/",
+             "title": "t", "author": "a", "created": 1, "media": [], "body": ""}
+check("r112g: relay_record_spoiler — own spoiler, own nsfw, the crosspost parent's flag and the "
+      "newest re-check item each blur; false / absent flags do not; non-dict is False",
+      v3.relay_record_spoiler(dict(_r112_rec, spoiler=True)) is True
+      and v3.relay_record_spoiler(dict(_r112_rec, **{_r112_age: True})) is True
+      and v3.relay_record_spoiler({**_r112_rec, "spoiler": False, _r112_age: False,
+                                        "parent": {"id": "1xt23ff", "spoiler": True}}) is True
+      and v3.relay_record_spoiler({**_r112_rec, "_update": {"id": "1xt23rm", _r112_age: True}}) is True
+      and v3.relay_record_spoiler({**_r112_rec, "spoiler": False, _r112_age: False}) is False
+      and v3.relay_record_spoiler(_r112_rec) is False
+      and v3.relay_record_spoiler(None) is False)
+check("r112h: the relay base carries the flag and resolve_post_media forwards it; an RSS-shaped "
+      "base without a flag source yields False",
+      v3.intake_base_data(v3._IntakeEntry(dict(_r112_rec, spoiler=True)))["spoiler"] is True
+      and v3.intake_base_data(v3._IntakeEntry(dict(_r112_rec)))["spoiler"] is False
+      and '"spoiler": bool(base.get("spoiler"))' in inspect.getsource(v3.resolve_post_media)
+      and '"spoiler": relay_record_spoiler(rec)' in inspect.getsource(v3.intake_base_data))
+_r112_src = inspect.getsource(v3.build_v3_payload)
+check("r112i: the blur lives in the ONE gallery() closure, keyed on media kind, never on a host",
+      _r112_src.count("def gallery(") == 1
+      and 'm.get("kind") != "video"' in _r112_src
+      and _r112_src.count("_strip_inline_img_tokens(") == 2
+      and not re.search(r"redd\.it|embedez|vxreddit|redditez", _r112_src.split("def gallery(")[1].split("\n\n")[0]))
+
+# ---- round 113 (2026-11-11): three reading fixes, no structure change ----
+# (a) the mobile / music YouTube hosts must resolve like www — live post 1xquvvi
+#     (r/Zenlesszonezeroleaks_) got no YouTube button and no second link
+#     message because the URL selector returned None while the id reader
+#     already accepted the host; (b) Reddit's escape for a literal `>` (`\>>`
+#     in the markdown, `>> Check here` on Reddit) must not put a backslash on
+#     the card — live 1xt22os; (c) a scheme-less `x.com/<user>/status/<id>`
+#     must become a clickable link — live 1xsunnc showed dead text.
+check("r113a: the mobile and music YouTube hosts select a URL (button + link message); www, "
+      "youtu.be, shorts, live and the id reader are unchanged",
+      all(v3.extract_youtube_url(u) == u and v3.select_youtube_url(u, "body") == u
+          for u in ("https://m.youtube.com/watch?v=hXE0oHPFWAM",
+                    "https://music.youtube.com/watch?v=hXE0oHPFWAM",
+                    "https://www.youtube.com/watch?v=hXE0oHPFWAM&t=5s",
+                    "https://youtu.be/hXE0oHPFWAM",
+                    "https://www.youtube.com/shorts/hXE0oHPFWAM",
+                    "https://www.youtube.com/live/hXE0oHPFWAM"))
+      and v3.extract_youtube_id("https://m.youtube.com/watch?v=hXE0oHPFWAM")[0] == "hXE0oHPFWAM"
+      and v3.extract_youtube_url("no link here") is None)
+check("r113b: Reddit's escaped literal `>` loses the backslash, a real quote line is untouched, "
+      "and the round-99 escaped spoiler opener still renders as `>!…!<`",
+      v3._clean_plain_body("Everything updated.\n\n\\>> Check here")
+      == "Everything updated.\n\n>> Check here"
+      and v3.clean_rss_body("<p>t</p><p><a href=\"https://sr.yatta.moe/x\">\\&gt;&gt; Check here</a></p>")
+      == "t\n\n[>> Check here](https://sr.yatta.moe/x)"
+      and v3._clean_plain_body("> quoted line") == "> quoted line"
+      and v3._clean_plain_body("\\>!not a spoiler!<") == ">!not a spoiler!<",
+      repr(v3._clean_plain_body("Everything updated.\n\n\\>> Check here")))
+check("r113c: a scheme-less x.com / twitter.com status URL is linked; every other shape is untouched",
+      v3._clean_plain_body("x.com/hotakatoki/status/2120176561634635897")
+      == "https://x.com/hotakatoki/status/2120176561634635897"
+      and v3._clean_plain_body("via twitter.com/a_b/status/123456789 today")
+      == "via https://twitter.com/a_b/status/123456789 today"
+      and v3._clean_plain_body("https://x.com/a/status/123456789") == "https://x.com/a/status/123456789"
+      and v3._clean_plain_body("x.com/a") == "x.com/a"
+      and v3._clean_plain_body("x.com/a/status/1") == "x.com/a/status/1"
+      and v3._clean_plain_body("abx.com/a/status/123456789") == "abx.com/a/status/123456789"
+      and v3._clean_plain_body("[read](x.com/a/status/123456789)") == "[read](x.com/a/status/123456789)")
+
+# ---- round 114 (2026-11-11): the unused YouTube mp4 playback path is GONE ----
+# The old optional seaof.glass attempt (`YOUTUBE_MEDIA_EMBED=1`) never produced a
+# reliable video and was never enabled in production. The read paths are: the
+# thumbnail image tile + the YouTube button + the bare link message. These guards
+# pin the removal — the switch, the template, the third-party host, the mp4 probe
+# and the "YouTube video tile" branch must not come back without a new decision.
+_r114_engine = inspect.getsource(v3)
+_r114_wf = open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8").read()
+_r114_env = ""
+_r114_env_path = os.path.join(ROOT, ".env.example")
+if os.path.isfile(_r114_env_path):
+    _r114_env = open(_r114_env_path, encoding="utf-8").read()
+check("r114a: no YouTube playback switch, template or third-party transcoder host survives in the engine",
+      "YOUTUBE_MEDIA_EMBED" not in _r114_engine.split("round 114")[0]
+      and not hasattr(v3, "YOUTUBE_MEDIA_EMBED")
+      and not hasattr(v3, "YOUTUBE_MP4_TEMPLATE")
+      and "seaof.glass/yt" not in _r114_engine)
+_r114_res_src = inspect.getsource(v3.resolve_youtube_media)
+check("r114b: resolve_youtube_media returns the thumbnail only (no video URL, no live gate)",
+      inspect.signature(v3.resolve_youtube_media).parameters.keys() == {"session", "vid"}
+      and _r114_res_src.rstrip().endswith("return thumb")
+      and "media_url =" not in _r114_res_src
+      and "seaof" not in _r114_res_src)
+check("r114c: a YouTube post's card carries an IMAGE tile, never a video-kind tile",
+      v3.build_v3_payload("Sub", {"title": "T", "author": "a", "crosspost": None, "youtube_url": None,
+                                  "stats": None, "body": "",
+                                  "media": [{"kind": "image", "url": "https://i.ytimg.com/vi/hXE0oHPFWAM/hqdefault.jpg"}]},
+                          "https://www.reddit.com/r/Sub/comments/x/", 1)["components"][0]["components"][2]["items"][0]["media"]["url"]
+      == "https://i.ytimg.com/vi/hXE0oHPFWAM/hqdefault.jpg")
+check("r114d: the workflow and the env template no longer map/document the removed switch",
+      "YOUTUBE_MEDIA_EMBED" not in _r114_wf and "YOUTUBE_MEDIA_EMBED" not in _r114_env)
 
 # ---- Round 89: no GitHub Actions annotation may leak out of this suite ----
 # Restore the real stdout first, then judge what the suite actually emitted.
