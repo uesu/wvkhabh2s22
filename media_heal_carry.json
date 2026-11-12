@@ -1,1 +1,94 @@
-{}
+{
+  "Wuthering_Waves_2120788688925864224": {
+    "account": "Wuthering_Waves",
+    "first_seen": 1794470640,
+    "last_checked": 1794470640,
+    "message_id": "1570347624702148681",
+    "payload": {
+      "components": [
+        {
+          "accent_color": 1942002,
+          "components": [
+            {
+              "content": "### [Wuthering Waves](https://x.com/Wuthering_Waves) just tweeted:",
+              "type": 10
+            },
+            {
+              "content": "Version 3.7 Wuthering Waves Battle Rush Outstanding Piece\n\nCredit to: [@TheCultits](https://x.com/TheCultits)\n\n[#WutheringWaves](https://x.com/hashtag/WutheringWaves) [#WuwaBattle](https://x.com/hashtag/WuwaBattle)",
+              "type": 10
+            },
+            {
+              "divider": true,
+              "spacing": 1,
+              "type": 14
+            },
+            {
+              "items": [
+                {
+                  "media": {
+                    "url": "https://video.twimg.com/amplify_video/2120464223797178368/vid/avc1/1280x720/U17S5rLVlHvoXfT-.mp4?tag=29"
+                  }
+                }
+              ],
+              "type": 12
+            },
+            {
+              "content": "🔽 Original video is ~634 MB — showing a smaller version (~150 MB) so it plays in Discord. [▶️ Watch full quality on X](https://video.twimg.com/amplify_video/2120464223797178368/vid/avc1/1920x1080/8Uf8ACoh0giem7gH.mp4?tag=29)",
+              "type": 10
+            },
+            {
+              "content": "-# 💬 1 🔁 3 ❤️ 35 👁️ 13632   •   🕐 <t:1794470400:f>",
+              "type": 10
+            },
+            {
+              "divider": true,
+              "spacing": 1,
+              "type": 14
+            },
+            {
+              "components": [
+                {
+                  "emoji": {
+                    "animated": true,
+                    "id": "1472388018689282261",
+                    "name": "starwardhmm"
+                  },
+                  "label": "Read Post",
+                  "style": 5,
+                  "type": 2,
+                  "url": "https://fxtwitter.com/Wuthering_Waves/status/2120788688925864224"
+                },
+                {
+                  "emoji": {
+                    "animated": true,
+                    "id": "1439878792653832253",
+                    "name": "starward11"
+                  },
+                  "label": "Citlali News",
+                  "style": 5,
+                  "type": 2,
+                  "url": "https://discord.gg/HyrVP9wRXu"
+                },
+                {
+                  "emoji": {
+                    "animated": true,
+                    "id": "1509026327548657914",
+                    "name": "starwardfans"
+                  },
+                  "label": "Donate",
+                  "style": 5,
+                  "type": 2,
+                  "url": "https://ko-fi.com/jieunlatte"
+                }
+              ],
+              "type": 1
+            }
+          ],
+          "type": 17
+        }
+      ],
+      "flags": 32768
+    },
+    "runs": 0
+  }
+}
