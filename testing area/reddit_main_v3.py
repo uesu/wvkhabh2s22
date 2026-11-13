@@ -1555,6 +1555,9 @@ CONTINUATION_CHAR_LIMIT = 3800
 # Buttons (style 5 = Link). YouTube button uses the animated starwardspark3.
 READ_POST_EMOJI = {"id": "1472388018689282261", "name": "starwardhmm", "animated": True}
 YOUTUBE_EMOJI = {"id": "1483083423290490891", "name": "starwardspark3", "animated": True}
+SUPPORT_FOOTER = ("-# It takes time, tools, hosting and ongoing maintenance to keep the news working. "
+                  "If it helps you stay updated, consider supporting so it can keep improving "
+                  "<a:starwardlove:1570666942233055312>")
 STATIC_BUTTONS = [
     {"label": "Citlali News", "url": "https://discord.gg/HyrVP9wRXu", "emoji": {"id": "1439878792653832253", "name": "starward11", "animated": True}},
     {"label": "Donate", "url": "https://ko-fi.com/jieunlatte", "emoji": {"id": "1509026327548657914", "name": "starwardfans", "animated": True}},
@@ -8165,7 +8168,8 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
                 units.append([gallery(_vid_media)])
             units.append([{"type": 10, "content": stats_line},
                           {"type": 14, "divider": True, "spacing": 1},
-                          row])
+                          row,
+                          {"type": 10, "content": SUPPORT_FOOTER}])
             containers = _pack_v2_containers(units, 16729344)
             if len(segments) <= 1 or _count_v2_components(containers) <= _V2_COMPONENT_CAP:
                 break
@@ -8203,6 +8207,7 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
         container2["components"].append({"type": 10, "content": stats_line})
         container2["components"].append({"type": 14, "divider": True, "spacing": 1})
         container2["components"].append(row)
+        container2["components"].append({"type": 10, "content": SUPPORT_FOOTER})
         payload = {"flags": IS_COMPONENTS_V2,
                    "components": [container1, container2]}
         if return_remainder:
@@ -8224,6 +8229,7 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
     inner.append({"type": 10, "content": stats_line})
     inner.append({"type": 14, "divider": True, "spacing": 1})
     inner.append(row)
+    inner.append({"type": 10, "content": SUPPORT_FOOTER})
     payload = {"flags": IS_COMPONENTS_V2,
                "components": [{"type": 17, "accent_color": 16729344, "components": inner}]}
     if return_remainder:

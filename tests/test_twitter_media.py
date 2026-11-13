@@ -935,7 +935,9 @@ check("r110: photo + card → Section(header + opening text, thumbnail = card ic
                             x3.linkify_text(_R110_TWEET["text"])]
       and _r110_p[0][2] == {"type": 11, "media": {"url": _R110_CARD}}
       and _r110_p[1:] == [(14, None), ("gallery", [_R110_PHOTO]),
-                          (10, "-# 💬 0 🔁 3 ❤️ 15 👁️ 2291   •   🕐 <t:1:f>"), (14, None), (1, None)],
+                          (10, "-# 💬 0 🔁 3 ❤️ 15 👁️ 2291   •   🕐 <t:1:f>"),
+                          (14, None), (1, None), (10, x3.SUPPORT_FOOTER)]
+      and "<a:starwardlove:1570666942233055312>" in x3.SUPPORT_FOOTER,
       _r110_p)
 _r110_v = _r110_shape(_r110_card([_R110_VIDEO, _R110_CARD]))
 check("r110: video + card → same shape with the video alone in the gallery",

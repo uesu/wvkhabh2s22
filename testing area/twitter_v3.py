@@ -633,6 +633,9 @@ LANGUAGE_NAMES = {
 # ---------------------------------------------------------------------------
 READ_POST_LABEL = "Read Post"
 READ_POST_EMOJI = {"id": "1472388018689282261", "name": "starwardhmm", "animated": True}
+SUPPORT_FOOTER = ("-# It takes time, tools, hosting and ongoing maintenance to keep the news working. "
+                  "If it helps you stay updated, consider supporting so it can keep improving "
+                  "<a:starwardlove:1570666942233055312>")
 STATIC_BUTTONS = [
     {
         "label": "Citlali News",
@@ -2038,6 +2041,7 @@ def build_v3_payload(account: str, tweet: dict, read_post_url: str,
     # --- NESTED BUTTONS START HERE ---
     inner_components.append({"type": 14, "divider": True, "spacing": 1})
     inner_components.append(build_nested_action_row(read_post_url))
+    inner_components.append({"type": 10, "content": SUPPORT_FOOTER})
 
     container = {
         "type": 17,

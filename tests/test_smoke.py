@@ -349,6 +349,10 @@ check("layout: 2nd gallery has 2 items", len(g2) == 1 and len(g2[0]["items"]) ==
 row = [c for c in c2["components"] if c.get("type") == 1][0]
 labels = [b["label"] for b in row["components"]]
 check("buttons: Read Post, YouTube, statics", labels == ["Read Post", "YouTube", "Citlali News", "Donate"], str(labels))
+check("footer: Reddit support note follows the action row",
+      c2["components"][-1] == {"type": 10, "content": v3.SUPPORT_FOOTER}
+      and "<a:starwardlove:1570666942233055312>" in v3.SUPPORT_FOOTER,
+      str(c2["components"][-1]))
 yt = row["components"][1]
 check("buttons: youtube uses starwardspark3",
       yt["emoji"] == {"id": "1483083423290490891", "name": "starwardspark3", "animated": True}, str(yt))
@@ -1854,7 +1858,7 @@ _r51_pl = v3.build_v3_payload(
     dict(_R29_BASE, crosspost={"url": "https://www.reddit.com/user/aphotide/comments/1wuv4j8/title/",
                                "path": "/user/aphotide/comments/1wuv4j8/title/"}),
     "https://www.reddit.com/r/AnantaLeaks/comments/1abc/t/", 1789749533)
-_r51_row = _r51_pl["components"][0]["components"][-1]
+_r51_row = next(c for c in _r51_pl["components"][0]["components"] if c.get("type") == 1)
 check("r51: Read Post destination unchanged on profile crosspost cards",
       _r51_row["components"][0]["label"] == "Read Post"
       and _r51_row["components"][0]["url"]
@@ -4959,7 +4963,8 @@ _r62_card = v3.build_v3_payload(
     "https://www.reddit.com/r/Zenlesszonezeroleaks_/comments/1wx9c77/x/", 1791097875)
 _r62_texts = [c["content"] for c in _r62_card["components"][0]["components"]
               if c.get("type") == 10]
-_r62_kinds = [c["type"] for c in _r62_card["components"][0]["components"]]
+_r62_kinds = [c["type"] for c in _r62_card["components"][0]["components"]
+              if c.get("content") != v3.SUPPORT_FOOTER]
 check("r62: 1wx9c77 card — no raw-URL text component",
       all("preview.redd.it" not in t for t in _r62_texts), str(_r62_texts))
 check("r62: 1wx9c77 card — gallery intact, header+stats only",
@@ -5027,7 +5032,8 @@ _r65_empty_card = v3.build_v3_payload(
      "body": v3._clean_plain_body(">\n> \n>>"), "media": [], "crosspost": None,
      "stats": {"comments": 4, "ups": 12}, "youtube_url": None, "op_comment": None},
     "https://www.reddit.com/r/HonkaiStarRail_leaks/comments/1wxvl13/x/", 1791139200)
-_r65_empty_kinds = [c["type"] for c in _r65_empty_card["components"][0]["components"]]
+_r65_empty_kinds = [c["type"] for c in _r65_empty_card["components"][0]["components"]
+                    if c.get("content") != v3.SUPPORT_FOOTER]
 check("r65: an all-'>' body omits the text component (header+stats only)",
       _r65_empty_kinds.count(10) == 2, str(_r65_empty_kinds))
 
@@ -5065,7 +5071,7 @@ def _r66_para(tag, n):
 
 def _r66_texts(payload):
     return [c["content"] for cont in payload["components"] for c in cont["components"]
-            if c.get("type") == 10]
+            if c.get("type") == 10 and c.get("content") != v3.SUPPORT_FOOTER]
 
 
 def _r66_chunks(conts):
@@ -5655,7 +5661,7 @@ check("r66: 15-photo long-body card keeps the round-38c two-container split (10 
       and [len(c["items"]) for c in _r66_g15["components"][0]["components"]
            + _r66_g15["components"][1]["components"] if c.get("type") == 12] == [10, 5]
       and [c["type"] for c in _r66_g15["components"][0]["components"]] == [10, 10, 14, 12]
-      and [c["type"] for c in _r66_g15["components"][1]["components"]] == [14, 12, 10, 14, 1],
+      and [c["type"] for c in _r66_g15["components"][1]["components"]] == [14, 12, 10, 14, 1, 10],
       str([[c["type"] for c in cont["components"]] for cont in _r66_g15["components"]]))
 # r66 guard updated in round 90: continuation payloads now carry a second
 # text component, the `-# 📜 Page X/Y` subtext footer, so the "exactly one
@@ -13098,7 +13104,7 @@ def _r109_shape(payload):
     for c in payload["components"]:
         out.append([(x["type"], x["content"] if x["type"] == 10 else
                      [it["media"]["url"] for it in x["items"]] if x["type"] == 12 else None)
-                    for x in c["components"]])
+                    for x in c["components"] if x.get("content") != v3.SUPPORT_FOOTER])
     return out
 
 
@@ -13132,8 +13138,8 @@ check("r109: inline-image body renders in reading order — each text segment is
 check("r109: header / stats line / divider / buttons / accent are unchanged by the interleave",
       _r109_p["flags"] == v3.IS_COMPONENTS_V2
       and all(c["type"] == 17 and c["accent_color"] == 16729344 for c in _r109_p["components"])
-      and _r109_p["components"][-1]["components"][-1] == v3.build_action_row(
-          "https://www.reddit.com/r/Sub/comments/x/", None))
+      and next(c for c in _r109_p["components"][-1]["components"] if c.get("type") == 1)
+      == v3.build_action_row("https://www.reddit.com/r/Sub/comments/x/", None))
 check("r109: no token or stray invisible separator ever leaks into the payload",
       "\u2063" not in json.dumps(_r109_p, ensure_ascii=False) and "IMG" not in json.dumps(_r109_p))
 _r109_legacy = _r109_shape(_r109_build(_r109_data("hello world", 2)))
