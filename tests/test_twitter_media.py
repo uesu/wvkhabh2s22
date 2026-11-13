@@ -252,6 +252,12 @@ check("r73 order: the observed live source order is JPG -> GIF 1 -> GIF 2 -> GIF
       and [e["url"] for e in x3.canonical_media_entries(_mixed_tweet["media"])[1:]]
       == [_GIF1, _GIF2, _GIF3])
 _photos_only = _fxtwitter_media([_photo(), _photo("https://pbs.twimg.com/media/b.jpg")])
+_R115_photo_list = [_photo(f"https://pbs.twimg.com/media/r115_{i}.jpg") for i in range(20)]
+_R115_photo_session = _Session()
+_R115_photo_items, _ = _collect(_fxtwitter_media(_R115_photo_list), _R115_photo_session)
+check("r115: collect_media accepts all 20 photos in the live FxTwitter `media.all` order",
+      _tiles(_R115_photo_items) == [p["url"] for p in _R115_photo_list]
+      and not _R115_photo_session.requests)
 check("r73 order: a photo-only post is unchanged (photos stay photos, same order)",
       x3.canonical_media_entries(_photos_only["media"]) == _photos_only["media"]["photos"])
 check("r73 order: a video-only post keeps the API order",
@@ -888,6 +894,151 @@ check("r73 config: the animated/AVIF content-type tiers are explicit constants",
       and x3.AVIF_IMAGE_TYPES == ("image/avif", "image/heic", "image/heif"))
 
 # ===========================================================================
+# ROUND 115 — X's combined per-post media limit increased to 20 (2026-11-13)
+# Live read-only FxTwitter probes: the account's supplied 20-image example
+# returned 18 media objects; the XCreators announcement confirms the new cap.
+# The synthetic 20-item mixed fixture covers the full newly announced ceiling.
+# ===========================================================================
+print("\n--- X 20-media gallery support ---")
+_R115_original_gallery_layout = x3.TWITTER_MEDIA_GALLERY_LAYOUT
+x3.TWITTER_MEDIA_GALLERY_LAYOUT = False
+check("r115: only explicit `on` enables grouped layout; off/missing/removed keep the separated default",
+      [x3._twitter_media_gallery_layout_enabled(value)
+       for value in ("on", " ON ", "off", "", None)]
+      == [True, True, False, False, False])
+_R115_entries = [
+    {"type": ("photo", "video", "gif")[i % 3],
+     "url": f"https://pbs.twimg.com/media/fixture_{i}.jpg"}
+    for i in range(20)
+]
+check("r115: canonical X media keeps all 20 photo/video/GIF entries in source order",
+      x3.canonical_media_entries({"all": _R115_entries}) == _R115_entries
+      and all(x3.media_entry_is_video(entry) == (entry["type"] != "photo")
+              for entry in _R115_entries))
+check("r115: defensive media cap is 20, not the former 4 and not unbounded",
+      len(x3.canonical_media_entries({"all": _R115_entries + [{"type": "photo", "url": "https://x/21"}]}))
+      == 20)
+with patch.object(x3, "probe_gif_candidates",
+                  new=AsyncMock(return_value=(None, "", None, ""))), \
+     patch.object(x3, "probe_video_size", new=AsyncMock(return_value=None)):
+    _R115_collected, _R115_collect_notes = asyncio.run(
+        x3.collect_media(None, {"media": {"all": _R115_entries}}))
+check("r115: collect_media emits all 20 mixed photos/videos/GIFs in their original order",
+      _tiles(_R115_collected) == [entry["url"] for entry in _R115_entries]
+      and not _R115_collect_notes)
+_R115_items = [{"media": {"url": entry["url"]}} for entry in _R115_entries]
+_R115_tweet = {"author": {"name": "Fixture", "screen_name": "fixture"},
+               "text": "20-item test", "replies": 0, "retweets": 0, "likes": 0, "views": 1}
+_R115_payload = x3.build_v3_payload("fixture", _R115_tweet, "https://x.com/fixture/status/1",
+                                   display_text="20-item test", posted_ts=1,
+                                   gallery_items=_R115_items,
+                                   media_notes=[f"-# video note {i}: " + ("x" * 180)
+                                                for i in range(20)])
+_R115_containers = _R115_payload["components"]
+_R115_galleries = [c for box in _R115_containers for c in box["components"] if c["type"] == 12]
+_R115_urls = [item["media"]["url"] for gallery in _R115_galleries for item in gallery["items"]]
+def _r115_count(component):
+    return 1 + sum(_r115_count(child) for child in component.get("components", []))
+check("r115: default separated layout emits all 20 media, one ordered gallery per item",
+      [len(g["items"]) for g in _R115_galleries] == [1] * 20
+      and _R115_urls == [entry["url"] for entry in _R115_entries],
+      str([len(g["items"]) for g in _R115_galleries]))
+check("r115: every Discord container is within 10 children and the payload is within 40 total components",
+      all(len(box["components"]) <= 10 for box in _R115_containers)
+      and sum(_r115_count(component) for component in _R115_containers) <= 40
+      and all(len(g["items"]) <= 10 for g in _R115_galleries))
+_R115_all_text = [c["content"] for box in _R115_containers for c in box["components"]
+                  if c.get("type") == 10]
+check("r115: many video diagnostics compact into one note block and stay inside Discord's 4,000-char text cap",
+      sum(map(len, _R115_all_text)) <= 4000
+      and sum("Additional media details omitted" in t for t in _R115_all_text) == 1,
+      str([len(t) for t in _R115_all_text]))
+_R115_quote = x3.build_quote_components(_R115_tweet, _R115_items, [])
+_R115_quote_galleries = [c for c in _R115_quote if c.get("type") == 12]
+check("r115: quoted media follows the default separated layout and keeps all 20 in order",
+      [len(g["items"]) for g in _R115_quote_galleries] == [1] * 20
+      and [item["media"]["url"] for g in _R115_quote_galleries for item in g["items"]]
+      == [entry["url"] for entry in _R115_entries])
+_R115_quote_payload = x3.build_v3_payload(
+    "fixture", _R115_tweet, "https://x.com/fixture/status/1", display_text="20-item test",
+    posted_ts=1, gallery_items=_R115_items, media_notes=[], quote_components=_R115_quote)
+_R115_qp_galleries = [c for box in _R115_quote_payload["components"]
+                      for c in box["components"] if c.get("type") == 12]
+check("r115: 20+20 separated media compact only the quote as needed to respect Discord's 40-component cap",
+      [len(g["items"]) for g in _R115_qp_galleries] == [1] * 20 + [10, 10]
+      and all(len(box["components"]) <= 10 for box in _R115_quote_payload["components"])
+      and sum(_r115_count(component) for component in _R115_quote_payload["components"]) <= 40
+      and [item["media"]["url"] for g in _R115_qp_galleries for item in g["items"]]
+      == [entry["url"] for entry in _R115_entries] * 2)
+
+_R115_workflow = open(os.path.join(ROOT, ".github", "workflows", "twitter_monitor.yml"), encoding="utf-8").read()
+_R115_env_example = open(os.path.join(ROOT, ".env.example"), encoding="utf-8").read()
+_R115_readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
+_R115_tracking = open(os.path.join(ROOT, "docs", "REPOSITORY_TRACKING.md"), encoding="utf-8").read()
+check("r115: the setting is workflow-wired and documented in the README, config example, and tracking guide",
+      "TWITTER_MEDIA_GALLERY_LAYOUT: ${{ vars.TWITTER_MEDIA_GALLERY_LAYOUT }}" in _R115_workflow
+      and "# TWITTER_MEDIA_GALLERY_LAYOUT=on" in _R115_env_example
+      and "TWITTER_MEDIA_GALLERY_LAYOUT" in _R115_readme
+      and "TWITTER_MEDIA_GALLERY_LAYOUT" in _R115_tracking)
+
+x3.TWITTER_MEDIA_GALLERY_LAYOUT = True
+_R115_grouped_payload = x3.build_v3_payload(
+    "fixture", _R115_tweet, "https://x.com/fixture/status/1", display_text="20-item test",
+    posted_ts=1, gallery_items=_R115_items, media_notes=[])
+_R115_grouped_galleries = [c for box in _R115_grouped_payload["components"]
+                           for c in box["components"] if c.get("type") == 12]
+check("r115: `on` groups 20 main-post items into ordered 10+10 galleries",
+      [len(g["items"]) for g in _R115_grouped_galleries] == [10, 10]
+      and [item["media"]["url"] for g in _R115_grouped_galleries for item in g["items"]]
+      == [entry["url"] for entry in _R115_entries])
+_R115_quote_on = x3.build_quote_components(_R115_tweet, _R115_items, [])
+_R115_grouped_quote_payload = x3.build_v3_payload(
+    "fixture", _R115_tweet, "https://x.com/fixture/status/1", display_text="20-item test",
+    posted_ts=1, gallery_items=_R115_items, media_notes=[], quote_components=_R115_quote_on)
+_R115_grouped_quote_galleries = [c for box in _R115_grouped_quote_payload["components"]
+                                 for c in box["components"] if c.get("type") == 12]
+check("r115: `on` groups quoted media too while staying within Discord's component limit",
+      [len(g["items"]) for g in _R115_grouped_quote_galleries] == [10, 10, 10, 10]
+      and sum(_r115_count(c) for c in _R115_grouped_quote_payload["components"]) <= 40)
+
+# Safety probe all post/quote media counts (0..20), under both layout modes.
+_R115_matrix_safe = True
+for _R115_layout in (False, True):
+    x3.TWITTER_MEDIA_GALLERY_LAYOUT = _R115_layout
+    for _R115_main_n in range(21):
+        for _R115_quote_n in range(21):
+            _R115_main = [{"media": {"url": f"https://x/main/{i}"}}
+                          for i in range(_R115_main_n)]
+            _R115_qitems = [{"media": {"url": f"https://x/quote/{i}"}}
+                            for i in range(_R115_quote_n)]
+            _R115_qcomps = (x3.build_quote_components(_R115_tweet, _R115_qitems, [])
+                            if _R115_quote_n else [])
+            _R115_probe = x3.build_v3_payload(
+                "fixture", _R115_tweet, "https://x.com/fixture/status/1",
+                display_text="matrix safety probe", posted_ts=1,
+                gallery_items=_R115_main, media_notes=[], quote_components=_R115_qcomps)
+            _R115_boxes = _R115_probe["components"]
+            _R115_gals = [c for box in _R115_boxes for c in box["components"]
+                          if c.get("type") == 12]
+            _R115_probe_urls = [item["media"]["url"] for gallery in _R115_gals
+                                for item in gallery["items"]]
+            _R115_expected_urls = ([f"https://x/main/{i}" for i in range(_R115_main_n)]
+                                   + [f"https://x/quote/{i}" for i in range(_R115_quote_n)])
+            _R115_matrix_safe &= (
+                all(len(box["components"]) <= 10 for box in _R115_boxes)
+                and sum(_r115_count(box) for box in _R115_boxes) <= 40
+                and _R115_probe_urls == _R115_expected_urls
+            )
+check("r115 safety probe: all 882 main/quote media-count combinations in separate/grouped modes preserve order and fit Discord limits",
+      _R115_matrix_safe)
+_R115_18 = x3.media_gallery_components(_R115_items[:18], grouped=True)
+check("r115: grouped 18-item gallery splits 10+8 without dropping the tail",
+      [len(g["items"]) for g in _R115_18] == [10, 8]
+      and [item["media"]["url"] for g in _R115_18 for item in g["items"]]
+      == [entry["url"] for entry in _R115_entries[:18]])
+x3.TWITTER_MEDIA_GALLERY_LAYOUT = _R115_original_gallery_layout
+
+# ===========================================================================
 # 5. ROUND 110 — link / app card artwork as a thumbnail (2026-11-05)
 # ===========================================================================
 print("\n--- 5. card artwork thumbnail (round 110) ---")
@@ -964,10 +1115,11 @@ check("r110: a second card image is never dropped — it stays in the gallery af
           [{"media": {"url": _R110_PHOTO}}, {"media": {"url": _R110_CARD.replace("8O4A5wKA", "zzzz")}}]))
 _r110_a = _r110_shape(_r110_card([_R110_PHOTO, _R110_CARD],
                                  lead_gallery_items=[{"media": {"url": "https://pbs.twimg.com/media/cover.jpg"}}]))
-check("r110: an article card already leads with its cover — no Section; the card image returns to the "
-      "gallery ahead of the native media",
+check("r110: an article card already leads with its cover — no Section; card and native media remain ordered and separate",
       all(k[0] != "section" for k in _r110_a)
-      and ("gallery", [_R110_CARD, _R110_PHOTO]) in _r110_a, _r110_a)
+      and [url for kind, value in _r110_a if kind == "gallery" for url in value]
+      == ["https://pbs.twimg.com/media/cover.jpg", _R110_CARD, _R110_PHOTO]
+      and all(len(value) == 1 for kind, value in _r110_a if kind == "gallery"), _r110_a)
 _r110_q = x3.build_quote_components({"id": "9", "author": {"name": "Q", "screen_name": "q"}, "text": "quoted"},
                                     [{"media": {"url": _R110_PHOTO}}, {"media": {"url": _R110_CARD}}], [])
 check("r110: a quoted post with native media + card gets the thumbnail beside its quote head",
