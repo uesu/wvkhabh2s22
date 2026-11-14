@@ -902,7 +902,7 @@ check("r73 config: the animated/AVIF content-type tiers are explicit constants",
 print("\n--- X 20-media gallery support ---")
 _R115_original_gallery_layout = x3.TWITTER_MEDIA_GALLERY_LAYOUT
 x3.TWITTER_MEDIA_GALLERY_LAYOUT = False
-check("r115: only explicit `on` enables grouped layout; off/missing/removed keep the separated default",
+check("r115: only explicit `on` forces grouping; off/missing/removed use the automatic item-count layout",
       [x3._twitter_media_gallery_layout_enabled(value)
        for value in ("on", " ON ", "off", "", None)]
       == [True, True, False, False, False])
@@ -939,10 +939,29 @@ _R115_galleries = [c for box in _R115_containers for c in box["components"] if c
 _R115_urls = [item["media"]["url"] for gallery in _R115_galleries for item in gallery["items"]]
 def _r115_count(component):
     return 1 + sum(_r115_count(child) for child in component.get("components", []))
-check("r115: default separated layout emits all 20 media, one ordered gallery per item",
+check("r115: default layout emits all 20 media separately and in source order",
       [len(g["items"]) for g in _R115_galleries] == [1] * 20
       and _R115_urls == [entry["url"] for entry in _R115_entries],
       str([len(g["items"]) for g in _R115_galleries]))
+_R115_legacy_groups = [x3.media_gallery_components(_R115_items[:n]) for n in (2, 3, 4)]
+check("r115: legacy-size 2, 3, and 4-item posts stay together in one gallery",
+      [[len(g["items"]) for g in galleries] for galleries in _R115_legacy_groups]
+      == [[2], [3], [4]])
+_R115_new_groups = [x3.media_gallery_components(_R115_items[:n]) for n in (5, 7, 8, 10, 20)]
+check("r115: new-size 5, 7, 8, 10, and 20-item posts use one separate gallery per attachment",
+      [[len(g["items"]) for g in galleries] for galleries in _R115_new_groups]
+      == [[1] * n for n in (5, 7, 8, 10, 20)])
+_R115_quote_legacy = [x3.build_quote_components(_R115_tweet, _R115_items[:n], [])
+                      for n in (2, 3, 4)]
+_R115_quote_legacy_sizes = [[len(g["items"]) for g in comps if g.get("type") == 12]
+                            for comps in _R115_quote_legacy]
+_R115_quote_new = [x3.build_quote_components(_R115_tweet, _R115_items[:n], [])
+                   for n in (5, 8)]
+_R115_quote_new_sizes = [[len(g["items"]) for g in comps if g.get("type") == 12]
+                         for comps in _R115_quote_new]
+check("r115: quoted media uses the same <=4 grouped / >4 separate default threshold",
+      _R115_quote_legacy_sizes == [[2], [3], [4]]
+      and _R115_quote_new_sizes == [[1] * 5, [1] * 8])
 check("r115: every Discord container is within 10 children and the payload is within 40 total components",
       all(len(box["components"]) <= 10 for box in _R115_containers)
       and sum(_r115_count(component) for component in _R115_containers) <= 40
@@ -986,6 +1005,9 @@ check("r115: the setting is workflow-wired and its optional guides document it w
       and _R115_documented)
 
 x3.TWITTER_MEDIA_GALLERY_LAYOUT = True
+_R115_forced_small = x3.media_gallery_components(_R115_items[:4])
+check("r115: setting `on` forces grouping for a legacy-size 4-item post too",
+      [len(g["items"]) for g in _R115_forced_small] == [4])
 _R115_grouped_payload = x3.build_v3_payload(
     "fixture", _R115_tweet, "https://x.com/fixture/status/1", display_text="20-item test",
     posted_ts=1, gallery_items=_R115_items, media_notes=[])
@@ -1119,11 +1141,11 @@ check("r110: a second card image is never dropped — it stays in the gallery af
           [{"media": {"url": _R110_PHOTO}}, {"media": {"url": _R110_CARD.replace("8O4A5wKA", "zzzz")}}]))
 _r110_a = _r110_shape(_r110_card([_R110_PHOTO, _R110_CARD],
                                  lead_gallery_items=[{"media": {"url": "https://pbs.twimg.com/media/cover.jpg"}}]))
-check("r110: an article card already leads with its cover — no Section; card and native media remain ordered and separate",
+check("r110: an article card already leads with its cover — no Section; the 2-item post media stays grouped and ordered",
       all(k[0] != "section" for k in _r110_a)
       and [url for kind, value in _r110_a if kind == "gallery" for url in value]
       == ["https://pbs.twimg.com/media/cover.jpg", _R110_CARD, _R110_PHOTO]
-      and all(len(value) == 1 for kind, value in _r110_a if kind == "gallery"), _r110_a)
+      and [len(value) for kind, value in _r110_a if kind == "gallery"] == [1, 2], _r110_a)
 _r110_q = x3.build_quote_components({"id": "9", "author": {"name": "Q", "screen_name": "q"}, "text": "quoted"},
                                     [{"media": {"url": _R110_PHOTO}}, {"media": {"url": _R110_CARD}}], [])
 check("r110: a quoted post with native media + card gets the thumbnail beside its quote head",

@@ -614,11 +614,12 @@ TEXT_CHUNK_SIZE = 1900
 MAX_TEXT_COMPONENTS = 4
 QUOTE_TEXT_BUDGET = 1500  # quote text shares a component with the quote header
 MAX_TWEET_MEDIA = 20  # X raised the combined photo/video attachment limit in November 2026.
+LEGACY_TWEET_MEDIA_LIMIT = 4  # Keep the old <=4 presentation grouped; split newly supported 5-20 media.
 MEDIA_GALLERY_SIZE = 10  # Discord Media Gallery limit per component.
 
 
 def _twitter_media_gallery_layout_enabled(value: str | None) -> bool:
-    """Only the explicit value `on` enables grouped galleries; default stays separate."""
+    """Only explicit `on` forces grouping; otherwise use the count-based default."""
     return isinstance(value, str) and value.strip().lower() == "on"
 
 
@@ -1777,14 +1778,18 @@ def thumbnail_section(texts: list, thumb_item: dict) -> dict:
 
 
 def media_gallery_components(items: list, *, grouped: bool | None = None) -> list:
-    """Build source-ordered Discord galleries, grouped only when explicitly enabled.
+    """Build ordered galleries, preserving legacy grouping for up to four items.
 
-    The default (unset/off) mirrors X's separate-media layout: one gallery per
-    attachment. `on` groups up to ten items into each gallery component.
+    By default, 1–4 attachments stay together in one gallery, matching the old
+    X limit; newly supported posts with 5–20 attachments use one gallery per
+    attachment. `TWITTER_MEDIA_GALLERY_LAYOUT=on` opts into grouping up to ten
+    items per gallery at any count. The explicit `grouped` argument is used by
+    the component-limit fallback and tests.
     """
     items = (items or [])[:MAX_TWEET_MEDIA]
     if grouped is None:
-        grouped = TWITTER_MEDIA_GALLERY_LAYOUT
+        grouped = (TWITTER_MEDIA_GALLERY_LAYOUT
+                   or len(items) <= LEGACY_TWEET_MEDIA_LIMIT)
     if not grouped:
         return [{"type": 12, "items": [item]} for item in items]
     return [{"type": 12, "items": items[i:i + MEDIA_GALLERY_SIZE]}

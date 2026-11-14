@@ -109,8 +109,8 @@ jobs:
           #   MEDIA_HEAL_SCOPE=on (/all)  also heal photos/gif/webp (full
           #                               round-47 scope)
           #   MEDIA_HEAL_SCOPE=off        never re-edit any media
-          # Round 115: unset/off keeps X attachments separate (one media tile
-          # per gallery); set the repo Variable to `on` to group up to 10 per gallery.
+          # Round 115: unset/off keeps legacy posts of 1-4 items together, then
+          # separates 5-20 items; set `on` to group up to 10 per gallery at any count.
           TWITTER_MEDIA_GALLERY_LAYOUT: ${{ vars.TWITTER_MEDIA_GALLERY_LAYOUT }}
           # Optional high video limit: unset/false keeps the 256 MiB default.
           TWITTER_HIGH_VIDEO_LIMIT: ${{ vars.TWITTER_HIGH_VIDEO_LIMIT }}
