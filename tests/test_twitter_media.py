@@ -962,12 +962,13 @@ _R115_quote_new_sizes = [[len(g["items"]) for g in comps if g.get("type") == 12]
 check("r115: quoted media uses the same <=4 grouped / >4 separate default threshold",
       _R115_quote_legacy_sizes == [[2], [3], [4]]
       and _R115_quote_new_sizes == [[1] * 5, [1] * 8])
-check("r115: every Discord container is within 10 children and the payload is within 40 total components",
-      all(len(box["components"]) <= 10 for box in _R115_containers)
-      and sum(_r115_count(component) for component in _R115_containers) <= 40
-      and all(len(g["items"]) <= 10 for g in _R115_galleries))
 _R115_all_text = [c["content"] for box in _R115_containers for c in box["components"]
                   if c.get("type") == 10]
+check("r115: a fitting 20-media card stays in one container and within the 40-component / 4,000-char message limits",
+      len(_R115_containers) == 1
+      and sum(_r115_count(component) for component in _R115_containers) <= 40
+      and sum(map(len, _R115_all_text)) <= 4000
+      and all(len(g["items"]) <= 10 for g in _R115_galleries))
 check("r115: many video diagnostics compact into one note block and stay inside Discord's 4,000-char text cap",
       sum(map(len, _R115_all_text)) <= 4000
       and sum("Additional media details omitted" in t for t in _R115_all_text) == 1,
@@ -983,10 +984,12 @@ _R115_quote_payload = x3.build_v3_payload(
     posted_ts=1, gallery_items=_R115_items, media_notes=[], quote_components=_R115_quote)
 _R115_qp_galleries = [c for box in _R115_quote_payload["components"]
                       for c in box["components"] if c.get("type") == 12]
-check("r115: 20+20 separated media compact only the quote as needed to respect Discord's 40-component cap",
+check("r115: 20+20 media compact only the quote as needed, then fit in one valid message/container",
       [len(g["items"]) for g in _R115_qp_galleries] == [1] * 20 + [10, 10]
-      and all(len(box["components"]) <= 10 for box in _R115_quote_payload["components"])
+      and len(_R115_quote_payload["components"]) == 1
       and sum(_r115_count(component) for component in _R115_quote_payload["components"]) <= 40
+      and sum(len(c.get("content", "")) for box in _R115_quote_payload["components"]
+              for c in box["components"] if c.get("type") == 10) <= 4000
       and [item["media"]["url"] for g in _R115_qp_galleries for item in g["items"]]
       == [entry["url"] for entry in _R115_entries] * 2)
 
@@ -1051,11 +1054,13 @@ for _R115_layout in (False, True):
             _R115_expected_urls = ([f"https://x/main/{i}" for i in range(_R115_main_n)]
                                    + [f"https://x/quote/{i}" for i in range(_R115_quote_n)])
             _R115_matrix_safe &= (
-                all(len(box["components"]) <= 10 for box in _R115_boxes)
+                len(_R115_boxes) == 1
                 and sum(_r115_count(box) for box in _R115_boxes) <= 40
+                and sum(len(c.get("content", "")) for box in _R115_boxes
+                        for c in box["components"] if c.get("type") == 10) <= 4000
                 and _R115_probe_urls == _R115_expected_urls
             )
-check("r115 safety probe: all 882 main/quote media-count combinations in separate/grouped modes preserve order and fit Discord limits",
+check("r115 safety probe: all 882 main/quote media-count combinations in separate/grouped modes preserve order and fit one valid container/message",
       _R115_matrix_safe)
 _R115_18 = x3.media_gallery_components(_R115_items[:18], grouped=True)
 check("r115: grouped 18-item gallery splits 10+8 without dropping the tail",

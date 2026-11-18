@@ -1826,7 +1826,12 @@ def _text_chars(component: dict) -> int:
 
 
 def _pack_twitter_components(components: list, accent: int) -> list:
-    """Pack card children into Discord containers (at most ten children each)."""
+    """Use one container when the complete card fits; chunk only as overflow fallback."""
+    total_components = 1 + sum(_twitter_component_count(component)
+                               for component in components)
+    total_text = sum(_text_chars(component) for component in components)
+    if total_components <= 40 and total_text <= 4000:
+        return [{"type": 17, "accent_color": accent, "components": components}]
     return [{"type": 17, "accent_color": accent,
              "components": components[i:i + 10]}
             for i in range(0, len(components), 10)]
