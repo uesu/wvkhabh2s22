@@ -363,9 +363,12 @@ MAX_CACHE_SIZE_TOTAL = _env_int("MAX_CACHE_SIZE_TOTAL", 10000)
 # keys again.
 MAX_POSTS_PER_RUN = _env_int("MAX_POSTS_PER_RUN", 25)
 
-# Wide window (48h) so posts approved from a subreddit's moderator queue a day
-# or more later are still caught (approval bumps the RSS "updated" stamp).
-MAX_AGE_SECONDS = 48 * 3600
+# Two-day Reddit monitoring window, configured in hours.
+REDDIT_MONITOR_WINDOW_HOURS = max(1, _env_int("REDDIT_MONITOR_WINDOW_HOURS", 48))
+MAX_AGE_SECONDS = REDDIT_MONITOR_WINDOW_HOURS * 3600
+# One cron interval of slack lets the relay's final 48 h re-check be consumed
+# even when a poll runs a few minutes after its scheduled age.
+RELAY_EDIT_CACHE_SECONDS = MAX_AGE_SECONDS + 1800
 
 # ---------------------------------------------------------------------------
 # ■ PENDING-POST RECHECK CACHE (round 30, 2026-09-19)
@@ -392,7 +395,7 @@ PENDING_RECHECK_SECONDS = _env_int("PENDING_RECHECK_SECONDS", 300)  # 5 min
 # deleted posts are still NEVER re-checked (the _NO_RECHECK_REASONS set), so
 # this raises the cadence for the small held set only. Override with the
 # PENDING_RECHECK_SECONDS Variable (set 1800 to restore the old behaviour).
-PENDING_MAX_AGE_SECONDS = 48 * 3600  # matches the 48h posting window
+PENDING_MAX_AGE_SECONDS = REDDIT_MONITOR_WINDOW_HOURS * 3600  # same hour-based window
 
 # Round 44: delivered-post retraction/tombstone. Disabled by default; when on
 # the webhook is called with wait=true so Discord returns a message ID.
@@ -400,6 +403,10 @@ RETRACT_DEAD_POSTS = os.getenv("RETRACT_DEAD_POSTS", "0").strip().lower() in ("1
 RETRACT_MODE = os.getenv("RETRACT_MODE", "edit").strip().lower() or "edit"
 RETRACT_WINDOW_SECONDS = _env_int("RETRACT_WINDOW_SECONDS", 21600)
 POSTED_MESSAGES_FILE = "posted_messages.json"
+# Additive mode: Reddit-flagged posts already blur media; this opt-in also
+# conceals their complete rendered body. Unset/false preserves body rendering.
+SPOILER_MEDIA_AND_BODY = (os.getenv("SPOILER_MEDIA_AND_BODY", "0").strip().lower()
+                          in ("1", "true", "yes", "on"))
 
 # Round 72 (+ precision follow-up and Round 74 cold-proxy coverage): inspect
 # Discord's response for video cards. A video endpoint can be reachable
@@ -504,6 +511,7 @@ def _effective_settings() -> dict:
         "fresh_hold_seconds": _int("FRESH_HOLD_SECONDS"),
         "pending_recheck_seconds": _int("PENDING_RECHECK_SECONDS"),
         "max_age_hours": (round(max_age / 3600) if max_age else None),
+        "reddit_monitor_window_hours": _int("REDDIT_MONITOR_WINDOW_HOURS"),
         "max_posts_per_run": _int("MAX_POSTS_PER_RUN"),
         "dedup_per_sub_cap": _int("MAX_CACHE_SIZE_PER_SUB"),
         "dedup_total_cap": _int("MAX_CACHE_SIZE_TOTAL"),
@@ -518,7 +526,8 @@ def _effective_settings() -> dict:
         "intake_reader": _get("INTAKE_READER"),
         "intake_configured": bool(_get("INTAKE_CHANNEL_ID") and _get("DISCORD_BOT_TOKEN")),
         "intake_stale_seconds": _int("INTAKE_STALE_SECONDS"),
-        "intake_lookback_seconds": _int("INTAKE_LOOKBACK_SECONDS"),
+        "intake_lookback_hours": _int("INTAKE_LOOKBACK_HOURS"),
+        "spoiler_media_and_body": bool(_get("SPOILER_MEDIA_AND_BODY")),
         # Round 108: archive hardening knobs (old chain).
         "arctic_min_spacing": _int("ARCTIC_MIN_SPACING"),
         "arctic_retry_budget": _int("ARCTIC_RETRY_BUDGET"),
@@ -742,6 +751,7 @@ def _init_run_stats():
         "unposted_candidates_considered": 0,
         "candidates_entering_processing": 0,
         "delivered": 0,
+        "edited": 0,
         "dry_run_would_deliver": 0,
         "failed_delivery": 0,
         "known_pending_suppressed": 0,
@@ -1789,6 +1799,77 @@ def load_posted_messages() -> dict:
         raise
 
 
+async def edit_relay_delivery(session, webhook_url: str, key: str,
+                              messages: dict, payload: dict,
+                              continuations: list, label: str) -> bool:
+    """Patch a delivered relay card and reconcile its overflow pages safely."""
+    record = messages.get(key) or {}
+    main_id = str(record.get("message_id") or "")
+    if not main_id or record.get("edit_hold"):
+        logging.warning("[%s] relay revision cannot be safely edited (%s)",
+                        label, record.get("edit_hold") or "missing Discord message id")
+        return False
+
+    async def patch_message(message_id: str, body: dict) -> bool:
+        url = f"{webhook_url}/messages/{message_id}?with_components=true"
+        async with session.patch(url, json=body,
+                                timeout=aiohttp.ClientTimeout(total=15)) as response:
+            if response.status not in (200, 204):
+                logging.error("[%s] relay edit PATCH returned HTTP %s", label, response.status)
+                return False
+            return True
+
+    if not await patch_message(main_id, payload):
+        return False
+    ids = [str(mid) for mid in (record.get("message_ids") or [main_id]) if str(mid)]
+    if main_id not in ids:
+        ids.insert(0, main_id)
+    old_pages = ids[1:]
+    shared = min(len(old_pages), len(continuations))
+    for index in range(shared):
+        if not await patch_message(old_pages[index], continuations[index]):
+            return False
+    for index in range(shared, len(continuations)):
+        record["edit_hold"] = "continuation_outcome_unknown"
+        record["last_checked"] = time.time()
+        save_posted_messages(messages)
+        try:
+            async with session.post(
+                    f"{webhook_url}?with_components=true&wait=true",
+                    json=continuations[index],
+                    timeout=aiohttp.ClientTimeout(total=15)) as response:
+                if response.status != 200:
+                    logging.error("[%s] relay continuation POST returned HTTP %s; held",
+                                  label, response.status)
+                    return False
+                message = await response.json(content_type=None)
+                if not isinstance(message, dict) or not message.get("id"):
+                    logging.error("[%s] relay continuation response omitted message id; held", label)
+                    return False
+                ids.append(str(message["id"]))
+                record["message_ids"] = ids
+                record.pop("edit_hold", None)
+                save_posted_messages(messages)
+        except Exception as error:
+            logging.error("[%s] relay continuation POST outcome uncertain; held (%s)",
+                          label, _sanitize_error_message(error))
+            return False
+    for message_id in old_pages[len(continuations):]:
+        url = f"{webhook_url}/messages/{message_id}"
+        async with session.delete(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+            if response.status not in (200, 204, 404):
+                logging.error("[%s] obsolete relay continuation DELETE returned HTTP %s",
+                              label, response.status)
+                return False
+    record["message_ids"] = [main_id] + ids[1:1 + len(continuations)]
+    record["payload"] = payload
+    record["continuations"] = continuations
+    record.pop("edit_hold", None)
+    record["last_checked"] = time.time()
+    save_posted_messages(messages)
+    return True
+
+
 def save_posted_messages(messages: dict) -> None:
     def _msg_age_ok(v: dict, now: float) -> bool:
         raw = v.get("continuation_completed_at", v.get("delivered_at"))
@@ -1798,7 +1879,9 @@ def save_posted_messages(messages: dict) -> None:
             ts = float(raw)
         except (TypeError, ValueError):
             return True
-        return now - ts <= RETRACT_WINDOW_SECONDS
+        window = (RELAY_EDIT_CACHE_SECONDS
+                  if v.get("relay_auto_edit") else RETRACT_WINDOW_SECONDS)
+        return now - ts <= window
     try:
         now = time.time()
         pruned = {
@@ -2909,7 +2992,8 @@ DISCORD_BOT_TOKEN = (os.getenv("DISCORD_BOT_TOKEN") or "").strip()
 INTAKE_STALE_SECONDS = max(120, _env_int("INTAKE_STALE_SECONDS", 1800))
 # How far back the channel is read each run (bounds the re-listing window
 # for held posts; one HTTP page per 100 messages, INTAKE_MAX_PAGES cap).
-INTAKE_LOOKBACK_SECONDS = max(600, _env_int("INTAKE_LOOKBACK_SECONDS", 6 * 3600))
+INTAKE_LOOKBACK_HOURS = max(1, _env_int("INTAKE_LOOKBACK_HOURS", REDDIT_MONITOR_WINDOW_HOURS))
+INTAKE_LOOKBACK_SECONDS = INTAKE_LOOKBACK_HOURS * 3600
 INTAKE_MAX_PAGES = 8
 # Round 103: complete records (`record.json` attachment, relay 0.0.7) are
 # fetched only when the inline record was cut or names a crosspost parent —
@@ -8007,6 +8091,18 @@ def build_action_row(reddit_url: str, youtube_url: str | None) -> dict:
     return {"type": 1, "components": buttons[:5]}
 
 
+def _spoilerize_body_text(body: str) -> str:
+    """Wrap each non-empty rendered line so a short post-level spoiler is hidden.
+
+    Reddit's explicit >!…!< markers have already been converted to Discord
+    spoiler syntax by the body cleaner. Unwrap those first to avoid nested
+    delimiters, then wrap each line independently (Discord-safe across newlines).
+    """
+    text = re.sub(r"\|\|([\s\S]*?)\|\|", r"\1", str(body or ""))
+    return "\n".join(f"||{line}||" if line.strip() else line
+                      for line in text.split("\n"))
+
+
 def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int,
                      *, return_remainder: bool = False):
     """
@@ -8103,6 +8199,8 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
     body_marked = _mark_inline_gallery_images(data["body"], _photo_media)
     body_src = _format_markdown_tables(_format_quote_blocks(
         _drop_gallery_media_lines(body_marked, media)))
+    if SPOILER_MEDIA_AND_BODY and data.get("spoiler"):
+        body_src = _spoilerize_body_text(body_src)
     single_budget = max(300, 3800 - len(header) - len(base_stats_line))
     if len(body_src) <= single_budget:
         stats_line = base_stats_line
@@ -8125,18 +8223,17 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
 
     # Round 112: a post Reddit flags spoiler / age-restricted blurs its IMAGE
     # and GIF tiles with Discord's own gallery-item `spoiler` flag. A VIDEO
-    # tile never gets it — whatever host serves it (v.redd.it, packaged-media,
-    # YouTube, embedez / redditez / vxreddit mirrors): the spoiler cover takes
-    # the player's fullscreen control away (owner-verified in Discohook). The key
-    # is OMITTED when the post is not flagged, so every unflagged card is
-    # byte-identical to before. Exempt by media KIND, never by host string.
+    # tile keeps the established behavior by default because Discord's cover
+    # can obscure player controls. The opt-in full-media/body mode deliberately
+    # applies the same spoiler cover to video tiles too. The key is omitted for
+    # unaffected media, preserving existing cards when the new mode is off.
     _blur = bool(data.get("spoiler"))
 
     def gallery(items: list) -> dict:
         out = []
         for m in items:
             item = {"media": {"url": m["url"]}}
-            if _blur and m.get("kind") != "video":
+            if _blur and (m.get("kind") != "video" or SPOILER_MEDIA_AND_BODY):
                 item["spoiler"] = True
             out.append(item)
         return {"type": 12, "items": out}
@@ -8699,7 +8796,8 @@ async def main():
     # the durable next-index marker as evidence across that interruption window.
     posted.update(key for key, value in posted_messages.items()
                   if isinstance(value, dict) and
-                  (value.get("continuations") or "continuation_next" in value))
+                  (value.get("continuations") or "continuation_next" in value
+                   or value.get("relay_auto_edit")))
     _listing_cache.clear()
     _redlib_post_page_cache.clear()
     _proxy_post_cache.clear()
@@ -8854,9 +8952,20 @@ async def main():
                         if not post_id:
                             continue
                         unique_key = f"{sub}_{post_id}"
-                        if unique_key in posted:
-                            # Dedup at collect stage: already posted, skip silently but count
-                            # This is before candidate counting, so track separately
+                        relay_edit = False
+                        if isinstance(entry, _IntakeEntry):
+                            prior = posted_messages.get(unique_key) or {}
+                            try:
+                                revision = max(1, int(entry.record.get("revision") or 1))
+                                prior_revision = max(1, int(prior.get("relay_revision") or 1))
+                            except (TypeError, ValueError):
+                                revision, prior_revision = 1, 1
+                            relay_edit = bool(prior.get("message_id")
+                                              and revision > prior_revision
+                                              and prior.get("relay_auto_edit", True))
+                            if relay_edit:
+                                entry.edit_existing = True
+                        if unique_key in posted and not relay_edit:
                             run_stats["dedup_skipped_in_run"] += 1
                             logging.debug(f"[{unique_key}] already posted (dedup) — skipped at collect.")
                             continue
@@ -8865,7 +8974,8 @@ async def main():
                         published_ts = time.mktime(published_parsed) if published_parsed else now
                         updated_ts = time.mktime(updated_parsed) if updated_parsed else published_ts
                         activity_ts = max(published_ts, updated_ts)
-                        if not is_first_run and (now - activity_ts > MAX_AGE_SECONDS):
+                        if (not is_first_run and not relay_edit
+                                and now - activity_ts > MAX_AGE_SECONDS):
                             continue
                         if provenance == "reddit-native":
                             native_keys.add(unique_key)
@@ -9364,7 +9474,8 @@ async def main():
                 # code path; re-check the live set before the expensive pipeline.
                 # TEST POST rebuilds are exempt (re-testing a cached post is
                 # their whole point).
-                if not TEST_POST_ID and unique_key in posted:
+                if (not TEST_POST_ID and unique_key in posted
+                        and not getattr(entry, "edit_existing", False)):
                     run_stats["dedup_skipped_in_run"] += 1
                     logging.debug(f"[{unique_key}] already posted (dedup) — skipped.")
                     continue
@@ -9696,11 +9807,31 @@ async def main():
                         run_stats["dry_run_would_deliver"] += 1
                         continue
 
+                    if getattr(entry, "edit_existing", False):
+                        _edit_ok = await edit_relay_delivery(
+                            session, webhook_url, unique_key, posted_messages,
+                            payload, continuations, unique_key)
+                        if _edit_ok:
+                            _edit_record = posted_messages[unique_key]
+                            _edit_record.update({
+                                "relay_auto_edit": True,
+                                "relay_revision": max(1, int(entry.record.get("revision") or 1)),
+                                "edited_at": time.time(),
+                            })
+                            run_stats["edited"] += 1
+                            save_posted_messages(posted_messages)
+                            logging.info("Reddit V3 Edited: %s (relay revision %s)",
+                                         unique_key, _edit_record["relay_revision"])
+                        else:
+                            run_stats["failed_delivery"] += 1
+                        continue
+
                     inspect_video_response = _has_video_media(data)
                     target_url = f"{webhook_url}?with_components=true"
-                    # Video cards, retraction and multi-part bodies need confirmed
-                    # message IDs. Ordinary single text cards keep the old POST.
-                    if RETRACT_DEAD_POSTS or inspect_video_response or continuations:
+                    # Video cards, retraction, multi-part bodies and relay edits
+                    # need confirmed message IDs; other ordinary cards keep the old POST.
+                    relay_auto_edit = isinstance(entry, _IntakeEntry)
+                    if RETRACT_DEAD_POSTS or inspect_video_response or continuations or relay_auto_edit:
                         target_url += "&wait=true"
                     if continuations:
                         # Persist before POST: a lost main response must not replay page one.
@@ -9719,7 +9850,7 @@ async def main():
                         main_post_connecting = False
                         if resp.status in (200, 204):
                             message_json = None
-                            if (RETRACT_DEAD_POSTS or inspect_video_response or continuations) and resp.status == 200:
+                            if (RETRACT_DEAD_POSTS or inspect_video_response or continuations or relay_auto_edit) and resp.status == 200:
                                 try:
                                     message_json = await resp.json(content_type=None)
                                 except Exception:
@@ -9732,7 +9863,8 @@ async def main():
                             # against a subreddit's real approval latency without
                             # guessing (grep the Actions log for LATENCY).
                             _pend_entry = pending.pop(unique_key, None)  # posted — no longer pending
-                            if (RETRACT_DEAD_POSTS or continuations) and isinstance(message_json, dict) and message_json.get("id"):
+                            if ((RETRACT_DEAD_POSTS or continuations or relay_auto_edit)
+                                    and isinstance(message_json, dict) and message_json.get("id")):
                                 record = posted_messages.setdefault(unique_key, {})
                                 record.update({
                                     "subreddit": subreddit,
@@ -9742,7 +9874,19 @@ async def main():
                                     "published_ts": int(published_ts),
                                     "payload": payload,
                                 })
+                                if relay_auto_edit:
+                                    record.update({
+                                        "relay_auto_edit": True,
+                                        "relay_revision": max(1, int(entry.record.get("revision") or 1)),
+                                    })
                                 record.pop("continuation_hold", None)
+                                if relay_auto_edit:
+                                    # Persist the returned ID immediately: the
+                                    # next relay revision must PATCH, never re-POST.
+                                    save_posted_messages(posted_messages)
+                            elif relay_auto_edit:
+                                logging.warning("[%s] delivered relay card has no Discord message ID; "
+                                                "later revisions cannot be patched", unique_key)
                             kinds = ",".join(sorted({m["kind"] for m in data["media"]})) or "text"
                             _m_prov = str(data.get("media_provider") or "").strip()
                             if not _m_prov and data.get("media"):
@@ -9907,7 +10051,7 @@ async def main():
                      f"{run_stats['candidates_entering_processing']} entering card processing, "
                      f"{run_stats['delivered'] + run_stats['dry_run_would_deliver']} delivered "
                      f"({run_stats['delivered']} real, {run_stats['dry_run_would_deliver']} dry-run), "
-                     f"{run_stats['failed_delivery']} failed, "
+                     f"{run_stats['edited']} relay edit(s), {run_stats['failed_delivery']} failed, "
                      f"{run_stats['known_pending_suppressed']} known-pending, "
                      f"{run_stats['retry_backoff']} retry-backoff, "
                      f"{run_stats['fresh_hold']} fresh-hold, "

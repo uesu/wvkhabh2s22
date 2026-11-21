@@ -2199,7 +2199,8 @@ _r34_loop_head = _r34_main_src.split(
     1)[1].split("webhook_url = get_webhook_for_subreddit(subreddit)", 1)[0]
 check("r34: the posting loop re-checks the dedup cache before posting (double guard, "
       "TEST POST rebuilds exempt)",
-      "if not TEST_POST_ID and unique_key in posted:" in _r34_loop_head, _r34_loop_head)
+      "if (not TEST_POST_ID and unique_key in posted" in _r34_loop_head
+      and "not getattr(entry, \"edit_existing\", False)" in _r34_loop_head, _r34_loop_head)
 check("r34: the per-run flood cap is wired into main",
       "cap_new_posts(new_posts, MAX_POSTS_PER_RUN)" in _r34_main_src)
 check("r34: BOTH save sites verify the save (a missing this-run key is a loud error)",
@@ -6985,8 +6986,8 @@ check("r72: both repository Variables are workflow-wired",
           for name in ("PROXY_VIDEO_HEAL", "PROXY_VIDEO_HEAL_DELAY")))
 # Full-body delivery also needs confirmed IDs; preserve both original conditions.
 check("r72: video/retract/continuation cards request wait=true and read the created message",
-      "if RETRACT_DEAD_POSTS or inspect_video_response or continuations:" in _r72_main
-      and "if (RETRACT_DEAD_POSTS or inspect_video_response or continuations) and resp.status == 200:" in _r72_main)
+      "if RETRACT_DEAD_POSTS or inspect_video_response or continuations or relay_auto_edit:" in _r72_main
+      and "if (RETRACT_DEAD_POSTS or inspect_video_response or continuations or relay_auto_edit) and resp.status == 200:" in _r72_main)
 check("r72: only an explicit unresolved item with message ID queues an edit after posting loop",
       "unresolved = _unresolved_healable_video_items(message_json, data)" in _r72_main
       and "if (unresolved and isinstance(message_json, dict)" in _r72_main
@@ -12925,11 +12926,13 @@ if os.path.isfile(_r104_relay_ts):
     _r104_ts = open(_r104_relay_ts, encoding="utf-8").read()
     _r104_srv = open(os.path.join(ROOT, "devvit", "gaming-express", "src", "server", "server.ts"),
                      encoding="utf-8").read()
-    check("r104 devvit 0.0.8: five re-check stages (5 min … 24 h), approval re-sends; the relay reads "
+    check("r104 devvit: six re-check stages through 48 h, approval/edit re-sends; the relay reads "
           "no comments (owner's request — no `opComments`, no `post.comments.get`, no `oc:` key)",
-          "300, 1800, 7200, 21600, 86400" in _r104_ts
+          all(str(stage) in _r104_ts for stage in (300, 1800, 7200, 21600, 86400))
+          and "RECHECK_WINDOW_HOURS * 3600" in _r104_ts
           and "export function becameLive(" in _r104_ts
-          and "RECHECK_WINDOW_SECONDS = 86400 + 1800" in _r104_srv
+          and "RECHECK_WINDOW_HOURS = 48" in _r104_ts
+          and "RECHECK_WINDOW_SECONDS = RECHECK_WINDOW_HOURS * 3600 + 1800" in _r104_srv
           and "reasons.push('approved')" in _r104_srv and "reasons.push('edited')" in _r104_srv
           and "opComment" not in _r104_ts and "opComment" not in _r104_srv
           and "comments.get(" not in _r104_srv and "'oc:'" not in _r104_srv and "`oc:" not in _r104_srv)
@@ -12944,12 +12947,13 @@ check("r101 main: the relay is read BEFORE the combined feed; `ok` in primary mo
       and 'relay_primary = (INTAKE_READER == "primary" and intake["status"] == "ok")' in _r101_main
       and "INTAKE-FALLBACK" in _r101_main and "INTAKE-SHADOW" in _r101_main
       and "run_stats[\"intake\"] = _intake_summary(intake)" in _r101_main)
-check("r101: defaults — primary, stale 1800 s, lookback 6 h; the three Variables and the bot "
-      "token are wired in reddit_monitor.yml (round-42 pattern)",
-      v3.INTAKE_STALE_SECONDS == 1800 and v3.INTAKE_LOOKBACK_SECONDS == 6 * 3600
+check("r101: defaults — primary, stale 1800 s, 48 h monitor/lookback; hour-based Variables and the "
+      "bot token are wired in reddit_monitor.yml",
+      v3.INTAKE_STALE_SECONDS == 1800 and v3.INTAKE_LOOKBACK_SECONDS == 48 * 3600
+      and v3.REDDIT_MONITOR_WINDOW_HOURS == 48
       and 'INTAKE_READER = ((os.getenv("INTAKE_READER") or "").strip().lower() or "primary")' in _r101_src
       and all(f"{n}: ${{{{ vars.{n} }}}}" in _r101_wf for n in
-              ("INTAKE_CHANNEL_ID", "INTAKE_READER", "INTAKE_STALE_SECONDS", "INTAKE_LOOKBACK_SECONDS"))
+              ("INTAKE_CHANNEL_ID", "INTAKE_READER", "INTAKE_STALE_SECONDS", "INTAKE_LOOKBACK_HOURS"))
       and "DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}" in _r101_wf)
 # Dev-only file: production checkouts have no .env.example (round 95d), so guard the read.
 if os.path.isfile(os.path.join(ROOT, ".env.example")):
@@ -13429,6 +13433,124 @@ _stdout_guard._record([_stdout_guard._partial])
 check("r89d: the suite never emits GitHub Actions workflow commands to stdout "
       "(simulated faults stay captured, so CI gets no false ::error:: annotation)",
       not _stdout_guard.leaks, _stdout_guard.leaks[:3])
+
+# ---- Reddit revision editing + opt-in body spoiler coverage ----
+check("r113: body spoiler mode wraps short Reddit-marked text and avoids nested spoiler delimiters",
+      v3._spoilerize_body_text("(It’s Truvia)") == "||(It’s Truvia)||"
+      and v3._spoilerize_body_text("line one\n\n||already hidden||")
+          == "||line one||\n\n||already hidden||")
+_r113_short = _r109_data("(It’s Truvia)", 1)
+_r113_short["spoiler"] = True
+with patch.object(v3, "SPOILER_MEDIA_AND_BODY", False):
+    _r113_default_payload = _r109_build(_r113_short)
+with patch.object(v3, "SPOILER_MEDIA_AND_BODY", True):
+    _r113_enabled_payload = _r109_build(_r113_short)
+_r113_default_body = next(
+    x["content"] for c in _r113_default_payload["components"]
+    for x in c["components"] if x.get("type") == 10 and "(It’s Truvia)" in x.get("content", ""))
+_r113_enabled_body = next(
+    x["content"] for c in _r113_enabled_payload["components"]
+    for x in c["components"] if x.get("type") == 10 and "Truvia" in x.get("content", ""))
+check("r113: spoiler switch is additive — unset mode leaves body literal; enabled mode hides the short body",
+      _r113_default_body == "(It’s Truvia)"
+      and _r113_enabled_body == "||(It’s Truvia)||")
+check("r113: body spoiler mode does not disable existing Reddit-flagged media blur",
+      [flag for _url, flag in _r112_items(_r113_enabled_payload)] == [True]
+      and [flag for _url, flag in _r112_items(_r109_build(_r109_data("plain", 1)))] == [None])
+_r113_long = _r109_data("spoiler phrase " * 350, 0)
+_r113_long["spoiler"] = True
+with patch.object(v3, "SPOILER_MEDIA_AND_BODY", True):
+    _r113_long_payload, _r113_long_rest = _r109_build(_r113_long, return_remainder=True)
+_r113_long_pages = v3.build_continuation_payloads(_r113_long_rest)
+_r113_long_texts = [x["content"] for c in _r113_long_payload["components"]
+                    for x in c["components"] if x.get("type") == 10]
+_r113_long_texts += [x["content"] for page in _r113_long_pages
+                     for c in page["components"] for x in c["components"]
+                     if x.get("type") == 10 and "spoiler phrase" in x.get("content", "")]
+_r113_long_body = [text for text in _r113_long_texts if "spoiler phrase" in text]
+check("r113: long spoiler bodies remain wrapped and balanced across the main card and continuation pages",
+      len(_r113_long_body) >= 2
+      and all(text.count("||") >= 2 and text.count("||") % 2 == 0
+              and text.startswith("||") and text.endswith("||")
+              for text in _r113_long_body))
+
+_r113_retention_tmp = tempfile.TemporaryDirectory()
+try:
+    _r113_cache_path = os.path.join(_r113_retention_tmp.name, "posted.json")
+    _r113_now = time.time()
+    _r113_cache = {
+        "Sub_edit": {"message_id": "m1", "relay_auto_edit": True,
+                     "delivered_at": _r113_now - (48 * 3600 + 20 * 60)},
+        "Sub_old_regular": {"message_id": "m2", "delivered_at": _r113_now - 7 * 3600},
+    }
+    with patch.object(v3, "POSTED_MESSAGES_FILE", _r113_cache_path):
+        v3.save_posted_messages(_r113_cache)
+        _r113_retained = v3.load_posted_messages()
+finally:
+    _r113_retention_tmp.cleanup()
+check("r113: delivered relay IDs survive the 48 h + 30 min scheduler slack; unrelated records keep old pruning",
+      "Sub_edit" in _r113_retained and "Sub_old_regular" not in _r113_retained)
+
+_r113_video = _r109_data("video description", 0, video=True)
+_r113_video["spoiler"] = True
+with patch.object(v3, "SPOILER_MEDIA_AND_BODY", False):
+    _r113_video_default = _r109_build(_r113_video)
+with patch.object(v3, "SPOILER_MEDIA_AND_BODY", True):
+    _r113_video_enabled = _r109_build(_r113_video)
+check("r113: combined spoiler mode flags video media too; off mode preserves the existing video tile behavior",
+      [flag for _url, flag in _r112_items(_r113_video_default)] == [None]
+      and [flag for _url, flag in _r112_items(_r113_video_enabled)] == [True]
+      and any("||video description||" in x["content"]
+              for c in _r113_video_enabled["components"]
+              for x in c["components"] if x.get("type") == 10))
+
+check("r113: two-day monitoring uses an hour-based setting in the workflow and intake reader",
+      v3.REDDIT_MONITOR_WINDOW_HOURS == 48
+      and v3.MAX_AGE_SECONDS == 48 * 3600
+      and v3.PENDING_MAX_AGE_SECONDS == 48 * 3600
+      and v3.INTAKE_LOOKBACK_HOURS == 48
+      and v3.RELAY_EDIT_CACHE_SECONDS == 48 * 3600 + 1800
+      and "REDDIT_MONITOR_WINDOW_HOURS: ${{ vars.REDDIT_MONITOR_WINDOW_HOURS }}" in _r101_wf
+      and "INTAKE_LOOKBACK_HOURS: ${{ vars.INTAKE_LOOKBACK_HOURS }}" in _r101_wf)
+check("r113: existing relay revisions with a later revision enter the PATCH path rather than repost",
+      "revision > prior_revision" in inspect.getsource(v3.main)
+      and "edit_existing" in inspect.getsource(v3.main)
+      and "session.patch(url, json=body" in inspect.getsource(v3.edit_relay_delivery)
+      and "relay_revision" in inspect.getsource(v3.main))
+
+class _R113Response:
+    def __init__(self, status=204, body=None):
+        self.status, self.body = status, body
+    async def __aenter__(self): return self
+    async def __aexit__(self, *args): return False
+    async def json(self, **kwargs): return self.body
+
+class _R113Session:
+    def __init__(self): self.patches, self.deletes, self.posts = [], [], []
+    def patch(self, url, json=None, **kwargs):
+        self.patches.append((url, json)); return _R113Response()
+    def delete(self, url, **kwargs):
+        self.deletes.append(url); return _R113Response()
+    def post(self, url, json=None, **kwargs):
+        self.posts.append((url, json)); return _R113Response(200, {"id": "new-page"})
+
+_r113_session = _R113Session()
+_r113_messages = {"Sub_abc123": {"message_id": "main", "message_ids": ["main", "page-old", "page-extra"],
+                                 "relay_revision": 1, "relay_auto_edit": True}}
+_r113_payload = {"flags": 32768, "components": []}
+_r113_pages = [{"flags": 32768, "components": [{"type": 17, "components": []}]}]
+with patch.object(v3, "save_posted_messages"):
+    _r113_edit_ok = asyncio.run(v3.edit_relay_delivery(
+        _r113_session, "https://discord.test/webhooks/token", "Sub_abc123",
+        _r113_messages, _r113_payload, _r113_pages, "Sub_abc123"))
+check("r113: revision edit PATCHes main and continuation, removes stale overflow and persists IDs",
+      _r113_edit_ok is True
+      and [u.rsplit("/", 1)[-1].split("?")[0] for u, _ in _r113_session.patches]
+          == ["main", "page-old"]
+      and _r113_session.deletes == ["https://discord.test/webhooks/token/messages/page-extra"]
+      and _r113_messages["Sub_abc123"]["message_ids"] == ["main", "page-old"]
+      and _r113_messages["Sub_abc123"]["payload"] == _r113_payload)
+
 
 if failures:
     print(f"SMOKE TEST FAILURES ({len(failures)}): {failures}")
