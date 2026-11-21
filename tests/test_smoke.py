@@ -12928,12 +12928,13 @@ if os.path.isfile(_r104_relay_ts):
     _r104_ts = open(_r104_relay_ts, encoding="utf-8").read()
     _r104_srv = open(os.path.join(ROOT, "devvit", "gaming-express", "src", "server", "server.ts"),
                      encoding="utf-8").read()
-    check("r104 devvit: six re-check stages through 48 h, approval/edit re-sends; the relay reads "
+    check("r104 devvit: five re-check stages through 24 h, approval/edit/spoiler re-sends; the relay reads "
           "no comments (owner's request — no `opComments`, no `post.comments.get`, no `oc:` key)",
-          all(str(stage) in _r104_ts for stage in (300, 1800, 7200, 21600, 86400))
+          all(str(stage) in _r104_ts for stage in (300, 1800, 7200, 21600))
           and "RECHECK_WINDOW_HOURS * 3600" in _r104_ts
           and "export function becameLive(" in _r104_ts
-          and "RECHECK_WINDOW_HOURS = 48" in _r104_ts
+          and "RECHECK_WINDOW_HOURS = 24" in _r104_ts
+          and "spoilerChanged(previous, item.spoiler)" in _r104_srv
           and "RECHECK_WINDOW_SECONDS = RECHECK_WINDOW_HOURS * 3600 + 1800" in _r104_srv
           and "reasons.push('approved')" in _r104_srv and "reasons.push('edited')" in _r104_srv
           and "opComment" not in _r104_ts and "opComment" not in _r104_srv
