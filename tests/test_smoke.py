@@ -1962,12 +1962,13 @@ check("r30/round-18/round-20/32/r63/r67/r95 gates: all skip paths record a pendi
       "content gate's call removed round 67 -- only removed-post-reason, "
       "archive-liveness, media-wait/partial-gallery and the round-95 liveness "
       "probe remain; ghost gates removed 2026-10-23)",
-      _r30_main.count("mark_pending(pending, unique_key") == 5
+      _r30_main.count("mark_pending(pending, unique_key") == 6
       and "mark_pending(pending, unique_key, _removed, now" in _r30_main
       and "mark_pending(pending, unique_key,\n" in _r30_main
       and 'mark_pending(pending, unique_key, "media_wait", now)' in _r30_main
       and 'mark_pending(pending, unique_key, "partial_gallery", now)' in _r30_main
       and "mark_pending(pending, unique_key, _hold_reason, now" in _r30_main
+      and 'mark_pending(pending, unique_key, _relay_hold, now' in _r30_main
       and "ghost-check" not in _r30_main
       and "arctic-ghost-check" not in _r30_main,
       str(_r30_main.count("mark_pending(pending, unique_key")))
@@ -11316,10 +11317,10 @@ v3._note_key({"hold_keys": "not a list"}, "hold_keys", {"key": "Sub_1xj"})
 check("r96c: _note_key can never raise into the delivery loop (missing/junk stats)",
       _r96c_missing == {"hold_keys": [{"key": "Sub_1xj"}]})
 _r96c_src96 = open(os.path.join(ROOT, "testing area/reddit_main_v3.py"), encoding="utf-8").read()
-check("r96c: both hold gates record the key they refused",
+check("r96c/r119: removal, queue and known-pending gates record the key they refused",
       '_note_key(run_stats, "hold_keys",' in _r96c_src96
       and '_note_key(run_stats, "known_pending_keys",' in _r96c_src96
-      and _r96c_src96.count('_note_key(run_stats, "hold_keys",') == 2)
+      and _r96c_src96.count('_note_key(run_stats, "hold_keys",') == 4)
 
 # Rendered through the real workflow step with a #11548-shaped record.
 _r96c_fake = {
@@ -12209,6 +12210,43 @@ check("r107: the main loop logs and counts the restore (relay_restores / relay_r
       and '"relay_restores": 0' in inspect.getsource(v3)
       and 'relay_listed_after_hold(pend, entry) is None' in inspect.getsource(v3._pending_throttle_skip))
 
+# Round 119 regression: the screenshots for #14980 showed clean v1 records paired with
+# newer v2 moderator-removal/deletion updates. Relay candidates must obey those updates
+# before the legacy liveness path is bypassed, and old terminal holds only reopen on a
+# clean, newer relay listing.
+_r119_v1 = dict(_r101_parsed, id="1y10xda", removed=None)
+_r119_removed = dict(_r119_v1, _update={"removed": "moderator", "deleted": False,
+                                       "_at": _r101_now - 60})
+_r119_removed_deleted = dict(_r119_v1, _update={"removed": "moderator", "deleted": True,
+                                               "_at": _r101_now - 60})
+_r119_deleted = dict(_r119_v1, _update={"removed": None, "deleted": True,
+                                       "_at": _r101_now - 60})
+_r119_queue = dict(_r119_v1, _update={"removed": "automod_filtered", "deleted": False,
+                                     "_at": _r101_now - 60})
+_r119_clean = dict(_r119_v1, _update={"removed": None, "deleted": False,
+                                     "_at": _r101_now - 60})
+_r119_stale_removed = dict(_r119_v1, removed="moderator",
+                           _update={"removed": None, "deleted": False, "_at": _r101_now - 60})
+check("r119: relay candidate state uses the newest v2 status; moderator removal/deletion and "
+      "AutoMod queue are held, while a clean v2 status is live and a stale v1 removal stays conservative",
+      v3.relay_candidate_hold_reason(_r119_removed) == "removed by moderators/filters"
+      and v3.relay_candidate_hold_reason(_r119_removed_deleted) == "deleted by author"
+      and v3.relay_candidate_hold_reason(_r119_deleted) == "deleted by author"
+      and v3.relay_candidate_hold_reason(_r119_queue) == "pending approval"
+      and v3.relay_candidate_hold_reason(_r119_clean) is None
+      and v3.relay_candidate_hold_reason(_r119_stale_removed) == "removed by moderators/filters")
+_r119_main = inspect.getsource(v3.main)
+_r119_status_gate = _r119_main.index("relay_candidate_hold_reason(entry.record)")
+_r119_processing = _r119_main.index("_eligible_for_cap.append((subreddit, post_path, unique_key")
+_r119_gate_source = _r119_main[_r119_status_gate:_r119_processing]
+check("r119: terminal relay evidence is held and continued before card processing; relay pending "
+      "removals are throttled unless the newer clean restore check passes",
+      "continue" in _r119_gate_source
+      and "_pending_throttle_skip(pending, unique_key, now, entry)" in _r119_gate_source
+      and "and (not isinstance(entry, _IntakeEntry) or _relay_terminal_pending)" in _r119_gate_source
+      and '"newly_rejected_removed"] += 1' in _r119_gate_source
+      and '"known_pending_suppressed"] += 1' in _r119_gate_source)
+
 # ---- Round 108 (2026-11-02): Arctic hardening for the OLD chain -------------
 # Reddit retires RSS on 2026-11-13; with the relay paused the backup chain leans
 # on Arctic Shift, whose known quirks (back-to-back timeouts, transient 429/5xx,
@@ -12955,9 +12993,11 @@ check("relay primary: primary mode is exclusive and unhealthy relay pauses witho
       and "INTAKE-PAUSED" in _r101_main and "INTAKE-SHADOW" in _r101_main
       and "INTAKE-FALLBACK" not in _r101_main
       and "run_stats[\"intake\"] = _intake_summary(intake)" in _r101_main)
-check("relay candidates bypass old pending throttle, fresh hold, liveness probes and persistent "
-      "media-wait throttles; legacy engine retains those gates",
-      'and not isinstance(entry, _IntakeEntry)\n                        and unique_key in pending' in _r101_main
+check("relay candidates bypass generic transient/fresh-age/archive probes, while relay removal "
+      "updates and never-recheck pending holds are still enforced",
+      "relay_candidate_hold_reason(entry.record)" in _r101_main
+      and "and (not isinstance(entry, _IntakeEntry) or _relay_terminal_pending)" in _r101_main
+      and "_pending_throttle_skip(pending, unique_key, now, entry)" in _r101_main
       and 'not isinstance(entry, _IntakeEntry)\n                        and FRESH_HOLD_SECONDS > 0' in _r101_main
       and 'if not TEST_POST_ID and not isinstance(entry, _IntakeEntry):\n                    _ls, _lwhy' in _r101_main
       and 'if not isinstance(entry, _IntakeEntry):\n                                mark_pending(pending, unique_key, "media_wait", now)' in _r101_main

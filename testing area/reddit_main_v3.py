@@ -2098,10 +2098,9 @@ def archive_listed_after_hold(pend, entry, now: float | None = None) -> float | 
 def _pending_throttle_skip(pending: dict, key: str, now: float, entry) -> bool:
     """Round 32: should this pending post be skipped (not re-verified) now?
 
-    Removed/deleted posts: always skipped — EXCEPT when the entry came from
-    RSS (entry is not an _ArcticEntry), i.e. the post re-appeared in the
-    feed with fresh content (a restore): the full pipeline runs and either
-    posts it (now live) or re-queues it (still shows a notice).
+    Removed/deleted posts: always skipped — EXCEPT when the entry is a
+    sufficiently new, clean RSS or relay listing (a restore): the full pipeline
+    runs and either posts it (now live) or re-queues it (still shows a notice).
     Round 108: an archive entry whose row was re-read clean AFTER the hold is
     let through by main() itself (`archive_listed_after_hold`, capped per run)
     before this throttle is consulted; this function keeps saying "skip" for
@@ -2975,10 +2974,11 @@ class _ArcticEntry:
 #     NOT probe the legacy RSS/Redlib/Arctic listing chain. This avoids silently
 #     mixing two engines. Set INTAKE_READER=off to deliberately select the old
 #     engine; shadow also runs the old engine for diagnostics.
-#   * Relay candidates bypass the legacy fresh-age floor, pending-recheck
-#     throttle, archive/liveness probes and legacy pending cache. Devvit status
-#     updates decide removal/approval; retryable relay media waits are simply
-#     retried from the next intake read.
+#   * Relay candidates bypass the legacy fresh-age floor, transient pending
+#     throttle and archive/liveness probes. The newest Devvit v2 status is still
+#     enforced before delivery: terminal removal/deletion holds stay suppressed
+#     until a newer clean relay listing confirms a restore; AutoMod queue holds
+#     remain retryable. Relay media waits retry from the next intake read.
 #   * INTAKE_READER=shadow: the old chain runs and decides; the relay is read
 #     for comparison (`INTAKE-SHADOW`). INTAKE_READER=off: the intake is not read
 #     and the old discovery engine is selected explicitly.
@@ -5184,6 +5184,29 @@ def relay_update_verdict(update: dict | None) -> tuple[str, str, str] | None:
     if reason:
         return "removed", f"relay re-check {when}: {reason}", "relay-update"
     return "live", f"relay re-check {when}: still listed on Reddit", "relay-update"
+
+
+def relay_candidate_hold_reason(record: dict | None) -> str | None:
+    """Return a hold reason carried by an unposted relay candidate, if any.
+
+    Relay candidates skip the legacy RSS/archive liveness probes, so their own
+    v1 record and newest v2 re-check must be applied before building a card.
+    The v2 re-check wins when it reports a removal/queue state; a clean v2
+    result does not erase an explicit removal marker in the v1 record — a
+    held post needs a clean, newer listing to be restored.
+    """
+    if not isinstance(record, dict):
+        return None
+    if bool(record.get("deleted")):
+        return "deleted by author"
+    update = record.get("_update")
+    if isinstance(update, dict):
+        if bool(update.get("deleted")):
+            return "deleted by author"
+        update_reason = _queue_or_removal_reason(update.get("removed"))
+        if update_reason:
+            return update_reason
+    return _queue_or_removal_reason(record.get("removed"))
 
 
 def relay_removal_reason_for(post_id: str | None) -> str | None:
@@ -9479,6 +9502,42 @@ async def main():
             # items BEFORE applying the per-run flood cap (MAX_POSTS_PER_RUN).
             _eligible_for_cap = []
             for subreddit, post_path, unique_key, published_ts, activity_ts, entry in new_posts:
+                # Relay entries skip legacy liveness probes, so honor the relay's
+                # own v1/v2 removal state before the candidate can reach delivery.
+                if not TEST_POST_ID and isinstance(entry, _IntakeEntry):
+                    _relay_hold = relay_candidate_hold_reason(entry.record)
+                    if _relay_hold:
+                        _prior_pending = pending.get(unique_key)
+                        _was_terminal_hold = (isinstance(_prior_pending, dict)
+                                              and _prior_pending.get("reason") in _NO_RECHECK_REASONS)
+                        if not DRY_RUN:
+                            mark_pending(pending, unique_key, _relay_hold, now,
+                                         source="relay", title=str(entry.record.get("title") or "")[:200],
+                                         published_ts=published_ts)
+                        if _relay_hold == "pending approval":
+                            run_stats["liveness_not_verified"] += 1
+                            _inc_reason(run_stats["liveness_by_reason"],
+                                        "relay re-check: pending approval")
+                            _note_key(run_stats, "hold_keys",
+                                      {"key": unique_key, "reason": _relay_hold,
+                                       "detail": "Devvit reports the post is still in an AutoMod queue",
+                                       "source": "relay", "gate": "relay-status"})
+                        elif _was_terminal_hold:
+                            run_stats["known_pending_suppressed"] += 1
+                            _inc_reason(run_stats["known_pending_by_reason"], _relay_hold)
+                            _note_key(run_stats, "known_pending_keys",
+                                      {"key": unique_key, "reason": _relay_hold})
+                        else:
+                            run_stats["newly_rejected_removed"] += 1
+                            _inc_reason(run_stats["newly_rejected_by_reason"], _relay_hold)
+                            _note_key(run_stats, "hold_keys",
+                                      {"key": unique_key, "reason": _relay_hold,
+                                       "detail": "Devvit relay reports removed/deleted",
+                                       "source": "relay", "gate": "relay-status"})
+                        logging.info(f"[{unique_key}] relay status is '{_relay_hold}' — "
+                                     "skipping Discord delivery.")
+                        continue
+
                 if (not TEST_POST_ID and not DRY_RUN and isinstance(entry, _IntakeEntry)
                         and isinstance(pending.get(unique_key), dict)
                         and pending[unique_key].get("reason") in _NO_RECHECK_REASONS
@@ -9519,13 +9578,17 @@ async def main():
                                      f"{int(max(0.0, now - _held_since) // 60)} min, but the "
                                      f"archive re-read it clean afterwards — restore, full "
                                      f"pipeline (live sources decide).")
-                # Round 30/32: pending-post recheck throttle — previously
-                # rejected/held posts are only re-checked once every
-                # PENDING_RECHECK_SECONDS (round 95c: default 5 min = one cron
-                # tick), and removed/deleted posts are not re-checked unless
-                # restored via RSS (or, round 108, re-read clean by the archive).
+                # Round 30/32 pending-post recheck throttle: retain it for RSS/archive
+                # candidates. Relay retries bypass ordinary transient throttles,
+                # but a never-recheck removal hold must still be suppressed unless
+                # relay_listed_after_hold above positively recognized a clean restore.
+                _relay_terminal_pending = (
+                    isinstance(entry, _IntakeEntry)
+                    and isinstance(pending.get(unique_key), dict)
+                    and pending[unique_key].get("reason") in _NO_RECHECK_REASONS
+                )
                 if (not TEST_POST_ID and not DRY_RUN
-                        and not isinstance(entry, _IntakeEntry)
+                        and (not isinstance(entry, _IntakeEntry) or _relay_terminal_pending)
                         and unique_key in pending
                         and _arc_listed is None
                         and _pending_throttle_skip(pending, unique_key, now, entry)):
@@ -9537,8 +9600,8 @@ async def main():
                         _note_key(run_stats, "known_pending_keys",
                                   {"key": unique_key, "reason": _pend_reason})
                         logging.debug(f"[{unique_key}] pending ({_pend_reason}) — "
-                                     f"not re-checking (removed posts re-enter via RSS "
-                                     f"when restored; entry expires at the 48 h window).")
+                                     f"not re-checking (relay/RSS must provide a newer "
+                                     f"clean listing; entry expires at the 48 h window).")
                     else:
                         _due_in = int(PENDING_RECHECK_SECONDS
                                       - (now - float(_pend.get("last_checked") or 0)))
