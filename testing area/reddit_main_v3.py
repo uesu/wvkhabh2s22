@@ -397,11 +397,11 @@ PENDING_RECHECK_SECONDS = _env_int("PENDING_RECHECK_SECONDS", 300)  # 5 min
 # PENDING_RECHECK_SECONDS Variable (set 1800 to restore the old behaviour).
 PENDING_MAX_AGE_SECONDS = REDDIT_MONITOR_WINDOW_HOURS * 3600  # same hour-based window
 
-# Round 44: delivered-post retraction/tombstone. Disabled by default; when on
-# the webhook is called with wait=true so Discord returns a message ID.
-RETRACT_DEAD_POSTS = os.getenv("RETRACT_DEAD_POSTS", "0").strip().lower() in ("1", "true", "yes", "on")
-RETRACT_MODE = os.getenv("RETRACT_MODE", "edit").strip().lower() or "edit"
-RETRACT_WINDOW_SECONDS = _env_int("RETRACT_WINDOW_SECONDS", 21600)
+# Legacy retraction helper is retained only for its offline historical tests;
+# production lifecycle actions are driven by Devvit intake updates below.
+LEGACY_RETRACTION_TEST_SWITCH = False
+LEGACY_RETRACT_MODE = "edit"
+LEGACY_RETRACT_WINDOW_SECONDS = 21600
 POSTED_MESSAGES_FILE = "posted_messages.json"
 # Additive mode: Reddit-flagged posts already blur media; this opt-in also
 # conceals their complete rendered body. Unset/false preserves body rendering.
@@ -1785,10 +1785,15 @@ def load_posted_messages() -> dict:
                         or (pages and index >= len(pages))
                         or any(not isinstance(page, dict) for page in pages)):
                     raise ValueError("invalid saved continuation progress")
-            if "message_ids" in record and (
-                    not isinstance(record["message_ids"], list)
-                    or any(not isinstance(mid, str) or not mid for mid in record["message_ids"])):
-                raise ValueError("invalid saved continuation message IDs")
+            for ids_field in ("message_ids", "extra_message_ids"):
+                if ids_field in record and (
+                        not isinstance(record[ids_field], list)
+                        or any(not isinstance(mid, str) or not mid for mid in record[ids_field])):
+                    raise ValueError("invalid saved Discord message IDs")
+            if "youtube_message_id" in record and (
+                    not isinstance(record["youtube_message_id"], str)
+                    or not record["youtube_message_id"]):
+                raise ValueError("invalid saved YouTube companion message ID")
             if not math.isfinite(float(record.get("continuation_retry_at") or 0)):
                 raise ValueError("invalid saved continuation retry time")
         return data
@@ -1872,7 +1877,8 @@ async def edit_relay_delivery(session, webhook_url: str, key: str,
 
 def save_posted_messages(messages: dict) -> None:
     def _msg_age_ok(v: dict, now: float) -> bool:
-        raw = v.get("continuation_completed_at", v.get("delivered_at"))
+        raw = v.get("retracted_at") if v.get("retracted") else v.get(
+            "continuation_completed_at", v.get("delivered_at"))
         if raw is None:
             return True
         try:
@@ -1880,14 +1886,15 @@ def save_posted_messages(messages: dict) -> None:
         except (TypeError, ValueError):
             return True
         window = (RELAY_EDIT_CACHE_SECONDS
-                  if v.get("relay_auto_edit") else RETRACT_WINDOW_SECONDS)
+                  if v.get("relay_auto_edit") or v.get("retracted")
+                  else LEGACY_RETRACT_WINDOW_SECONDS)
         return now - ts <= window
     try:
         now = time.time()
         pruned = {
             k: v for k, v in (messages or {}).items()
-            if isinstance(v, dict) and not v.get("retracted")
-            and (v.get("continuations") or _msg_age_ok(v, now))
+            if isinstance(v, dict) and ((v.get("continuations") and not v.get("retracted"))
+                                        or _msg_age_ok(v, now))
         }
         directory = os.path.dirname(os.path.abspath(POSTED_MESSAGES_FILE))
         temporary = None
@@ -5199,6 +5206,106 @@ def relay_update_for(post_id: str | None) -> dict | None:
     None when the relay has not looked at it (yet)."""
     upd = _INTAKE_UPDATES.get(str(post_id or "").lower())
     return upd if isinstance(upd, dict) else None
+
+
+def relay_update_is_retryable_queue(update: dict | None) -> bool:
+    """A currently AutoMod-filtered item is pending approval, not live or terminal."""
+    if not isinstance(update, dict) or bool(update.get("deleted")):
+        return False
+    category = str(update.get("removed") or "").strip().lower()
+    return category in _QUEUE_CATEGORIES
+
+
+def relay_approval_repost(entry_record: dict | None, prior: dict | None,
+                          latest_update: dict | None) -> bool:
+    """A confirmed approval may restore a card deleted by an earlier removal."""
+    reasons = {
+        part.strip().lower()
+        for part in str((entry_record or {}).get("resent") or "").split("+")
+        if part.strip()
+    }
+    return bool((prior or {}).get("retracted") and "approved" in reasons
+                and not _relay_update_removal_reason(latest_update)
+                and not relay_update_is_retryable_queue(latest_update))
+
+
+def _relay_update_removal_reason(update: dict | None) -> str | None:
+    """Return a terminal removal verdict; keep the retryable AutoMod queue live."""
+    if not isinstance(update, dict):
+        return None
+    if bool(update.get("deleted")):
+        return "deleted by author or Reddit"
+    category = str(update.get("removed") or "").strip().lower()
+    if not category or category in _QUEUE_CATEGORIES:
+        return None
+    return f"removed by Reddit ({category})"
+
+
+async def apply_relay_removal_updates(session, posted_messages: dict, now: float) -> int:
+    """Delete delivered Discord parts when Devvit reports a terminal removal.
+
+    The relay is the authority: no RSS/listing/mirror probes, no configurable
+    opt-in, and no inference from a missing listing. Pending AutoMod-filtered
+    posts are deliberately retained. A 404 is idempotent success (already gone).
+    """
+    deleted_cards = 0
+    changed = False
+    for key, record in list(posted_messages.items()):
+        if not isinstance(record, dict) or record.get("retracted"):
+            continue
+        post_id = extract_post_id(str(record.get("path") or "")) or key.rsplit("_", 1)[-1]
+        update = relay_update_for(post_id)
+        reason = _relay_update_removal_reason(update)
+        if not reason:
+            continue
+        delivered_at = record.get("delivered_at")
+        try:
+            if delivered_at is not None and now - float(delivered_at) > RELAY_EDIT_CACHE_SECONDS:
+                continue
+        except (TypeError, ValueError):
+            continue
+        subreddit = str(record.get("subreddit") or key.rsplit("_", 1)[0])
+        webhook_url = get_webhook_for_subreddit(subreddit)
+        ids = []
+        for value in [record.get("message_id"), *(record.get("message_ids") or []),
+                      *(record.get("extra_message_ids") or []),
+                      record.get("youtube_message_id")]:
+            message_id = str(value or "").strip()
+            if message_id and message_id not in ids:
+                ids.append(message_id)
+        if not webhook_url or not ids:
+            logging.warning("[%s] relay reported %s, but there is no stored Discord message ID to delete",
+                            key, reason)
+            continue
+        all_gone = True
+        for message_id in ids:
+            try:
+                async with session.delete(
+                    f"{webhook_url}/messages/{message_id}",
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as response:
+                    if response.status not in (200, 204, 404):
+                        all_gone = False
+                        logging.error("[%s] relay removal DELETE returned HTTP %s for message %s",
+                                      key, response.status, message_id)
+            except Exception as error:
+                all_gone = False
+                logging.error("[%s] relay removal DELETE failed (%s)", key,
+                              _sanitize_error_message(error))
+        if all_gone:
+            record["retracted"] = True
+            record["retracted_at"] = int(now)
+            record["retracted_reason"] = reason
+            record.pop("continuations", None)
+            record.pop("continuation_next", None)
+            record.pop("payload", None)
+            deleted_cards += 1
+            changed = True
+            logging.info("[%s] relay lifecycle removed %d Discord message(s): %s",
+                         key, len(ids), reason)
+    if changed:
+        save_posted_messages(posted_messages)
+    return deleted_cards
 
 
 def liveness_hold_decision(state: str, strict: bool) -> bool:
@@ -8589,12 +8696,12 @@ async def heal_proxy_video_message(session, webhook_url: str, message_id: str,
 
 
 async def retract_dead_posts(session, posted_messages: dict, now: float) -> None:
-    if not RETRACT_DEAD_POSTS or not posted_messages:
+    if not LEGACY_RETRACTION_TEST_SWITCH or not posted_messages:
         return
     for unique_key, record in list(posted_messages.items()):
         if not isinstance(record, dict) or record.get("retracted"):
             continue
-        if now - float(record.get("delivered_at") or 0) > RETRACT_WINDOW_SECONDS:
+        if now - float(record.get("delivered_at") or 0) > LEGACY_RETRACT_WINDOW_SECONDS:
             continue
         subreddit = record.get("subreddit") or unique_key.rsplit("_", 1)[0]
         path = record.get("path") or ""
@@ -8611,15 +8718,15 @@ async def retract_dead_posts(session, posted_messages: dict, now: float) -> None
             listing = None
         listing_ids, listing_oldest_age = listing if listing else (None, None)
         decision = reddit_signals.retraction_decision(
-            enabled=RETRACT_DEAD_POSTS,
-            mode=RETRACT_MODE,
+            enabled=LEGACY_RETRACTION_TEST_SWITCH,
+            mode=LEGACY_RETRACT_MODE,
             post_id=post_id,
             published_ts=float(record.get("published_ts") or record.get("delivered_at") or now),
             now=now,
             listing_ids=listing_ids,
             listing_oldest_age=listing_oldest_age,
             live_removal_reason=reason,
-            tail_margin_seconds=RETRACT_WINDOW_SECONDS,
+            tail_margin_seconds=LEGACY_RETRACT_WINDOW_SECONDS,
         )
         if not decision:
             continue
@@ -8900,6 +9007,9 @@ async def main():
                 # `ok` makes it the listing for this run; anything else falls
                 # through to the pre-round-101 chain below, unchanged.
                 intake = await fetch_intake_records(session, now)
+                if not DRY_RUN and _INTAKE_UPDATES:
+                    run_stats["relay_removed_cards"] = await apply_relay_removal_updates(
+                        session, posted_messages, now)
                 run_stats["intake"] = _intake_summary(intake)
                 relay_primary = (INTAKE_READER == "primary" and intake["status"] == "ok")
                 if intake["status"] == "off":
@@ -8953,6 +9063,7 @@ async def main():
                             continue
                         unique_key = f"{sub}_{post_id}"
                         relay_edit = False
+                        relay_repost = False
                         if isinstance(entry, _IntakeEntry):
                             prior = posted_messages.get(unique_key) or {}
                             try:
@@ -8960,12 +9071,17 @@ async def main():
                                 prior_revision = max(1, int(prior.get("relay_revision") or 1))
                             except (TypeError, ValueError):
                                 revision, prior_revision = 1, 1
+                            relay_repost = relay_approval_repost(
+                                entry.record, prior, relay_update_for(post_id))
                             relay_edit = bool(prior.get("message_id")
+                                              and not prior.get("retracted")
                                               and revision > prior_revision
                                               and prior.get("relay_auto_edit", True))
                             if relay_edit:
                                 entry.edit_existing = True
-                        if unique_key in posted and not relay_edit:
+                            if relay_repost:
+                                entry.repost_after_retraction = True
+                        if unique_key in posted and not relay_edit and not relay_repost:
                             run_stats["dedup_skipped_in_run"] += 1
                             logging.debug(f"[{unique_key}] already posted (dedup) — skipped at collect.")
                             continue
@@ -8974,7 +9090,7 @@ async def main():
                         published_ts = time.mktime(published_parsed) if published_parsed else now
                         updated_ts = time.mktime(updated_parsed) if updated_parsed else published_ts
                         activity_ts = max(published_ts, updated_ts)
-                        if (not is_first_run and not relay_edit
+                        if (not is_first_run and not relay_edit and not relay_repost
                                 and now - activity_ts > MAX_AGE_SECONDS):
                             continue
                         if provenance == "reddit-native":
@@ -9303,11 +9419,6 @@ async def main():
                 logging.info(f"Reddit monitor: no unposted candidates to consider (combined feed {run_stats['combined_entries']} entries, "
                              f"{run_stats['subreddits_represented']} of {run_stats['subreddits_configured']} subreddits represented; "
                              f"dedup skipped {run_stats['dedup_skipped_in_run']} in collect).")
-                if RETRACT_DEAD_POSTS and not DRY_RUN:
-                    try:
-                        await retract_dead_posts(session, posted_messages, now)
-                    except Exception as e:
-                        logging.error(f"Retract failed (no-candidates): {_sanitize_error_message(e)}")
                 # Persistence handling for no-candidates (including dry-run)
                 if DRY_RUN:
                     logging.info("DRY RUN finished (no candidates): cache NOT saved, Discord NOT touched.")
@@ -9828,10 +9939,10 @@ async def main():
 
                     inspect_video_response = _has_video_media(data)
                     target_url = f"{webhook_url}?with_components=true"
-                    # Video cards, retraction, multi-part bodies and relay edits
-                    # need confirmed message IDs; other ordinary cards keep the old POST.
+                    # Video cards, multi-part bodies and relay-delivered cards
+                    # need confirmed IDs for repair, continuation and lifecycle actions.
                     relay_auto_edit = isinstance(entry, _IntakeEntry)
-                    if RETRACT_DEAD_POSTS or inspect_video_response or continuations or relay_auto_edit:
+                    if inspect_video_response or continuations or relay_auto_edit:
                         target_url += "&wait=true"
                     if continuations:
                         # Persist before POST: a lost main response must not replay page one.
@@ -9850,7 +9961,7 @@ async def main():
                         main_post_connecting = False
                         if resp.status in (200, 204):
                             message_json = None
-                            if (RETRACT_DEAD_POSTS or inspect_video_response or continuations or relay_auto_edit) and resp.status == 200:
+                            if (inspect_video_response or continuations or relay_auto_edit) and resp.status == 200:
                                 try:
                                     message_json = await resp.json(content_type=None)
                                 except Exception:
@@ -9863,9 +9974,13 @@ async def main():
                             # against a subreddit's real approval latency without
                             # guessing (grep the Actions log for LATENCY).
                             _pend_entry = pending.pop(unique_key, None)  # posted — no longer pending
-                            if ((RETRACT_DEAD_POSTS or continuations or relay_auto_edit)
+                            if ((continuations or relay_auto_edit)
                                     and isinstance(message_json, dict) and message_json.get("id")):
-                                record = posted_messages.setdefault(unique_key, {})
+                                if getattr(entry, "repost_after_retraction", False):
+                                    record = {}
+                                    posted_messages[unique_key] = record
+                                else:
+                                    record = posted_messages.setdefault(unique_key, {})
                                 record.update({
                                     "subreddit": subreddit,
                                     "path": path,
@@ -9957,12 +10072,28 @@ async def main():
                             # thumb + animated button stay as they are.
                             if data.get("youtube_url") and YOUTUBE_LINK_MESSAGE:
                                 try:
+                                    _yt_url = f"{webhook_url}?wait=true" if relay_auto_edit else webhook_url
                                     async with session.post(
-                                        webhook_url,
+                                        _yt_url,
                                         json={"content": data["youtube_url"]},
                                         timeout=aiohttp.ClientTimeout(total=15),
                                     ) as yt_resp:
                                         if yt_resp.status in (200, 204):
+                                            if relay_auto_edit and yt_resp.status == 200:
+                                                try:
+                                                    _yt_message = await yt_resp.json(content_type=None)
+                                                    if isinstance(_yt_message, dict) and _yt_message.get("id"):
+                                                        _saved = posted_messages.get(unique_key) or {}
+                                                        _extras = list(_saved.get("extra_message_ids") or [])
+                                                        _extras.append(str(_yt_message["id"]))
+                                                        _saved["extra_message_ids"] = list(dict.fromkeys(_extras))
+                                                        _saved["youtube_message_id"] = str(_yt_message["id"])
+                                                        posted_messages[unique_key] = _saved
+                                                        save_posted_messages(posted_messages)
+                                                except Exception as _yt_id_error:
+                                                    logging.warning("[%s] YouTube companion delivered but its message ID "
+                                                                    "could not be saved (%s)", unique_key,
+                                                                    type(_yt_id_error).__name__)
                                             logging.info(f"YouTube link message posted: "
                                                          f"{data['youtube_url']}")
                                         else:
@@ -10030,8 +10161,6 @@ async def main():
                     for url, mid, payload, label, urls in proxy_video_heal_queue),
                     return_exceptions=True)
 
-            if RETRACT_DEAD_POSTS and not DRY_RUN:
-                await retract_dead_posts(session, posted_messages, now)
 
         _reach_line = log_redlib_reachability()   # round 49: which mirrors actually answered
         run_stats["redlib_instances_configured"] = len([

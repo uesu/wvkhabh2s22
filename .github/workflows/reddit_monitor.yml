@@ -140,12 +140,9 @@ jobs:
           # Round 67 (2026-10-07): the content-advisory gate and its four
           # Variables were REMOVED from the engine, so they no longer map
           # here (the engine makes no content-based posting decision on any
-          # path). The optional retraction seatbelt (round 44) remains.
+          # path). Relay lifecycle deletion is automatic and needs no setting.
           # Any Variable whose round-63-removed gate no longer exists is
           # likewise unmapped — see the round-63 note in .env.example.
-          RETRACT_DEAD_POSTS: ${{ vars.RETRACT_DEAD_POSTS }}
-          RETRACT_MODE: ${{ vars.RETRACT_MODE }}
-          RETRACT_WINDOW_SECONDS: ${{ vars.RETRACT_WINDOW_SECONDS }}
           # Two-day Reddit relisting/edit window, expressed in hours.
           REDDIT_MONITOR_WINDOW_HOURS: ${{ vars.REDDIT_MONITOR_WINDOW_HOURS }}
           # Opt-in: spoiler all media tiles (including video) and the full Reddit-marked body.

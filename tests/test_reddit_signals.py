@@ -164,7 +164,7 @@ async def _run_main_case(age_seconds=120, listing=(("abc123",), 600),
         "_fetch_new_listing", "verify_archive_post_live", "fetch_post_json",
         "resolve_post_media", "create_discohook_share", "load_posted",
         "load_pending", "save_posted", "save_pending", "save_posted_messages",
-        "load_posted_messages", "RETRACT_DEAD_POSTS", "aiohttp",
+        "load_posted_messages", "LEGACY_RETRACTION_TEST_SWITCH", "aiohttp",
         "FRESH_HOLD_SECONDS",
     ]
     old = {name: getattr(v3, name) for name in names}
@@ -177,7 +177,7 @@ async def _run_main_case(age_seconds=120, listing=(("abc123",), 600),
         v3.SUBREDDITS = ["TestSub"]
         v3.TEST_POST_ID = ""
         v3.DRY_RUN = False
-        v3.RETRACT_DEAD_POSTS = False
+        v3.LEGACY_RETRACTION_TEST_SWITCH = False
         if fresh_hold is not None:
             v3.FRESH_HOLD_SECONDS = fresh_hold
         # listing_confirm removed in 2026-10-21 cleanup — ignored if passed
@@ -385,7 +385,7 @@ check("r67: empty/unknown mode values fall back to the documented default",
       v3._env_mode("R67_UNSET_MODE_CHECK", "balanced", v3.VIDEO_QUALITY_MODES) == "balanced"
       and v3.VIDEO_QUALITY_MODE in v3.VIDEO_QUALITY_MODES
       and os.environ.get("REDDIT_VIDEO_QUALITY", "") != "bananas")
-check("static retraction disabled variable", "RETRACT_DEAD_POSTS" in _v3_src)
+check("static no configurable retraction variable", all(x not in _v3_src for x in ('os.getenv("RETRACT_DEAD_POSTS"', 'os.getenv("RETRACT_MODE"', 'os.getenv("RETRACT_WINDOW_SECONDS"')))
 check("static redlib memo cache", "_redlib_post_page_cache" in _v3_src)
 check("static proxy memo cache", "_proxy_post_cache" in _v3_src)
 check("r63: settle window, mod-queue gate, dup-media gate and repost gate symbols "
@@ -394,7 +394,7 @@ check("r63: settle window, mod-queue gate, dup-media gate and repost gate symbol
       and "MOD_QUEUE_GATE" not in _v3_src and "mod_queue_reason(" not in _v3_src
       and "DUP_MEDIA_GATE" not in _v3_src and "REPOST_GATE" not in _v3_src
       and "settle_holds(" not in _v3_src)
-check("static webhook wait true conditional", "&wait=true" in _main_src and "RETRACT_DEAD_POSTS" in _main_src)
+check("static relay cards request wait=true for saved message IDs", "&wait=true" in _main_src and "relay_auto_edit" in _main_src and "apply_relay_removal_updates" in _main_src)
 check("r67 workflow wires REDDIT_VIDEO_QUALITY as a Variable",
       "REDDIT_VIDEO_QUALITY: ${{ vars.REDDIT_VIDEO_QUALITY }}" in _wf)
 check("workflow persists posted_messages", "posted_messages.json" in _wf)

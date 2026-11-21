@@ -2966,10 +2966,14 @@ check("r42/r45 guard updated in round 67: the removed gate's repository "
       "Variables are unmapped",
       not any(_v in _r35_workflow for _v in _r35_removed_vars))
 check("r44: workflow persists posted_messages only when present", "posted_messages.json" in _r35_workflow and "-f posted_messages.json" in _r35_workflow)
-check("r44: wait=true is conditional on retraction", "&wait=true" in _r35_main_src and "RETRACT_DEAD_POSTS" in _r35_main_src)
+check("r44: relay messages request wait=true for safe lifecycle operations", "&wait=true" in _r35_main_src and "relay_auto_edit" in _r35_main_src)
 check("r42: signal module is side-effect-free (no aiohttp import)", "aiohttp" not in inspect.getsource(signals))
-check("r63: retraction defaults are OFF / edit / 6h, as specified",
-      v3.RETRACT_DEAD_POSTS is False and v3.RETRACT_MODE == "edit" and v3.RETRACT_WINDOW_SECONDS == 21600)
+_r63_v3_src = inspect.getsource(v3)
+check("r63: no user-configurable legacy retraction mode remains; relay lifecycle is always-on",
+      "os.getenv(\"RETRACT_DEAD_POSTS\"" not in _r63_v3_src
+      and "os.getenv(\"RETRACT_MODE\"" not in _r63_v3_src
+      and "os.getenv(\"RETRACT_WINDOW_SECONDS\"" not in _r63_v3_src
+      and "apply_relay_removal_updates" in _r63_v3_src)
 
 # ---- R63 end-to-end: retract_dead_posts actually drives the Discord call --
 class _R63Resp:
@@ -3034,12 +3038,12 @@ def _r63_record(now):
 
 
 async def _r63_run(mode, enabled, window, now, listing_result, live_reason):
-    saved = (v3.RETRACT_DEAD_POSTS, v3.RETRACT_MODE, v3.RETRACT_WINDOW_SECONDS,
+    saved = (v3.LEGACY_RETRACTION_TEST_SWITCH, v3.LEGACY_RETRACT_MODE, v3.LEGACY_RETRACT_WINDOW_SECONDS,
              v3._fetch_new_listing, v3.live_removal_reason, v3.get_webhook_for_subreddit)
     try:
-        v3.RETRACT_DEAD_POSTS = enabled
-        v3.RETRACT_MODE = mode
-        v3.RETRACT_WINDOW_SECONDS = window
+        v3.LEGACY_RETRACTION_TEST_SWITCH = enabled
+        v3.LEGACY_RETRACT_MODE = mode
+        v3.LEGACY_RETRACT_WINDOW_SECONDS = window
 
         async def _fake_listing(session, subreddit):
             return listing_result
@@ -3055,7 +3059,7 @@ async def _r63_run(mode, enabled, window, now, listing_result, live_reason):
         await v3.retract_dead_posts(session, records, now)
         return session, records
     finally:
-        (v3.RETRACT_DEAD_POSTS, v3.RETRACT_MODE, v3.RETRACT_WINDOW_SECONDS,
+        (v3.LEGACY_RETRACTION_TEST_SWITCH, v3.LEGACY_RETRACT_MODE, v3.LEGACY_RETRACT_WINDOW_SECONDS,
          v3._fetch_new_listing, v3.live_removal_reason, v3.get_webhook_for_subreddit) = saved
 
 
@@ -5193,14 +5197,14 @@ def _test_full_body_delivery_resume():
     class ConnectorError(Exception):
         pass
 
-    original = (v3.POSTED_MESSAGES_FILE, v3.RETRACT_DEAD_POSTS, v3.asyncio.sleep,
+    original = (v3.POSTED_MESSAGES_FILE, v3.LEGACY_RETRACTION_TEST_SWITCH, v3.asyncio.sleep,
                 v3._DISCORD_CONNECTOR_ERRORS)
     async def no_wait(_delay):
         pass
     try:
         with tempfile.TemporaryDirectory() as tmp:
             v3.POSTED_MESSAGES_FILE = str(Path(tmp) / "messages.json")
-            v3.RETRACT_DEAD_POSTS = False
+            v3.LEGACY_RETRACTION_TEST_SWITCH = False
             v3.asyncio.sleep = no_wait
             v3._DISCORD_CONNECTOR_ERRORS = (ConnectorError,)
             pages = v3.build_continuation_payloads("x" * 18000)
@@ -5223,7 +5227,7 @@ def _test_full_body_delivery_resume():
             assert resume.calls == pages[1:] and settled["continuations"] == []
             assert settled["message_ids"] == ["main"] + [f"page{i+1}" for i in range(len(pages))]
             # Completion after a long deferral must survive until ordinary dedup saves.
-            records["old"] = {"delivered_at": time.time() - v3.RETRACT_WINDOW_SECONDS - 3600,
+            records["old"] = {"delivered_at": time.time() - v3.LEGACY_RETRACT_WINDOW_SECONDS - 3600,
                               "message_id": "old-main", "message_ids": ["old-main"],
                               "continuations": pages[:1], "continuation_next": 0}
             asyncio.run(v3.deliver_body_continuations(
@@ -5274,7 +5278,7 @@ def _test_full_body_delivery_resume():
                 else:
                     raise AssertionError("corrupt delivery cache silently discarded")
     finally:
-        (v3.POSTED_MESSAGES_FILE, v3.RETRACT_DEAD_POSTS, v3.asyncio.sleep,
+        (v3.POSTED_MESSAGES_FILE, v3.LEGACY_RETRACTION_TEST_SWITCH, v3.asyncio.sleep,
          v3._DISCORD_CONNECTOR_ERRORS) = original
 
 try:
@@ -5711,12 +5715,12 @@ class _R66Session:
 
 
 async def _r66_run(mode, fail_part=None):
-    saved = (v3.RETRACT_DEAD_POSTS, v3.RETRACT_MODE, v3.RETRACT_WINDOW_SECONDS,
+    saved = (v3.LEGACY_RETRACTION_TEST_SWITCH, v3.LEGACY_RETRACT_MODE, v3.LEGACY_RETRACT_WINDOW_SECONDS,
              v3._fetch_new_listing, v3.live_removal_reason, v3.get_webhook_for_subreddit)
     try:
-        v3.RETRACT_DEAD_POSTS = True
-        v3.RETRACT_MODE = mode
-        v3.RETRACT_WINDOW_SECONDS = 21600
+        v3.LEGACY_RETRACTION_TEST_SWITCH = True
+        v3.LEGACY_RETRACT_MODE = mode
+        v3.LEGACY_RETRACT_WINDOW_SECONDS = 21600
 
         async def _fake_listing(session, subreddit):
             return ({"zzz_other"}, 7200)
@@ -5733,7 +5737,7 @@ async def _r66_run(mode, fail_part=None):
         await v3.retract_dead_posts(session, records, _r63_now)
         return session, records
     finally:
-        (v3.RETRACT_DEAD_POSTS, v3.RETRACT_MODE, v3.RETRACT_WINDOW_SECONDS,
+        (v3.LEGACY_RETRACTION_TEST_SWITCH, v3.LEGACY_RETRACT_MODE, v3.LEGACY_RETRACT_WINDOW_SECONDS,
          v3._fetch_new_listing, v3.live_removal_reason,
          v3.get_webhook_for_subreddit) = saved
 
@@ -5781,12 +5785,11 @@ check("r66 updated: reddit_monitor.yml — all 12 stale env mappings fully gone 
 check("r66 updated: reddit_monitor.yml — FRESH_HOLD_SECONDS wired, LISTING_CONFIRM removed",
       "FRESH_HOLD_SECONDS: ${{ vars.FRESH_HOLD_SECONDS }}" in _r66_wf
       and "LISTING_CONFIRM" not in _r66_wf)
-check("r66: reddit_monitor.yml — kept mappings intact (pending recheck, "
-      "retraction); r67 guard update: the removed gate's four Variables are "
-      "no longer part of this list, and REDDIT_VIDEO_QUALITY joined it",
+check("r66: reddit_monitor.yml keeps supported runtime settings and removes all retraction Variables",
       all(f"{_n}: ${{{{ vars.{_n} }}}}" in _r66_wf for _n in
-          ["PENDING_RECHECK_SECONDS", "RETRACT_DEAD_POSTS", "RETRACT_MODE",
-           "RETRACT_WINDOW_SECONDS", "REDDIT_VIDEO_QUALITY"]))
+          ["PENDING_RECHECK_SECONDS", "REDDIT_VIDEO_QUALITY"])
+      and all(_n not in _r66_wf for _n in
+              ["RETRACT_DEAD_POSTS", "RETRACT_MODE", "RETRACT_WINDOW_SECONDS"]))
 check("r66: reddit_monitor.yml — round-61 deploy steps untouched",
       "Sync to the live branch tip" in _r66_wf
       and "git reset --hard FETCH_HEAD" in _r66_wf
@@ -6985,9 +6988,9 @@ check("r72: both repository Variables are workflow-wired",
       all(f"{name}: ${{{{ vars.{name} }}}}" in _r72_workflow
           for name in ("PROXY_VIDEO_HEAL", "PROXY_VIDEO_HEAL_DELAY")))
 # Full-body delivery also needs confirmed IDs; preserve both original conditions.
-check("r72: video/retract/continuation cards request wait=true and read the created message",
-      "if RETRACT_DEAD_POSTS or inspect_video_response or continuations or relay_auto_edit:" in _r72_main
-      and "if (RETRACT_DEAD_POSTS or inspect_video_response or continuations or relay_auto_edit) and resp.status == 200:" in _r72_main)
+check("r72: video/continuation/relay cards request wait=true and read the created message",
+      "if inspect_video_response or continuations or relay_auto_edit:" in _r72_main
+      and "if (inspect_video_response or continuations or relay_auto_edit) and resp.status == 200:" in _r72_main)
 check("r72: only an explicit unresolved item with message ID queues an edit after posting loop",
       "unresolved = _unresolved_healable_video_items(message_json, data)" in _r72_main
       and "if (unresolved and isinstance(message_json, dict)" in _r72_main
@@ -7078,7 +7081,7 @@ async def _r72_main_case(media, response, current=None, enabled=True,
                 (v3, "PROXY_MEDIA", False),
                 (v3, "PROXY_VIDEO_HEAL", enabled),
                 (v3, "PROXY_VIDEO_HEAL_DELAY", 6),
-                (v3, "RETRACT_DEAD_POSTS", retract),
+                (v3, "LEGACY_RETRACTION_TEST_SWITCH", retract),
                 (v3, "aiohttp", _Aio),
                 (v3, "fetch_post_json", AsyncMock(return_value=base)),
                 (v3, "resolve_post_media", AsyncMock(return_value=data)),
@@ -7178,7 +7181,7 @@ async def _test_completed_continuations_recover_missing_dedup(ambiguous=False):
                 ("_RUN_RESULT_FILE", str(Path(tmp) / "result.json")),
                 ("SUBREDDITS", ["TestSub"]), ("TEST_POST_ID", ""),
                 ("DRY_RUN", False), ("PROXY_MEDIA", False),
-                ("RETRACT_DEAD_POSTS", False), ("FRESH_HOLD_SECONDS", 0),
+                ("LEGACY_RETRACTION_TEST_SWITCH", False), ("FRESH_HOLD_SECONDS", 0),
                 ("aiohttp", SimpleNamespace(ClientSession=Session,
                                              ClientTimeout=lambda total=None: None)),
                 ("fetch_combined_feed", AsyncMock(return_value=SimpleNamespace(entries=[
@@ -7311,10 +7314,9 @@ check("r72 main: Discord 204 without JSON skips repair but caches delivery",
       and "TestSub_abc123" in _r72_posted_204)
 _r72_main_retract, _, _r72_records = asyncio.run(_r72_main_case(
     [{"kind": "video", "url": _r72_url}], _r72_good_message, retract=True))
-check("r72 main: retraction seatbelt still records original ID with no heal for healthy video",
+check("r72 main: a healthy non-relay video is not retracted or placed in the relay lifecycle cache",
       not _r72_main_retract.gets and not _r72_main_retract.patches
-      and _r72_records["TestSub_abc123"]["message_id"] == "msg1"
-      and _r72_records["TestSub_abc123"]["payload"] == _r72_main_retract.posts[0][1])
+      and "TestSub_abc123" not in _r72_records)
 
 # Crosspost regressions live in this already-registered runner, not a new file.
 import unittest
@@ -7974,11 +7976,11 @@ async def _r21_feed_coverage_all_posted():
     combined_entries = [_E2("Zenlesszonezeroleaks_","aaa"), _E2("AnantaLeaks","bbb")]
     class _F: entries = combined_entries
     # Mock the feed to return those entries
-    old_vals = {k: getattr(v3, k) for k in ["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts","_ArcticEntry"]}
+    old_vals = {k: getattr(v3, k) for k in ["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts","_ArcticEntry"]}
     pending={}
     try:
         v3.SUBREDDITS=["Zenlesszonezeroleaks_","AnantaLeaks","Genshin_Impact_Leaks"]
-        v3.TEST_POST_ID=""; v3.DRY_RUN=False; v3.RETRACT_DEAD_POSTS=False; v3.FRESH_HOLD_SECONDS=0
+        v3.TEST_POST_ID=""; v3.DRY_RUN=False; v3.LEGACY_RETRACTION_TEST_SWITCH=False; v3.FRESH_HOLD_SECONDS=0
         v3.fetch_combined_feed=lambda s: asyncio.sleep(0, result=_F())
         v3.verify_archive_post_live=lambda s,p,label="",feed_ok=True: asyncio.sleep(0, result=(True,"live"))
         v3.fetch_post_json=lambda s,pid,use_oauth=False: asyncio.sleep(0, result=None)
@@ -8025,11 +8027,11 @@ async def _r21_archive_not_inflate():
             self["content"]=[{"value":"b"}]; self["summary"]="b"
     combined_entries = [_E2("Zenlesszonezeroleaks_","aaa")]
     class _F: entries = combined_entries
-    old_vals={k: getattr(v3,k) for k in ["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts","_ArcticEntry"]}
+    old_vals={k: getattr(v3,k) for k in ["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts","_ArcticEntry"]}
     pending={}
     try:
         v3.SUBREDDITS=["Zenlesszonezeroleaks_","AnantaLeaks"]
-        v3.TEST_POST_ID=""; v3.DRY_RUN=False; v3.RETRACT_DEAD_POSTS=False; v3.FRESH_HOLD_SECONDS=0
+        v3.TEST_POST_ID=""; v3.DRY_RUN=False; v3.LEGACY_RETRACTION_TEST_SWITCH=False; v3.FRESH_HOLD_SECONDS=0
         v3.fetch_combined_feed=lambda s: asyncio.sleep(0, result=_F())
         v3.verify_archive_post_live=lambda s,p,label="",feed_ok=True: asyncio.sleep(0, result=(True,"live"))
         v3.fetch_post_json=lambda s,pid,use_oauth=False: asyncio.sleep(0, result=None)
@@ -8104,9 +8106,9 @@ check("r21: wrong-shaped JSON (list) handled without crash", "Combined-feed entr
 
 # Partial monitor failure: incomplete flag preserved, exception not masked
 async def _r21_partial_failure():
-    old_vals={k: getattr(v3,k) for k in ["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","aiohttp","FRESH_HOLD_SECONDS"]}
+    old_vals={k: getattr(v3,k) for k in ["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","aiohttp","FRESH_HOLD_SECONDS"]}
     try:
-        v3.SUBREDDITS=["TestSub"]; v3.TEST_POST_ID=""; v3.DRY_RUN=False; v3.RETRACT_DEAD_POSTS=False; v3.FRESH_HOLD_SECONDS=0
+        v3.SUBREDDITS=["TestSub"]; v3.TEST_POST_ID=""; v3.DRY_RUN=False; v3.LEGACY_RETRACTION_TEST_SWITCH=False; v3.FRESH_HOLD_SECONDS=0
         v3.fetch_combined_feed=lambda s: (_ for _ in ()).throw(RuntimeError("boom"))  # will raise
         v3.load_posted=lambda: set(); v3.load_pending=lambda: {}
         v3.save_posted=lambda posted, keep_newest=frozenset(): set(posted)
@@ -8145,9 +8147,9 @@ async def _r21_secret_sanitized():
     # Synthetic secret-bearing exception through real main() -> report JSON + summary + logs
     synthetic_secret = "https://discord.com/api/webhooks/123456/SECRET_TOKEN_abc123_xyz"
     token_url = "https://example.com/api?token=SECRET_TOKEN_abc123_xyz"
-    old_vals = {k: getattr(v3, k) for k in ["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","aiohttp","FRESH_HOLD_SECONDS"]}
+    old_vals = {k: getattr(v3, k) for k in ["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","aiohttp","FRESH_HOLD_SECONDS"]}
     try:
-        v3.SUBREDDITS=["TestSub"]; v3.TEST_POST_ID=""; v3.DRY_RUN=False; v3.RETRACT_DEAD_POSTS=False; v3.FRESH_HOLD_SECONDS=0
+        v3.SUBREDDITS=["TestSub"]; v3.TEST_POST_ID=""; v3.DRY_RUN=False; v3.LEGACY_RETRACTION_TEST_SWITCH=False; v3.FRESH_HOLD_SECONDS=0
         # Failure before processing with secret in exception
         def _boom(s):
             raise RuntimeError(f"failed to fetch {synthetic_secret} with {token_url} and Authorization: Bearer SECRET_BEARER_123")
@@ -8281,8 +8283,8 @@ async def _r21_test_normal_success():
             self["published_parsed"]=time.gmtime(time.time()-120); self["updated_parsed"]=self["published_parsed"]
             self["content"]=[{"value":"b"}]; self["summary"]="b"
     class _F: entries=[_E()]
-    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
-           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"RETRACT_DEAD_POSTS":False,"FRESH_HOLD_SECONDS":0,
+    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
+           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"LEGACY_RETRACTION_TEST_SWITCH":False,"FRESH_HOLD_SECONDS":0,
                   "fetch_combined_feed":lambda s: asyncio.sleep(0, result=_F()),
                   "verify_archive_post_live":lambda s,p,label="",feed_ok=True: asyncio.sleep(0, result=(True,"live")),
                   "fetch_post_json":lambda s,pid,use_oauth=False: asyncio.sleep(0, result=None),
@@ -8310,8 +8312,8 @@ asyncio.run(_r21_test_normal_success())
 # Test no candidates -> completed true, persistence unchanged
 async def _r21_test_no_candidates():
     class _F: entries=[]
-    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
-           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"RETRACT_DEAD_POSTS":False,"FRESH_HOLD_SECONDS":0,
+    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
+           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"LEGACY_RETRACTION_TEST_SWITCH":False,"FRESH_HOLD_SECONDS":0,
                   "fetch_combined_feed":lambda s: asyncio.sleep(0, result=_F()),
                   "load_posted":lambda: set(),
                   "load_pending":lambda: {},
@@ -8338,8 +8340,8 @@ async def _r21_test_dry_run():
             self["published_parsed"]=time.gmtime(time.time()-120); self["updated_parsed"]=self["published_parsed"]
             self["content"]=[{"value":"b"}]; self["summary"]="b"
     class _F: entries=[_E()]
-    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
-           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":True,"RETRACT_DEAD_POSTS":False,"FRESH_HOLD_SECONDS":0,
+    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
+           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":True,"LEGACY_RETRACTION_TEST_SWITCH":False,"FRESH_HOLD_SECONDS":0,
                   "fetch_combined_feed":lambda s: asyncio.sleep(0, result=_F()),
                   "verify_archive_post_live":lambda s,p,label="",feed_ok=True: asyncio.sleep(0, result=(True,"live")),
                   "fetch_post_json":lambda s,pid,use_oauth=False: asyncio.sleep(0, result=None),
@@ -8365,8 +8367,8 @@ asyncio.run(_r21_test_dry_run())
 
 # Test failure before processing -> incomplete, persistence not-reached
 async def _r21_test_failure_before():
-    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","aiohttp","FRESH_HOLD_SECONDS"],
-           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"RETRACT_DEAD_POSTS":False,"FRESH_HOLD_SECONDS":0,
+    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","aiohttp","FRESH_HOLD_SECONDS"],
+           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"LEGACY_RETRACTION_TEST_SWITCH":False,"FRESH_HOLD_SECONDS":0,
                   "fetch_combined_feed":lambda s: (_ for _ in ()).throw(RuntimeError("boom before")),
                   "load_posted":lambda: set(),
                   "load_pending":lambda: {},
@@ -8398,8 +8400,8 @@ async def _r21_test_failure_during_persistence():
     class _F: entries=[_E()]
     def _fail_save(posted, keep_newest=frozenset()):
         raise OSError("disk full")
-    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
-           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"RETRACT_DEAD_POSTS":False,"FRESH_HOLD_SECONDS":0,
+    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
+           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"LEGACY_RETRACTION_TEST_SWITCH":False,"FRESH_HOLD_SECONDS":0,
                   "fetch_combined_feed":lambda s: asyncio.sleep(0, result=_F()),
                   "verify_archive_post_live":lambda s,p,label="",feed_ok=True: asyncio.sleep(0, result=(True,"live")),
                   "fetch_post_json":lambda s,pid,use_oauth=False: asyncio.sleep(0, result=None),
@@ -8425,8 +8427,8 @@ asyncio.run(_r21_test_failure_during_persistence())
 async def _r21_test_unchanged_vs_saved():
     # Unchanged: no new posts, so posted == posted_at_start, persistence unchanged
     class _F0: entries=[]
-    mocks0={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
-           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"RETRACT_DEAD_POSTS":False,"FRESH_HOLD_SECONDS":0,
+    mocks0={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
+           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"LEGACY_RETRACTION_TEST_SWITCH":False,"FRESH_HOLD_SECONDS":0,
                   "fetch_combined_feed":lambda s: asyncio.sleep(0, result=_F0()),
                   "load_posted":lambda: {"TestSub_existing"},
                   "load_pending":lambda: {},
@@ -8448,8 +8450,8 @@ async def _r21_test_unchanged_vs_saved():
             self["published_parsed"]=time.gmtime(time.time()-120); self["updated_parsed"]=self["published_parsed"]
             self["content"]=[{"value":"b"}]; self["summary"]="b"
     class _F1: entries=[_E()]
-    mocks1={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
-           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"RETRACT_DEAD_POSTS":False,"FRESH_HOLD_SECONDS":0,
+    mocks1={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
+           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"LEGACY_RETRACTION_TEST_SWITCH":False,"FRESH_HOLD_SECONDS":0,
                   "fetch_combined_feed":lambda s: asyncio.sleep(0, result=_F1()),
                   "verify_archive_post_live":lambda s,p,label="",feed_ok=True: asyncio.sleep(0, result=(True,"live")),
                   "fetch_post_json":lambda s,pid,use_oauth=False: asyncio.sleep(0, result=None),
@@ -8488,8 +8490,8 @@ async def _r21_test_provider_diagnostics():
     class _MockProxy:
         async def proxy_warmup(self, session):
             return {"vxreddit":{"ok":True,"detail":"1 media"}, "redditez":{"ok":False,"detail":"down"}, "embeddit":{"ok":True,"detail":"2 media"}}
-    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts","reddit_proxy"],
-           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"RETRACT_DEAD_POSTS":False,"FRESH_HOLD_SECONDS":0,
+    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts","reddit_proxy"],
+           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"LEGACY_RETRACTION_TEST_SWITCH":False,"FRESH_HOLD_SECONDS":0,
                   "fetch_combined_feed":lambda s: asyncio.sleep(0, result=_F()),
                   "verify_archive_post_live":lambda s,p,label="",feed_ok=True: asyncio.sleep(0, result=(True,"live")),
                   "fetch_post_json":lambda s,pid,use_oauth=False: asyncio.sleep(0, result=None),
@@ -8718,8 +8720,8 @@ async def _r21_test_mocked_impl_quality_retains_base():
             self["published_parsed"]=__import__("time").gmtime(__import__("time").time()-120); self["updated_parsed"]=self["published_parsed"]
             self["content"]=[{"value":"b"}]; self["summary"]="b"
     class _F: entries=[_E()]
-    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
-           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"RETRACT_DEAD_POSTS":False,"FRESH_HOLD_SECONDS":0,
+    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
+           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"LEGACY_RETRACTION_TEST_SWITCH":False,"FRESH_HOLD_SECONDS":0,
                   "fetch_combined_feed":lambda s: __import__("asyncio").sleep(0, result=_F()),
                   "verify_archive_post_live":lambda s,p,label="",feed_ok=True: __import__("asyncio").sleep(0, result=(True,"live")),
                   "fetch_post_json":lambda s,pid,use_oauth=False: __import__("asyncio").sleep(0, result=None),
@@ -8895,8 +8897,8 @@ async def _r21_test_mocked_impl_enrichment_preserves_provenance():
         v3.reddit_proxy = _DummyProxy2()
     v3.fetch_proxy_post_memo = _mock_proxy_img
     v3.enrich_gallery_redlib = _mock_enrich_fail
-    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
-           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"RETRACT_DEAD_POSTS":False,"FRESH_HOLD_SECONDS":0,
+    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","create_discohook_share","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
+           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"LEGACY_RETRACTION_TEST_SWITCH":False,"FRESH_HOLD_SECONDS":0,
                   "fetch_combined_feed":lambda s: __import__("asyncio").sleep(0, result=_F()),
                   "verify_archive_post_live":lambda s,p,label="",feed_ok=True: __import__("asyncio").sleep(0, result=(True,"live")),
                   "fetch_post_json":lambda s,pid,use_oauth=False: __import__("asyncio").sleep(0, result=None),
@@ -9020,8 +9022,8 @@ async def _r21_test_mocked_impl_heal_no_patch_on_cleared():
             self["published_parsed"]=__import__("time").gmtime(__import__("time").time()-120); self["updated_parsed"]=self["published_parsed"]
             self["content"]=[{"value":"b"}]; self["summary"]="b"
     class _F: entries=[_E()]
-    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts","PROXY_VIDEO_HEAL","PROXY_VIDEO_HEAL_DELAY"],
-           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"RETRACT_DEAD_POSTS":False,"FRESH_HOLD_SECONDS":0,"PROXY_VIDEO_HEAL":True,"PROXY_VIDEO_HEAL_DELAY":0,
+    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","verify_archive_post_live","fetch_post_json","resolve_post_media","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts","PROXY_VIDEO_HEAL","PROXY_VIDEO_HEAL_DELAY"],
+           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"LEGACY_RETRACTION_TEST_SWITCH":False,"FRESH_HOLD_SECONDS":0,"PROXY_VIDEO_HEAL":True,"PROXY_VIDEO_HEAL_DELAY":0,
                   "fetch_combined_feed":lambda s: __import__("asyncio").sleep(0, result=_F()),
                   "verify_archive_post_live":lambda s,p,label="",feed_ok=True: __import__("asyncio").sleep(0, result=(True,"live")),
                   "fetch_post_json":lambda s,pid,use_oauth=False: __import__("asyncio").sleep(0, result=None),
@@ -9045,8 +9047,8 @@ asyncio.run(_r21_test_mocked_impl_heal_no_patch_on_cleared())
 async def _r21_test_finalization_not_overwrite():
     # Simulate failure after successful persistence would have been written, ensure finally doesn't overwrite
     class _F: entries=[]
-    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","RETRACT_DEAD_POSTS","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
-           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"RETRACT_DEAD_POSTS":False,"FRESH_HOLD_SECONDS":0,
+    mocks={"patch":["SUBREDDITS","TEST_POST_ID","DRY_RUN","fetch_combined_feed","load_posted","load_pending","save_posted","save_pending","save_posted_messages","load_posted_messages","LEGACY_RETRACTION_TEST_SWITCH","aiohttp","FRESH_HOLD_SECONDS","fetch_arctic_subreddit_posts"],
+           "set":{"SUBREDDITS":["TestSub"],"TEST_POST_ID":"","DRY_RUN":False,"LEGACY_RETRACTION_TEST_SWITCH":False,"FRESH_HOLD_SECONDS":0,
                   "fetch_combined_feed":lambda s: asyncio.sleep(0, result=_F()),
                   "load_posted":lambda: set(),
                   "load_pending":lambda: {},
@@ -9435,10 +9437,10 @@ async def _check_r86_all_fixes():
     mocks_9651 = {
         "patch": ["SUBREDDITS", "TEST_POST_ID", "DRY_RUN", "fetch_combined_feed", "verify_archive_post_live",
                   "fetch_post_json", "resolve_post_media", "create_discohook_share", "load_posted", "load_pending",
-                  "save_posted", "save_pending", "save_posted_messages", "load_posted_messages", "RETRACT_DEAD_POSTS",
+                  "save_posted", "save_pending", "save_posted_messages", "load_posted_messages", "LEGACY_RETRACTION_TEST_SWITCH",
                   "aiohttp", "FRESH_HOLD_SECONDS", "fetch_arctic_subreddit_posts", "fetch_working_reddit_feed"],
         "set": {
-            "SUBREDDITS": ["TestSub"], "TEST_POST_ID": "", "DRY_RUN": False, "RETRACT_DEAD_POSTS": False,
+            "SUBREDDITS": ["TestSub"], "TEST_POST_ID": "", "DRY_RUN": False, "LEGACY_RETRACTION_TEST_SWITCH": False,
             "FRESH_HOLD_SECONDS": 0,
             "fetch_combined_feed": lambda s: asyncio.sleep(0, result=_EmptyFeed9651()),
             "fetch_working_reddit_feed": lambda s, sub: asyncio.sleep(0, result=_EmptyFeed9651()),
@@ -12430,7 +12432,7 @@ async def _r108c_main():
     _now = time.time()
     _keep = ["SUBREDDITS", "TEST_POST_ID", "DRY_RUN", "fetch_combined_feed", "verify_archive_post_live",
              "fetch_post_json", "resolve_post_media", "create_discohook_share", "load_posted", "load_pending",
-             "save_posted", "save_pending", "save_posted_messages", "load_posted_messages", "RETRACT_DEAD_POSTS",
+             "save_posted", "save_pending", "save_posted_messages", "load_posted_messages", "LEGACY_RETRACTION_TEST_SWITCH",
              "aiohttp", "FRESH_HOLD_SECONDS", "fetch_arctic_subreddit_posts", "fetch_arctic_posts_by_ids",
              "fetch_subreddit_feed", "INTAKE_CHANNEL_ID", "DISCORD_BOT_TOKEN", "ARCTIC_RESTORE_MAX_PER_RUN"]
     old_vals = {k: getattr(v3, k) for k in _keep if hasattr(v3, k)}
@@ -12449,7 +12451,7 @@ async def _r108c_main():
     saved = {}
     try:
         v3.SUBREDDITS = ["AnantaLeaks"]
-        v3.TEST_POST_ID = ""; v3.DRY_RUN = False; v3.RETRACT_DEAD_POSTS = False; v3.FRESH_HOLD_SECONDS = 0
+        v3.TEST_POST_ID = ""; v3.DRY_RUN = False; v3.LEGACY_RETRACTION_TEST_SWITCH = False; v3.FRESH_HOLD_SECONDS = 0
         v3.INTAKE_CHANNEL_ID = ""; v3.DISCORD_BOT_TOKEN = ""; v3.ARCTIC_RESTORE_MAX_PER_RUN = 5
         v3.fetch_combined_feed = lambda s: asyncio.sleep(0, result=_F())
         v3.fetch_subreddit_feed = lambda s, sub: asyncio.sleep(0, result=_F())
@@ -12865,7 +12867,7 @@ check("r104 pipeline: a relay record the CDN could NOT complete keeps the round-
       f"{_r104_calls2}")
 
 async def _r104_retract():
-    saved = (v3.RETRACT_DEAD_POSTS, v3.RETRACT_MODE, dict(v3._INTAKE_UPDATES))
+    saved = (v3.LEGACY_RETRACTION_TEST_SWITCH, v3.LEGACY_RETRACT_MODE, dict(v3._INTAKE_UPDATES))
     calls = {"listing": 0, "live": 0}
     async def _listing(session, sub):
         calls["listing"] += 1
@@ -12874,7 +12876,7 @@ async def _r104_retract():
         calls["live"] += 1
         return None
     try:
-        v3.RETRACT_DEAD_POSTS, v3.RETRACT_MODE = True, "edit"
+        v3.LEGACY_RETRACTION_TEST_SWITCH, v3.LEGACY_RETRACT_MODE = True, "edit"
         v3._INTAKE_UPDATES.clear()
         v3._INTAKE_UPDATES["1xlrchk"] = _r103_item("1xlrchk")
         posted = {k: {"delivered_at": _r101_now - 300, "published_ts": _r101_now - 400,
@@ -12886,7 +12888,7 @@ async def _r104_retract():
              patch.object(v3, "get_webhook_for_subreddit", lambda s: None):
             await v3.retract_dead_posts(None, posted, _r101_now)
     finally:
-        v3.RETRACT_DEAD_POSTS, v3.RETRACT_MODE = saved[0], saved[1]
+        v3.LEGACY_RETRACTION_TEST_SWITCH, v3.LEGACY_RETRACT_MODE = saved[0], saved[1]
         v3._INTAKE_UPDATES.clear()
         v3._INTAKE_UPDATES.update(saved[2])
     return calls
@@ -13491,6 +13493,74 @@ finally:
 check("r113: delivered relay IDs survive the 48 h + 30 min scheduler slack; unrelated records keep old pruning",
       "Sub_edit" in _r113_retained and "Sub_old_regular" not in _r113_retained)
 
+# ---- relay lifecycle updates: automatic deletion of terminally removed cards ----
+class _R114LifecycleResponse:
+    def __init__(self, status): self.status = status
+    async def __aenter__(self): return self
+    async def __aexit__(self, *args): return False
+
+class _R114LifecycleSession:
+    def __init__(self, statuses=None): self.calls = []; self.statuses = dict(statuses or {})
+    def delete(self, url, **kwargs):
+        message_id = url.rsplit("/", 1)[-1]
+        self.calls.append(message_id)
+        return _R114LifecycleResponse(self.statuses.get(message_id, 204))
+
+async def _r114_delete_case(update, statuses=None, age=120):
+    saved_updates = dict(v3._INTAKE_UPDATES)
+    now = time.time()
+    key = "Genshin_Impact_Leaks_1y14t1p"
+    records = {key: {
+        "subreddit": "Genshin_Impact_Leaks",
+        "path": "/r/Genshin_Impact_Leaks/comments/1y14t1p/title/",
+        "message_id": "main1", "message_ids": ["main1", "page2", "page2"],
+        "extra_message_ids": ["youtube3"], "youtube_message_id": "youtube3",
+        "relay_auto_edit": True, "delivered_at": now - age,
+        "continuations": [{"components": []}], "payload": {"components": []},
+    }}
+    session = _R114LifecycleSession(statuses)
+    try:
+        v3._INTAKE_UPDATES.clear()
+        if update is not None:
+            v3._INTAKE_UPDATES["1y14t1p"] = {"id": "1y14t1p", "sub": "Genshin_Impact_Leaks", **update}
+        with patch.object(v3, "get_webhook_for_subreddit", lambda _sub: "https://discord.test/api/webhooks/1/token"), \
+             patch.object(v3, "POSTED_MESSAGES_FILE", os.path.join(tempfile.gettempdir(), "r114-posted-messages.json")):
+            result = await v3.apply_relay_removal_updates(session, records, now)
+    finally:
+        v3._INTAKE_UPDATES.clear()
+        v3._INTAKE_UPDATES.update(saved_updates)
+    return result, session.calls, records[key]
+
+check("r114: a later relay approval can repost a card deleted on earlier terminal status, but stale or queued states cannot",
+      v3.relay_approval_repost({"resent": "approved"}, {"retracted": True}, None)
+      and v3.relay_approval_repost({"resent": "approved+edited"}, {"retracted": True},
+                                  {"removed": None, "deleted": False})
+      and not v3.relay_approval_repost({"resent": "edited"}, {"retracted": True}, None)
+      and not v3.relay_approval_repost({"resent": "approved"}, {"retracted": False}, None)
+      and not v3.relay_approval_repost({"resent": "approved"}, {"retracted": True},
+                                      {"removed": "moderator", "deleted": True})
+      and not v3.relay_approval_repost({"resent": "approved"}, {"retracted": True},
+                                      {"removed": "automod_filtered", "deleted": False}))
+_r114_count, _r114_deleted_ids, _r114_deleted_record = asyncio.run(_r114_delete_case(
+    {"removed": "moderator", "deleted": True}))
+check("r114: explicit terminal relay removal deletes the main card, every continuation and YouTube companion exactly once",
+      _r114_count == 1 and _r114_deleted_ids == ["main1", "page2", "youtube3"]
+      and _r114_deleted_record.get("retracted") is True
+      and "payload" not in _r114_deleted_record and "continuations" not in _r114_deleted_record,
+      str((_r114_count, _r114_deleted_ids, _r114_deleted_record)))
+_r114_queue_count, _r114_queue_ids, _ = asyncio.run(_r114_delete_case(
+    {"removed": "automod_filtered", "deleted": False}))
+check("r114: retryable AutoModerator queue status never deletes the delivered Discord card",
+      _r114_queue_count == 0 and not _r114_queue_ids)
+_r114_unknown_count, _r114_unknown_ids, _ = asyncio.run(_r114_delete_case(None))
+check("r114: no relay removal update means no delete (no absence inference)",
+      _r114_unknown_count == 0 and not _r114_unknown_ids)
+_r114_retry_count, _r114_retry_ids, _r114_retry_record = asyncio.run(_r114_delete_case(
+    {"removed": "moderator", "deleted": False}, {"page2": 403}))
+check("r114: failed part is not acknowledged; a later replay retries all IDs and 404 is idempotent",
+      _r114_retry_count == 0 and not _r114_retry_record.get("retracted")
+      and _r114_retry_ids == ["main1", "page2", "youtube3"])
+
 _r113_video = _r109_data("video description", 0, video=True)
 _r113_video["spoiler"] = True
 with patch.object(v3, "SPOILER_MEDIA_AND_BODY", False):
@@ -13512,6 +13582,9 @@ check("r113: two-day monitoring uses an hour-based setting in the workflow and i
       and v3.RELAY_EDIT_CACHE_SECONDS == 48 * 3600 + 1800
       and "REDDIT_MONITOR_WINDOW_HOURS: ${{ vars.REDDIT_MONITOR_WINDOW_HOURS }}" in _r101_wf
       and "INTAKE_LOOKBACK_HOURS: ${{ vars.INTAKE_LOOKBACK_HOURS }}" in _r101_wf)
+check("r114: Devvit re-sends a full revision when only the Reddit spoiler flag changes",
+      "spoilerChanged(previous, item.spoiler)" in open(os.path.join(ROOT, "devvit/gaming-express/src/server/server.ts"), encoding="utf-8").read()
+      and "reasons.push('spoiler')" in open(os.path.join(ROOT, "devvit/gaming-express/src/server/server.ts"), encoding="utf-8").read())
 check("r113: existing relay revisions with a later revision enter the PATCH path rather than repost",
       "revision > prior_revision" in inspect.getsource(v3.main)
       and "edit_existing" in inspect.getsource(v3.main)
