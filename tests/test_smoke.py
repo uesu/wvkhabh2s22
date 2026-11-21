@@ -209,6 +209,10 @@ if v3 is None:
     print("FATAL: reddit_main_v3.py could not be imported.")
     sys.exit(1)
 
+# Existing end-to-end cases exercise the retained legacy engine explicitly;
+# relay-primary behavior has dedicated tests that set the mode themselves.
+v3.INTAKE_READER = "off"
+
 # ---- 2. body cleaning -----------------------------------------------------
 html = ('<table><tr><td><p><a href="https://preview.redd.it/abc123.png?width=1280&s=x">'
         'https://preview.redd.it/abc123.png?width=1280&s=x</a></p>'
@@ -2106,7 +2110,8 @@ _r32_gate = _r32_main_src.split("liveness gate", 1)[1].split(
 check("r32: the liveness gate now covers RSS entries too (live 1wl41aj: a "
       "queued post arrived via RSS with real content and was posted — the "
       "gate was Arctic-only)",
-      "if not TEST_POST_ID and entry is not None:" in _r32_gate
+      "if (not TEST_POST_ID and entry is not None" in _r32_gate
+      and "and not isinstance(entry, _IntakeEntry)" in _r32_gate
       and "and isinstance(entry, _ArcticEntry)):" not in _r32_main_src
       and "feed_ok=not isinstance(entry, _ArcticEntry)" in _r32_gate, _r32_gate)
 
@@ -12594,7 +12599,7 @@ check("r102 reader: in a shared channel the newest relay RECORD sets the age (a 
       "from another bot does not vouch for the relay) and noise is skipped",
       _r102_shared["status"] == "ok" and _r102_shared["newest_age"] == 40
       and len(_r102_shared["records"]) == 3 and _r102_shared["seen"] == 3)
-check("r102 reader: other bots chatting while the relay is silent -> stale -> old chain",
+check("r102 reader: other bots chatting while the relay is silent cannot make a stale relay healthy",
       asyncio.run(_r101_reader(_r102_noise + _r101_msgs(3, 5000)))[0]["status"] == "stale")
 _r102_blank = asyncio.run(_r101_reader([{"id": m["id"], "content": ""} for m in _r101_msgs(5, 40)]))[0]
 check("r102 reader: messages whose content comes back empty (Message Content Intent off) are "
@@ -12802,13 +12807,12 @@ check("r104 record.json: a 0.0.8 re-sent record (`resent: approved`, revision 2)
 
 _r104_base = v3.intake_base_data(v3._IntakeEntry(_r104_by["1xlofcl"]))
 _r104_cut_base = v3.intake_base_data(v3._IntakeEntry(_r103_by["1xlcut3"]))
-check("r104 base: a complete record (nothing cut, parent named) is `relay_complete`; a record the CDN "
-      "could not complete is not; Reddit's counts ride on the base (the newest re-check wins over "
-      "the record); no OP-comment key anywhere",
-      _r104_base["relay_complete"] is True and _r104_cut_base["relay_complete"] is False
+check("r104 base: relay records remain authoritative even when CDN completion is unavailable; "
+      "old Reddit/Redlib/Arctic fill-in is never enabled; counts ride on the base; no OP-comment key",
+      _r104_base["relay_complete"] is True and _r104_cut_base["relay_complete"] is True
       and v3.intake_base_data(v3._IntakeEntry(_r103_by["1xlplain"]))["relay_complete"] is True
       and v3.intake_base_data(v3._IntakeEntry(_r103_by["1xlxpst"]))["relay_complete"] is True
-      and v3.intake_base_data(v3._IntakeEntry(dict(_r103_xp)))["relay_complete"] is False
+      and v3.intake_base_data(v3._IntakeEntry(dict(_r103_xp)))["relay_complete"] is True
       and not any("op_comment" in k for k in _r104_base)
       and _r104_base["relay_stats"] == {"ups": _r101_rec["score"], "comments": _r101_rec["comments"]}
       and v3.relay_record_stats(dict(_r101_parsed, _update=_r103_item("x", score=41, comments=7)))
@@ -12861,9 +12865,9 @@ check("r104 pipeline: a complete relay gallery with every proxy down is still se
       and _r104_d["title"] == "Boothill & co"
       and _r104_calls["arctic"] == 0 and _r104_calls["redlib"] == 0 and _r104_calls["proxy"] >= 1,
       f"{_r104_calls} {_r104_d['media']} {_r104_d['stats']}")
-check("r104 pipeline: a relay record the CDN could NOT complete keeps the round-101 fill-in "
-      "(archive + redlib harvest still asked) — the fallback chain is untouched",
-      _r104_calls2["arctic"] >= 1 and _r104_calls2["redlib"] >= 1,
+check("relay isolation: a truncated relay record remains authoritative when CDN completion fails; "
+      "no Reddit/Redlib/Arctic fill-in is probed",
+      _r104_calls2["arctic"] == 0 and _r104_calls2["redlib"] == 0,
       f"{_r104_calls2}")
 
 async def _r104_retract():
@@ -12940,16 +12944,27 @@ if os.path.isfile(_r104_relay_ts):
           and "opComment" not in _r104_ts and "opComment" not in _r104_srv
           and "comments.get(" not in _r104_srv and "'oc:'" not in _r104_srv and "`oc:" not in _r104_srv)
 _r101_main = inspect.getsource(v3.main)
-check("r101 main: the relay is read BEFORE the combined feed; `ok` in primary mode makes it the "
-      "listing (combined request, per-sub fallback and archive sweep skipped, status 'relay'); "
-      "anything else logs INTAKE-FALLBACK/INTAKE-SHADOW and runs the old chain unchanged",
+check("relay primary: primary mode is exclusive and unhealthy relay pauses without old-engine "
+      "fallback/probing; off/shadow retain the old engine explicitly",
       _r101_main.index("intake = await fetch_intake_records(session, now)")
       < _r101_main.index("combined = None if relay_primary else await fetch_combined_feed(session)")
       < _r101_main.index('combined_fetch_status = "relay"')
       < _r101_main.index("for sub in ([] if relay_primary else SUBREDDITS):")
-      and 'relay_primary = (INTAKE_READER == "primary" and intake["status"] == "ok")' in _r101_main
-      and "INTAKE-FALLBACK" in _r101_main and "INTAKE-SHADOW" in _r101_main
+      and 'relay_primary = INTAKE_READER == "primary"' in _r101_main
+      and 'relay_ready = relay_primary and intake["status"] == "ok"' in _r101_main
+      and "INTAKE-PAUSED" in _r101_main and "INTAKE-SHADOW" in _r101_main
+      and "INTAKE-FALLBACK" not in _r101_main
       and "run_stats[\"intake\"] = _intake_summary(intake)" in _r101_main)
+check("relay candidates bypass old pending throttle, fresh hold, liveness probes and persistent "
+      "media-wait throttles; legacy engine retains those gates",
+      'and not isinstance(entry, _IntakeEntry)\n                        and unique_key in pending' in _r101_main
+      and 'not isinstance(entry, _IntakeEntry)\n                        and FRESH_HOLD_SECONDS > 0' in _r101_main
+      and 'if not TEST_POST_ID and not isinstance(entry, _IntakeEntry):\n                    _ls, _lwhy' in _r101_main
+      and 'if not isinstance(entry, _IntakeEntry):\n                                mark_pending(pending, unique_key, "media_wait", now)' in _r101_main
+      and "legacy fresh hold 30 s" in v3._settings_line({"fresh_hold_seconds": 30,
+            "pending_recheck_seconds": 300, "intake_reader": "primary"})
+      and "legacy recheck 300 s" in v3._settings_line({"fresh_hold_seconds": 30,
+            "pending_recheck_seconds": 300, "intake_reader": "primary"}))
 check("r101: defaults — primary, stale 1800 s, 48 h monitor/lookback; hour-based Variables and the "
       "bot token are wired in reddit_monitor.yml",
       v3.INTAKE_STALE_SECONDS == 1800 and v3.INTAKE_LOOKBACK_SECONDS == 48 * 3600

@@ -663,10 +663,11 @@ def _settings_line(settings: dict, intake: dict | None = None) -> str:
 
         parts = []
         floor = settings.get("fresh_hold_seconds")
+        legacy_scope = ("legacy " if settings.get("intake_reader") == "primary" else "")
         if isinstance(floor, (int, float)):
-            parts.append("fresh hold off (0 s)" if floor == 0
-                         else f"fresh hold {int(floor)} s")
-        for label, val in (("recheck", num("pending_recheck_seconds", " s")),
+            parts.append(legacy_scope + ("fresh hold off (0 s)" if floor == 0
+                                         else f"fresh hold {int(floor)} s"))
+        for label, val in ((legacy_scope + "recheck", num("pending_recheck_seconds", " s")),
                            ("window", num("max_age_hours", " h")),
                            ("flood cap", num("max_posts_per_run"))):
             if val:
@@ -2968,27 +2969,22 @@ class _ArcticEntry:
 # spoiler,<age flag>,score,comments,removed,xpost,media[],body,bodyTruncated`.
 #
 # Behaviour:
-#   * INTAKE_READER=primary (default): when the channel answers AND its newest
-#     message is younger than INTAKE_STALE_SECONDS, the relay IS the listing:
-#     the combined feed, the per-subreddit fallback and the archive sweep are
-#     skipped for this run (`combined_fetch_status=relay`). A stale/failed/
-#     unconfigured relay logs ONE `INTAKE-FALLBACK` line and the pre-round-101
-#     chain runs exactly as before — the relay is additive, never a new way
-#     to go blind.
-#   * INTAKE_READER=shadow: the old chain runs as before; the relay is read
-#     and compared, and the difference is logged (`INTAKE-SHADOW`). Nothing
-#     else changes. INTAKE_READER=off: the channel is not read at all.
-#   * Relay entries are Reddit's OWN listing (the app reads /new with the
-#     platform's credentials), so they carry provenance "reddit-native" and
-#     count for the round-98 stale-snapshot override, like the combined feed.
-#   * A held post (media_wait, liveness, pending approval …) re-enters each
-#     run for as long as its record sits inside the INTAKE_LOOKBACK_SECONDS
-#     window — the same "listed again, re-probed again" behaviour the 100-entry
-#     RSS window gave. Older holds are reclaimed by the round-98 archive path.
-#   * The reader is credentials-light: ONE bot token (DISCORD_BOT_TOKEN, repo
-#     secret) with View Channel + Read Message History on the intake channel and
-#     the Message Content intent enabled. The token travels only in the
-#     Authorization header; it is never logged or written anywhere.
+#   * INTAKE_READER=primary (default): the relay is the ONLY discovery and
+#     liveness authority. When healthy, only its records are consumed; when
+#     stale/unconfigured/unreachable/empty, the run pauses discovery and does
+#     NOT probe the legacy RSS/Redlib/Arctic listing chain. This avoids silently
+#     mixing two engines. Set INTAKE_READER=off to deliberately select the old
+#     engine; shadow also runs the old engine for diagnostics.
+#   * Relay candidates bypass the legacy fresh-age floor, pending-recheck
+#     throttle, archive/liveness probes and legacy pending cache. Devvit status
+#     updates decide removal/approval; retryable relay media waits are simply
+#     retried from the next intake read.
+#   * INTAKE_READER=shadow: the old chain runs and decides; the relay is read
+#     for comparison (`INTAKE-SHADOW`). INTAKE_READER=off: the intake is not read
+#     and the old discovery engine is selected explicitly.
+#   * The reader uses ONE bot token (DISCORD_BOT_TOKEN, repo secret) with View
+#     Channel + Read Message History and Message Content intent. It travels only
+#     in the Authorization header; it is never logged or written anywhere.
 # ---------------------------------------------------------------------------
 INTAKE_READER = ((os.getenv("INTAKE_READER") or "").strip().lower() or "primary")
 if INTAKE_READER not in ("primary", "shadow", "off"):
@@ -3294,13 +3290,11 @@ def intake_base_data(entry) -> dict:
         "vred_id": extract_vreddit_id(" ".join([url, media_blob, rec.get("body") or ""])),
         "redgifs_url": extract_redgifs_url(" ".join([url, rec.get("body") or ""])),
         "youtube_url": select_youtube_url(outbound, rec.get("body") or ""),
-        # Round 104: a COMPLETE relay record (nothing cut, parent named) is
-        # the whole post as Reddit shows it — the
-        # media resolver then asks no redlib instance, no reddit.com
-        # instance and no archive for it; only the vxreddit/embedez/
-        # embeddit proxies (part of the relay structure) and the native
-        # URLs the record carries.
-        "relay_complete": not _intake_needs_full_record(rec),
+        # Relay records are authoritative input even when their optional
+        # attachment was unavailable or the body was truncated. Never ask the
+        # legacy Reddit/Redlib/Arctic engine to fill them in; resolve only from
+        # relay-carried URLs and the relay-approved media proxy services.
+        "relay_complete": True,
         "relay_stats": relay_record_stats(rec),
         # Round 112: Reddit's spoiler / age flag (record, re-check, parent) —
         # the card blurs its IMAGE tiles only; video tiles are never spoilered.
@@ -3501,11 +3495,16 @@ def _intake_line(intake: dict | None) -> str:
     if isinstance(done, int) and done > 0:
         tail.append(f"{done} completed")
     inner = (", ".join(tail)) if tail else (intake.get("detail") or "")
-    label = {"ok": "relay ok", "stale": "relay STALE → old chain",
-             "empty": "relay EMPTY → old chain",
-             "unconfigured": "relay unconfigured → old chain",
-             "error": "relay ERROR → old chain"}.get(
-        status, f"relay {status} → old chain")
+    if status == "ok":
+        label = "relay ok"
+    elif INTAKE_READER == "shadow":
+        label = f"relay {status} (shadow; old engine active)"
+    else:
+        label = {"stale": "relay STALE (delivery paused)",
+                 "empty": "relay EMPTY (delivery paused)",
+                 "unconfigured": "relay unconfigured (delivery paused)",
+                 "error": "relay ERROR (delivery paused)"}.get(
+            status, f"relay {status} (delivery paused)")
     return f"intake {intake.get('mode')} ({label}" + (f"; {inner}" if inner else "") + ")"
 
 
@@ -9003,35 +9002,39 @@ async def main():
                 run_stats["combined_entries"] = 0
                 run_stats["subreddits_represented"] = 0
             else:
-                # ---- Round 101: the Devvit relay is read FIRST ------------------
-                # `ok` makes it the listing for this run; anything else falls
-                # through to the pre-round-101 chain below, unchanged.
+                # ---- Devvit relay is the sole default intake path ------------
+                # The legacy engine runs only when explicitly selected with
+                # INTAKE_READER=off or shadow. A degraded relay pauses delivery;
+                # it never triggers old-engine probing or mixed-source intake.
                 intake = await fetch_intake_records(session, now)
                 if not DRY_RUN and _INTAKE_UPDATES:
                     run_stats["relay_removed_cards"] = await apply_relay_removal_updates(
                         session, posted_messages, now)
                 run_stats["intake"] = _intake_summary(intake)
-                relay_primary = (INTAKE_READER == "primary" and intake["status"] == "ok")
+                relay_primary = INTAKE_READER == "primary"
+                relay_ready = relay_primary and intake["status"] == "ok"
                 if intake["status"] == "off":
                     logging.info("INTAKE: reader off (INTAKE_READER=off) — old chain.")
-                elif relay_primary:
+                elif relay_ready:
                     logging.info(
                         f"INTAKE: relay ok — {len(intake['records'])} record(s) for this "
                         f"engine ({intake['seen']} in window, {intake['pages']} page(s), "
                         f"newest {intake['newest_age']} s, {intake.get('updates') or 0} "
                         f"re-checked, {intake.get('completed') or 0} completed from "
-                        f"record.json) — relay is the listing; "
-                        f"combined feed / fallback / archive sweep skipped.")
+                        f"record.json) — relay is the only intake; "
+                        f"legacy discovery/probes skipped.")
+                elif relay_primary:
+                    logging.error(
+                        f"INTAKE-PAUSED: relay {intake['status']}"
+                        + (f" ({intake['detail']})" if intake.get("detail") else "")
+                        + " — delivery paused; legacy engine was not probed.")
                 elif INTAKE_READER == "shadow":
                     logging.info(
                         f"INTAKE-SHADOW: relay {intake['status']} — "
                         f"{len(intake['records'])} record(s) for this engine; "
                         f"old chain decides this run.")
                 else:
-                    logging.warning(
-                        f"INTAKE-FALLBACK: relay {intake['status']}"
-                        + (f" ({intake['detail']})" if intake.get("detail") else "")
-                        + " — running the old chain (combined feed → per-sub → archive).")
+                    logging.info("INTAKE: legacy engine selected explicitly; relay is diagnostic only.")
                 # Refresh the settings line so the summary states the outcome.
                 try:
                     run_stats["settings_line"] = _settings_line(_effective_settings(),
@@ -9100,24 +9103,25 @@ async def main():
                 relay_entries = [_IntakeEntry(r, r.get("_message_id"))
                                  for r in intake.get("records") or []]
                 if relay_primary:
-                    # Relay entries are Reddit's own listing, but each record is
-                    # a one-time sighting replayed from the channel — it must
-                    # NOT build the round-98 feed streak (a removed post would
-                    # stay "listed" by replay). Provenance "relay": the
-                    # fresher-listing rule in candidate_liveness_verdict covers
-                    # the stale-archive case statelessly instead.
-                    _per_sub_entries = {}
-                    for _e in relay_entries:
-                        _per_sub_entries[_e.record["sub"]] = _per_sub_entries.get(_e.record["sub"], 0) + 1
-                    run_stats["feed_subreddits_with_entries"] = dict(_per_sub_entries)
-                    run_stats["feed_subreddits_missing"] = sorted(set(SUBREDDITS) - set(_per_sub_entries))
-                    combined_entries_val = len(relay_entries)
-                    subreddits_represented_val = len(_per_sub_entries)
-                    combined_fetch_status = "relay"
-                    entries = relay_entries[:1] if is_first_run else relay_entries
-                    if entries:
-                        collect(entries, None, provenance="relay")
-                    run_stats["intake"]["candidates"] = len(new_posts)
+                    # A record is replayed from Discord, not a fresh listing
+                    # query; never infer liveness from its continued presence.
+                    if relay_ready:
+                        _per_sub_entries = {}
+                        for _e in relay_entries:
+                            _per_sub_entries[_e.record["sub"]] = _per_sub_entries.get(_e.record["sub"], 0) + 1
+                        run_stats["feed_subreddits_with_entries"] = dict(_per_sub_entries)
+                        run_stats["feed_subreddits_missing"] = sorted(set(SUBREDDITS) - set(_per_sub_entries))
+                        combined_entries_val = len(relay_entries)
+                        subreddits_represented_val = len(_per_sub_entries)
+                        combined_fetch_status = "relay"
+                        entries = relay_entries[:1] if is_first_run else relay_entries
+                        if entries:
+                            collect(entries, None, provenance="relay")
+                        run_stats["intake"]["candidates"] = len(new_posts)
+                    else:
+                        combined_entries_val = 0
+                        subreddits_represented_val = 0
+                        combined_fetch_status = "relay_paused"
                     run_stats["fallback_status"] = "not_attempted"
                     run_stats["fallback_entries"] = None
                     run_stats["fallback_subreddits_covered"] = None
@@ -9268,12 +9272,8 @@ async def main():
                 run_stats["arctic_candidates"] = arctic_candidates_total
                 run_stats["arctic_subreddits_tried"] = arctic_subs_tried
 
-                # ---- Round 101: relay records when the relay is NOT the listing
-                # shadow: compare only (log the difference, change nothing).
-                # primary-but-degraded (stale/empty/error): whatever the relay
-                # DID deliver is still Reddit's own sighting — add the records
-                # the old chain missed, so a late-arriving fallback never loses
-                # a post the relay already saw.
+                # Non-primary mode: shadow compares only. Primary mode never
+                # reaches this block, including when the relay is unhealthy.
                 if relay_entries and not relay_primary:
                     _old_keys = {p[2] for p in new_posts}
                     _before = len(new_posts)
@@ -9329,7 +9329,7 @@ async def main():
             # removed -> `last_checked` refreshed and it stays held. Selection is
             # `_reclaim_due`; any archive error is a no-op (fail-open).
             reclaim_sources = {}
-            if not is_first_run and not TEST_POST_ID:
+            if not is_first_run and not TEST_POST_ID and not relay_primary:
                 _seen_keys = {p[2] for p in new_posts}
                 _reclaim_keys = _reclaim_due(pending, _seen_keys, now,
                                              RECLAIM_MAX_PER_RUN)
@@ -9525,6 +9525,7 @@ async def main():
                 # tick), and removed/deleted posts are not re-checked unless
                 # restored via RSS (or, round 108, re-read clean by the archive).
                 if (not TEST_POST_ID and not DRY_RUN
+                        and not isinstance(entry, _IntakeEntry)
                         and unique_key in pending
                         and _arc_listed is None
                         and _pending_throttle_skip(pending, unique_key, now, entry)):
@@ -9547,7 +9548,8 @@ async def main():
                                      f"skipping recheck, due again in ~{_due_in}s.")
                     continue
                 # ---- round 64 (updated 2026-10-21): minimum-age hold (FRESH_HOLD_SECONDS) ----
-                if not TEST_POST_ID and FRESH_HOLD_SECONDS > 0:
+                if (not TEST_POST_ID and not isinstance(entry, _IntakeEntry)
+                        and FRESH_HOLD_SECONDS > 0):
                     _post_age = now - float(published_ts or now)
                     if _post_age < FRESH_HOLD_SECONDS:
                         run_stats["fresh_hold"] += 1
@@ -9697,7 +9699,7 @@ async def main():
                 # real content. They are NOT posted and NOT added to the dedup
                 # cache: if the post is approved later it surfaces again and
                 # posts normally. Explicit TEST POST rebuilds are unaffected.
-                if not TEST_POST_ID:
+                if not TEST_POST_ID and not isinstance(entry, _IntakeEntry):
                     _r_title = str((post_json or {}).get("title") or base.get("title") or "")
                     _r_body = (strip_html(str((post_json or {}).get("selftext") or ""))
                                or str(base.get("body") or ""))
@@ -9726,7 +9728,8 @@ async def main():
                 # fallback). Otherwise skip + don't cache: a queued post
                 # re-checks on the short approval interval and posts the moment
                 # a live source can see it.
-                if not TEST_POST_ID and entry is not None:
+                if (not TEST_POST_ID and entry is not None
+                        and not isinstance(entry, _IntakeEntry)):
                     _live, _why = await verify_archive_post_live(
                         session, path, label=unique_key,
                         feed_ok=not isinstance(entry, _ArcticEntry))
@@ -9760,7 +9763,7 @@ async def main():
                 # lookup. Held only on positive evidence; "no record yet" and
                 # "archive unreachable" post exactly as before unless
                 # REDDIT_LIVENESS_STRICT=1. See the ROUND 95 block.
-                if not TEST_POST_ID:
+                if not TEST_POST_ID and not isinstance(entry, _IntakeEntry):
                     _ls, _lwhy, _lsrc = await candidate_liveness_verdict(
                         session, key=unique_key, path=path,
                         post_json=post_json, entry=entry)
@@ -9861,7 +9864,8 @@ async def main():
                             if "reddit.com/gallery/" in _base_content.lower():
                                 _hint = True
                         if _hint:
-                            mark_pending(pending, unique_key, "media_wait", now)
+                            if not isinstance(entry, _IntakeEntry):
+                                mark_pending(pending, unique_key, "media_wait", now)
                             run_stats["media_wait"] += 1
                             logging.debug(f"[{unique_key}] archive record says this post "
                                          f"has media (gallery/media_metadata) but no "
@@ -9884,7 +9888,8 @@ async def main():
                         else:
                             _arctic_n = _arctic_media_count(getattr(entry, "_arctic_post", None))
                         if _arctic_n > len(data["media"]):
-                            mark_pending(pending, unique_key, "partial_gallery", now)
+                            if not isinstance(entry, _IntakeEntry):
+                                mark_pending(pending, unique_key, "partial_gallery", now)
                             run_stats["partial_gallery"] += 1
                             logging.debug(f"[{unique_key}] archive record lists "
                                          f"{_arctic_n} gallery items but the sources "

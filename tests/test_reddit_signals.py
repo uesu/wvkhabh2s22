@@ -51,6 +51,8 @@ def load_module(name: str, rel: str):
 
 signals = load_module("reddit_signals_unit", "testing area/reddit_signals.py")
 v3 = load_module("reddit_v3_unit", "testing area/reddit_main_v3.py")
+# Main-loop cases below cover the retained legacy engine, selected explicitly.
+v3.INTAKE_READER = "off"
 
 check("import: reddit_signals", signals is not None)
 check("import: reddit_main_v3", v3 is not None)

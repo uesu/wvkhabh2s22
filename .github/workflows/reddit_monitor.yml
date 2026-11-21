@@ -123,13 +123,9 @@ jobs:
           YOUTUBE_LINK_MESSAGE: ${{ vars.YOUTUBE_LINK_MESSAGE }}
           DISCOHOOK_PREVIEW: ${{ vars.DISCOHOOK_PREVIEW }}
           FEEDTOKEN_JSON_STAGGER: ${{ vars.FEEDTOKEN_JSON_STAGGER }}
-          # Media-waiting entries are re-checked every PENDING_RECHECK_SECONDS
-          # (default 1800 s). Removed posts are never re-checked.
+          # Retained legacy engine only: relay-path candidates bypass both
+          # the pending recheck throttle and the stateless fresh-age hold.
           PENDING_RECHECK_SECONDS: ${{ vars.PENDING_RECHECK_SECONDS }}
-          # Round 64 (2026-10-04; updated 2026-10-21 cleanup):
-          # stateless fresh-age hold — FRESH_HOLD_SECONDS floors a
-          # candidate's age (default 30 s). The companion pristine listing
-          # gate has been removed; no listing-confirm wiring remains.
           FRESH_HOLD_SECONDS: ${{ vars.FRESH_HOLD_SECONDS }}
           # Dedup retention and per-run flood cap (round 34; all optional).
           MAX_CACHE_SIZE_PER_SUB: ${{ vars.MAX_CACHE_SIZE_PER_SUB }}
