@@ -13598,9 +13598,18 @@ check("r113: two-day monitoring uses an hour-based setting in the workflow and i
       and v3.RELAY_EDIT_CACHE_SECONDS == 48 * 3600 + 1800
       and "REDDIT_MONITOR_WINDOW_HOURS: ${{ vars.REDDIT_MONITOR_WINDOW_HOURS }}" in _r101_wf
       and "INTAKE_LOOKBACK_HOURS: ${{ vars.INTAKE_LOOKBACK_HOURS }}" in _r101_wf)
-check("r114: Devvit re-sends a full revision when only the Reddit spoiler flag changes",
-      "spoilerChanged(previous, item.spoiler)" in open(os.path.join(ROOT, "devvit/gaming-express/src/server/server.ts"), encoding="utf-8").read()
-      and "reasons.push('spoiler')" in open(os.path.join(ROOT, "devvit/gaming-express/src/server/server.ts"), encoding="utf-8").read())
+_r114_devvit_server_path = os.path.join(
+    ROOT, "devvit", "gaming-express", "src", "server", "server.ts")
+if os.path.isfile(_r114_devvit_server_path):
+    _r114_devvit_server = open(_r114_devvit_server_path, encoding="utf-8").read()
+    check("r114: Devvit re-sends a full revision when only the Reddit spoiler flag changes",
+          "spoilerChanged(previous, item.spoiler)" in _r114_devvit_server
+          and "reasons.push('spoiler')" in _r114_devvit_server)
+else:
+    # The production runtime repositories intentionally omit the Devvit app;
+    # its source-level assertion only applies to the full development checkout.
+    check("r114: spoiler-resend source assertion is skipped in runtime-only checkout",
+          True)
 check("r113: existing relay revisions with a later revision enter the PATCH path rather than repost",
       "revision > prior_revision" in inspect.getsource(v3.main)
       and "edit_existing" in inspect.getsource(v3.main)
