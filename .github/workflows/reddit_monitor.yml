@@ -382,7 +382,7 @@ jobs:
           print()
           print("### Feed")
           relay = data.get("combined_fetch_status") == "relay"
-          line("Relay records for this engine (6 h window)" if relay else "Combined-feed entries", "combined_entries")
+          line("Relay records for this engine (intake lookback)" if relay else "Combined-feed entries", "combined_entries")
           if data.get("subreddits_represented") is not None:
               print(f"- Subreddits represented: {v('subreddits_represented')} of {v('subreddits_configured')}")
           else:

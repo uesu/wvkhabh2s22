@@ -13089,7 +13089,7 @@ check("r105: a relay-served run is not described in old-chain words — quiet su
       and "(quiet, not missing; no archive attempt)" in _r105_summary
       and "archive attempt below" not in _r105_summary
       and "Feed fallback: not attempted (relay is the listing)" in _r105_summary
-      and "Relay records for this engine (6 h window): 0" in _r105_summary
+      and "Relay records for this engine (intake lookback): 0" in _r105_summary
       and "Combined-feed entries" not in _r105_summary
       and "Subreddits missing from the combined feed: HonkaiNexusAnimaLeaks (archive attempt below)" in _r96_summary
       and "Feed fallback: not attempted (combined succeeded)" in _r96_summary,
