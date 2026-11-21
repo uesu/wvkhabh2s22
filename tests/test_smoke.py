@@ -1873,9 +1873,9 @@ check("r51: Read Post destination unchanged on profile crosspost cards",
 # ---- round 30 (2026-09-19): pending-post recheck cache --------------------
 # The four skip gates now record the post in pending_reddit.json and a
 # pending post is re-verified at most once every PENDING_RECHECK_SECONDS.
-check("r30 defaults: 5-min recheck (round 95c; was 30 min), 48h prune window",
+check("r30 defaults: 5-min recheck (round 95c; was 30 min), 5h prune window",
       v3.PENDING_RECHECK_SECONDS == 300 and v3.PENDING_RECHECK_SECONDS == 5 * 60
-      and v3.PENDING_MAX_AGE_SECONDS == 48 * 3600
+      and v3.PENDING_MAX_AGE_SECONDS == 5 * 3600
       and v3.PENDING_FILE == "pending_reddit.json")
 
 _r30_now = 1758240000.0
@@ -11390,7 +11390,7 @@ check("r97: the engine records its resolved settings, not the env strings",
       isinstance(_r97_settings, dict)
       and _r97_settings.get("fresh_hold_seconds") == int(v3.FRESH_HOLD_SECONDS)
       and _r97_settings.get("pending_recheck_seconds") == int(v3.PENDING_RECHECK_SECONDS)
-      and _r97_settings.get("max_age_hours") == 48
+      and _r97_settings.get("max_age_hours") == 5
       and _r97_settings.get("max_posts_per_run") == int(v3.MAX_POSTS_PER_RUN)
       and _r97_settings.get("dedup_per_sub_cap") == int(v3.MAX_CACHE_SIZE_PER_SUB)
       and _r97_settings.get("liveness_probe") is bool(v3.REDDIT_LIVENESS_PROBE)
@@ -11478,7 +11478,7 @@ check("r97: a record without the new fields still renders (no Settings line)",
 _r97_line = v3._init_run_stats().get("settings_line", "")
 check("r97: the settings line is built by the engine (workflow stays small)",
       _r97_line.startswith("**Settings:** fresh hold ")
-      and "recheck 300 s" in _r97_line and "window 48 h" in _r97_line
+      and "recheck 300 s" in _r97_line and "window 5 h" in _r97_line
       and v3._settings_line({}) == "")
 # GitHub refuses a workflow whose step script exceeds 21,000 characters: prod
 # #11568 (2026-10-30 08:40Z) failed with "Exceeded max expression length 21000"
@@ -12547,8 +12547,9 @@ check("r108c: end to end (fallback mode): the hold whose archive row was re-read
 
 
 class _R101Resp:
-    def __init__(self, status, data):
+    def __init__(self, status, data, headers=None):
         self.status, self._data = status, data
+        self.headers = dict(headers or {})
 
     async def json(self, content_type=None):
         return self._data
@@ -12564,13 +12565,14 @@ class _R101Resp:
 
 
 class _R101Session:
-    def __init__(self, messages=None, status=200):
+    def __init__(self, messages=None, status=200, response_headers=None):
         self.messages, self.status, self.calls = messages or [], status, []
+        self.response_headers = dict(response_headers or {})
 
     def get(self, url, **kw):
         self.calls.append((url, dict(kw.get("params") or {}), dict(kw.get("headers") or {})))
         if self.status != 200:
-            return _R101Resp(self.status, {"message": "Missing Access"})
+            return _R101Resp(self.status, {"message": "Missing Access"}, self.response_headers)
         before = kw["params"].get("before")
         page = [m for m in self.messages if before is None or int(m["id"]) < int(before)]
         page.sort(key=lambda m: int(m["id"]), reverse=True)   # Discord: newest first
@@ -12587,7 +12589,7 @@ def _r101_msgs(n, newest_age, other_sub=False):
     return out
 
 
-async def _r101_reader(messages=None, status=200, **env):
+async def _r101_reader(messages=None, status=200, response_headers=None, **env):
     saved = {k: getattr(v3, k) for k in ("INTAKE_READER", "INTAKE_CHANNEL_ID", "DISCORD_BOT_TOKEN",
                                           "INTAKE_STALE_SECONDS", "SUBREDDITS")}
     try:
@@ -12596,7 +12598,7 @@ async def _r101_reader(messages=None, status=200, **env):
         v3.SUBREDDITS = ["HonkaiStarRail_leaks", "Genshin_Impact_Leaks"]
         for k, val in env.items():
             setattr(v3, k, val)
-        session = _R101Session(messages, status)
+        session = _R101Session(messages, status, response_headers)
         return await v3.fetch_intake_records(session, _r101_now), session
     finally:
         for k, val in saved.items():
@@ -12621,6 +12623,17 @@ check("r101 reader: stale (newest older than INTAKE_STALE_SECONDS), empty, HTTP 
       and asyncio.run(_r101_reader(_r101_msgs(3, 40), status=403))[0]["status"] == "http_403"
       and asyncio.run(_r101_reader(_r101_msgs(3, 40), DISCORD_BOT_TOKEN=""))[0]["status"] == "unconfigured"
       and asyncio.run(_r101_reader(_r101_msgs(3, 40), INTAKE_READER="off"))[0]["status"] == "off")
+_r101_429, _r101_429_session = asyncio.run(_r101_reader(
+    status=429, response_headers={"Retry-After": "2.5", "X-RateLimit-Scope": "shared",
+                                  "X-RateLimit-Global": "true", "X-RateLimit-Bucket": "channel-history"}))
+check("r101 reader: Discord 429 diagnostics identify channel-history page and safe rate-limit headers",
+      _r101_429["status"] == "http_429" and _r101_429["pages"] == 1
+      and "Discord channel-history page 1/8" in _r101_429["detail"]
+      and "retry-after=2.5s" in _r101_429["detail"]
+      and "scope=shared" in _r101_429["detail"]
+      and "global=true" in _r101_429["detail"]
+      and "bucket=channel-history" in _r101_429["detail"]
+      and _r101_429_session.calls[0][0].endswith("/messages"))
 _r101_many, _r101_s2 = asyncio.run(_r101_reader(_r101_msgs(230, 40)))
 check("r101 reader: pages newest-first with `before` (100 per page, bounded by INTAKE_MAX_PAGES), "
       "stops at the lookback cutoff and dedups by id",
@@ -12970,12 +12983,13 @@ if os.path.isfile(_r104_relay_ts):
     _r104_ts = open(_r104_relay_ts, encoding="utf-8").read()
     _r104_srv = open(os.path.join(ROOT, "devvit", "gaming-express", "src", "server", "server.ts"),
                      encoding="utf-8").read()
-    check("r104 devvit: five re-check stages through 24 h, approval/edit/spoiler re-sends; the relay reads "
-          "no comments (owner's request — no `opComments`, no `post.comments.get`, no `oc:` key)",
-          all(str(stage) in _r104_ts for stage in (300, 1800, 7200, 21600))
+    check("r104: four Devvit re-check stages through 5 h, approval/edit/spoiler re-sends; no comments",
+          "opComments" not in _r104_ts and "post.comments.get" not in _r104_srv
+          and "oc:" not in _r104_srv
+          and all(str(stage) in _r104_ts for stage in (300, 1800, 7200))
           and "RECHECK_WINDOW_HOURS * 3600" in _r104_ts
           and "export function becameLive(" in _r104_ts
-          and "RECHECK_WINDOW_HOURS = 24" in _r104_ts
+          and "RECHECK_WINDOW_HOURS = 5" in _r104_ts
           and "spoilerChanged(previous, item.spoiler)" in _r104_srv
           and "RECHECK_WINDOW_SECONDS = RECHECK_WINDOW_HOURS * 3600 + 1800" in _r104_srv
           and "reasons.push('approved')" in _r104_srv and "reasons.push('edited')" in _r104_srv
@@ -13005,10 +13019,12 @@ check("relay candidates bypass generic transient/fresh-age/archive probes, while
             "pending_recheck_seconds": 300, "intake_reader": "primary"})
       and "legacy recheck 300 s" in v3._settings_line({"fresh_hold_seconds": 30,
             "pending_recheck_seconds": 300, "intake_reader": "primary"}))
-check("r101: defaults — primary, stale 1800 s, 48 h monitor/lookback; hour-based Variables and the "
+check("r101: defaults — primary, stale 1800 s, 5 h monitor/lookback; hour-based Variables and the "
       "bot token are wired in reddit_monitor.yml",
-      v3.INTAKE_STALE_SECONDS == 1800 and v3.INTAKE_LOOKBACK_SECONDS == 48 * 3600
-      and v3.REDDIT_MONITOR_WINDOW_HOURS == 48
+      v3.INTAKE_STALE_SECONDS == 1800 and v3.INTAKE_LOOKBACK_SECONDS == 5 * 3600
+      and v3.REDDIT_MONITOR_WINDOW_HOURS == 5
+      and 'min(5, max(1, _env_int("REDDIT_MONITOR_WINDOW_HOURS", 5)))' in _r101_src
+      and 'min(5, max(1, _env_int("INTAKE_LOOKBACK_HOURS", 5)))' in _r101_src
       and 'INTAKE_READER = ((os.getenv("INTAKE_READER") or "").strip().lower() or "primary")' in _r101_src
       and all(f"{n}: ${{{{ vars.{n} }}}}" in _r101_wf for n in
               ("INTAKE_CHANNEL_ID", "INTAKE_READER", "INTAKE_STALE_SECONDS", "INTAKE_LOOKBACK_HOURS"))
@@ -13538,7 +13554,7 @@ try:
     _r113_now = time.time()
     _r113_cache = {
         "Sub_edit": {"message_id": "m1", "relay_auto_edit": True,
-                     "delivered_at": _r113_now - (48 * 3600 + 20 * 60)},
+                     "delivered_at": _r113_now - (5 * 3600 + 20 * 60)},
         "Sub_old_regular": {"message_id": "m2", "delivered_at": _r113_now - 7 * 3600},
     }
     with patch.object(v3, "POSTED_MESSAGES_FILE", _r113_cache_path):
@@ -13546,7 +13562,7 @@ try:
         _r113_retained = v3.load_posted_messages()
 finally:
     _r113_retention_tmp.cleanup()
-check("r113: delivered relay IDs survive the 48 h + 30 min scheduler slack; unrelated records keep old pruning",
+check("r113: delivered relay IDs survive the 5 h + 30 min scheduler slack; unrelated records keep old pruning",
       "Sub_edit" in _r113_retained and "Sub_old_regular" not in _r113_retained)
 
 # ---- relay lifecycle updates: automatic deletion of terminally removed cards ----
@@ -13630,12 +13646,12 @@ check("r113: combined spoiler mode flags video media too; off mode preserves the
               for c in _r113_video_enabled["components"]
               for x in c["components"] if x.get("type") == 10))
 
-check("r113: two-day monitoring uses an hour-based setting in the workflow and intake reader",
-      v3.REDDIT_MONITOR_WINDOW_HOURS == 48
-      and v3.MAX_AGE_SECONDS == 48 * 3600
-      and v3.PENDING_MAX_AGE_SECONDS == 48 * 3600
-      and v3.INTAKE_LOOKBACK_HOURS == 48
-      and v3.RELAY_EDIT_CACHE_SECONDS == 48 * 3600 + 1800
+check("r113: 5-hour monitoring uses hour-based settings and preserves scheduler slack",
+      v3.REDDIT_MONITOR_WINDOW_HOURS == 5
+      and v3.MAX_AGE_SECONDS == 5 * 3600
+      and v3.PENDING_MAX_AGE_SECONDS == 5 * 3600
+      and v3.INTAKE_LOOKBACK_HOURS == 5
+      and v3.RELAY_EDIT_CACHE_SECONDS == 5 * 3600 + 1800
       and "REDDIT_MONITOR_WINDOW_HOURS: ${{ vars.REDDIT_MONITOR_WINDOW_HOURS }}" in _r101_wf
       and "INTAKE_LOOKBACK_HOURS: ${{ vars.INTAKE_LOOKBACK_HOURS }}" in _r101_wf)
 _r114_devvit_server_path = os.path.join(

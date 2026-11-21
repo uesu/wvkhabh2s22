@@ -358,15 +358,15 @@ def _env_float(name: str, default: float) -> float:
 MAX_CACHE_SIZE_PER_SUB = _env_int("MAX_CACHE_SIZE_PER_SUB", 250)
 MAX_CACHE_SIZE_TOTAL = _env_int("MAX_CACHE_SIZE_TOTAL", 10000)
 # Round 34: per-run flood cap — one run posts at most this many NEW posts
-# (the newest ones); the rest retry next run inside the 48 h window. A loud
+# (the newest ones); the rest retry next run inside the configured monitor window. A loud
 # log line instead of a mass re-post storm if the dedup cache ever loses
 # keys again.
 MAX_POSTS_PER_RUN = _env_int("MAX_POSTS_PER_RUN", 25)
 
-# Two-day Reddit monitoring window, configured in hours.
-REDDIT_MONITOR_WINDOW_HOURS = max(1, _env_int("REDDIT_MONITOR_WINDOW_HOURS", 48))
+# Reddit monitoring window, configured in hours; legacy values above 5 are capped.
+REDDIT_MONITOR_WINDOW_HOURS = min(5, max(1, _env_int("REDDIT_MONITOR_WINDOW_HOURS", 5)))
 MAX_AGE_SECONDS = REDDIT_MONITOR_WINDOW_HOURS * 3600
-# One cron interval of slack lets the relay's final 48 h re-check be consumed
+# One cron interval of slack lets the relay's final 5 h re-check be consumed
 # even when a poll runs a few minutes after its scheduled age.
 RELAY_EDIT_CACHE_SECONDS = MAX_AGE_SECONDS + 1800
 
@@ -1695,21 +1695,21 @@ def _verify_dedup_save(posted_at_start: set, posted: set, saved: set) -> None:
 def cap_new_posts(new_posts: list, cap: int) -> list:
     """Round 34: bound one run's post count (MAX_POSTS_PER_RUN note).
     `new_posts` is sorted oldest-first; keep the NEWEST `cap` entries and
-    log the dropped oldest (they retry next run inside the 48 h window)."""
+    log the dropped oldest (they retry next run inside the configured monitor window)."""
     if cap <= 0:
         if new_posts:
             logging.warning(f"POST FLOOD GUARD: {len(new_posts)} new posts this run "
                             f"exceed the cap of {cap} — posting the newest {cap}; the "
-                            f"{len(new_posts)} oldest retry next run inside the 48 h "
-                            f"window. Dropped: {[p[2] for p in new_posts]}")
+                            f"{len(new_posts)} oldest retry next run inside the configured "
+                            f"monitor window. Dropped: {[p[2] for p in new_posts]}")
         return []
     if len(new_posts) <= cap:
         return new_posts
     dropped = [p[2] for p in new_posts[:len(new_posts) - cap]]
     logging.warning(f"POST FLOOD GUARD: {len(new_posts)} new posts this run "
                     f"exceed the cap of {cap} — posting the newest {cap}; the "
-                    f"{len(dropped)} oldest retry next run inside the 48 h "
-                    f"window. Dropped: {dropped}")
+                    f"{len(dropped)} oldest retry next run inside the configured "
+                    f"monitor window. Dropped: {dropped}")
     return new_posts[-cap:]
 
 
@@ -1745,7 +1745,7 @@ def load_pending() -> dict:
 
 
 def save_pending(pending: dict) -> None:
-    # Prune entries older than PENDING_MAX_AGE_SECONDS (the 48h posting
+    # Prune entries older than PENDING_MAX_AGE_SECONDS (the configured posting
     # window has passed — collect() can no longer pick the post up anyway).
     def _first_seen_age_ok(v: dict, now: float) -> bool:
         raw = v.get("first_seen")
@@ -1952,7 +1952,7 @@ def pending_due(pending: dict, key: str, now: float) -> bool:
 # ---------------------------------------------------------------------------
 # ■ ROUND 32 (2026-09-20), simplified in round 63: REASON-AWARE PENDING
 # RE-CHECK. Removed/deleted posts (the no-recheck set) are NEVER re-checked
-# while the entry exists (self-expires at the 48 h window) — a removed post
+# while the entry exists (self-expires at the configured monitor window) — a removed post
 # cannot change state while removed; if a mod RESTORES it, it re-enters via
 # RSS with a fresh "updated" stamp, which bypasses the skip and the full
 # pipeline posts it. Everything else (approval-pending, transient source
@@ -2057,7 +2057,7 @@ def archive_listed_after_hold(pend, entry, now: float | None = None) -> float | 
     ~12:35Z). The old chain had no equivalent: "removed posts re-enter via RSS"
     is a dead end once Reddit retires RSS (2026-11-13), so a post that was held
     off a mod-queue snapshot and approved later would have stayed held until
-    the 48 h window dropped it. Here the archive's own re-read plays the part
+    the configured monitor window dropped it. Here the archive's own re-read plays the part
     the relay message plays in round 107:
       * the row must be the archive's record of THIS post, re-read AFTER the
         hold (`archive_snapshot_time` > max(first_seen, last_checked));
@@ -2867,7 +2867,7 @@ def arctic_media_items(post) -> list:
 # When RSS yields NO new posts for a subreddit, re-check the Arctic Shift
 # archive's /api/posts/search (same post JSON shape as the /api/posts/ids
 # lookup above). Archive posts are wrapped as feedparser-style entries and
-# run through the SAME collect() in main() — dedup cache + 48h freshness
+# run through the SAME collect() in main() — dedup cache + configured freshness
 # window apply unchanged. Soft-fail on any error; shares the 3-strike
 # _arctic_fail_count circuit breaker with the crosspost archive lookup.
 # Arctic's score/num_comments are stale for ~36h after posting, so they are
@@ -2922,7 +2922,7 @@ async def fetch_arctic_subreddit_posts(session, subreddit: str,
 class _ArcticEntry:
     """Minimal feedparser-style entry wrapping an Arctic Shift post, so
     archive posts flow through the SAME collect() as RSS entries (dedup
-    cache + 48h freshness window apply unchanged). entry_to_base_data()
+    cache + configured freshness window apply unchanged). entry_to_base_data()
     reads title/author/link as attributes and content/summary/
     media_thumbnail via .get() — exactly like a feedparser entry."""
 
@@ -2993,9 +2993,11 @@ INTAKE_CHANNEL_ID = (os.getenv("INTAKE_CHANNEL_ID") or "").strip()
 DISCORD_BOT_TOKEN = (os.getenv("DISCORD_BOT_TOKEN") or "").strip()
 # Newest relay message older than this => relay considered paused/broken.
 INTAKE_STALE_SECONDS = max(120, _env_int("INTAKE_STALE_SECONDS", 1800))
-# How far back the channel is read each run (bounds the re-listing window
-# for held posts; one HTTP page per 100 messages, INTAKE_MAX_PAGES cap).
-INTAKE_LOOKBACK_HOURS = max(1, _env_int("INTAKE_LOOKBACK_HOURS", REDDIT_MONITOR_WINDOW_HOURS))
+# How far back the Discord intake channel is read each run. Keep this separate
+# from the configured post/dedup monitor window: a 5 h channel scan bounds
+# paginated Discord history requests, while the relay itself rechecks through
+# the chosen 5 h delivery-status window.
+INTAKE_LOOKBACK_HOURS = min(5, max(1, _env_int("INTAKE_LOOKBACK_HOURS", 5)))
 INTAKE_LOOKBACK_SECONDS = INTAKE_LOOKBACK_HOURS * 3600
 INTAKE_MAX_PAGES = 8
 # Round 103: complete records (`record.json` attachment, relay 0.0.7) are
@@ -3352,6 +3354,24 @@ async def fetch_intake_records(session: aiohttp.ClientSession, now: float) -> di
                         404: "channel id unknown to this bot (wrong id, or bot not in the server)",
                         429: "rate limited",
                     }.get(resp.status, "unexpected status")
+                    if resp.status == 429:
+                        # Keep safe Discord rate-limit telemetry in the report:
+                        # page index distinguishes an initial throttle from a
+                        # long-window pagination hit; headers identify the bucket
+                        # and server-directed wait without logging the bot token.
+                        rate_headers = getattr(resp, "headers", {}) or {}
+                        details = [f"Discord channel-history page {out['pages']}/{INTAKE_MAX_PAGES}"]
+                        retry_after = str(rate_headers.get("Retry-After", "")).strip()
+                        if re.fullmatch(r"\d+(?:\.\d+)?", retry_after):
+                            details.append(f"retry-after={retry_after}s")
+                        for header, label in (("X-RateLimit-Scope", "scope"),
+                                              ("X-RateLimit-Global", "global"),
+                                              ("X-RateLimit-Remaining", "remaining"),
+                                              ("X-RateLimit-Bucket", "bucket")):
+                            value = str(rate_headers.get(header, "")).strip()
+                            if re.fullmatch(r"[A-Za-z0-9._-]{1,80}", value):
+                                details.append(f"{label}={value}")
+                        out["detail"] += " (" + "; ".join(details) + ")"
                     return out
                 page = await resp.json(content_type=None)
             if not isinstance(page, list):
@@ -5141,9 +5161,9 @@ async def candidate_liveness_verdict(session, *, key: str, path: str,
     # the moment the app listed the post — positive evidence, no request.
     relay_record = getattr(entry, "record", None) if isinstance(entry, _IntakeEntry) else None
     if isinstance(relay_record, dict):
-        # Round 103: the relay looked at the post AGAIN after listing it
-        # (0.0.7 re-checks at ~10 min / 30 min / 2 h / 6 h). That is Reddit's
-        # own current state — positive evidence either way, no request.
+        # The relay looked at the post AGAIN after listing it (current schedule:
+        # ~5 min / 30 min / 2 h / 5 h). That is Reddit's own current state —
+        # positive evidence either way, no separate request.
         verdict = relay_update_verdict(relay_record.get("_update"))
         if verdict:
             return verdict
@@ -5153,7 +5173,7 @@ async def candidate_liveness_verdict(session, *, key: str, path: str,
         # Round 104: a relay record IS Reddit's own /new listing — a clean
         # `removed` is positive evidence the post was live when Reddit
         # listed it, and the relay re-checks it again ~5 min / 30 min /
-        # 2 h / 6 h / 24 h later (v: 2 updates, retraction path). The
+        # 2 h / 5 h later (v: 2 updates, retraction path). The
         # archive is not consulted for relay candidates any more.
         return ("live", "listed on Reddit's /new by the relay (not removed); "
                         "relay re-check pending", "relay-listing")
@@ -9245,7 +9265,7 @@ async def main():
                         continue
                     arctic_subs_tried += 1
                     # Round 96: record WHY a subreddit produced no archive
-                    # candidates. "empty" (nothing in the 48 h window) and
+                    # candidates. "empty" (nothing in the configured monitor window) and
                     # "failed" (the search itself errored) look identical in the
                     # candidate counts, but only one of them means the run is
                     # blind for that subreddit — the summary has to say which.
@@ -9407,7 +9427,7 @@ async def main():
                                 str(_rpost.get("permalink") or ""))
                             if _rpub <= 0:
                                 # No usable timestamp: do not guess. The hold
-                                # stands and the 48 h window still governs it.
+                                # stands and the configured monitor window still governs it.
                                 _outcome = "no_timestamp"
                             elif _rremoved:
                                 # Still not live: refresh the clock but KEEP the
@@ -9601,7 +9621,7 @@ async def main():
                                   {"key": unique_key, "reason": _pend_reason})
                         logging.debug(f"[{unique_key}] pending ({_pend_reason}) — "
                                      f"not re-checking (relay/RSS must provide a newer "
-                                     f"clean listing; entry expires at the 48 h window).")
+                                     f"clean listing; entry expires at the configured monitor window).")
                     else:
                         _due_in = int(PENDING_RECHECK_SECONDS
                                       - (now - float(_pend.get("last_checked") or 0)))
@@ -9904,7 +9924,7 @@ async def main():
                     # forever). Skip + don't cache: the next run retries, and
                     # once the media is available (Arctic fields filled, or a
                     # proxy renders the og: tags) the full gallery posts. The
-                    # 48h freshness window bounds the retries.
+                    # configured freshness window bounds the retries.
                     # Round 83c: Mod-queued galleries (1xd8ppc/1xd8vra/1xd9pre) are
                     # automod_filtered with url=reddit.com/gallery/<id> and no
                     # gallery_data/media_metadata while queued — _arctic_media_hint

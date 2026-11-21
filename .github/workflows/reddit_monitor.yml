@@ -166,7 +166,7 @@ jobs:
           #   INTAKE_CHANNEL_ID (Variable) the intake channel id
           # Optional: INTAKE_READER=primary (default) | shadow | off;
           # INTAKE_STALE_SECONDS (1800) — older newest message => old chain;
-          # INTAKE_LOOKBACK_HOURS (defaults to REDDIT_MONITOR_WINDOW_HOURS, 48).
+          # INTAKE_LOOKBACK_HOURS (default 5; see the source defaults).
           # Unset/unhealthy => the pre-round-101 chain runs exactly as before.
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           INTAKE_CHANNEL_ID: ${{ vars.INTAKE_CHANNEL_ID }}
