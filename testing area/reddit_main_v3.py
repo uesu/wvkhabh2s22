@@ -3996,6 +3996,8 @@ _INLINE_IMG_STRAY_RE = re.compile(r"\u2063(?:IMG\d*|MEDIA:[^\u2063\n]*)?\u2063?"
 _INLINE_IMG_LINK_RE = re.compile(r"!?\[([^\]\n]*)\]\((https?://[^)\s]+)\)")
 _INLINE_REDDIT_GIF_REF_RE = re.compile(
     r"!\[\s*gif\s*\]\(\s*([A-Za-z0-9_-]{5,64})\s*\)", re.I)
+_INLINE_REDDIT_IMAGE_REF_RE = re.compile(
+    r"!\[\s*(?:img|image)\s*\]\(\s*([A-Za-z0-9_-]{5,64})\s*\)", re.I)
 _HTML_MEDIA_LINK_RE = re.compile(
     r"\[([^\]\n]*)\]\(\s*(https?://(?:i\.|preview\.)redd\.it/[^\s)]*)\s*\)")
 _HTML_MEDIA_BARE_RE = re.compile(
@@ -4139,10 +4141,24 @@ def _mark_inline_gallery_images(body: str, photo_media: list) -> str:
         used.add(idx)
         return f"\n{_inline_img_token(idx)}\n"
 
+    def _repl_image_ref(m: re.Match) -> str:
+        # Reddit rich-text images may use a bare file ID without extension.
+        # Resolve only against one unambiguous extracted photo; never guess.
+        prefix = m.group(1).lower()
+        matches = [idx for key, idx in key_to_idx.items() if key.startswith(prefix + ".")]
+        if len(matches) != 1:
+            return m.group(0)
+        idx = matches[0]
+        if idx in used:
+            return ""
+        used.add(idx)
+        return f"\n{_inline_img_token(idx)}\n"
+
     marked = body
     if has_marks:
         marked = _MEDIA_MARK_RE.sub(_repl_marker, _MEDIA_MARK_LINE_RE.sub(_repl_marker, marked))
     marked = _INLINE_REDDIT_GIF_REF_RE.sub(_repl_gif_ref, marked)
+    marked = _INLINE_REDDIT_IMAGE_REF_RE.sub(_repl_image_ref, marked)
     marked = _INLINE_IMG_LINK_RE.sub(_repl_link, marked)
     marked = REDDIT_MEDIA_URL_RE.sub(_repl_bare, marked)
     if not used:
@@ -4175,14 +4191,16 @@ def _inline_img_segments(body_out: str) -> tuple[list, list]:
             idx = int(m.group(1))
             if idx in seen:
                 continue
+            # Every Reddit inline image is its own media block. Flush before
+            # the next marker so adjacent pictures retain their exact order
+            # and separation instead of becoming an unrelated gallery.
+            if imgs:
+                _flush()
             seen.add(idx)
             order.append(idx)
             imgs.append(idx)
             continue
         if imgs:
-            # consecutive picture paragraphs (Reddit emits every embedded
-            # picture as its own paragraph) pool into ONE gallery — only
-            # prose closes the section
             if not line.strip():
                 continue
             _flush()
@@ -4234,6 +4252,8 @@ def _count_v2_components(containers: list) -> int:
 # Spans a body split must NEVER slice through — a sliced link renders
 # broken markdown (live 1wxfuj5: "[Set](https://…").
 _PROTECTED_SPAN_RES = (
+    # Inline-media sentinels must remain intact when the body is paginated.
+    _INLINE_IMG_TOKEN_RE,
     # markdown link [text](url) — the whole thing is one span
     re.compile(r"\[[^\[\]\n]*\]\(https?://[^)\s]*\)"),
     # bare URL (never extends past a ')' — that is punctuation in prose,
@@ -4645,29 +4665,76 @@ def _split_continuation_chunks(rest: str) -> list:
             break
         head, text = _split_with_balance(text, budget)
         chunks.append(head)
-    return [c for c in chunks if c.strip()]
+    chunks = [c for c in chunks if c.strip()]
+    # Discord's 40-component cap includes container wrappers and the page
+    # footer. Split media-rich pages by ordered text/media units as well as
+    # characters (34 body components + footer fit in four containers).
+    paged = []
+    for chunk in chunks:
+        tokens = list(_INLINE_IMG_TOKEN_RE.finditer(chunk))
+        if not tokens:
+            paged.append(chunk)
+            continue
+        events = []
+        cursor = 0
+        for token in tokens:
+            before = chunk[cursor:token.start()].strip()
+            if before:
+                events.append(before)
+            events.append(token.group(0))
+            cursor = token.end()
+        after = chunk[cursor:].strip()
+        if after:
+            events.append(after)
+        for start in range(0, len(events), 34):
+            paged.append("\n\n".join(events[start:start + 34]))
+    return paged
 
 
-def build_continuation_payloads(rest: str) -> list:
-    """Round 66: the follow-up message payloads that carry a card body's
-    remainder (see the ROUND 66 block above). Text-only Components V2
-    containers, same accent color as the card, starting directly with the
-    remaining body text and ending with a subtext `-# 📜 Page X/Y` footer.
-    Continue until the complete readable source body is consumed; message
-    count depends on content, including part five and beyond."""
+def build_continuation_payloads(rest: str, media: list | None = None,
+                                spoiler: bool = False) -> list:
+    """Build follow-up pages, retaining inline Reddit media positions.
+
+    Continuation text is still split at the same safe character boundaries.
+    When the remainder contains inline-image sentinels, each sentinel becomes
+    a separate type-12 media block between its surrounding text components.
+    Legacy text-only remainders keep their byte-compatible payload shape.
+    """
     chunks = _split_continuation_chunks(rest)
     if not chunks:
         return []
+    photos = [m for m in (media or []) if isinstance(m, dict) and m.get("kind") != "video"]
     total_pages = len(chunks) + 1
-    return [
-        {"flags": IS_COMPONENTS_V2,
-         "components": [{"type": 17, "accent_color": 16729344,
-                         "components": [
-                             {"type": 10, "content": chunk},
-                             {"type": 10, "content": f"-# 📜 Page {idx}/{total_pages}"},
-                         ]}]}
-        for idx, chunk in enumerate(chunks, start=2)
-    ]
+    payloads = []
+    for idx, chunk in enumerate(chunks, start=2):
+        tokens = list(_INLINE_IMG_TOKEN_RE.finditer(chunk))
+        if not tokens or not photos:
+            children = [
+                {"type": 10, "content": chunk},
+                {"type": 10, "content": f"-# 📜 Page {idx}/{total_pages}"},
+            ]
+            containers = [{"type": 17, "accent_color": 16729344, "components": children}]
+        else:
+            units = []
+            cursor = 0
+            for token in tokens:
+                before = chunk[cursor:token.start()].strip()
+                if before:
+                    units.append([{"type": 10, "content": before}])
+                photo_idx = int(token.group(1))
+                if 0 <= photo_idx < len(photos):
+                    item = {"media": {"url": photos[photo_idx]["url"]}}
+                    if spoiler:
+                        item["spoiler"] = True
+                    units.append([{"type": 12, "items": [item]}])
+                cursor = token.end()
+            after = chunk[cursor:].strip()
+            if after:
+                units.append([{"type": 10, "content": after}])
+            units.append([{"type": 10, "content": f"-# 📜 Page {idx}/{total_pages}"}])
+            containers = _pack_v2_containers(units, 16729344)
+        payloads.append({"flags": IS_COMPONENTS_V2, "components": containers})
+    return payloads
 
 
 async def deliver_body_continuations(session, webhook_url: str, key: str, records: dict) -> None:
@@ -8443,25 +8510,35 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
             out.append(item)
         return {"type": 12, "items": out}
 
-    # Round 109: continuation pages never carry a token — a photo referenced
-    # only on a later page joins the trailing gallery of the main card.
-    body_rest = _strip_inline_img_tokens(body_rest)
+    # Keep inline sentinels on continuation pages; build_continuation_payloads
+    # resolves them into ordered, standalone media blocks. Only photos never
+    # referenced anywhere in the body belong in the main card's trailing gallery.
     segments, inline_order = _inline_img_segments(body_out)
     if segments:
         def _chunks(items: list) -> list:
             return [items[i:i + MEDIA_PER_GALLERY]
                     for i in range(0, len(items), MEDIA_PER_GALLERY)]
 
-        _used_idx = set(inline_order)
-        _trailing = [m for i, m in enumerate(_photo_media) if i not in _used_idx]
+        _used_idx = {int(m.group(1)) for m in _INLINE_IMG_TOKEN_RE.finditer(body_src)}
+        _trailing_idx = [i for i in range(len(_photo_media)) if i not in _used_idx]
+        _trailing = [_photo_media[i] for i in _trailing_idx]
         while True:
+            if body_rest and _trailing:
+                # Keep media that has no body marker behind all body-positioned
+                # media. Otherwise an unreferenced image on page one could jump
+                # ahead of a referenced image on a later continuation page.
+                body_rest += "\n\n" + "\n\n".join(
+                    _inline_img_token(i) for i in _trailing_idx)
+                _trailing = []
+                _trailing_idx = []
             units = [[{"type": 10, "content": header}]]
             for _text, _idxs in segments:
                 _unit = []
                 if _text:
                     _unit.append({"type": 10, "content": _text})
-                for _chunk in _chunks([_photo_media[i] for i in _idxs]):
-                    _unit.append(gallery(_chunk))
+                for _photo_idx in _idxs:
+                    if 0 <= _photo_idx < len(_photo_media):
+                        _unit.append(gallery([_photo_media[_photo_idx]]))
                 units.append(_unit)
             for _chunk in _chunks(_trailing):
                 units.append([gallery(_chunk)])
@@ -8473,13 +8550,25 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
                           row,
                           {"type": 10, "content": SUPPORT_FOOTER}])
             containers = _pack_v2_containers(units, 16729344)
-            if len(segments) <= 1 or _count_v2_components(containers) <= _V2_COMPONENT_CAP:
+            if _count_v2_components(containers) <= _V2_COMPONENT_CAP or len(segments) <= 1:
                 break
-            # over the component cap: fold the last two sections into one
-            # (their prose joined, their pictures pooled below it)
-            (_t1, _i1), (_t2, _i2) = segments[-2], segments[-1]
-            segments = segments[:-2] + [
-                ("\n\n".join(t for t in (_t1, _t2) if t), _i1 + _i2)]
+            # A Discord message has a hard 40-component cap. Preserve every
+            # image as a distinct block by moving whole trailing inline sections
+            # to the continuation stream rather than pooling adjacent media.
+            moved_text, moved_idxs = segments.pop()
+            moved_parts = ([moved_text] if moved_text else [])
+            moved_parts.extend(_inline_img_token(i) for i in moved_idxs)
+            moved = "\n\n".join(moved_parts)
+            body_rest = moved + (("\n\n" + body_rest) if body_rest else "")
+        if body_rest:
+            total_pages = 1 + len(_split_continuation_chunks(body_rest))
+            updated_stats = f"{base_stats_line} • 📜 Page 1/{total_pages}"
+            if updated_stats != stats_line:
+                for _container in containers:
+                    for _child in _container.get("components", []):
+                        if _child.get("type") == 10 and _child.get("content") == stats_line:
+                            _child["content"] = updated_stats
+                stats_line = updated_stats
         payload = {"flags": IS_COMPONENTS_V2, "components": containers}
         if return_remainder:
             return payload, body_rest
@@ -10101,7 +10190,8 @@ async def main():
                     # follow-up messages (see build_continuation_payloads).
                     payload, body_rest = build_v3_payload(subreddit, data, reddit_url,
                                                           posted_ts, return_remainder=True)
-                    continuations = build_continuation_payloads(body_rest)
+                    continuations = build_continuation_payloads(
+                        body_rest, data["media"], spoiler=bool(data.get("spoiler")))
 
                     if DRY_RUN:
                         kinds = ",".join(sorted({m["kind"] for m in data["media"]})) or "text"

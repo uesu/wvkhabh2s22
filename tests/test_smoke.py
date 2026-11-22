@@ -13084,6 +13084,13 @@ check("r115: shorthand GIF parsing is conservative; non-GIF markdown IDs are not
           dict(_r101_rec, url="https://www.reddit.com/r/WutheringWavesLeaks/comments/test/",
                media=[], body="![image](not-a-url) ![gif](validgifid123)")))]
       == ["https://i.redd.it/validgifid123.gif"])
+check("r116: Reddit rich-text ![img](file-id) resolves only to a matching extracted image and becomes a position token",
+      v3._mark_inline_gallery_images("Before\n\n![img](pshfucm0b23i1)\n\nAfter", [
+          {"kind": "image", "url": "https://i.redd.it/pshfucm0b23i1.jpeg"}])
+      == "Before\n\n\u2063IMG0\u2063\n\nAfter"
+      and v3._mark_inline_gallery_images("![img](unknownfileid)", [
+          {"kind": "image", "url": "https://i.redd.it/pshfucm0b23i1.jpeg"}])
+      == "![img](unknownfileid)")
 _r115_supplemented = v3.supplement_relay_inline_media(
     [{"kind": "image", "url": "https://i.redd.it/cover-image.jpeg"},
      {"kind": "gif", "url": "https://i.redd.it/hvsluodja23i1.gif"}],
@@ -13316,11 +13323,11 @@ check("r109: links to NON-gallery targets stay as written; repeated references t
       == [(10, "intro"), (12, ["https://i.redd.it/img00abcde.png"])])
 _r109_pool = _r109_shape(_r109_build(_r109_data(
     f"# 6 - Enemies {_r109_url(0)}\n\n{_r109_url(1)}\n\n{_r109_url(2)}\n\n# 7 - Tutorials {_r109_url(3)}", 4)))
-check("r109: consecutive picture paragraphs (Reddit emits every embedded picture as its own "
-      "paragraph — the live '6 - Enemies' section) pool into ONE gallery under their heading; "
-      "only prose closes a section",
-      _r109_pool == [[_r109_hdr, (10, "# 6 - Enemies"), (12, [_r109_url(0), _r109_url(1), _r109_url(2)]),
-                      (10, "# 7 - Tutorials"), (12, [_r109_url(3)]), _r109_stats, _r109_div, (1, None)]],
+check("r116: consecutive inline picture paragraphs stay in separate media blocks and source order",
+      _r109_pool == [[_r109_hdr, (10, "# 6 - Enemies"),
+                      (12, [_r109_url(0)]), (12, [_r109_url(1)]), (12, [_r109_url(2)]),
+                      (10, "# 7 - Tutorials"), (12, [_r109_url(3)])],
+                     [_r109_stats, _r109_div, (1, None)]],
       _r109_pool)
 _r109_vid = _r109_shape(_r109_build(_r109_data(f"intro {_r109_url(0)}\n\nmore {_r109_url(1)}", 2, video=True)))
 check("r109: the round-38c video tile keeps its OWN media block after the sections",
@@ -13331,26 +13338,51 @@ check("r109: more than 10 unreferenced pictures split into ≤10-item trailing g
       [len(v) for t, v in _r109_many[0] if t == 12] == [1, 10, 3])
 _r109_long = ("intro " + _r109_url(0) + "\n\n" + ("lorem ipsum dolor sit amet " * 160)
               + "\n\nlast " + _r109_url(1) + "\n\nend")
+_r116_multipage_data = _r109_data(
+    "start " + _r109_url(0) + "\n\n" + ("alpha paragraph text " * 230)
+    + "\n\nmiddle " + _r109_url(1) + "\n\n" + ("beta paragraph text " * 230)
+    + "\n\nend " + _r109_url(2) + "\n\nfinished", 3)
+_r116_main, _r116_rest = _r109_build(_r116_multipage_data, return_remainder=True)
+_r116_continuations = v3.build_continuation_payloads(_r116_rest, _r116_multipage_data["media"])
+def _r116_components(payload):
+    return [x for c in payload["components"] for x in c["components"]]
+_r116_media = [item["media"]["url"] for payload in [_r116_main] + _r116_continuations
+               for item in _r116_components(payload) if item.get("type") == 12
+               for item in item.get("items", [])]
+check("r116: inline images after first-page text stay on their later continuation pages, in source order, as separate media blocks",
+      len(_r116_continuations) >= 2
+      and _r116_media == [_r109_url(0), _r109_url(1), _r109_url(2)]
+      and [len(item["items"]) for payload in [_r116_main] + _r116_continuations
+           for item in _r116_components(payload) if item.get("type") == 12] == [1, 1, 1]
+      and all("\u2063" not in json.dumps(payload, ensure_ascii=False)
+              for payload in [_r116_main] + _r116_continuations),
+      (len(_r116_continuations), _r116_media))
 _r109_pp, _r109_rest = _r109_build(_r109_data(_r109_long, 3), return_remainder=True)
-check("r109: a picture referenced only on a continuation page joins the trailing gallery; the "
-      "continuation text carries neither the URL nor a token",
-      [len(v) for t, v in _r109_shape(_r109_pp)[0] if t == 12] == [1, 2]
-      and "\u2063" not in _r109_rest and "preview.redd.it" not in _r109_rest
-      and _r109_rest.endswith("last\n\nend"), repr(_r109_rest[-60:]))
+check("r116: a picture referenced only on a continuation page stays off the main card and renders inline later",
+      [v for t, v in _r109_shape(_r109_pp)[0] if t == 12] == [[_r109_url(0)]]
+      and "preview.redd.it" not in _r109_rest
+      and [it["media"]["url"] for page in v3.build_continuation_payloads(
+          _r109_rest, _r109_data(_r109_long, 3)["media"])
+          for x in _r116_components(page) if x.get("type") == 12 for it in x["items"]]
+          == [_r109_url(1), _r109_url(2)]
+      and _r109_rest.endswith(v3._inline_img_token(2)), repr(_r109_rest[-60:]))
 for _r109_n in (12, 14, 20, 30):
     _r109_big = "\n\n".join(f"# Section {i} {_r109_url(i)}\n\ntext {i}" for i in range(_r109_n))
-    _r109_bp = _r109_build(_r109_data(_r109_big, _r109_n))
-    _r109_bs = _r109_shape(_r109_bp)
-    check(f"r109: {_r109_n} sections — every container holds ≤10 children, the whole message stays "
-          "≤40 components (sections past the cap fold into the last one), the stats / divider / "
-          "buttons trio stays together at the end, and every picture is still on the card",
-          v3._count_v2_components(_r109_bp["components"]) <= 40
-          and all(len(c["components"]) <= 10 for c in _r109_bp["components"])
-          and [t for t, _ in _r109_bs[-1][-3:]] == [10, 14, 1]
-          and all(1 <= len(v) <= 10 for c in _r109_bs for t, v in c if t == 12)
-          and sorted(u for c in _r109_bs for t, v in c if t == 12 for u in v)
+    _r109_data_big = _r109_data(_r109_big, _r109_n)
+    _r109_bp, _r109_rem = _r109_build(_r109_data_big, return_remainder=True)
+    _r109_pages = [_r109_bp] + v3.build_continuation_payloads(_r109_rem, _r109_data_big["media"])
+    _r109_bs = [_r109_shape(page) for page in _r109_pages]
+    check(f"r116: {_r109_n} inline sections preserve every separate image across pages under Discord component limits",
+          all(v3._count_v2_components(page["components"]) <= 40
+              and all(len(c["components"]) <= 10 for c in page["components"])
+              for page in _r109_pages)
+          and [t for t, _ in _r109_bs[0][-1][-3:]] == [10, 14, 1]
+          and all(1 <= len(v) <= 10 for page in _r109_bs for shape in page
+                  for t, v in shape if t == 12)
+          and sorted(u for page in _r109_bs for shape in page for t, v in shape if t == 12 for u in v)
           == sorted(_r109_url(i) for i in range(_r109_n)),
-          (v3._count_v2_components(_r109_bp["components"]), [len(c["components"]) for c in _r109_bp["components"]]))
+          ([(v3._count_v2_components(page["components"]),
+             [len(c["components"]) for c in page["components"]]) for page in _r109_pages]))
 # Old-structure (RSS / redlib HTML) route: clean_rss_body leaves a position
 # marker (`⁣MEDIA:<file key>⁣`, no URL) where a picture reference stood, the
 # builder resolves it against the gallery, and the same interleaved card comes
@@ -13407,11 +13439,11 @@ check("r109b: external-preview thumbs, redd.it short links and <img> tags keep t
                         'https://external-preview.redd.it/x.png?s=1</a> and https://redd.it/abc12</p>'
                         f'<p><img src="{_r109_P}"> t</p>') == "and\n\nt")
 _r109_src = inspect.getsource(v3.build_v3_payload)
-check("r109: build_v3_payload marks the body BEFORE the round-62/66/71/99 choke point and strips "
-      "tokens on both legacy branches and the continuation remainder",
+check("r116: build_v3_payload marks the body before formatting and preserves tokens for continuation rendering",
       _r109_src.index("_mark_inline_gallery_images(") < _r109_src.index("_drop_gallery_media_lines(")
-      and _r109_src.count("_strip_inline_img_tokens(") == 2
-      and "_inline_img_segments(body_out)" in _r109_src)
+      and _r109_src.count("_strip_inline_img_tokens(") == 1
+      and "_inline_img_segments(body_out)" in _r109_src
+      and "body_rest, data[\"media\"], spoiler=bool(data.get(\"spoiler\"))" in inspect.getsource(v3))
 
 # ---- round 112 (2026-11-11): spoiler / NSFW relay posts blur IMAGE tiles only ----
 # A relay record Reddit flags `spoiler` or `nsfw` (own flag, newest re-check item,
@@ -13492,7 +13524,7 @@ _r112_src = inspect.getsource(v3.build_v3_payload)
 check("r112i: the blur lives in the ONE gallery() closure, keyed on media kind, never on a host",
       _r112_src.count("def gallery(") == 1
       and 'm.get("kind") != "video"' in _r112_src
-      and _r112_src.count("_strip_inline_img_tokens(") == 2
+      and _r112_src.count("_strip_inline_img_tokens(") == 1
       and not re.search(r"redd\.it|embedez|vxreddit|redditez", _r112_src.split("def gallery(")[1].split("\n\n")[0]))
 
 # ---- round 113 (2026-11-11): three reading fixes, no structure change ----
