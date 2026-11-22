@@ -2032,28 +2032,34 @@ check("r30 P3: pending_reddit.json exists at the repo root for the checkout",
       os.path.exists(os.path.join(ROOT, "pending_reddit.json")))
 
 # ---- R31: feed-token .json probe gate (REDDIT_JSON_PROBE) ----------------
-_r31_saved = (v3.JSON_PROBE_MODE, v3.REDDIT_CLIENT_ID, v3.REDDIT_CLIENT_SECRET)
+_r31_saved = (v3.JSON_PROBE_MODE, v3.REDDIT_CLIENT_ID, v3.REDDIT_CLIENT_SECRET,
+              v3.REDDIT_FEED_TOKEN)
 try:
-    def _r31_probe(mode, cid, csecret):
+    def _r31_probe(mode, cid, csecret, token=""):
         v3.JSON_PROBE_MODE = mode
         v3.REDDIT_CLIENT_ID = cid
         v3.REDDIT_CLIENT_SECRET = csecret
+        v3.REDDIT_FEED_TOKEN = token
         return v3.feedtoken_probe_enabled()
-    check("r31 probe: auto (default) without an OAuth app is OFF (the 65 s 403 probe)",
+    check("r31 probe: environment default is off, including empty workflow Variables",
+          'JSON_PROBE_MODE = (os.getenv("REDDIT_JSON_PROBE") or "off").strip().lower()'
+          in open(v3.__file__, encoding="utf-8").read())
+    check("r31 probe: auto without token or OAuth is OFF",
           _r31_probe("auto", "", "") is False)
-    check("r31 probe: unset/empty mode = auto — without an app is OFF",
-          _r31_probe("", "", "") is False)
-    check("r31 probe: auto WITH both app secrets is ON (legacy fallback under working OAuth)",
+    check("r31 probe: auto with both app secrets remains an explicit opt-in",
           _r31_probe("auto", "clientid", "clientsecret") is True)
+    check("r31 probe: auto with feed token remains an explicit opt-in",
+          _r31_probe("auto", "", "", "feed=example&user=reader") is True)
     check("r31 probe: force is ON even without an app",
           _r31_probe("force", "", "") is True)
-    check("r31 probe: off wins even with an app",
-          _r31_probe("off", "clientid", "clientsecret") is False)
+    check("r31 probe: off wins even with app secrets and feed token",
+          _r31_probe("off", "clientid", "clientsecret", "feed=example&user=reader") is False)
     check("r31 probe: fetch_post_json's feed-token branch is gated",
           "REDDIT_FEED_TOKEN and feedtoken_probe_enabled()"
           in inspect.getsource(v3.fetch_post_json))
 finally:
-    (v3.JSON_PROBE_MODE, v3.REDDIT_CLIENT_ID, v3.REDDIT_CLIENT_SECRET) = _r31_saved
+    (v3.JSON_PROBE_MODE, v3.REDDIT_CLIENT_ID, v3.REDDIT_CLIENT_SECRET,
+     v3.REDDIT_FEED_TOKEN) = _r31_saved
 
 # ---- R32: reason-aware pending re-check + RSS liveness gate (round 32)
 import inspect as _r32_inspect
@@ -13092,6 +13098,34 @@ check("r115: relay shorthand GIFs supplement partial proxy galleries without dup
       and "![gif]" not in _r115_marked
       and "cover-image.jpeg" in _r115_supplemented[0]["url"],
       str((len(_r115_supplemented), _r115_inline_order[:3], _r115_marked[:80])))
+_r116_relay_rec = dict(_r101_rec, id="1y2dxhl", sub="wutheringwavesleaks",
+    permalink="/r/WutheringWavesLeaks/comments/1y2dxhl/wuthering_waves_4x_official_interview/",
+    created=1795313781, media=["https://i.redd.it/hvsluodja23i1.gif"],
+    body="Gallery\n\n![gif](hvsluodja23i1)")
+_r116_candidate = v3.test_post_intake_candidate(
+    {"status": "ok", "records": [_r116_relay_rec]},
+    "WutheringWavesLeaks", "1y2dxhl", 1795314000)
+check("r116: targeted TEST_POST_ID selects the exact matching complete relay record and keeps child identity",
+      _r116_candidate is not None
+      and _r116_candidate[0] == "WutheringWavesLeaks"
+      and _r116_candidate[2] == "WutheringWavesLeaks_1y2dxhl"
+      and isinstance(_r116_candidate[5], v3._IntakeEntry)
+      and _r116_candidate[5].record["id"] == "1y2dxhl"
+      and v3.extract_post_id(_r116_candidate[1]) == "1y2dxhl"
+      and v3.test_post_intake_candidate(
+          {"status": "stale", "records": [_r116_relay_rec]},
+          "WutheringWavesLeaks", "1y2dxhl", 1795314000) is None)
+_r116_main = inspect.getsource(v3.main)
+check("r116: primary-relay TEST_POST_ID never falls through to legacy JSON/RSS/Redlib; non-primary selection is explicit",
+      'if INTAKE_READER == "primary":' in _r116_main
+      and "test_post_intake_candidate(" in _r116_main
+      and "legacy Reddit/Redlib fallback is intentionally disabled" in _r116_main
+      and "using legacy sources because INTAKE_READER=" in _r116_main)
+check("r116: workflow defaults targeted tests to no-delivery/no-cache, while ordinary scheduled dispatch remains live",
+      "options: ['auto', 'yes', 'no']" in _r101_wf
+      and "default: 'auto'" in _r101_wf
+      and "github.event.inputs.dry_run == 'yes' || (github.event.inputs.test_post != '' && github.event.inputs.dry_run != 'no')" in _r101_wf
+      and "TEST_POST_ID: ${{ github.event.inputs.test_post }}" in _r101_wf)
 check("r101b: markdown backslash escapes inside BARE URLs are resolved (live 1xlhem9 "
       "`x.com/minmyouk\\_xx`); prose escapes and [label](url) targets (round-99 approved card) "
       "untouched — the plain-body path (relay + archive)",

@@ -33,15 +33,15 @@ on:
   workflow_dispatch:          # allows manual + external-cron triggering
     inputs:
       test_post:
-        description: 'Optional TEST POST: rebuild ONE specific post, e.g. AnantaLeaks/1wgvcz7 (native RSS/redlib fallback if the post JSON 403s). Leave empty for a normal run.'
+        description: 'Optional TEST POST: rebuild one specific post from the primary relay, e.g. WutheringWavesLeaks/1y2dxhl. Test posts bypass dedup; leave empty for a normal run.'
         required: false
         default: ''
       dry_run:
-        description: 'Dry run: build + log the payloads, but do NOT post to Discord and do NOT save the cache. Useful before promoting.'
+        description: 'auto = targeted test posts are dry-run; ordinary runs stay live. yes = always dry-run. no = explicitly allow live delivery.'
         type: choice
-        options: ['no', 'yes']
+        options: ['auto', 'yes', 'no']
         required: false
-        default: 'no'
+        default: 'auto'
 
 permissions:
   contents: write
@@ -90,7 +90,7 @@ jobs:
           # EMBEDEZ_API_KEY: ${{ secrets.EMBEDEZ_API_KEY }}   # round 13: no longer used —
           #   V3's proxy path (redditez/vxreddit/embeddit) is keyless; the secret
           #   can be deleted from the repo (only the old V2 needs it)
-          REDDIT_FEED_TOKEN: ${{ secrets.REDDIT_FEED_TOKEN }}   # your Reddit feed token (recommended — old.reddit.com -> Preferences -> Feeds; paste the full private RSS link `https://old.reddit.com/.rss?feed=<key>&user=<user>` (also `https://www.reddit.com/.rss?feed=…` / `https://reddit.com/.rss?feed=…` / `https://old.reddit.com/?feed=…` — host/path-agnostic, query-only) or any shorthand `<key>&user=<user>`/`?feed=<key>&user=<user>`/`feed=<key>&user=<user>`/bare `<key>`; V3 also tries it on .json for full mode)
+          REDDIT_FEED_TOKEN: ${{ secrets.REDDIT_FEED_TOKEN }}   # personal Reddit feed token (recommended); authenticates RSS; .json only when REDDIT_JSON_PROBE opts in
           # round 24 (2026-09-18): miningtcup's DogWAF token — the SAME
           # value the Twitter monitor uses (NITTER_RSS_TOKEN), stored as a
           # repo SECRET in both repos (GitHub masks secrets in all logs);
@@ -98,10 +98,12 @@ jobs:
           # if the operator scoped the token to nitter only, that
           # instance just logs a bot-check miss and the chain moves on.
           NITTER_RSS_TOKEN: ${{ secrets.NITTER_RSS_TOKEN }}
-          # Test tools (round 12): manual runs only. TEST_POST_ID rebuilds one
-          # specific post; DRY_RUN logs payloads without touching Discord.
+          # Targeted test posts default to a safe dry-run, bypass dedup, and
+          # use relay records when the primary intake is healthy. A deliberate
+          # `dry_run: no` is required to post a test card to Discord. Normal
+          # scheduled/external dispatches (no test_post) remain live.
           TEST_POST_ID: ${{ github.event.inputs.test_post }}
-          DRY_RUN: ${{ github.event.inputs.dry_run == 'yes' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run == 'yes' || (github.event.inputs.test_post != '' && github.event.inputs.dry_run != 'no') }}
           # OPTIONAL switches (repo Variables, all work with no Variable set).
           # Empty GitHub Variables are passed through as empty strings; each
           # Python module restores its documented default for empty values.
@@ -131,7 +133,7 @@ jobs:
           MAX_CACHE_SIZE_PER_SUB: ${{ vars.MAX_CACHE_SIZE_PER_SUB }}
           MAX_CACHE_SIZE_TOTAL: ${{ vars.MAX_CACHE_SIZE_TOTAL }}
           MAX_POSTS_PER_RUN: ${{ vars.MAX_POSTS_PER_RUN }}
-          # REDDIT_JSON_PROBE: auto (default), force, or off.
+          # REDDIT_JSON_PROBE: off (default); set auto/force to opt in.
           REDDIT_JSON_PROBE: ${{ vars.REDDIT_JSON_PROBE }}
           # Round 67 (2026-10-07): the content-advisory gate and its four
           # Variables were REMOVED from the engine, so they no longer map

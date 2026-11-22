@@ -17,11 +17,9 @@
 #        2026 note: new API access may require Reddit's approval form
 #        (Responsible Builder Policy) — not guaranteed, so V3 never depends
 #        on it. If you get one, just add the two secrets; no code change.
-#     b) FEED TOKEN ON .json (ROUND 79: auto now powers .json FIRST when a
-#        valid REDDIT_FEED_TOKEN exists — see feedtoken_probe_enabled()
-#        below; anonymous .json is still 403 from datacenters, verified
-#        2026-09-20 — stagger capped to ≤2 s for the token tier vs 65 s
-#        anonymous, instant 1-request RSS fallback, 403 remembered for the run):
+#     b) FEED TOKEN ON .json (optional; REDDIT_JSON_PROBE defaults to off).
+#        Set it to auto/force to try .json; anonymous .json is 403 from
+#        datacenters, and a 403 falls back to RSS and is remembered for the run.
 #        www.reddit.com/comments/<id>.json?limit=25&raw_json=1&{feed_q}
 #        (feed_q = format_reddit_feed_query(REDDIT_FEED_TOKEN); host/path-
 #        agnostic — old.reddit.com/.rss?feed=… etc; auto OFF when token
@@ -262,8 +260,8 @@ SUBREDDITS = [s.strip() for s in SUBREDDITS_STR.split(",") if s.strip()]
 DEFAULT_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 # Personal Reddit feed token (old.reddit.com -> Preferences -> Feeds).
-# Still used for the RSS feed (rate tier) AND now also attempted on the
-# .json endpoints (workaround for the 2026 datacenter JSON wall — see header).
+# Used for the authenticated RSS feed. The optional .json probe is OFF unless
+# REDDIT_JSON_PROBE explicitly selects `auto` or `force` (see header).
 REDDIT_FEED_TOKEN = os.getenv("REDDIT_FEED_TOKEN", "").strip()
 
 
@@ -1531,16 +1529,16 @@ FEEDTOKEN_JSON_STAGGER = _env_int("FEEDTOKEN_JSON_STAGGER", 65)
 # app the round-12 probe was 65 s of guaranteed 403 log noise per run with
 # new posts (first attempt only — a 403 is remembered for the rest of the
 # run; steady-state runs never reached it).
-#   auto (default; unset/empty = auto) — Round 79: powers .json FIRST when
-#          REDDIT_FEED_TOKEN (format_reddit_feed_query valid) exists OR when
-#          BOTH REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET are set (real app);
-#          a 403 is remembered for the run and the next post uses the 1-req
-#          RSS fallback instantly — no extra run cost;
-#   force — legacy behavior: always try (token stagger capped ≤2s);
-#   off   — never.
-# Repo Variable REDDIT_JSON_PROBE (wired in reddit_monitor.yml).
+#   off (default; unset/empty = off) — never use the feed token on .json;
+#          the token remains available for authenticated RSS feeds.
+#   auto — powers .json FIRST when REDDIT_FEED_TOKEN (format_reddit_feed_query
+#          valid) exists OR when BOTH Reddit OAuth app secrets are set; a 403
+#          is remembered for the run and the next post uses RSS instantly.
+#   force — legacy behavior: always try (token stagger capped ≤2s).
+# Repo Variable REDDIT_JSON_PROBE (wired in reddit_monitor.yml) can explicitly
+# override the safe default; use `auto` or `force` only when desired.
 # ---------------------------------------------------------------------------
-JSON_PROBE_MODE = os.getenv("REDDIT_JSON_PROBE", "auto").strip().lower()
+JSON_PROBE_MODE = (os.getenv("REDDIT_JSON_PROBE") or "off").strip().lower()
 
 
 def feedtoken_probe_enabled() -> bool:
@@ -1549,9 +1547,9 @@ def feedtoken_probe_enabled() -> bool:
         return False
     if JSON_PROBE_MODE == "force":
         return True
-    # auto (default; also any unrecognized value): legacy OAuth path OR new
-    # token-powered path (instant fallback, see fetch_post_json). Empty
-    # REDDIT_FEED_TOKEN keeps the old OFF behavior for the r31 test.
+    # auto (or an unrecognized value): legacy OAuth path OR the optional
+    # token-powered path (instant fallback, see fetch_post_json). The runtime
+    # default is off; REDDIT_FEED_TOKEN alone never enables this probe.
     if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
         return True
     if REDDIT_FEED_TOKEN and format_reddit_feed_query(REDDIT_FEED_TOKEN):
@@ -6030,8 +6028,8 @@ async def fetch_post_json(session: aiohttp.ClientSession, post_id: str, use_oaut
     elif not _feedtoken_json_failed and REDDIT_FEED_TOKEN and feedtoken_probe_enabled():
         # Workaround attempt: the personal feed token on a .json endpoint.
         # Anonymous .json is 403 from datacenters; the token MIGHT lift it.
-        # Round 79: auto now powers .json FIRST when REDDIT_FEED_TOKEN exists
-        # (host/path-agnostic via format_reddit_feed_query); a 403 is
+        # Round 79: when REDDIT_JSON_PROBE=auto, the feed token powers .json
+        # FIRST (host/path-agnostic via format_reddit_feed_query); a 403 is
         # remembered for the run and the caller falls back to the 1-request
         # combined RSS path instantly — savings, no perf loss.
         feed_q = format_reddit_feed_query(REDDIT_FEED_TOKEN)
@@ -8922,9 +8920,10 @@ def test_post_entries(now: float) -> list:
     """
     TEST_POST_ID=<subreddit>/<post_id> -> one synthetic entry so a specific
     post can be rebuilt on demand (workflow_dispatch input `test_post`).
-    Bypasses the feed and the dedup cache on purpose (re-testing is the
-    point). Data source: post JSON when reachable (FULL MODE); otherwise
-    the RSS feed entry / redlib post page (round 12c native fallback).
+    Bypasses the normal listing and dedup cache on purpose. In primary relay
+    mode, main() replaces this stub with the matching complete relay record;
+    the old JSON/RSS/redlib test source is used only when relay is explicitly
+    off or shadow-selected.
     """
     parts = TEST_POST_ID.split("/", 1)
     sub_name, pid = (parts + [""])[:2] if len(parts) < 2 else parts
@@ -8935,6 +8934,36 @@ def test_post_entries(now: float) -> list:
         return []
     path = f"/r/{sub}/comments/{pid}/"
     return [(sub, path, f"{sub}_{pid}", now, now, None)]
+
+
+def test_post_intake_candidate(intake: dict, subreddit: str, post_id: str,
+                               now: float) -> tuple | None:
+    """The relay-backed TEST_POST_ID candidate, or None if the current relay
+    window does not contain that exact post. Never reaches into legacy Reddit
+    JSON/RSS/Redlib sources while the relay is the selected primary engine.
+    """
+    if not isinstance(intake, dict) or intake.get("status") != "ok":
+        return None
+    target_sub = (subreddit or "").strip().lower()
+    target_id = (post_id or "").strip().lower()
+    for raw in intake.get("records") or []:
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("id") or "").strip().lower() != target_id:
+            continue
+        path = normalize_reddit_path(str(raw.get("permalink") or ""))
+        record_sub = (str(raw.get("sub") or "").strip().lower()
+                      or (extract_subreddit(path) or "").lower())
+        if not path or record_sub != target_sub:
+            continue
+        created = raw.get("created")
+        published = float(created) if isinstance(created, (int, float)) else now
+        rec = dict(raw)
+        rec["permalink"] = path
+        entry = _IntakeEntry(rec, message_id="test-post")
+        return (subreddit, path, f"{subreddit}_{target_id}", published,
+                published, entry)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -8953,10 +8982,8 @@ async def main():
         logging.warning("REDDIT_FEED_TOKEN not set — running anonymously. The combined feed "
                         "(1 request/run) usually fits the ~1 req/min limit, but add your feed "
                         "token (old.reddit.com -> Preferences -> Feeds) as REDDIT_FEED_TOKEN "
-                        "to be bulletproof. (V3 also uses it on .json for FULL MODE — "
-                        "round 79: auto now powers .json FIRST when the token is valid "
-                        "(instant fallback, 403 remembered for the run); set "
-                        "REDDIT_JSON_PROBE=off to disable.)")
+                        "to be bulletproof. REDDIT_JSON_PROBE defaults to off; the feed token "
+                        "is not sent to .json unless explicitly enabled.")
     if not (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET):
         if feedtoken_probe_enabled():
             logging.info("No Reddit OAuth app secrets — V3 uses native RSS data; the feed "
@@ -9093,11 +9120,42 @@ async def main():
             # feed entirely and still runs the delivery loop below.
             native_keys = set()
 
-            # ---- TEST POST mode (round 12): rebuild one specific post --------
+            # ---- TEST POST mode: rebuild one specific post -------------------
             if TEST_POST_ID:
-                logging.info(f"TEST POST mode: {TEST_POST_ID} (dry_run={DRY_RUN}) — "
-                             f"feed + dedup cache bypassed on purpose.")
-                new_posts = test_post_entries(now)
+                test_entries = test_post_entries(now)
+                new_posts = test_entries
+                if INTAKE_READER == "primary":
+                    # The new engine remains the source of truth even for a
+                    # manual test. TEST_POST_ID bypasses only the normal
+                    # listing/dedup gates; it must not route through legacy
+                    # post JSON, combined RSS or Redlib when relay is primary.
+                    test_intake = await fetch_intake_records(session, now)
+                    run_stats["intake"] = _intake_summary(test_intake)
+                    run_stats["settings_line"] = _settings_line(
+                        _effective_settings(), run_stats["intake"])
+                    if test_entries:
+                        test_sub, _, _, _, _, _ = test_entries[0]
+                        test_pid = extract_post_id(test_entries[0][1]) or ""
+                        relay_candidate = test_post_intake_candidate(
+                            test_intake, test_sub, test_pid, now)
+                    else:
+                        relay_candidate = None
+                    if relay_candidate:
+                        new_posts = [relay_candidate]
+                        logging.info(f"TEST POST mode: {TEST_POST_ID} (dry_run={DRY_RUN}) — "
+                                     "using the primary relay record; normal listing and "
+                                     "dedup bypassed, no legacy Reddit/Redlib probes.")
+                    else:
+                        new_posts = []
+                        status = str(test_intake.get("status") or "unknown")
+                        logging.error(f"TEST POST {TEST_POST_ID}: relay-primary test could not "
+                                      f"find this post in the current relay window (status={status}); "
+                                      "legacy Reddit/Redlib fallback is intentionally disabled. "
+                                      "No delivery or cache write will occur.")
+                else:
+                    logging.info(f"TEST POST mode: {TEST_POST_ID} (dry_run={DRY_RUN}) — "
+                                 f"using legacy sources because INTAKE_READER={INTAKE_READER}; "
+                                 "normal listing and dedup bypassed.")
                 # Test mode does not populate combined stats; mark as test_post
                 combined_fetch_status = "test_post"
                 run_stats["combined_entries"] = 0
