@@ -13060,6 +13060,38 @@ check("r101b: inline rich-text images in a text post's markdown body (live 1xlh3
                media=["https://preview.redd.it/6ymlc2ap23zh1.jpeg?width=1706&s=b",
                       "https://preview.redd.it/a5jn0lcp23zh1.jpeg?width=1290&s=d"])))]
       == ["https://i.redd.it/6ymlc2ap23zh1.jpeg", "https://i.redd.it/a5jn0lcp23zh1.jpeg"])
+# Reddit rich-text GIF references omit the CDN URL and extension. The id is
+# the i.redd.it filename; convert only an explicit `![gif](id)` marker.
+_r115_gif_ids = ["hvsluodja23i1"] + [f"gallerygif{i:02d}id" for i in range(18)]
+_r115_gif_body = "Gallery\n\n" + "\n".join(f"![gif]({gid})" for gid in _r115_gif_ids)
+_r115_gif_rec = dict(_r101_rec, id="1y2dxhl", url="https://www.reddit.com/r/WutheringWavesLeaks/comments/1y2dxhl/",
+                     media=["https://i.redd.it/hvsluodja23i1.gif"], body=_r115_gif_body)
+_r115_gif_items = v3.extract_native_media(v3.intake_content_html(_r115_gif_rec))
+check("r115: relay shorthand GIFs resolve to i.redd.it URLs, preserve order, and dedupe against media[]",
+      len(_r115_gif_items) == 19
+      and [m["url"] for m in _r115_gif_items]
+          == [f"https://i.redd.it/{gid}.gif" for gid in _r115_gif_ids]
+      and all(m["kind"] == "gif" for m in _r115_gif_items),
+      str(_r115_gif_items[:3]))
+check("r115: shorthand GIF parsing is conservative; non-GIF markdown IDs are not guessed as media",
+      [m["url"] for m in v3.extract_native_media(v3.intake_content_html(
+          dict(_r101_rec, url="https://www.reddit.com/r/WutheringWavesLeaks/comments/test/",
+               media=[], body="![image](not-a-url) ![gif](validgifid123)")))]
+      == ["https://i.redd.it/validgifid123.gif"])
+_r115_supplemented = v3.supplement_relay_inline_media(
+    [{"kind": "image", "url": "https://i.redd.it/cover-image.jpeg"},
+     {"kind": "gif", "url": "https://i.redd.it/hvsluodja23i1.gif"}],
+    v3.intake_content_html(_r115_gif_rec))
+_r115_marked = v3._mark_inline_gallery_images(_r115_gif_body, _r115_supplemented)
+_r115_segments, _r115_inline_order = v3._inline_img_segments(_r115_marked)
+check("r115: relay shorthand GIFs supplement partial proxy galleries without duplicating CDN files",
+      len(_r115_supplemented) == 20
+      and len(_r115_inline_order) == 19
+      and _r115_inline_order == list(range(1, 20))
+      and all("![gif]" not in text for text, _ in _r115_segments)
+      and "![gif]" not in _r115_marked
+      and "cover-image.jpeg" in _r115_supplemented[0]["url"],
+      str((len(_r115_supplemented), _r115_inline_order[:3], _r115_marked[:80])))
 check("r101b: markdown backslash escapes inside BARE URLs are resolved (live 1xlhem9 "
       "`x.com/minmyouk\\_xx`); prose escapes and [label](url) targets (round-99 approved card) "
       "untouched — the plain-body path (relay + archive)",

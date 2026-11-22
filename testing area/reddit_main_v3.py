@@ -3165,11 +3165,22 @@ def intake_content_html(rec: dict) -> str:
     if not urls and parent:
         urls = list(parent.get("media") or [])
     # Inline rich-text images live in the markdown body as bare preview.redd.it
-    # / i.redd.it URLs (live records 1xlgs9j, 1xlh3fw). Reddit's RSS content
-    # carried them as anchors, so the native extractor must still see them.
+    # / i.redd.it URLs (live records 1xlgs9j, 1xlh3fw), or as Reddit's
+    # shorthand `![gif](<media-id>)` reference (live 1y2dxhl). RSS carried
+    # full URLs as anchors; for the shorthand form the media id is also the
+    # i.redd.it filename, so an explicit GIF marker safely supplies `.gif`.
+    # Keep all body references in source order and let the native extractor's
+    # normal URL-key dedupe collapse overlap with the record's media list.
     try:
-        urls += [m.group(0) for m in REDDIT_MEDIA_URL_RE.finditer(
-            str(rec.get("body") or "").replace("\\_", "_"))]
+        body = str(rec.get("body") or "").replace("\\_", "_")
+        body_refs = []
+        for m in REDDIT_MEDIA_URL_RE.finditer(body):
+            body_refs.append((m.start(), m.group(0)))
+        for m in re.finditer(
+                r"!\[\s*gif\s*\]\(\s*([A-Za-z0-9_-]{5,64})\s*\)",
+                body, re.I):
+            body_refs.append((m.start(), f"https://i.redd.it/{m.group(1)}.gif"))
+        urls.extend(url for _, url in sorted(body_refs, key=lambda item: item[0]))
     except Exception:
         pass
     for u in urls:
@@ -3185,6 +3196,35 @@ def intake_content_html(rec: dict) -> str:
     permalink = html_lib.escape(f"https://www.reddit.com{rec.get('permalink') or ''}", quote=True)
     parts.append(f'<span><a href="{permalink}">[comments]</a></span>')
     return "".join(parts)
+
+
+def supplement_relay_inline_media(media: list, content_html: str | None) -> list:
+    """Merge media URLs exposed by a complete relay body's inline references
+    into a partial proxy gallery. Relay posts can have shorthand GIFs in the
+    body that public proxy embeds omit; retain the proxy's URLs/order, then
+    append only genuinely new Reddit CDN files from the relay's RSS-shaped
+    content. The regular final media deduper still resolves proxy wrappers.
+    """
+    out = [dict(item) for item in (media or []) if isinstance(item, dict)]
+    seen_urls = {str(item.get("url") or "") for item in out}
+    seen_reddit = set()
+    for url in seen_urls:
+        if REDDIT_MEDIA_URL_RE.fullmatch(url):
+            seen_reddit.add(_reddit_media_key(url))
+    added = 0
+    for item in extract_native_media(content_html):
+        url = str(item.get("url") or "")
+        key = _reddit_media_key(url)
+        if url in seen_urls or key in seen_reddit:
+            continue
+        out.append(dict(item))
+        seen_urls.add(url)
+        seen_reddit.add(key)
+        added += 1
+    if added:
+        logging.info(f"relay inline media: supplemented proxy gallery with {added} "
+                     "additional Reddit-hosted item(s).")
+    return out
 
 
 class _IntakeEntry:
@@ -3956,6 +3996,8 @@ _MEDIA_MARK_RE = re.compile(r"\u2063MEDIA:([^\u2063\n]+)\u2063")
 _MEDIA_MARK_LINE_RE = re.compile(r"(?m)^[ \t>]*\u2063MEDIA:([^\u2063\n]+)\u2063[ \t]*$")
 _INLINE_IMG_STRAY_RE = re.compile(r"\u2063(?:IMG\d*|MEDIA:[^\u2063\n]*)?\u2063?")
 _INLINE_IMG_LINK_RE = re.compile(r"!?\[([^\]\n]*)\]\((https?://[^)\s]+)\)")
+_INLINE_REDDIT_GIF_REF_RE = re.compile(
+    r"!\[\s*gif\s*\]\(\s*([A-Za-z0-9_-]{5,64})\s*\)", re.I)
 _HTML_MEDIA_LINK_RE = re.compile(
     r"\[([^\]\n]*)\]\(\s*(https?://(?:i\.|preview\.)redd\.it/[^\s)]*)\s*\)")
 _HTML_MEDIA_BARE_RE = re.compile(
@@ -4090,9 +4132,19 @@ def _mark_inline_gallery_images(body: str, photo_media: list) -> str:
         tok = _token_for(m.group(0))
         return m.group(0) if tok is None else tok
 
+    def _repl_gif_ref(m: re.Match) -> str:
+        idx = key_to_idx.get(f"{m.group(1)}.gif".lower())
+        if idx is None:
+            return m.group(0)
+        if idx in used:
+            return ""
+        used.add(idx)
+        return f"\n{_inline_img_token(idx)}\n"
+
     marked = body
     if has_marks:
         marked = _MEDIA_MARK_RE.sub(_repl_marker, _MEDIA_MARK_LINE_RE.sub(_repl_marker, marked))
+    marked = _INLINE_REDDIT_GIF_REF_RE.sub(_repl_gif_ref, marked)
     marked = _INLINE_IMG_LINK_RE.sub(_repl_link, marked)
     marked = REDDIT_MEDIA_URL_RE.sub(_repl_bare, marked)
     if not used:
@@ -7990,6 +8042,12 @@ async def resolve_post_media(session: aiohttp.ClientSession, base: dict,
                     logging.info(f"[{label or 'stats'}] stats via embeddit — {stats}")
             except Exception as e:
                 logging.info(f"[{label or 'stats'}] embeddit stats fetch failed: {e}")
+
+    # Relay bodies can carry rich-text GIF shorthand absent from proxy metadata.
+    # Supplement, rather than replace, an otherwise usable proxy gallery so a
+    # text-only/incomplete mirror cannot silently hide those Reddit media.
+    if relay_complete and proxy_media_used and not has_video:
+        media = supplement_relay_inline_media(media, base.get("content_html"))
 
     # Round 104: the relay record's own counts (Reddit's numbers at listing
     # / re-check time) when no proxy served the stats line.
