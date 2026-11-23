@@ -11924,6 +11924,17 @@ check("r99: one-column detection needs BOTH boundary pipes — prose with a pipe
       and all(v3._format_markdown_tables(_b) == _b for _b in _r66_bad_tbls)
       and v3._format_markdown_tables(_r71_tbl) == _r71_expected,
       repr(v3._format_markdown_tables("|H|\n|:-|\n|row|\n| x | y |")))
+_r116_megathread_link = (
+    "[All Previous Showcase Megathreads](https://www.reddit.com/r/"
+    "HonkaiStarRail_leaks/search?sort=new&restrict_sr=on&q=flair%3A%3Atheherta_01%3A%2BShowcase%2BMegathread)"
+)
+_r116_empty_link_table = f"|{_r116_megathread_link}|\n|:-|"
+check("r116: a link-only one-column Markdown table becomes a clean standalone Discord link",
+      v3._format_markdown_tables(_r116_empty_link_table) == _r116_megathread_link
+      and v3._format_markdown_tables(
+          f"Intro\n\n{_r116_empty_link_table}\n\nOutro")
+          == f"Intro\n\n{_r116_megathread_link}\n\nOutro"
+      and v3._format_markdown_tables("|H|\n|:-|") == "|H|\n|:-|")
 check("r99: a blank line never bridges a table to PROSE or to an unbounded pipe line",
       v3._format_markdown_tables("|H|\n\n|:-|\n\ntext | not a row") == "|H|\n\n|:-|\n\ntext | not a row"
       and v3._format_markdown_tables("| a | b |\n|---|---|\n| x | y |\n\nplain") == "**a x**\n- b: y\n\nplain")

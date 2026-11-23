@@ -4530,8 +4530,18 @@ def _format_markdown_tables(body: str | None) -> str:
             rows.append(cells)
             k += 1
         if not rows:
-            # a header + separator with no data rows at all (or a first
-            # data row of the wrong width): not a table — never guess
+            # Reddit sometimes uses a one-column table solely to style a
+            # single previous-megathread link: the link is the header and
+            # `|:-|` is the separator, with no data row. Discord has no table
+            # rendering, so unwrap this known shape into the standalone link
+            # instead of leaking the boundary pipes and separator literally.
+            if (len(headers) == 1
+                    and re.fullmatch(r"\[[^\]\n]+\]\(https?://[^)\s]+\)", headers[0])):
+                out.append(html_lib.unescape(headers[0]).strip())
+                i = seq[1] + 1
+                continue
+            # Other header + separator-only / wrong-width shapes remain
+            # byte-identical — do not guess that arbitrary prose is a table.
             out.append(lines[i])
             i += 1
             continue
