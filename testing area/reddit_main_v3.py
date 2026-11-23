@@ -4719,8 +4719,9 @@ def build_continuation_payloads(rest: str, media: list | None = None,
     for idx, chunk in enumerate(chunks, start=2):
         tokens = list(_INLINE_IMG_TOKEN_RE.finditer(chunk))
         if not tokens or not photos:
+            text_chunk = _spoilerize_body_text(chunk) if spoiler else chunk
             children = [
-                {"type": 10, "content": chunk},
+                {"type": 10, "content": text_chunk},
                 {"type": 10, "content": f"-# 📜 Page {idx}/{total_pages}"},
             ]
             containers = [{"type": 17, "accent_color": 16729344, "components": children}]
@@ -4730,6 +4731,8 @@ def build_continuation_payloads(rest: str, media: list | None = None,
             for token in tokens:
                 before = chunk[cursor:token.start()].strip()
                 if before:
+                    if spoiler:
+                        before = _spoilerize_body_text(before)
                     units.append([{"type": 10, "content": before}])
                 photo_idx = int(token.group(1))
                 if 0 <= photo_idx < len(photos):
@@ -4740,6 +4743,8 @@ def build_continuation_payloads(rest: str, media: list | None = None,
                 cursor = token.end()
             after = chunk[cursor:].strip()
             if after:
+                if spoiler:
+                    after = _spoilerize_body_text(after)
                 units.append([{"type": 10, "content": after}])
             units.append([{"type": 10, "content": f"-# 📜 Page {idx}/{total_pages}"}])
             containers = _pack_v2_containers(units, 16729344)
@@ -8374,33 +8379,32 @@ def build_action_row(reddit_url: str, youtube_url: str | None) -> dict:
 
 
 def _spoilerize_body_text(body: str) -> str:
-    """Wrap each non-empty rendered line so a short post-level spoiler is hidden.
+    """Wrap each complete text span in one post-level spoiler pair.
 
     Reddit's explicit >!…!< markers have already been converted to Discord
-    spoiler syntax by the body cleaner. Unwrap those first to avoid nested
-    delimiters, then wrap each line independently (Discord-safe across newlines).
+    spoiler syntax by the body cleaner. Unwrap those first so the post-level
+    spoiler is one reveal action, not nested or individually revealed pieces.
+    Inline gallery sentinels stay outside the text wrappers because they become
+    separate media components; their own spoiler cover is applied separately.
     """
     text = re.sub(r"\|\|([\s\S]*?)\|\|", r"\1", str(body or ""))
 
-    def wrap_visible_parts(line: str) -> str:
-        # Inline gallery sentinels become separate media blocks later. Keep
-        # them outside text spoiler delimiters so a token-only segment cannot
-        # leave an empty `||||` wrapper beside the media block.
-        tokens = list(_INLINE_IMG_TOKEN_RE.finditer(line))
-        if not tokens:
-            return f"||{line}||" if line.strip() else line
-        parts = []
-        cursor = 0
-        for token in tokens:
-            before = line[cursor:token.start()]
-            parts.append(f"||{before}||" if before.strip() else before)
-            parts.append(token.group(0))
-            cursor = token.end()
-        after = line[cursor:]
-        parts.append(f"||{after}||" if after.strip() else after)
-        return "".join(parts)
+    def wrap_span(span: str) -> str:
+        core = span.strip()
+        if not core:
+            return span
+        leading = span[:len(span) - len(span.lstrip())]
+        trailing = span[len(span.rstrip()):]
+        return f"{leading}||{core}||{trailing}"
 
-    return "\n".join(wrap_visible_parts(line) for line in text.split("\n"))
+    parts = []
+    cursor = 0
+    for token in _INLINE_IMG_TOKEN_RE.finditer(text):
+        parts.append(wrap_span(text[cursor:token.start()]))
+        parts.append(token.group(0))
+        cursor = token.end()
+    parts.append(wrap_span(text[cursor:]))
+    return "".join(parts)
 
 
 def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int,
@@ -8499,12 +8503,11 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
     body_marked = _mark_inline_gallery_images(data["body"], _photo_media)
     body_src = _format_markdown_tables(_format_quote_blocks(
         _drop_gallery_media_lines(body_marked, media)))
-    # Reddit's post-level Spoiler flag covers the complete post, not just its
-    # media. Hide the rendered body by default as well; this markup flows into
-    # any continuation pages produced from body_rest. Selective rich-text
-    # spoilers remain untouched when the post-level flag is false.
-    if data.get("spoiler"):
-        body_src = _spoilerize_body_text(body_src)
+    # Split the plain rendered text first so each Discord message can have a
+    # self-contained spoiler wrapper; a delimiter cannot span message pages.
+    # The whole body in a single message gets exactly one wrapper across all
+    # paragraphs. Selective rich-text spoilers remain untouched without the
+    # post-level flag.
     single_budget = max(300, 3800 - len(header) - len(base_stats_line))
     if len(body_src) <= single_budget:
         stats_line = base_stats_line
@@ -8524,6 +8527,8 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
             if next_total == total_pages:
                 break
             total_pages = max(2, next_total)
+    if data.get("spoiler") and body_out:
+        body_out = _spoilerize_body_text(body_out)
 
     # Round 112: Reddit-flagged posts blur image/GIF tiles by default. A VIDEO
     # tile keeps the established behavior because Discord's cover can obscure

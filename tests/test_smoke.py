@@ -13621,10 +13621,12 @@ check("r89d: the suite never emits GitHub Actions workflow commands to stdout "
       not _stdout_guard.leaks, _stdout_guard.leaks[:3])
 
 # ---- Reddit revision editing + post-level body spoiler coverage ----
-check("r113: body spoiler mode wraps short Reddit-marked text and avoids nested spoiler delimiters",
-      v3._spoilerize_body_text("(It’s Truvia)") == "||(It’s Truvia)||"
+check("r117: post-level spoiler uses one wrapper for a complete multi-paragraph body",
+      v3._spoilerize_body_text("first paragraph\n\nsecond paragraph")
+          == "||first paragraph\n\nsecond paragraph||"
+      and v3._spoilerize_body_text("(It’s Truvia)") == "||(It’s Truvia)||"
       and v3._spoilerize_body_text("line one\n\n||already hidden||")
-          == "||line one||\n\n||already hidden||")
+          == "||line one\n\nalready hidden||")
 _r113_short = _r109_data("(It’s Truvia)", 1)
 _r113_short["spoiler"] = True
 with patch.object(v3, "SPOILER_MEDIA_AND_BODY", False):
@@ -13640,6 +13642,19 @@ _r113_enabled_body = next(
 check("r115: Reddit post-level Spoiler hides the short body by default (video opt-in does not gate it)",
       _r113_default_body == "||(It’s Truvia)||"
       and _r113_enabled_body == "||(It’s Truvia)||")
+_r117_multi = _r109_data("first paragraph\n\nsecond paragraph", 0)
+_r117_multi["spoiler"] = True
+_r117_multi_payload = _r109_build(_r117_multi)
+_r117_multi_components = [x for c in _r117_multi_payload["components"]
+                          for x in c["components"] if x.get("type") == 10]
+_r117_multi_body = next(x["content"] for x in _r117_multi_components
+                        if "first paragraph" in x.get("content", ""))
+_r117_multi_header = next(x["content"] for x in _r117_multi_components
+                          if "###" in x.get("content", ""))
+check("r117: multi-paragraph post body reveals in one click while title stays visible",
+      _r117_multi_body == "||first paragraph\n\nsecond paragraph||"
+      and _r117_multi_body.count("||") == 2
+      and "||" not in _r117_multi_header)
 _r115_text_only = _r109_data("text-only post description", 0)
 _r115_text_only["spoiler"] = True
 _r115_text_only_payload = _r109_build(_r115_text_only)
@@ -13666,17 +13681,16 @@ _r113_long = _r109_data("spoiler phrase " * 350, 0)
 _r113_long["spoiler"] = True
 with patch.object(v3, "SPOILER_MEDIA_AND_BODY", False):
     _r113_long_payload, _r113_long_rest = _r109_build(_r113_long, return_remainder=True)
-_r113_long_pages = v3.build_continuation_payloads(_r113_long_rest)
+_r113_long_pages = v3.build_continuation_payloads(_r113_long_rest, spoiler=True)
 _r113_long_texts = [x["content"] for c in _r113_long_payload["components"]
                     for x in c["components"] if x.get("type") == 10]
 _r113_long_texts += [x["content"] for page in _r113_long_pages
                      for c in page["components"] for x in c["components"]
                      if x.get("type") == 10 and "spoiler phrase" in x.get("content", "")]
 _r113_long_body = [text for text in _r113_long_texts if "spoiler phrase" in text]
-check("r115: long post-level spoiler bodies remain wrapped across main and continuation pages by default",
+check("r117: each long-body message chunk has one complete spoiler wrapper across its paragraphs",
       len(_r113_long_body) >= 2
-      and all(text.count("||") >= 2 and text.count("||") % 2 == 0
-              and text.startswith("||") and text.endswith("||")
+      and all(text.count("||") == 2 and text.startswith("||") and text.endswith("||")
               for text in _r113_long_body))
 
 _r113_retention_tmp = tempfile.TemporaryDirectory()
