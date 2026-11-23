@@ -8371,8 +8371,26 @@ def _spoilerize_body_text(body: str) -> str:
     delimiters, then wrap each line independently (Discord-safe across newlines).
     """
     text = re.sub(r"\|\|([\s\S]*?)\|\|", r"\1", str(body or ""))
-    return "\n".join(f"||{line}||" if line.strip() else line
-                      for line in text.split("\n"))
+
+    def wrap_visible_parts(line: str) -> str:
+        # Inline gallery sentinels become separate media blocks later. Keep
+        # them outside text spoiler delimiters so a token-only segment cannot
+        # leave an empty `||||` wrapper beside the media block.
+        tokens = list(_INLINE_IMG_TOKEN_RE.finditer(line))
+        if not tokens:
+            return f"||{line}||" if line.strip() else line
+        parts = []
+        cursor = 0
+        for token in tokens:
+            before = line[cursor:token.start()]
+            parts.append(f"||{before}||" if before.strip() else before)
+            parts.append(token.group(0))
+            cursor = token.end()
+        after = line[cursor:]
+        parts.append(f"||{after}||" if after.strip() else after)
+        return "".join(parts)
+
+    return "\n".join(wrap_visible_parts(line) for line in text.split("\n"))
 
 
 def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int,
@@ -8471,7 +8489,11 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
     body_marked = _mark_inline_gallery_images(data["body"], _photo_media)
     body_src = _format_markdown_tables(_format_quote_blocks(
         _drop_gallery_media_lines(body_marked, media)))
-    if SPOILER_MEDIA_AND_BODY and data.get("spoiler"):
+    # Reddit's post-level Spoiler flag covers the complete post, not just its
+    # media. Hide the rendered body by default as well; this markup flows into
+    # any continuation pages produced from body_rest. Selective rich-text
+    # spoilers remain untouched when the post-level flag is false.
+    if data.get("spoiler"):
         body_src = _spoilerize_body_text(body_src)
     single_budget = max(300, 3800 - len(header) - len(base_stats_line))
     if len(body_src) <= single_budget:
@@ -8493,12 +8515,10 @@ def build_v3_payload(subreddit: str, data: dict, reddit_url: str, posted_ts: int
                 break
             total_pages = max(2, next_total)
 
-    # Round 112: a post Reddit flags spoiler / age-restricted blurs its IMAGE
-    # and GIF tiles with Discord's own gallery-item `spoiler` flag. A VIDEO
-    # tile keeps the established behavior by default because Discord's cover
-    # can obscure player controls. The opt-in full-media/body mode deliberately
-    # applies the same spoiler cover to video tiles too. The key is omitted for
-    # unaffected media, preserving existing cards when the new mode is off.
+    # Round 112: Reddit-flagged posts blur image/GIF tiles by default. A VIDEO
+    # tile keeps the established behavior because Discord's cover can obscure
+    # player controls; SPOILER_MEDIA_AND_BODY remains an opt-in to blur videos.
+    # The body itself is now always spoiler-wrapped for a post-level flag above.
     _blur = bool(data.get("spoiler"))
 
     def gallery(items: list) -> dict:

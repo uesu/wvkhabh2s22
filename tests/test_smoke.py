@@ -13466,11 +13466,10 @@ _r112_flag = dict(_r112_plain, spoiler=True)
 check("r112a: a flagged post blurs every image tile (spoiler: true on each gallery item)",
       _r112_items(_r109_build(_r112_flag)) == [(_r109_url(0), True), (_r109_url(1), True)],
       _r112_items(_r109_build(_r112_flag)))
-check("r112b: an unflagged post is byte-identical — no spoiler key anywhere, missing key == False",
+check("r112b: an unflagged post stays byte-identical to an explicit false flag and emits no spoiler key",
       json.dumps(_r109_build(_r112_plain), sort_keys=True)
       == json.dumps(_r109_build(dict(_r112_plain, spoiler=False)), sort_keys=True)
-      and "spoiler" not in json.dumps(_r109_build(_r112_plain))
-      and _r109_shape(_r109_build(_r112_plain)) == _r109_shape(_r109_build(_r112_flag)),
+      and "spoiler" not in json.dumps(_r109_build(_r112_plain)),
       json.dumps(_r109_build(_r112_plain))[:200])
 _r112_vid = _r109_build(dict(_r109_data("intro", 1, video=True), spoiler=True))
 _r112_mir = _r109_build(dict(_r109_data("intro", 1), spoiler=True,
@@ -13492,15 +13491,19 @@ check("r112e: a gif tile is an image tile — blurred like one",
       _r112_items(_r112_gif) == [("https://i.redd.it/anim.gif", True)])
 _r112_two = _r109_build(dict(_r109_data("x", 14, video=True), spoiler=True))
 _r112_inl = _r109_build(dict(_r109_data(f"a {_r109_url(0)}\n\nb {_r109_url(1)}", 3, video=True), spoiler=True))
-check("r112f: the two-container (14 photos) and the interleaved (round-109) layouts blur every "
-      "photo and leave the video tile alone — one choke point covers all three branches",
+check("r112f: multi-container and interleaved layouts keep photo covers and default video behavior; flagged body is hidden",
       all(s is True for u, s in _r112_items(_r112_two) if "v.redd.it" not in u)
       and [s for u, s in _r112_items(_r112_two) if "v.redd.it" in u] == [None]
       and len(_r112_items(_r112_two)) == 15
       and all(s is True for u, s in _r112_items(_r112_inl) if "v.redd.it" not in u)
       and [s for u, s in _r112_items(_r112_inl) if "v.redd.it" in u] == [None]
       and len(_r112_items(_r112_inl)) == 4
-      and _r109_shape(_r112_two) == _r109_shape(_r109_build(_r109_data("x", 14, video=True))),
+      and [u for u, _ in _r112_items(_r112_two)]
+          == [u for u, _ in _r112_items(_r109_build(_r109_data("x", 14, video=True)))]
+      and any(x.get("content") == "||x||" for c in _r112_two["components"]
+              for x in c["components"])
+      and all("||||" not in x.get("content", "") for c in _r112_inl["components"]
+              for x in c["components"] if x.get("type") == 10),
       (_r112_items(_r112_two)[-3:], _r112_items(_r112_inl)))
 _r112_rec = {"v": 1, "id": "1xt23rm", "sub": "Sub", "permalink": "/r/Sub/comments/1xt23rm/t/",
              "title": "t", "author": "a", "created": 1, "media": [], "body": ""}
@@ -13606,7 +13609,7 @@ check("r89d: the suite never emits GitHub Actions workflow commands to stdout "
       "(simulated faults stay captured, so CI gets no false ::error:: annotation)",
       not _stdout_guard.leaks, _stdout_guard.leaks[:3])
 
-# ---- Reddit revision editing + opt-in body spoiler coverage ----
+# ---- Reddit revision editing + post-level body spoiler coverage ----
 check("r113: body spoiler mode wraps short Reddit-marked text and avoids nested spoiler delimiters",
       v3._spoilerize_body_text("(It’s Truvia)") == "||(It’s Truvia)||"
       and v3._spoilerize_body_text("line one\n\n||already hidden||")
@@ -13623,15 +13626,34 @@ _r113_default_body = next(
 _r113_enabled_body = next(
     x["content"] for c in _r113_enabled_payload["components"]
     for x in c["components"] if x.get("type") == 10 and "Truvia" in x.get("content", ""))
-check("r113: spoiler switch is additive — unset mode leaves body literal; enabled mode hides the short body",
-      _r113_default_body == "(It’s Truvia)"
+check("r115: Reddit post-level Spoiler hides the short body by default (video opt-in does not gate it)",
+      _r113_default_body == "||(It’s Truvia)||"
       and _r113_enabled_body == "||(It’s Truvia)||")
+_r115_text_only = _r109_data("text-only post description", 0)
+_r115_text_only["spoiler"] = True
+_r115_text_only_payload = _r109_build(_r115_text_only)
+_r115_text_only_body = next(
+    x["content"] for c in _r115_text_only_payload["components"]
+    for x in c["components"] if x.get("type") == 10
+    and "text-only post description" in x.get("content", ""))
+check("r115: text-only post-level Spoiler hides the description even with no media",
+      _r115_text_only_body == "||text-only post description||"
+      and not any(x.get("type") == 12 for c in _r115_text_only_payload["components"]
+                  for x in c["components"]))
+_r115_selective = _r109_data("visible ||only this phrase||", 0)
+_r115_selective_payload = _r109_build(_r115_selective)
+_r115_selective_body = next(
+    x["content"] for c in _r115_selective_payload["components"]
+    for x in c["components"] if x.get("type") == 10
+    and "visible" in x.get("content", ""))
+check("r115: selective rich-text spoiler remains selective when the post-level flag is absent",
+      _r115_selective_body == "visible ||only this phrase||")
 check("r113: body spoiler mode does not disable existing Reddit-flagged media blur",
       [flag for _url, flag in _r112_items(_r113_enabled_payload)] == [True]
       and [flag for _url, flag in _r112_items(_r109_build(_r109_data("plain", 1)))] == [None])
 _r113_long = _r109_data("spoiler phrase " * 350, 0)
 _r113_long["spoiler"] = True
-with patch.object(v3, "SPOILER_MEDIA_AND_BODY", True):
+with patch.object(v3, "SPOILER_MEDIA_AND_BODY", False):
     _r113_long_payload, _r113_long_rest = _r109_build(_r113_long, return_remainder=True)
 _r113_long_pages = v3.build_continuation_payloads(_r113_long_rest)
 _r113_long_texts = [x["content"] for c in _r113_long_payload["components"]
@@ -13640,7 +13662,7 @@ _r113_long_texts += [x["content"] for page in _r113_long_pages
                      for c in page["components"] for x in c["components"]
                      if x.get("type") == 10 and "spoiler phrase" in x.get("content", "")]
 _r113_long_body = [text for text in _r113_long_texts if "spoiler phrase" in text]
-check("r113: long spoiler bodies remain wrapped and balanced across the main card and continuation pages",
+check("r115: long post-level spoiler bodies remain wrapped across main and continuation pages by default",
       len(_r113_long_body) >= 2
       and all(text.count("||") >= 2 and text.count("||") % 2 == 0
               and text.startswith("||") and text.endswith("||")
@@ -13737,9 +13759,12 @@ with patch.object(v3, "SPOILER_MEDIA_AND_BODY", False):
     _r113_video_default = _r109_build(_r113_video)
 with patch.object(v3, "SPOILER_MEDIA_AND_BODY", True):
     _r113_video_enabled = _r109_build(_r113_video)
-check("r113: combined spoiler mode flags video media too; off mode preserves the existing video tile behavior",
+check("r115: body is hidden by default; combined mode only additionally flags video media",
       [flag for _url, flag in _r112_items(_r113_video_default)] == [None]
       and [flag for _url, flag in _r112_items(_r113_video_enabled)] == [True]
+      and any("||video description||" in x["content"]
+              for c in _r113_video_default["components"]
+              for x in c["components"] if x.get("type") == 10)
       and any("||video description||" in x["content"]
               for c in _r113_video_enabled["components"]
               for x in c["components"] if x.get("type") == 10))
