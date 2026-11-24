@@ -105,7 +105,7 @@ jobs:
           # which makes Discord resolve the asset. Runs AFTER the posting
           # loop, so posting speed is unchanged. Optional Variables:
           #   MEDIA_HEAL=off              disable it
-          #   MEDIA_HEAL_DELAY_SECONDS=45 wait before each re-edit
+          #   MEDIA_HEAL_DELAY_SECONDS=15 wait before revalidation/repair (default 15)
           #   MEDIA_HEAL_ATTEMPTS=4       max re-edits per message (default 4,
           #                               hard-capped at 4)
           #   MEDIA_HEAL_SCOPE=video      round 56 default: only video
@@ -118,15 +118,6 @@ jobs:
           # Round 115: unset/off keeps legacy posts of 1-4 items together, then
           # separates 5-20 items; set `on` to group up to 10 per gallery at any count.
           TWITTER_MEDIA_GALLERY_LAYOUT: ${{ vars.TWITTER_MEDIA_GALLERY_LAYOUT }}
-          # Optional high video limit: unset/false keeps the 256 MiB default.
-          TWITTER_HIGH_VIDEO_LIMIT: ${{ vars.TWITTER_HIGH_VIDEO_LIMIT }}
-          # Round 95c: stale-backlog floor. An entry older than this many
-          # hours is refused (STALE-SKIP) before any tweet-data request, so a
-          # degraded nitter mirror that answers `feed OK` with a days-old
-          # backlog cannot post old tweets as news. Unset/empty keeps 24 h.
-          #   TWITTER_MAX_AGE_HOURS=0     switch the guard off entirely
-          #   TWITTER_MAX_AGE_HOURS=48    keep a two-day catch-up window
-          TWITTER_MAX_AGE_HOURS: ${{ vars.TWITTER_MAX_AGE_HOURS }}
           MEDIA_HEAL: ${{ vars.MEDIA_HEAL }}
           MEDIA_HEAL_DELAY_SECONDS: ${{ vars.MEDIA_HEAL_DELAY_SECONDS }}
           MEDIA_HEAL_ATTEMPTS: ${{ vars.MEDIA_HEAL_ATTEMPTS }}
@@ -267,9 +258,18 @@ jobs:
             echo "- successful feeds: ${feeds_ok}"
             echo "- failed feeds: ${feeds_failed}"
             echo "- empty feeds: ${feeds_empty}"
+            v3_summary=$(grep -o 'V3 SUMMARY:.*' twitter_monitor.log 2>/dev/null | tail -n 1 || true)
+            engine_new_candidates=""
+            if [ -n "$v3_summary" ]; then
+              engine_new_candidates=$(printf '%s' "$v3_summary" | sed -nE 's/.*new_candidates=([0-9]+).*/\1/p')
+            fi
             echo
             echo "### Posts"
-            echo "- new candidates: not separately measured by this log format"
+            if [ -n "$engine_new_candidates" ]; then
+              echo "- new candidates: ${engine_new_candidates} (engine counter)"
+            else
+              echo "- new candidates: not separately measured by this log format"
+            fi
             echo "- posts delivered: $(count_matches 'V3 Posted:')"
             # Round 96b: name WHICH accounts fed and which instance answered, so a
             # "successful feeds: 4" count never leaves the reader guessing which
@@ -314,44 +314,25 @@ jobs:
               echo "- diagnostic coverage: unavailable (empty or missing log)"
             fi
             echo
-            echo "### Dedup / backlog state (round 95c)"
-            v3_summary=$(grep -o 'V3 SUMMARY:.*' twitter_monitor.log 2>/dev/null | tail -n 1 || true)
+            echo "### Deduplication state (round 119)"
             if [ -n "$v3_summary" ]; then
               echo "- engine: ${v3_summary#V3 SUMMARY: }"
             else
               echo "- engine: unavailable (no V3 SUMMARY line — the engine did not reach the end of its run, so per-run post/skip counts are unknown)"
             fi
-            stale_logged=$(count_matches 'STALE-SKIP:')
-            echo "- entries refused as stale backlog: ${stale_logged}"
-            # Round 96b: name the refused backlog entries (bounded), with their age,
-            # so "3 stale" is verifiable without the Actions log.
-            stale_keys=$(grep -o '\[[^]]*\] STALE-SKIP: entry is [0-9.]* h old' twitter_monitor.log 2>/dev/null \
-              | sed -E 's/^\[([^]]*)\] STALE-SKIP: entry is ([0-9.]+) h old/- \1 — \2 h old/' \
-              | head -n 5 || true)
-            if [ -n "$stale_keys" ]; then
-              echo "- refused keys (oldest-first as logged):"
-              printf '%s\n' "$stale_keys" | sed 's/^/  /'
-              stale_total=$(count_matches 'STALE-SKIP:')
-              if [ "$stale_total" -gt 5 ]; then
-                echo "  - … $((stale_total - 5)) more not shown"
-              fi
+            echo "- cache behavior: keys already in posted_tweets.json are skipped; uncached entries are eligible regardless of tweet age."
+            echo "- cache retention is bounded by MAX_CACHE_SIZE_PER_ACCOUNT and MAX_CACHE_SIZE_TOTAL; only retained keys can guarantee a duplicate skip."
+            cache_pressure=$(grep -o 'dedup cache near cap:.*' twitter_monitor.log 2>/dev/null | tail -n 1 || true)
+            if [ -n "$cache_pressure" ]; then
+              echo "- cache near-cap warning: ${cache_pressure#dedup cache near cap: }"
             fi
-            # Round 96b: the engine's own line is authoritative; if the log has a
-            # different number of matching lines, the log was truncated and the
-            # reader should trust the engine values, not the line counts.
             if [ -n "$v3_summary" ]; then
-              engine_stale=$(printf '%s' "$v3_summary" | sed -nE 's/.*stale_skipped=([0-9]+).*/\1/p')
               engine_posted=$(printf '%s' "$v3_summary" | sed -nE 's/.*posted=([0-9]+).*/\1/p')
               posted_logged=$(count_matches 'V3 Posted:')
-              if [ -n "$engine_stale" ] && [ "$engine_stale" != "$stale_logged" ]; then
-                echo "- note: engine reported ${engine_stale} stale-skip(s), this log has ${stale_logged} line(s) — trust the engine value (the log may be truncated)."
-              fi
               if [ -n "$engine_posted" ] && [ "$engine_posted" != "$posted_logged" ]; then
                 echo "- note: engine reported ${engine_posted} delivered post(s), this log has ${posted_logged} 'V3 Posted' line(s) — trust the engine value (the log may be truncated)."
               fi
             fi
-            echo "- already-posted entries skipped by cache: see dedup_skipped above"
-            echo "- why this matters: the cache prevents re-posts only for keys it holds. A down/restoring nitter instance can answer with days-old entries; the stale floor refuses those BEFORE any tweet-data request, so a stale feed can never turn into a re-post or a burst of old cards."
             echo
             echo "### State"
             echo "- cache: ${TWITTER_CACHE_RESULT:-not-reached}"

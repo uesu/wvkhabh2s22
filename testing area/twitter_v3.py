@@ -44,7 +44,7 @@
 #     proxy warm-up, not a portrait incompatibility; direct URLs now used
 #     for all videos. Ananta_EN added to the default account list.
 #   • Everything from round 3 is kept: clickable hashtags/mentions, smart
-#     video sizing (probe real bytes; >256 MB → smaller formats[] rendition or
+#     video sizing (probe real bytes; >400 MiB → smaller formats[] rendition or
 #     thumbnail+watch link), /en translation, 🕐 timestamps, null-safe color.
 #   • ROUND 10 (2026-09-13): FULL X ARTICLE support — FxTwitter's API returns
 #     each article as clean JSON (tweet.article: title, cover image, draft.js
@@ -110,7 +110,6 @@ import os
 import re
 import json
 import time
-import calendar
 import html as html_lib
 import asyncio
 import logging
@@ -175,125 +174,8 @@ def _env_int(name: str, default: int) -> int:
 MAX_CACHE_SIZE_PER_ACCOUNT = _env_int("MAX_CACHE_SIZE_PER_ACCOUNT", 250)
 MAX_CACHE_SIZE_TOTAL = _env_int("MAX_CACHE_SIZE_TOTAL", 10000)
 
-# ---------------------------------------------------------------------------
-# ■ ROUND 95c (2026-10-30): STALE-BACKLOG GUARD
-#
-# The dedup cache is the primary "never post twice" mechanism, and it works
-# whenever the key is present. It cannot help when the key is absent — a cache
-# reset, a different deployment, or per-account eviction — and a nitter instance
-# that is down / restoring / serving a backup answers with an OLD backlog
-# instead of a fresh timeline. Live 2026-10-30 (run #12043): TYPEII_EN's feed
-# answered with 20 entries whose tweets were 46 h, 4 days and 11 days old, and
-# all three were posted as if new (the same author/page had posted them days
-# earlier in the other deployment).
-#
-# So: an entry older than TWITTER_MAX_AGE_HOURS is not a new tweet, whatever the
-# cache says. The check runs BEFORE the tweet-data fetch, so a stale backlog
-# costs ZERO requests instead of a full card build.
-#   TWITTER_MAX_AGE_HOURS — 24 by default (a 5-minute cron posts real tweets
-#     within minutes; anything older than a day is a backlog, not news). Set 0
-#     to disable the guard and restore pre-95c behaviour exactly.
-# Two independent witnesses give the age: the feed's pubDate and the tweet id's
-# own snowflake. For an OWN tweet the id is authoritative — it is immutable and
-# encodes the creation instant, so a mirror that re-stamps an old backlog entry
-# with "now" (or mangles the date outright) cannot smuggle it through; the feed
-# date is only a fallback when the id is unparsable. For a REPOST (link points
-# at another author's status) the feed date wins, because that id is the
-# ORIGINAL tweet's and is old by definition.
-# A live/legit tweet is never blocked: the floor is far above the cron cadence,
-# and an entry whose age cannot be established (no published_parsed, no
-# parsable id) is posted as before — this guard only ever rejects entries whose
-# own timestamp says they are old.
-# ---------------------------------------------------------------------------
-TWITTER_MAX_AGE_HOURS = max(0, _env_int("TWITTER_MAX_AGE_HOURS", 24))
-TWITTER_MAX_AGE_SECONDS = TWITTER_MAX_AGE_HOURS * 3600
-_TWITTER_SNOWFLAKE_EPOCH_MS = 1288834974657
-
-
-def tweet_id_created_ts(tweet_id: str | None) -> float | None:
-    """Creation time (unix seconds) from a tweet id's snowflake, or None.
-
-    A tweet id is a 64-bit snowflake whose high bits are milliseconds since
-    twitter's epoch, so the age is derivable even when the feed omits a date.
-    """
-    try:
-        value = int(str(tweet_id or "").strip())
-    except (TypeError, ValueError):
-        return None
-    if value <= 0:
-        return None
-    return ((value >> 22) + _TWITTER_SNOWFLAKE_EPOCH_MS) / 1000.0
-
-
-def feed_date_age_seconds(entry, now: float) -> float | None:
-    """Age from the feed's own pubDate (None = the feed gave no usable date)."""
-    parsed = None
-    try:
-        parsed = entry.get("published_parsed") if entry is not None else None
-    except Exception:
-        parsed = None
-    if not parsed:
-        return None
-    try:
-        # feedparser yields UTC struct_time; timegm reads it as UTC. time.mktime
-        # would interpret it as LOCAL time — on a UTC+8 machine every entry
-        # would look 8 h older, so a 16 h-old tweet would hit a 24 h floor.
-        return max(0.0, float(now) - calendar.timegm(parsed))
-    except (OverflowError, ValueError, TypeError):
-        return None
-
-
-def tweet_entry_age_seconds(entry, now: float, tweet_id: str = "") -> float | None:
-    """Best-effort age of a feed entry in seconds (None = cannot establish)."""
-    age = feed_date_age_seconds(entry, now)
-    if age is not None:
-        return age
-    created = tweet_id_created_ts(tweet_id)
-    if created:
-        return max(0.0, float(now) - created)
-    return None
-
-
-def link_author(link: str) -> str | None:
-    """Screen name in a status link (`.../<author>/status/<id>`), if present."""
-    match = re.search(r"(?:x|twitter)\.com/([A-Za-z0-9_]+)/status/", str(link or ""))
-    return match.group(1) if match else None
-
-
-def judged_entry_age_seconds(entry, now: float, tweet_id: str = "",
-                             account: str = "") -> float | None:
-    """The age the stale floor should judge this entry by.
-
-    Two independent witnesses exist: the feed's pubDate and the tweet id's own
-    snowflake. They normally agree. When they disagree:
-
-    * OWN TWEET — the id is immutable and cannot be re-dated, so the OLDER of
-      the two wins. A degraded mirror that re-stamps an old backlog entry with
-      "now" therefore cannot smuggle it through (the #12043 shape).
-    * REPOST — the link points at the ORIGINAL author's status, whose id is as
-      old as the original tweet, while the entry legitimately appears now. The
-      repost's own pubDate is the truthful age, so it wins; judging by the id
-      would silently stop every repost of an older tweet.
-    """
-    feed_age = feed_date_age_seconds(entry, now)
-    created = tweet_id_created_ts(tweet_id)
-    id_age = max(0.0, float(now) - created) if created else None
-    author = link_author(getattr(entry, "link", ""))
-    is_repost = bool(author and account and author.lower() != account.lower())
-    if is_repost:
-        # the id belongs to the ORIGINAL tweet, so it is old by design
-        return feed_age if feed_age is not None else id_age
-    # Own tweet: the id is immutable and encodes the creation instant exactly,
-    # while a feed date can be re-stamped by a degraded mirror (a backlog entry
-    # labelled "now") or broken outright (epoch 0). The id wins when present.
-    return id_age if id_age is not None else feed_age
-
-
-def is_stale_entry(age_seconds: float | None) -> bool:
-    """True only when the age is KNOWN and beyond the floor (fail-open)."""
-    if not TWITTER_MAX_AGE_SECONDS or age_seconds is None:
-        return False
-    return age_seconds > TWITTER_MAX_AGE_SECONDS
+# Entries are not age-filtered: the durable posted_tweets.json cache is the
+# duplicate guard, and older unseen feed items remain eligible for delivery.
 
 # ■ X RSS SOURCE FLEET — a SERIAL fallback chain: the first instance that
 # answers HTTP 200 with entries wins, so every dead member above it costs a
@@ -478,39 +360,25 @@ AVIF_IMAGE_TYPES = ("image/avif", "image/heic", "image/heif")
 IS_COMPONENTS_V2 = 1 << 15  # Flag for rich card layout
 
 # ---------------------------------------------------------------------------
-# ■ VIDEO GALLERY LIMITS (from live Discord tests, 2026-09-11)
-# 191 MB confirmed plays, 405 MB confirmed fails -> 256 MiB sits safely
-# between them. Tune here if Discord changes its behaviour.
+# ■ VIDEO GALLERY LIMIT (round 119)
+# The operator manually verified that a ~395 MB 1920x1080 X video embeds and
+# plays in Discord. Use a fixed 400 MiB cap (no opt-in Variable); if a source
+# rendition exceeds it, probe lower MP4 variants in descending bitrate and
+# choose the best one that fits. Cold proxy resolution remains handled by the
+# existing bounded post-delivery media-heal path.
 # ---------------------------------------------------------------------------
-# ROUND 47 NOTE (2026-10-01): a ~295 MB 3840x2160 amplify_video mp4 was shown
-# by hand to embed, and Discord raised the NITRO UPLOAD limit 500 MB -> 1 GB
-# on 2026-09-29 — but that limit governs UPLOADED ATTACHMENTS, not the media
-# proxy that renders external urls, and one manual success is not a proven
-# ceiling. The cap therefore stays at the measured, proven value.
-def _video_size_limit(value: str | None) -> int:
-    """Explicit opt-in only; unset and malformed values retain the 256 MiB default."""
-    return (350 if str(value or "").strip().lower() in ("1", "true", "yes", "on") else 256) * 1024 * 1024
-
-
-VIDEO_SIZE_LIMIT = _video_size_limit(os.getenv("TWITTER_HIGH_VIDEO_LIMIT"))
+VIDEO_SIZE_LIMIT = 400 * 1024 * 1024
 RISKY_DURATION_SECONDS = 300                   # > 5 min ...
 RISKY_MIN_PIXELS = 1920 * 1080                 # ... AND >= 1080p = risky when size unknown
-MAX_VARIANT_PROBES = 3                         # smaller mp4s to try before giving up
 
 # Set True ONLY if portrait videos are PROVEN broken again (see gallery_video_url).
 PORTRAIT_PROXY = False
 
-# ROUND 10 (2026-09-13): optional safety cap for gallery tiles. 0 = OFF
-# (use VIDEO_SIZE_LIMIT above). LIVE-VERIFIED 2026-09-13 via
-# "testing area/video_diag.py": 171 MB and 234 MB gallery tiles PLAY;
-# 521 MB and up FAIL ("image not found") in every URL style — so the
-# 256 MiB default sits in a proven-safe gap and needs no change.
-# If Discord's proxy ever breaks a <= 256 MB tile again (rare + transient —
-# the same URL plays fine when re-posted), set this to a smaller proven
-# value, e.g.  GALLERY_VIDEO_LIMIT = 100 * 1024 * 1024  # 100 MiB.
-# When active, videos above it are downgraded to the largest variant at or
-# below it, or get a "watch on X" note — so the gallery never carries a
-# tile Discord's proxy can't play.
+# ROUND 10: optional additional safety cap for gallery tiles. 0 = OFF
+# (use the fixed 400 MiB VIDEO_SIZE_LIMIT above). When active, videos above
+# this smaller cap are downgraded to the largest variant at or below it, or
+# get a "watch on X" note. Keep it off unless a lower ceiling is deliberately
+# tested; a 400 MiB external-media cap is the current operator-approved default.
 GALLERY_VIDEO_LIMIT = 0
 
 # ---------------------------------------------------------------------------
@@ -542,7 +410,7 @@ GALLERY_VIDEO_LIMIT = 0
 # back unresolved (normally none).
 # ---------------------------------------------------------------------------
 MEDIA_HEAL = os.getenv("MEDIA_HEAL", "on").strip().lower() not in ("0", "off", "no", "false")
-MEDIA_HEAL_DELAY_SECONDS = _env_int("MEDIA_HEAL_DELAY_SECONDS", 45)
+MEDIA_HEAL_DELAY_SECONDS = _env_int("MEDIA_HEAL_DELAY_SECONDS", 15)
 # Bounded retry policy (2026-10-11): up to four same-payload re-edits at the
 # 45-second delay, so an unresolved video gets up to ~180 s for Discord's
 # external-media proxy to resolve. A successful edit exits immediately, so
@@ -1535,12 +1403,9 @@ async def collect_media(session: aiohttp.ClientSession, tweet_like: dict) -> tup
         # --- too big for Discord's gallery ---
         mb = size / (1024 * 1024)
         _variants = ranked_mp4_variants(v)
-        if effective_limit < VIDEO_SIZE_LIMIT:
-            # ROUND 10: guard active -> check ALL variants (not just the top 3
-            # by bitrate) so a much smaller rendition still gets a chance.
-            _candidates = _variants
-        else:
-            _candidates = _variants[:MAX_VARIANT_PROBES]
+        # Probe all known MP4 renditions in descending bitrate: if the 4K
+        # and 1080p files exceed the gallery cap, a 720p file can still fit.
+        _candidates = _variants
         swapped = False
         for variant_url in _candidates:
             if variant_url == video_url:
@@ -2400,7 +2265,6 @@ async def main():
     # Round 95c: per-run counters for the machine-readable summary line at the
     # end. Counting only — no control flow depends on them.
     dedup_skipped = 0
-    stale_skipped = 0
     new_candidates = 0
     forced_test_reposts = 0
     account_stats: dict[str, dict[str, int]] = {}
@@ -2518,24 +2382,7 @@ async def main():
                 published_parsed = entry.get("published_parsed")
                 rss_ts = time.mktime(published_parsed) if published_parsed else now
 
-                # ROUND 95c: stale-backlog guard — runs before ANY request, so a
-                # down/restoring nitter instance that serves an old backlog costs
-                # nothing and posts nothing. TEST_TWEET_ID is exempt (an operator
-                # explicitly asked for that one tweet). Fail-open: unknown age
-                # posts as before.
-                if TWITTER_MAX_AGE_SECONDS and not test_tweet_id:
-                    entry_age = judged_entry_age_seconds(entry, now, tweet_id,
-                                                        account)
-                    if is_stale_entry(entry_age):
-                        stale_skipped += 1
-                        logging.info(
-                            f"[{unique_key}] STALE-SKIP: entry is "
-                            f"{entry_age / 3600.0:.1f} h old (> "
-                            f"{TWITTER_MAX_AGE_HOURS} h floor) — old backlog from "
-                            f"the feed, not a new tweet; not posted.")
-                        continue
-
-                # A new candidate passed cache and age checks. This is a
+                # An uncached entry is eligible regardless of age. This is a
                 # counting-only metric; provider failures still count as a
                 # candidate considered by this run.
                 if not force_cached_test:
@@ -2728,16 +2575,15 @@ async def main():
         logging.error(f"DEDUP GUARD: {len(missing)} key(s) posted this run are "
                       f"MISSING from the saved dedup cache — they WILL be "
                       f"re-posted next run: {sorted(missing)[:10]}")
-    # Round 95c: ONE machine-readable state line. Workflow logs are not
-    # readable by later agents; the step summary greps this line, so the
-    # dedup/backlog state survives without the raw log.
+    # Round 119: ONE machine-readable cache/delivery state line. Workflow logs
+    # are not readable by later agents; the step summary greps this line, so
+    # dedup state survives without the raw log (there is no age-based skip).
     logging.info(f"V3 SUMMARY: posted={len(posted_urls - posted_urls_at_start)} "
                  f"forced_test_reposts={forced_test_reposts} "
-                 f"dedup_skipped={dedup_skipped} stale_skipped={stale_skipped} "
+                 f"dedup_skipped={dedup_skipped} "
                  f"new_candidates={new_candidates} "
                  f"accounts={format_account_summary(account_stats)} "
-                 f"cache_missing={len(missing)} cache_keys={len(posted_urls)} "
-                 f"max_age_hours={TWITTER_MAX_AGE_HOURS}")
+                 f"cache_missing={len(missing)} cache_keys={len(posted_urls)}")
     logging.info("Twitter V3 Monitor execution finished.")
 
 

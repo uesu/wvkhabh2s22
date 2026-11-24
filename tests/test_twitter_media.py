@@ -31,6 +31,7 @@ import types
 import asyncio
 import inspect
 import importlib.util
+from unittest.mock import AsyncMock, patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -456,7 +457,7 @@ check("r73 cost: the playable-mp4 card probed the chain once and the mp4 size on
       str(_probe_counts(_s)))
 
 _s = (_Session().image(x3.GIFCONVERT_BASE + "avif?url=", "image/avif")
-      .body(_GIF1, 400 * _MB))
+      .body(_GIF1, 500 * _MB))
 _items, _notes = _collect(_fxtwitter_media([_g1]), _s)
 check("r73 gif: an unplayable mp4 uses the AVIF last resort instead of a static thumbnail",
       _tiles(_items) == [x3.GIFCONVERT_BASE + "avif?url="
@@ -482,7 +483,7 @@ check("r73 cost: at most 4 animated-candidate HEADs and at most 2 AVIF-route HEA
 
 # an AVIF learned during the animated pass is REUSED — no AVIF route is asked
 _s = _Session().image("gif.fxtwitter.com/tweet_video/GifOneAAA.webp", "image/avif") \
-               .body(_GIF1, 400 * _MB)
+               .body(_GIF1, 500 * _MB)
 _items, _notes = _collect(_fxtwitter_media([_g1]), _s)
 check("r73 cost: an AVIF remembered in the first pass is reused, not re-discovered",
       _tiles(_items) == ["https://gif.fxtwitter.com/tweet_video/GifOneAAA.webp"]
@@ -520,7 +521,7 @@ check("r73 api: non-tweet_video URLs get no candidates at all",
       and x3.gif_avif_candidates("https://video.twimg.com/ext_tw_video/x.mp4") == ()
       and x3.gif_converter_candidates(None) == () and x3.gif_avif_candidates("") == ())
 
-_s = _Session().body(_GIF1, 400 * _MB)
+_s = _Session().body(_GIF1, 500 * _MB)
 _items, _notes = _collect(_fxtwitter_media([_g1]), _s)
 check("r73 gif: with no AVIF either, the round-11 behaviour stands (thumbnail + note)",
       _tiles(_items) == ["https://pbs.twimg.com/media/poster.jpg"]
@@ -680,8 +681,8 @@ check("r100 config: carry-over defaults to 6 h, the state file is media_heal_car
 check("r100 config: the state file name avoids 'pending' — merge_monitor_caches.py drops "
       "pending-dict keys that the posted list covers, and these keys ARE dedup keys",
       "pending" not in x3.MEDIA_HEAL_PENDING_FILE)
-check("r100 config: in-run heal defaults are untouched (45 s x 4, video scope)",
-      (x3.MEDIA_HEAL_DELAY_SECONDS, x3.MEDIA_HEAL_ATTEMPTS, x3.MEDIA_HEAL_SCOPE) == (45, 4, "video"))
+check("r119 config: in-run heal uses a 15-second default, four bounded attempts, video scope",
+      (x3.MEDIA_HEAL_DELAY_SECONDS, x3.MEDIA_HEAL_ATTEMPTS, x3.MEDIA_HEAL_SCOPE) == (15, 4, "video"))
 
 _real_delay, _real_hook = x3.MEDIA_HEAL_DELAY_SECONDS, x3.DEFAULT_WEBHOOK_URL
 try:
@@ -854,44 +855,78 @@ check("r100 workflow: the carry file is git-ignored like the other caches (force
 
 
 # ===========================================================================
-# 5. NO NEW CONFIGURATION, NO NEW DEPENDENCY ON A VARIABLE
+# ROUND 119 — fixed 400 MiB cap, complete variant fallback and faster heal
 # ===========================================================================
-print("\n--- 5. configuration and CI wiring ---")
-check("r73 config: the new media helpers read no environment variable",
-      not any("os.getenv" in inspect.getsource(f) for f in (
-          x3.canonical_media_entries, x3.media_entry_is_video,
-          x3.image_format_tier, x3.resolve_gif_image, x3.collect_media)))
-check("r73 config: media-heal defaults are untouched by this round",
+print("\n--- round 119: video cap, resolution fallback and cold-media timing ---")
+check("r119: media-heal defaults to 15 seconds without changing bounded attempts/scope",
       (x3.MEDIA_HEAL_DELAY_SECONDS, x3.MEDIA_HEAL_ATTEMPTS,
-       x3.MEDIA_HEAL, x3.MEDIA_HEAL_SCOPE) == (45, 4, True, "video"),
-      f"{x3.MEDIA_HEAL_DELAY_SECONDS} {x3.MEDIA_HEAL_ATTEMPTS} {x3.MEDIA_HEAL_SCOPE}")
-check("r73 config: the proven 256 MiB gallery cap is unchanged",
-      x3.VIDEO_SIZE_LIMIT == 256 * 1024 * 1024)
-# Optional 350 MiB setting is explicit and malformed/unset inputs stay at 256 MiB.
-x2 = load_module("twitter_media_v2_limit", "testing area/twitter_v2_button_outside.py")
-for _module in (x3, x2):
-    for _input in (None, "", "0", "false", "off", "350", "garbage"):
-        check(f"high video cap defaults to 256 MiB for {_module.__name__} {_input!r}",
-              _module._video_size_limit(_input) == 256 * 1024 * 1024)
-    for _input in ("1", "true", "YES", " on "):
-        check(f"high video cap opts in to 350 MiB for {_module.__name__} {_input!r}",
-              _module._video_size_limit(_input) == 350 * 1024 * 1024)
+       x3.MEDIA_HEAL, x3.MEDIA_HEAL_SCOPE) == (15, 4, True, "video"))
+_x2 = load_module("twitter_media_v2_fixed_limit", "testing area/twitter_v2_button_outside.py")
+for _module in (x3, _x2):
+    check(f"r119: {_module.__name__} has the fixed 400 MiB cap",
+          _module.VIDEO_SIZE_LIMIT == 400 * _MB)
+    _src = inspect.getsource(_module)
+    check(f"r119: {_module.__name__} no longer has the deleted opt-in cap variable",
+          "TWITTER_HIGH_VIDEO_LIMIT" not in _src
+          and "_video_size_limit" not in _src)
 
-# Exercise actual selection, not just config parsing, at both limits and their edges.
-from unittest.mock import AsyncMock, patch
-for _module in (x3, x2):
-    for _limit, _size, _expected in ((256, 256, True), (256, 257, False),
-                                     (350, 350, True), (350, 351, False)):
-        with patch.object(_module, "VIDEO_SIZE_LIMIT", _limit * _MB), \
-             patch.object(_module, "probe_video_size", new=AsyncMock(return_value=_size * _MB)):
-            _items, _notes = asyncio.run(_module.collect_media(None, _legacy_media([_video()])))
-        check(f"video limit selection {_module.__name__}: {_size}/{_limit} MiB",
-              bool(_items) and (_items[0]["media"]["url"] == _CLIP) is _expected,
-              str((_items, _notes)))
+# The operator's observed ~395 MB 1080p rendition is retained as-is.
+for _module in (x3, _x2):
+    async def _probe_395(_session, _url, **_kwargs):
+        return 395_000_000  # decimal MB from the operator's observed rendition
+    with patch.object(_module, "probe_video_size", new=AsyncMock(side_effect=_probe_395)):
+        _items, _notes = asyncio.run(_module.collect_media(
+            None, {"media": {"videos": [_video()], "photos": []}}))
+    check(f"r119: {_module.__name__} keeps a 395 MB 1080p video under the 400 MiB cap",
+          _tiles(_items) == [_CLIP] and not _notes, str((_items, _notes)))
 
-check("r73 config: the animated/AVIF content-type tiers are explicit constants",
-      x3.ANIMATED_IMAGE_TYPES == ("image/webp", "image/gif")
-      and x3.AVIF_IMAGE_TYPES == ("image/avif", "image/heic", "image/heif"))
+# Exact boundary passes; 1 byte over causes fallback. Test two chains to pin
+# 4K -> 1080p and 4K -> 1080p (still too large) -> 720p.
+_4K = "https://video.twimg.com/amplify_video/id/vid/avc1/3840x2160/4k.mp4?tag=29"
+_1080 = "https://video.twimg.com/amplify_video/id/vid/avc1/1920x1080/1080.mp4?tag=29"
+_720 = "https://video.twimg.com/amplify_video/id/vid/avc1/1280x720/720.mp4?tag=29"
+
+def _ladder_video():
+    return {"type": "video", "url": _4K, "width": 3840, "height": 2160,
+            "formats": [
+                {"url": _4K, "container": "mp4", "bitrate": 8_000_000},
+                {"url": _1080, "container": "mp4", "bitrate": 4_000_000},
+                {"url": _720, "container": "mp4", "bitrate": 1_000_000},
+            ]}
+
+for _module in (x3, _x2):
+    async def _probe_exact(_session, _url, **_kwargs):
+        return 400 * _MB
+    with patch.object(_module, "probe_video_size", new=AsyncMock(side_effect=_probe_exact)):
+        _items, _notes = asyncio.run(_module.collect_media(
+            None, {"media": {"videos": [_video()], "photos": []}}))
+    check(f"r119: {_module.__name__} accepts exactly 400 MiB",
+          _tiles(_items) == [_CLIP] and not _notes)
+
+    async def _probe_4k_to_1080(_session, url, **_kwargs):
+        return {_4K: 401 * _MB, _1080: 395_000_000, _720: 102 * _MB}[url]
+    with patch.object(_module, "probe_video_size", new=AsyncMock(side_effect=_probe_4k_to_1080)):
+        _items, _notes = asyncio.run(_module.collect_media(
+            None, {"media": {"videos": [_ladder_video()], "photos": []}}))
+    check(f"r119: {_module.__name__} falls from over-cap 4K to the best fitting 1080p rendition",
+          _tiles(_items) == [_1080] and _notes and "smaller version" in _notes[0],
+          str((_items, _notes)))
+
+    async def _probe_4k_to_720(_session, url, **_kwargs):
+        return {_4K: 401 * _MB, _1080: 400 * _MB + 1, _720: 102 * _MB}[url]
+    with patch.object(_module, "probe_video_size", new=AsyncMock(side_effect=_probe_4k_to_720)):
+        _items, _notes = asyncio.run(_module.collect_media(
+            None, {"media": {"videos": [_ladder_video()], "photos": []}}))
+    check(f"r119: {_module.__name__} continues through all variants to 720p when 1080p is over cap",
+          _tiles(_items) == [_720] and _notes and "smaller version" in _notes[0],
+          str((_items, _notes)))
+
+_wf = open(os.path.join(ROOT, ".github", "workflows", "twitter_monitor.yml"), encoding="utf-8").read()
+check("r119: active workflow has no high-video opt-in or age-floor variable",
+      "TWITTER_HIGH_VIDEO_LIMIT" not in _wf and "TWITTER_MAX_AGE_HOURS" not in _wf)
+check("r119: workflow and docs state the 15-second default and age-independent feed behavior",
+      "MEDIA_HEAL_DELAY_SECONDS=15" in _wf
+      and "uncached entries are eligible regardless of tweet age" in _wf)
 
 # ===========================================================================
 # ROUND 115 — X's combined per-post media limit increased to 20 (2026-11-13)

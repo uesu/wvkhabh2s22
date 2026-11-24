@@ -45,7 +45,7 @@
 #     proxy warm-up, not a portrait incompatibility; direct URLs now used
 #     for all videos. Ananta_EN added to the default account list.
 #   • Everything from round 3 is kept: clickable hashtags/mentions, smart
-#     video sizing (probe real bytes; >256 MB -> smaller formats[] rendition
+#     video sizing (probe real bytes; >400 MiB -> smaller formats[] rendition
 #     or thumbnail+watch link), /en translation, timestamps, null-safe color.
 #   • ROUND 10 (2026-09-13): FULL X ARTICLE support — FxTwitter's API returns
 #     each article as clean JSON (tweet.article: title, cover image, draft.js
@@ -149,35 +149,20 @@ GIF_WEBP_BASE = "https://gif.fxtwitter.com/tweet_video/"
 GIF_RAILWAY_BASE = "https://fastgif-production.up.railway.app/tweet_video/"
 IS_COMPONENTS_V2 = 1 << 15  # Flag for rich card layout
 
-# ---------------------------------------------------------------------------
-# ■ VIDEO GALLERY LIMITS (from live Discord tests, 2026-09-11)
-# 191 MB confirmed plays, 405 MB confirmed fails -> 256 MiB sits safely
-# between them. Tune here if Discord changes its behaviour.
-# ---------------------------------------------------------------------------
-def _video_size_limit(value: str | None) -> int:
-    """Explicit opt-in only; unset and malformed values retain the 256 MiB default."""
-    return (350 if str(value or "").strip().lower() in ("1", "true", "yes", "on") else 256) * 1024 * 1024
-
-
-VIDEO_SIZE_LIMIT = _video_size_limit(os.getenv("TWITTER_HIGH_VIDEO_LIMIT"))
+# Fixed gallery limit, aligned with the actively used V3 engine. The operator
+# manually verified that a ~395 MB 1080p X video embeds and plays in Discord.
+VIDEO_SIZE_LIMIT = 400 * 1024 * 1024
 RISKY_DURATION_SECONDS = 300                   # > 5 min ...
 RISKY_MIN_PIXELS = 1920 * 1080                 # ... AND >= 1080p = risky when size unknown
-MAX_VARIANT_PROBES = 3                         # smaller mp4s to try before giving up
 
 # Set True ONLY if portrait videos are PROVEN broken again (see gallery_video_url).
 PORTRAIT_PROXY = False
 
-# ROUND 10 (2026-09-13): optional safety cap for gallery tiles. 0 = OFF
-# (use VIDEO_SIZE_LIMIT above). LIVE-VERIFIED 2026-09-13 via
-# "testing area/video_diag.py": 171 MB and 234 MB gallery tiles PLAY;
-# 521 MB and up FAIL ("image not found") in every URL style — so the
-# 256 MiB default sits in a proven-safe gap and needs no change.
-# If Discord's proxy ever breaks a <= 256 MB tile again (rare + transient —
-# the same URL plays fine when re-posted), set this to a smaller proven
-# value, e.g.  GALLERY_VIDEO_LIMIT = 100 * 1024 * 1024  # 100 MiB.
-# When active, videos above it are downgraded to the largest variant at or
-# below it, or get a "watch on X" note — so the gallery never carries a
-# tile Discord's proxy can't play.
+# ROUND 10: optional additional safety cap for gallery tiles. 0 = OFF
+# (use the fixed 400 MiB VIDEO_SIZE_LIMIT above). When active, videos above
+# this smaller cap are downgraded to the largest variant at or below it, or
+# get a "watch on X" note. Keep it off unless a lower ceiling is deliberately
+# tested; a 400 MiB external-media cap is the current operator-approved default.
 GALLERY_VIDEO_LIMIT = 0
 
 # ---------------------------------------------------------------------------
@@ -523,12 +508,9 @@ async def collect_media(session: aiohttp.ClientSession, tweet_like: dict) -> tup
         # --- too big for Discord's gallery ---
         mb = size / (1024 * 1024)
         _variants = ranked_mp4_variants(v)
-        if effective_limit < VIDEO_SIZE_LIMIT:
-            # ROUND 10: guard active -> check ALL variants (not just the top 3
-            # by bitrate) so a much smaller rendition still gets a chance.
-            _candidates = _variants
-        else:
-            _candidates = _variants[:MAX_VARIANT_PROBES]
+        # Probe all known MP4 renditions in descending bitrate so lower
+        # resolutions remain eligible if larger versions exceed the cap.
+        _candidates = _variants
         swapped = False
         for variant_url in _candidates:
             if variant_url == video_url:

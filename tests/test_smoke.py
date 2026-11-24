@@ -3691,16 +3691,16 @@ check("r47: the webhook POST asks for the created message (wait=true) so media c
 check("r47: healing runs AFTER the posting loop, so it never delays a post",
       _r47_src.index("await heal_unresolved_media(session, heal_queue)")
       > _r47_src.index("heal_queue.append("))
-check("r47: the heal pass is opt-outable and defaults ON",
+check("r47: the heal pass is opt-outable and defaults ON with a 15-second revalidation wait",
       _r47_x.MEDIA_HEAL is True and _r47_x.MEDIA_HEAL_ATTEMPTS >= 1
-      and 30 <= _r47_x.MEDIA_HEAL_DELAY_SECONDS <= 60)
-check("r47: the proven 256 MiB external-video cap is unchanged (no guessing)",
-      _r47_x.VIDEO_SIZE_LIMIT == 256 * 1024 * 1024,
+      and _r47_x.MEDIA_HEAL_DELAY_SECONDS == 15)
+check("r119: the fixed external-video gallery cap is 400 MiB",
+      _r47_x.VIDEO_SIZE_LIMIT == 400 * 1024 * 1024,
       f"limit={_r47_x.VIDEO_SIZE_LIMIT / (1024 * 1024):.0f} MiB")
 
-# ---- 2026-10-11: bounded Twitter video heal (default 4, hard cap 4) -------
-check("r63: twitter media-heal default is four bounded attempts at 45s",
-      (_r47_x.MEDIA_HEAL_DELAY_SECONDS, _r47_x.MEDIA_HEAL_ATTEMPTS) == (45, 4))
+# ---- bounded Twitter video heal (default 4, hard cap 4) -------------------
+check("r119: twitter media-heal default is four bounded attempts at 15s",
+      (_r47_x.MEDIA_HEAL_DELAY_SECONDS, _r47_x.MEDIA_HEAL_ATTEMPTS) == (15, 4))
 check("r63: media-heal attempts are hard-capped at four in source",
       "MEDIA_HEAL_ATTEMPTS = min(4, max(1, _env_int(\"MEDIA_HEAL_ATTEMPTS\", 4)))"
       in open(os.path.join(ROOT, "testing area", "twitter_v3.py"), encoding="utf-8").read())
@@ -4436,9 +4436,9 @@ try:
     check("r49b: twitter_v3 empty cache Variables use defaults",
           (_r49b_twitter.MAX_CACHE_SIZE_PER_ACCOUNT,
            _r49b_twitter.MAX_CACHE_SIZE_TOTAL) == (250, 10000))
-    check("r49b: twitter_v3 empty media-heal Variables use defaults",
+    check("r49b: twitter_v3 empty media-heal Variables use the 15-second/four-attempt defaults",
           (_r49b_twitter.MEDIA_HEAL_DELAY_SECONDS,
-           _r49b_twitter.MEDIA_HEAL_ATTEMPTS) == (45, 4))
+           _r49b_twitter.MEDIA_HEAL_ATTEMPTS) == (15, 4))
     check("r100: twitter_v3 empty MEDIA_HEAL_CARRY_HOURS keeps the 6 h default",
           _r49b_twitter.MEDIA_HEAL_CARRY_HOURS == 6)
     _r49b_reddit = load_module("smoke_reddit_v3_empty_env", _r49b_files[2])
@@ -7847,6 +7847,7 @@ check("existing Twitter summary handles timestamp-prefixed five-account producti
       "accounts observed in feed logs: 5" in _app_tw_summary
       and "entries read: 98" in _app_tw_summary
       and "successful feeds: 5" in _app_tw_summary
+      and "new candidates: not separately measured by this log format" in _app_tw_summary
       and "posts delivered: 1" in _app_tw_summary and "cache: success" in _app_tw_summary)
 _app_fail_log = (_app_tw_log + "2026-10-17 04:00:46,000 [WARNING] [Offline] NO working nitter instance this run\n"
                  "2026-10-17 04:00:46,001 [INFO] [Offline] skipping — no feed / 0 entries.\n")
@@ -10653,13 +10654,13 @@ async def _r93_removed_spam_liveness_contracts():
 asyncio.run(_r93_removed_spam_liveness_contracts())
 
 # ===========================================================================
-# ROUND 94 (2026-10-28): Twitter run diagnostics, run-result presence, opt-in
-# 350 MiB video cap. The summary and the state line are operator-facing, so
+# ROUND 94/119: Twitter run diagnostics, run-result presence and fixed
+# 400 MiB video cap. The summary and state line are operator-facing, so
 # these guards pin the parts a passing suite could otherwise fake: an empty log
 # (tee creates the file before the monitor writes a line) must not look like
 # "0 errors", every diagnostic pattern must still match a REAL engine log line
-# (a silently dead category would print a permanent 0), and the opt-in cap must
-# reach the live workflow without a second hardcoded 256 MiB cap behind it.
+# (a silently dead category would print a permanent 0), and the fixed cap must
+# be consistently set in both X engines with complete variant fallback.
 # ===========================================================================
 
 # 1. An EMPTY log file is the common failure shape: the workflow pipes through
@@ -10693,31 +10694,21 @@ check("r94: every Twitter diagnostic category still matches a real engine log li
       and 'logging.error(f"MEDIA-HEAL {key}: edit error' in _r94_engine_src,
       [p for p, lit in _r94_pairs if p not in _r94_wf_src or lit not in _r94_engine_src])
 
-# 3. The opt-in cap is wired to the LIVE workflow only, and nothing behind it
-#    still enforces 256 MiB.
+# 3. Round 119: fixed 400 MiB cap in both X engines, no tuning Variable.
 _r94_rd_wf = open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"),
                   encoding="utf-8").read()
-check("r94: the optional 350 MiB cap is mapped from a repository Variable in the "
-      "Twitter workflow only (Reddit keeps its own MAX_MEDIA_BYTES)",
-      "TWITTER_HIGH_VIDEO_LIMIT: ${{ vars.TWITTER_HIGH_VIDEO_LIMIT }}" in _r94_wf_src
-      and "TWITTER_HIGH_VIDEO_LIMIT" not in _r94_rd_wf)
 _r94_v2_src = open(os.path.join(ROOT, "testing area", "twitter_v2_button_outside.py"),
                    encoding="utf-8").read()
-check("r94: unsetting the Variable leaves the proven 256 MiB cap in both engines, "
-      "with the gallery sub-cap still off",
-      x3._video_size_limit(None) == 256 * 1024 * 1024
-      and x3._video_size_limit("") == 256 * 1024 * 1024
-      and x3.VIDEO_SIZE_LIMIT == 256 * 1024 * 1024
-      and x3.GALLERY_VIDEO_LIMIT == 0
-      and 'VIDEO_SIZE_LIMIT = _video_size_limit(os.getenv("TWITTER_HIGH_VIDEO_LIMIT"))'
-      in _r94_v2_src)
-check("r94: the cap has exactly one source of truth (no second hardcoded 256 MiB "
-      "limit left behind in either engine)",
-      all("256 * 1024 * 1024" not in src
-          and src.count("VIDEO_SIZE_LIMIT = _video_size_limit(") == 1
-          for src in (_r94_engine_src, _r94_v2_src))
-      and _r94_engine_src.count("_video_size_limit(os.getenv(\"TWITTER_HIGH_VIDEO_LIMIT\"))") == 1,
-      (_r94_engine_src.count("256 * 1024 * 1024"), _r94_v2_src.count("256 * 1024 * 1024")))
+check("r119: both X engines use the fixed 400 MiB gallery cap, with no opt-in variable",
+      x3.VIDEO_SIZE_LIMIT == 400 * 1024 * 1024
+      and "VIDEO_SIZE_LIMIT = 400 * 1024 * 1024" in _r94_engine_src
+      and "VIDEO_SIZE_LIMIT = 400 * 1024 * 1024" in _r94_v2_src
+      and "TWITTER_HIGH_VIDEO_LIMIT" not in _r94_engine_src + _r94_v2_src + _r94_wf_src
+      and "TWITTER_HIGH_VIDEO_LIMIT" not in _r94_rd_wf)
+check("r119: the engines probe all available MP4 variants when the source exceeds the cap",
+      "_candidates = _variants" in _r94_engine_src
+      and "_candidates = _variants" in _r94_v2_src
+      and "MAX_VARIANT_PROBES" not in _r94_engine_src + _r94_v2_src)
 
 # 4. The Reddit run-result line reports presence only: the four documented
 #    states, and never the record's own contents (it can carry anything).
@@ -10992,14 +10983,10 @@ check("r95: the Redlib warning appears only when nothing answered",
       "no Redlib mirror answered this run" not in _r95_answered,
       [ln for ln in _r95_answered.splitlines() if "Redlib" in ln])
 
-# ---- Round 95c: a down/maintenance nitter instance cannot cause a re-post ----
-# Live 2026-10-30 (run #12043): every mirror answered 502/429 and the surviving
-# one served days-old entries, which were posted as if new. The cache is the
-# first line of defence; the stale floor is the second, and it costs no request.
-_x95c_now = (_r30_x.tweet_id_created_ts("2115271059188613499") + 46.35 * 3600)
-# ^ the wall clock of the real run #12043 (2026-10-30T00:55Z): the newest of
-#   the three backlog tweets was 46.35 h old at the moment it was posted.
-_x95c_max = _r30_x.TWITTER_MAX_AGE_SECONDS
+# ---- Round 119: no age floor; retained cache remains the dedup guard --------
+# The operator reported TYPEII_EN/2119676737907007696 was in old feed logs but
+# was skipped after a 24-hour floor. Older uncached entries must remain eligible;
+# keys still present in posted_tweets.json must continue to skip before fetching.
 check("r95c: the pending re-check wait is exactly one 5-minute cron tick",
       v3.PENDING_RECHECK_SECONDS == 300
       and v3.PENDING_RECHECK_SECONDS == 5 * 60,
@@ -11011,100 +10998,24 @@ check("r95c: removed/deleted holds are still never re-checked at the shorter int
           {"k": {"reason": "removal notice", "last_checked": 0.0}}, "k", 1e9,
           v3._ArcticEntry({"id": "x1", "subreddit": "AnantaLeaks"})) is True,
       "a removed post must not be re-probed just because the interval shrank")
-check("r95c: the stale floor defaults to 24 h and is switchable",
-      _x95c_max == 24 * 3600 and _r30_x.TWITTER_MAX_AGE_HOURS == 24,
-      (_x95c_max, _r30_x.TWITTER_MAX_AGE_HOURS))
-check("r95c: the three entries posted by run #12043 are refused as stale backlog",
-      all(_r30_x.is_stale_entry(_r30_x.tweet_entry_age_seconds({}, _x95c_now, _tid))
-          for _tid in ("2115271059188613499", "2114559707734245394", "2112102702817972715")),
-      [_r30_x.tweet_entry_age_seconds({}, _x95c_now, _tid) for _tid in
-       ("2115271059188613499", "2114559707734245394", "2112102702817972715")])
-_x95c_fresh = "%d" % (((int(_x95c_now * 1000) - 4 * 60 * 1000) - _r30_x._TWITTER_SNOWFLAKE_EPOCH_MS) << 22)
-_x95c_fresh_age = _r30_x.tweet_entry_age_seconds({}, _x95c_now, _x95c_fresh)
-check("r95c: a genuinely new tweet (minutes old) is never refused",
-      _x95c_fresh_age is not None and 200 < _x95c_fresh_age < 400
-      and not _r30_x.is_stale_entry(_x95c_fresh_age),
-      _x95c_fresh_age)
-check("r95c: the guard fails OPEN — an entry it cannot date is posted, not dropped",
-      _r30_x.tweet_entry_age_seconds({}, _x95c_now, "") is None
-      and _r30_x.tweet_entry_age_seconds({}, _x95c_now, "not-an-id") is None
-      and _r30_x.tweet_entry_age_seconds({}, _x95c_now, "0") is None
-      and not _r30_x.is_stale_entry(None)
-      and not _r30_x.is_stale_entry(0.0),
-      "unknown age must still post (a strict guard would silently drop live tweets)")
-class _X95cEntry:
-    def __init__(self, link, published=None):
-        self.link = link
-        self._published = published
-
-    def get(self, key, default=None):
-        return self._published if key == "published_parsed" else default
-
-
-_x95c_own = _X95cEntry("https://x.com/TYPEII_EN/status/2112102702817972715",
-                       time.gmtime(_x95c_now - 3600))
-_x95c_own_age = _r30_x.judged_entry_age_seconds(_x95c_own, _x95c_now,
-                                                "2112102702817972715", "TYPEII_EN")
-check("r95c: an own tweet is judged by its id, so a re-stamped backlog entry cannot slip through",
-      # feed says 1 h, the immutable id says 256 h -> the id wins, entry refused.
-      _x95c_own_age is not None and _x95c_own_age > 200 * 3600
-      and _r30_x.is_stale_entry(_x95c_own_age),
-      _x95c_own_age)
-_x95c_bogus = _X95cEntry("https://x.com/TYPEII_EN/status/1", time.gmtime(0))  # a 1970 feed date
-check("r95c: a broken feed date (epoch 0) cannot hold a fresh own tweet",
-      not _r30_x.is_stale_entry(
-          _r30_x.judged_entry_age_seconds(_x95c_bogus, _x95c_now, _x95c_fresh, "TYPEII_EN")),
-      _r30_x.judged_entry_age_seconds(_x95c_bogus, _x95c_now, _x95c_fresh, "TYPEII_EN"))
-check("r95c: ages are read as UTC, so a non-UTC machine cannot shift the floor "
-      "(time.mktime would add the local offset)",
-      abs(_r30_x.feed_date_age_seconds(_X95cEntry("x", time.gmtime(_x95c_now - 3600)),
-                                       _x95c_now) - 3600) < 2
-      and "calendar.timegm(parsed)" in open(
-          os.path.join(ROOT, "testing area/twitter_v3.py"), encoding="utf-8").read())
-_x95c_rt = _X95cEntry("https://x.com/SomeoneElse/status/2112102702817972715",
-                      time.gmtime(_x95c_now - 300))
-_x95c_rt_age = _r30_x.judged_entry_age_seconds(_x95c_rt, _x95c_now,
-                                               "2112102702817972715", "TYPEII_EN")
-check("r95c: a repost is judged by its own feed date, so reposting an older tweet still posts",
-      _x95c_rt_age is not None and _x95c_rt_age < 600
-      and not _r30_x.is_stale_entry(_x95c_rt_age),
-      _x95c_rt_age)
-check("r95c: with no id an own tweet falls back to the feed date; with neither the entry posts",
-      _r30_x.judged_entry_age_seconds(_X95cEntry("https://x.com/TYPEII_EN/status/1"),
-                                      _x95c_now, "2112102702817972715", "TYPEII_EN") > 200 * 3600
-      and _r30_x.judged_entry_age_seconds(_X95cEntry("https://x.com/SomeoneElse/status/1"),
-                                          _x95c_now, "2112102702817972715", "TYPEII_EN") > 200 * 3600
-      and _r30_x.judged_entry_age_seconds(_X95cEntry("https://x.com/TYPEII_EN/status/1"),
-                                          _x95c_now, "", "TYPEII_EN") is None)
 _x95c_src = open(os.path.join(ROOT, "testing area/twitter_v3.py"), encoding="utf-8").read()
-_x95c_loop = _x95c_src.split("for entry in entries:", 1)[1]
-_x95c_i_stale = _x95c_loop.find("is_stale_entry(entry_age)")
-_x95c_i_fetch = _x95c_loop.find("fetch_tweet_details_any")
-check("r95c: the stale check runs BEFORE the tweet-data fetch, so a stale backlog costs zero requests",
-      0 <= _x95c_i_stale < _x95c_i_fetch,
-      (_x95c_i_stale, _x95c_i_fetch))
-check("r95c: TEST_TWEET_ID stays exempt (an operator explicitly asked for that tweet)",
-      "if TWITTER_MAX_AGE_SECONDS and not test_tweet_id:" in _x95c_src)
-check("r95c: the stale skip is logged as its own greppable reason",
-      "STALE-SKIP:" in _x95c_src and "not posted." in _x95c_src)
 _x95c_wf = open(os.path.join(ROOT, ".github/workflows/twitter_monitor.yml"), encoding="utf-8").read()
-check("r95c: the stale floor's off-switch is actually wired (a Variable the workflow never "
-      "passes through would be silently ignored in CI)",
-      "TWITTER_MAX_AGE_HOURS: ${{ vars.TWITTER_MAX_AGE_HOURS }}" in _x95c_wf
-      and 'TWITTER_MAX_AGE_HOURS' in _x95c_src)
-# Every tuning knob documented in the README must reach its workflow, or setting
-# it in repository settings does nothing. The six exceptions are not repository
-# Variables: ACCOUNTS/SUBREDDITS are edited in the workflow, DRY_RUN and the two
-# TEST_* switches are one-off dispatch inputs, EMBEDEZE_API_KEY belongs to the
-# standby V2 engine.
+_x95c_loop = _x95c_src.split("for entry in entries:", 1)[1]
+_x95c_i_cache = _x95c_loop.find("if unique_key in posted_urls:")
+_x95c_i_fetch = _x95c_loop.find("fetch_tweet_details_any")
+check("r119: the Twitter engine and workflow have no age floor or stale-skip path",
+      all(token not in _x95c_src + _x95c_wf for token in
+          ("TWITTER_MAX_AGE_HOURS", "TWITTER_MAX_AGE_SECONDS", "STALE-SKIP:",
+           "stale_skipped=", "max_age_hours=")))
+check("r119: ordinary cache dedup still happens before tweet-data fetch, independent of age",
+      0 <= _x95c_i_cache < _x95c_i_fetch
+      and "dedup_skipped += 1" in _x95c_loop
+      and "uncached entries are eligible regardless of tweet age" in _x95c_wf,
+      (_x95c_i_cache, _x95c_i_fetch))
+# Every variable documented in the README must reach its workflow, or setting
+# it in repository settings does nothing. Dispatch inputs are not repo Variables.
 _r95c_not_variables = {"ACCOUNTS", "SUBREDDITS", "DRY_RUN", "TEST_POST_ID",
                        "TEST_TWEET_ID", "FORCE_TEST_TWEET", "EMBEDEZ_API_KEY"}
-# Round 95d (2026-10-30): README.md is a DEV-ONLY file — sync_prod.py keeps it (and
-# docs/) out of both production repositories on purpose. This block used to open it
-# unconditionally, which crashed the first prod CI run after the round-95 merge
-# (uesu/7jkxmy9nvbc #332, uesu/wvkhabh2s22 #417: FileNotFoundError at this line) even
-# though every production check above and below it had passed. A documentation check
-# must therefore be skipped when the documentation is absent, never crash.
 _r95c_readme_path = os.path.join(ROOT, "README.md")
 if os.path.isfile(_r95c_readme_path):
     _x95c_readme = open(_r95c_readme_path, encoding="utf-8").read()
@@ -11114,34 +11025,35 @@ if os.path.isfile(_r95c_readme_path):
                                                  encoding="utf-8").read()))
     _x95c_unwired = [n for n in _x95c_documented
                      if n not in _x95c_mapped and n not in _r95c_not_variables]
-    check("r95c: every README-documented tuning knob is passed through by its workflow",
-          _x95c_documented and not _x95c_unwired,
-          _x95c_unwired)
+    check("r119: every README-documented tuning knob still reaches its workflow",
+          _x95c_documented and not _x95c_unwired, _x95c_unwired)
 else:
-    # Production checkout: no knob table to read, so the table check cannot run. The
-    # round's own knob is still proven wired above (r95c, stale-floor off-switch), and
-    # this branch keeps that proof explicit instead of silently dropping it.
-    check("r95c: in a production checkout (no README.md) the round's knob is still mapped",
-          "TWITTER_MAX_AGE_HOURS: ${{ vars.TWITTER_MAX_AGE_HOURS }}" in _x95c_wf)
-
-check("r95c: the engine emits one machine-readable state line for the workflow summary",
-      # must be INFO: the summary step greps the log, and DEBUG lines are not emitted.
+    check("r119: production checkout confirms the media-heal default in source",
+          'MEDIA_HEAL_DELAY_SECONDS = _env_int("MEDIA_HEAL_DELAY_SECONDS", 15)' in _x95c_src)
+check("r119: V3 summary reports cache/delivery counters without age-floor fields",
       'logging.info(f"V3 SUMMARY: posted=' in _x95c_src
-      and "dedup_skipped=" in _x95c_src and "stale_skipped=" in _x95c_src
-      and "cache_missing=" in _x95c_src,
-      [ln.strip() for ln in _x95c_src.splitlines() if "V3 SUMMARY" in ln][:2])
-_x95c_log = ("[INFO] V3 SUMMARY: posted=0 dedup_skipped=3 stale_skipped=3 "
-             "cache_missing=0 cache_keys=294 max_age_hours=24\n"
-             "[INFO] [TYPEII_EN_2112102702817972715] STALE-SKIP: entry is 257.3 h old\n")
-_x95c_summary = _app_summary_shell_with_json("twitter", _x95c_log)
-check("r95c: the summary carries the engine's dedup/backlog state without the raw log",
-      "posted=0 dedup_skipped=3 stale_skipped=3" in _x95c_summary
-      and "- entries refused as stale backlog: 1" in _x95c_summary
-      and "### Dedup / backlog state" in _x95c_summary,
-      [ln for ln in _x95c_summary.splitlines() if "stale" in ln][:3])
-check("r95c: a run that never reached the state line says so instead of implying zero re-posts",
-      "engine: unavailable" in _app_summary_shell_with_json("twitter", _app_tw_log))
-check("r95c: an unpersisted dedup cache is called out as a re-post risk",
+      and "dedup_skipped=" in _x95c_src and "cache_missing=" in _x95c_src
+      and "stale_skipped=" not in _x95c_src and "max_age_hours=" not in _x95c_src)
+_x95c_log = ("[INFO] dedup cache near cap: 476 key(s) (per-account quota 250, "
+             "backstop 10000); hot: Wuthering=249\n"
+             "[INFO] [TYPEII_EN_2119676737907007696] V3 Posted: "
+             "TYPEII_EN_2119676737907007696 (lang=en | source=fxtwitter)\n"
+             "[INFO] V3 SUMMARY: posted=1 forced_test_reposts=0 dedup_skipped=3 "
+             "new_candidates=1 accounts=TYPEII_EN:new=1/cached=3/delivered=1 "
+             "cache_missing=0 cache_keys=294\n")
+_x95c_summary = _app_summary_shell("twitter", _x95c_log)
+check("r119: an old uncached tweet is reportable as delivered; summary has no stale refusals",
+      "TYPEII_EN_2119676737907007696" in _x95c_summary
+      and "### Deduplication state" in _x95c_summary
+      and "new candidates: 1 (engine counter)" in _x95c_summary
+      and "cache near-cap warning: 476 key(s) (per-account quota 250, backstop 10000); hot: Wuthering=249" in _x95c_summary
+      and "uncached entries are eligible regardless of tweet age" in _x95c_summary
+      and "STALE-SKIP" not in _x95c_summary
+      and "entries refused as stale backlog" not in _x95c_summary,
+      [ln for ln in _x95c_summary.splitlines() if "Deduplication" in ln or "211967" in ln])
+check("r119: a run that never reached the state line says so instead of implying zero re-posts",
+      "engine: unavailable" in _app_summary_shell("twitter", _app_tw_log))
+check("r119: an unpersisted dedup cache is called out as a re-post risk",
       "the dedup cache was not persisted this run" in _app_summary_shell("twitter", _app_tw_log,
                                                                         twitter_cache="failed")
       and "not persisted this run" not in _app_summary_shell("twitter", _app_tw_log,
@@ -11254,13 +11166,10 @@ _t96b_log = "\n".join([
     "2026-10-30 06:10:04,303 [WARNING] [PomPom_HonkaiSR] NO working nitter instance this run "
     "— account skipped (see TEST_TWEET_ID to rebuild one tweet).",
     "2026-10-30 06:10:05,404 [INFO] [Wuthering_Waves] skipping — no feed / 0 entries",
-    "2026-10-30 06:10:09,505 [INFO] [TYPEII_EN_2115271059188613499] STALE-SKIP: entry is 46.1 h old "
-    "— older than the 24 h floor, not posted.",
-    "2026-10-30 06:10:09,606 [INFO] [TYPEII_EN_2114559707734245394] STALE-SKIP: entry is 94.0 h old "
-    "— older than the 24 h floor, not posted.",
-    "2026-10-30 06:10:10,707 [INFO] V3 Posted: TYPEII_EN_2115271059188613499 (lang=en | source=fxtwitter)",
-    "2026-10-30 06:10:11,909 [INFO] V3 SUMMARY: posted=1 dedup_skipped=3 stale_skipped=2 "
-    "cache_missing=0 cache_keys=294 max_age_hours=24",
+    "2026-10-30 06:10:10,707 [INFO] V3 Posted: TYPEII_EN_2119676737907007696 (lang=en | source=fxtwitter)",
+    "2026-10-30 06:10:11,909 [INFO] V3 SUMMARY: posted=1 forced_test_reposts=0 dedup_skipped=3 "
+    "new_candidates=1 accounts=TYPEII_EN:new=1/cached=3/delivered=1 "
+    "cache_missing=0 cache_keys=294",
 ]) + "\n"
 _t96b_summary = _app_summary_shell("twitter", _t96b_log)
 check("r96b: the Twitter summary names each account and the instance that fed it",
@@ -11271,23 +11180,14 @@ check("r96b: a dark or empty account is named, not just counted",
       "PomPom_HonkaiSR: FAILED — no working nitter instance this run" in _t96b_summary
       and "Wuthering_Waves: empty feed (0 entries)" in _t96b_summary,
       [ln for ln in _t96b_summary.splitlines() if "FAILED" in ln or "empty feed" in ln][:2])
-check("r96b: the delivered tweet keys are listed, not only a count",
+check("r119: an older uncached feed item appears in delivered keys; no age-refusal list is emitted",
       "delivered keys:" in _t96b_summary
-      and "- TYPEII_EN_2115271059188613499" in _t96b_summary,
-      [ln for ln in _t96b_summary.splitlines() if "delivered keys" in ln][:1])
-check("r96b: the refused backlog keys are listed with their age",
-      "refused keys (oldest-first as logged):" in _t96b_summary
-      and "TYPEII_EN_2115271059188613499 — 46.1 h old" in _t96b_summary
-      and "TYPEII_EN_2114559707734245394 — 94.0 h old" in _t96b_summary,
-      [ln for ln in _t96b_summary.splitlines() if "h old" in ln][:2])
+      and "TYPEII_EN_2119676737907007696" in _t96b_summary
+      and "refused keys" not in _t96b_summary
+      and "STALE-SKIP" not in _t96b_summary
+      and "stale_skipped" not in _t96b_summary)
 check("r96b: a consistent log produces no truncation note",
       "trust the engine value" not in _t96b_summary)
-_t96b_bad = _t96b_log.replace("stale_skipped=2", "stale_skipped=7")
-_t96b_bad_summary = _app_summary_shell("twitter", _t96b_bad)
-check("r96b: a truncated log is called out instead of silently under-reporting",
-      "engine reported 7 stale-skip(s), this log has 2 line(s)" in _t96b_bad_summary
-      and "trust the engine value" in _t96b_bad_summary,
-      [ln for ln in _t96b_bad_summary.splitlines() if "trust the engine" in ln][:1])
 _t96b_many = "\n".join(
     f"2026-10-30 06:10:1{i % 10},00{i % 10} [INFO] V3 Posted: TYPEII_EN_2115{i:012d} (lang=en | source=fxtwitter)"
     for i in range(12)) + "\n"
@@ -12027,12 +11927,12 @@ _r100_src = open(os.path.join(ROOT, "testing area", "twitter_v3.py"), encoding="
 _r100_wf = open(os.path.join(ROOT, ".github", "workflows", "twitter_monitor.yml"),
                 encoding="utf-8").read()
 check("r100: carry-over is on by default (6 h), capped at 20 messages/run, state in "
-      "media_heal_carry.json; in-run heal (45 s x 4, video scope) and the 256 MiB cap unchanged",
+      "media_heal_carry.json; in-run heal (15 s x 4, video scope) and fixed 400 MiB cap",
       (_r100_x.MEDIA_HEAL_CARRY_HOURS, _r100_x.MEDIA_HEAL_CARRY_MAX_PER_RUN,
        _r100_x.MEDIA_HEAL_PENDING_FILE) == (6, 20, "media_heal_carry.json")
       and (_r100_x.MEDIA_HEAL_DELAY_SECONDS, _r100_x.MEDIA_HEAL_ATTEMPTS,
-           _r100_x.MEDIA_HEAL_SCOPE) == (45, 4, "video")
-      and _r100_x.VIDEO_SIZE_LIMIT == 256 * 1024 * 1024)
+           _r100_x.MEDIA_HEAL_SCOPE) == (15, 4, "video")
+      and _r100_x.VIDEO_SIZE_LIMIT == 400 * 1024 * 1024)
 check("r100: the Variable is wired in twitter_monitor.yml (round-42 pattern) and the engine "
       "reads it through _env_int (empty-string safe)",
       "MEDIA_HEAL_CARRY_HOURS: ${{ vars.MEDIA_HEAL_CARRY_HOURS }}" in _r100_wf
