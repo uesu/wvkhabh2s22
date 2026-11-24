@@ -2882,6 +2882,34 @@ for _rel in ("testing area/reddit_main.py", "testing area/reddit_main_v2_embedez
     except Exception as _e:
         check(f"r85 parity: {_rel} format helper + redaction (synthetic)", False, f"{type(_e).__name__}: {_e}")
 
+# --- Inactive Reddit V2 card layout remains structurally aligned with V3 ---
+try:
+    _v2 = load_module("smoke_reddit_v2_card_layout", "testing area/reddit_main_v2_embedez.py")
+    _v2_media = [{"url": f"https://cdn.example/photo-{i}.jpg"} for i in range(11)]
+    _v2_media.append({"url": "https://cdn.example/clip.mp4"})
+    _v2_payload = _v2.build_v2_payload(
+        "ExampleSub", {
+            "content": {"title": "<b>Patch news</b>", "description": "<p>Body copy</p>",
+                        "media": _v2_media,
+                        "statistics": {"comments": 4, "shares": 2, "likes": 9, "views": 100}},
+            "user": {"displayName": "<b>NewsBot</b>"},
+        }, "https://www.reddit.com/r/ExampleSub/comments/abc123/post/", posted_ts=1_800_000_000)
+    _v2_containers = _v2_payload["components"]
+    _v2_first, _v2_second = (_v2_containers[0]["components"], _v2_containers[1]["components"])
+    _v2_galleries = [c for container in _v2_containers for c in container["components"]
+                     if c.get("type") == 12]
+    assert _v2_payload["flags"] == (1 << 15) and len(_v2_containers) == 2
+    assert _v2_first[0]["type"] == 10 and "Patch news" in _v2_first[0]["content"]
+    assert _v2_first[1]["content"] == "Body copy"
+    assert [len(g["items"]) for g in _v2_galleries] == [10, 1, 1]
+    assert "💬 4" in next(c["content"] for c in _v2_second if c.get("type") == 10 and "💬" in c.get("content", ""))
+    assert any("consider supporting" in c.get("content", "") for c in _v2_second)
+    check("inactive Reddit V2 renderer follows V3 card order with split photo galleries, separate video, stats, actions and footer", True)
+except AssertionError as _e:
+    check("inactive Reddit V2 renderer follows V3 card order with split photo galleries, separate video, stats, actions and footer", False, str(_e))
+except Exception as _e:
+    check("inactive Reddit V2 renderer follows V3 card order with split photo galleries, separate video, stats, actions and footer", False, f"{type(_e).__name__}: {_e}")
+
 # --- Ensure redaction is used in v3 exception paths ---
 try:
     _src_fetch = inspect.getsource(v3._fetch_feed)
@@ -11307,12 +11335,12 @@ check("r97: every run result carries the settings block and the fresh-hold names
       _r97_init.get("effective_settings") == _r97_settings
       and _r97_init.get("fresh_hold_keys") == [])
 # A renamed/missing constant must degrade to one "unavailable" value, never raise.
-_r97_saved_age = v3.MAX_AGE_SECONDS
+_r97_saved_age = v3.LEGACY_MAX_AGE_SECONDS
 try:
-    v3.MAX_AGE_SECONDS = None
+    v3.LEGACY_MAX_AGE_SECONDS = None
     _r97_degraded = v3._effective_settings()
 finally:
-    v3.MAX_AGE_SECONDS = _r97_saved_age
+    v3.LEGACY_MAX_AGE_SECONDS = _r97_saved_age
 check("r97: a missing constant degrades to unavailable instead of raising",
       _r97_degraded.get("max_age_hours") is None
       and _r97_degraded.get("fresh_hold_seconds") == _r97_settings.get("fresh_hold_seconds"))
@@ -11452,7 +11480,7 @@ def _r98_extract(name):
 
 
 _r98_ns = {"STALE_SNAPSHOT_TICKS": 3, "RECLAIM_MAX_PER_RUN": 5,
-           "PENDING_RECHECK_SECONDS": 300, "MAX_AGE_SECONDS": 172800,
+           "PENDING_RECHECK_SECONDS": 300, "LEGACY_MAX_AGE_SECONDS": 172800,
            "_NATIVE_FEED_STREAK_CAP": 99,
            "_SNAPSHOT_SOURCES": frozenset({"arctic-entry", "arctic-lookup"})}
 _r98_ok = True
@@ -12265,7 +12293,7 @@ check("r108: a 429 is retried after its Retry-After (short values honoured, long
       _r108["retry_after"][0] == [] and 0.25 <= _r108["retry_after"][1] < 3.0
       and _r108["retry_after"][2] == 0
       and str(_r108["retry_after"][3] or "").isdigit()
-      and abs(int(_r108["retry_after"][3]) - (time.time() - v3.MAX_AGE_SECONDS)) < 120
+      and abs(int(_r108["retry_after"][3]) - (time.time() - v3.LEGACY_MAX_AGE_SECONDS)) < 120
       and v3.ARCTIC_RETRY_MAX_WAIT <= 5.0, str(_r108["retry_after"]))
 check("r108: a 404 (or any non-retryable answer) is final — one request, one strike, one failure",
       _r108["final_404"][0] is None and _r108["final_404"][1] == 1 and _r108["final_404"][2] == 1
@@ -12936,16 +12964,38 @@ check("relay candidates bypass generic transient/fresh-age/archive probes, while
             "pending_recheck_seconds": 300, "intake_reader": "primary"})
       and "legacy recheck 300 s" in v3._settings_line({"fresh_hold_seconds": 30,
             "pending_recheck_seconds": 300, "intake_reader": "primary"}))
-check("r101: defaults — primary, stale 1800 s, 5 h monitor/lookback; hour-based Variables and the "
-      "bot token are wired in reddit_monitor.yml",
-      v3.INTAKE_STALE_SECONDS == 1800 and v3.INTAKE_LOOKBACK_SECONDS == 5 * 3600
-      and v3.REDDIT_MONITOR_WINDOW_HOURS == 5
-      and 'min(5, max(1, _env_int("REDDIT_MONITOR_WINDOW_HOURS", 5)))' in _r101_src
-      and 'min(5, max(1, _env_int("INTAKE_LOOKBACK_HOURS", 5)))' in _r101_src
+_r120_active_docs = "".join(
+    open(os.path.join(ROOT, name), encoding="utf-8").read()
+    for name in ("README.md", ".env.example")
+    if os.path.isfile(os.path.join(ROOT, name)))
+check("r120: relay-primary no longer has a source-post age cutoff; intake lookback remains 5 h",
+      "REDDIT_MONITOR_WINDOW_HOURS" not in _r101_src + _r101_wf + _r120_active_docs
+      and "LEGACY_MAX_AGE_SECONDS = 5 * 3600" in _r101_src
+      and "min(5, max(1, _env_int(\"INTAKE_LOOKBACK_HOURS\", 5)))" in _r101_src
+      and v3.INTAKE_STALE_SECONDS == 1800 and v3.INTAKE_LOOKBACK_SECONDS == 5 * 3600
+      and v3.LEGACY_MAX_AGE_SECONDS == 5 * 3600
       and 'INTAKE_READER = ((os.getenv("INTAKE_READER") or "").strip().lower() or "primary")' in _r101_src
       and all(f"{n}: ${{{{ vars.{n} }}}}" in _r101_wf for n in
               ("INTAKE_CHANNEL_ID", "INTAKE_READER", "INTAKE_STALE_SECONDS", "INTAKE_LOOKBACK_HOURS"))
       and "DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}" in _r101_wf)
+_r120_now = time.time()
+_r120_old_created = _r120_now - 32 * 3600
+_r120_relay_entry = v3._IntakeEntry({
+    "id": "1y3i54e", "sub": "AnantaLeaks",
+    "permalink": "/r/AnantaLeaks/comments/1y3i54e/does_anyone_know/",
+    "created": _r120_old_created,
+})
+check("r120: a 32-hour-old relay record remains eligible, while legacy candidates keep the 5 h bound",
+      v3._candidate_age_allowed(_r120_relay_entry, is_first_run=False,
+                                relay_edit=False, relay_repost=False,
+                                now=_r120_now, activity_ts=_r120_old_created)
+      and not v3._candidate_age_allowed(object(), is_first_run=False,
+                                        relay_edit=False, relay_repost=False,
+                                        now=_r120_now, activity_ts=_r120_old_created))
+_r120_main_src = inspect.getsource(v3.main)
+check("r120: retained cache dedup still runs before relay age eligibility",
+      _r120_main_src.index("if unique_key in posted and not relay_edit and not relay_repost:")
+      < _r120_main_src.index("if not _candidate_age_allowed("))
 # Dev-only file: production checkouts have no .env.example (round 95d), so guard the read.
 if os.path.isfile(os.path.join(ROOT, ".env.example")):
     check("r101: the new secret and Variables are documented in .env.example",
@@ -13694,13 +13744,12 @@ check("r115: body is hidden by default; combined mode only additionally flags vi
               for c in _r113_video_enabled["components"]
               for x in c["components"] if x.get("type") == 10))
 
-check("r113: 5-hour monitoring uses hour-based settings and preserves scheduler slack",
-      v3.REDDIT_MONITOR_WINDOW_HOURS == 5
-      and v3.MAX_AGE_SECONDS == 5 * 3600
+check("r120: legacy and lifecycle five-hour windows stay fixed; the removed age Variable is not wired",
+      v3.LEGACY_MAX_AGE_SECONDS == 5 * 3600
       and v3.PENDING_MAX_AGE_SECONDS == 5 * 3600
       and v3.INTAKE_LOOKBACK_HOURS == 5
       and v3.RELAY_EDIT_CACHE_SECONDS == 5 * 3600 + 1800
-      and "REDDIT_MONITOR_WINDOW_HOURS: ${{ vars.REDDIT_MONITOR_WINDOW_HOURS }}" in _r101_wf
+      and "REDDIT_MONITOR_WINDOW_HOURS" not in _r101_wf
       and "INTAKE_LOOKBACK_HOURS: ${{ vars.INTAKE_LOOKBACK_HOURS }}" in _r101_wf)
 _r114_devvit_server_path = os.path.join(
     ROOT, "devvit", "gaming-express", "src", "server", "server.ts")

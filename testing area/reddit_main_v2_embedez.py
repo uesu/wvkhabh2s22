@@ -1,6 +1,10 @@
 # ---------------------------------------------------------------------------
-# ■ Reddit RSS Feed Monitor — V2 (Components V2 rich card via EmbedEZ API)
+# ■ Reddit RSS Feed Monitor — V2 (INACTIVE legacy card renderer)
 # ---------------------------------------------------------------------------
+# Not selected by the production workflow. The active engine is
+# reddit_main_v3.py; this file is retained for local comparison only. Its
+# Components V2 card builder follows the current V3 section order, while its
+# EmbedEZ dependency and discovery behavior remain legacy-specific.
 # Same monitoring as reddit_main.py (V1), but each post is rendered as a
 # Discord Components V2 card (type 17 container, media gallery, stats,
 # timestamp, buttons nested inside) using data from the EmbedEZ API.
@@ -431,6 +435,12 @@ def build_nested_action_row(reddit_url: str, youtube_url: str | None = None) -> 
 
 def build_v2_payload(subreddit: str, data: dict, reddit_url: str,
                      youtube_url: str | None = None, posted_ts: int | None = None) -> dict:
+    """Build the retained EmbedEZ card using the current V3 card layout.
+
+    This engine is intentionally inactive in the workflow. Keep its visual
+    structure compatible for local comparisons without changing discovery,
+    scheduling, or the active Devvit delivery path.
+    """
     content = data.get("content") or {}
     user = data.get("user") or {}
     preview = data.get("preview") or {}
@@ -441,48 +451,69 @@ def build_v2_payload(subreddit: str, data: dict, reddit_url: str,
         or f"New post in r/{subreddit}"
     description = strip_html(content.get("description") or content.get("text")) \
         or strip_html(preview.get("description"))
-    author_name = user.get("displayName") or user.get("name") or f"r/{subreddit}"
+    author_name = strip_html(user.get("displayName") or user.get("name")) or f"r/{subreddit}"
 
+    # Match V3's ordered card sections: heading/body, divider + media, stats,
+    # divider + actions, and the maintenance footer. Keep video tiles in their
+    # own gallery and respect Discord's ten-items-per-gallery limit.
+    media_urls = extract_media_urls(data)
+    video_urls = [u for u in media_urls
+                  if re.search(r"\.(?:mp4|m4v|mov|webm|m3u8)(?:[?#]|$)", str(u), re.I)]
+    photo_urls = [u for u in media_urls if u not in video_urls]
+    photo_urls = photo_urls[:20]
+    video_urls = video_urls[:10]
     inner_components = [
         {"type": 10, "content": f"### [{title}]({reddit_url})\n*by {author_name} in r/{subreddit}*"},
     ]
     if description:
         inner_components.append({"type": 10, "content": description})
 
-    # — media gallery —
-    media_urls = extract_media_urls(data)
-    if media_urls:
-        items = [{"media": {"url": u}} for u in media_urls[:10]]
-        inner_components.append({"type": 14, "divider": True, "spacing": 1})
-        inner_components.append({"type": 12, "items": items})
-
-    # — stats line (full data) or limited-preview note + Discord timestamp —
-    ts_suffix = f"   •   🕐 <t:{posted_ts}:f>" if posted_ts else ""
+    stats_suffix = f"   •   🕐 <t:{posted_ts}:f>" if posted_ts else ""
     if limited:
-        inner_components.append({
-            "type": 10,
-            "content": f"-# ℹ️ Limited preview — set a valid EMBEDEZ_API_KEY for full stats & media{ts_suffix}",
-        })
+        stats_line = ("-# ℹ️ Limited preview — set a valid EMBEDEZ_API_KEY for full stats & media"
+                      f"{stats_suffix}")
     else:
         stats = content.get("statistics") or {}
         comments = stats.get("comments", 0)
         shares = stats.get("shares", 0)
         likes = stats.get("likes", 0)
         views = stats.get("views", "N/A")
-        inner_components.append({
-            "type": 10,
-            "content": f"-# 💬 {comments} 🔁 {shares} ❤️ {likes} 👁️ {views}{ts_suffix}",
-        })
+        stats_line = f"-# 💬 {comments} 🔁 {shares} ❤️ {likes} 👁️ {views}{stats_suffix}"
 
-    # — YouTube callout (bare URL stays clickable; auto-embed only works in V1) —
+    if photo_urls or video_urls:
+        inner_components.append({"type": 14, "divider": True, "spacing": 1})
+        for start in range(0, len(photo_urls), 10):
+            items = [{"media": {"url": u}} for u in photo_urls[start:start + 10]]
+            inner_components.append({"type": 12, "items": items})
+        if video_urls:
+            inner_components.append({"type": 12, "items": [
+                {"media": {"url": u}} for u in video_urls
+            ]})
+
+    inner_components.append({"type": 10, "content": stats_line})
     if youtube_url:
-        inner_components.append({
-            "type": 10,
-            "content": f"**YouTube:** {youtube_url}",
-        })
-
+        inner_components.append({"type": 10, "content": f"**YouTube:** {youtube_url}"})
     inner_components.append({"type": 14, "divider": True, "spacing": 1})
     inner_components.append(build_nested_action_row(reddit_url, youtube_url))
+    inner_components.append({
+        "type": 10,
+        "content": ("-# It takes time, tools, hosting and ongoing maintenance to keep the news working. "
+                    "If it helps you stay updated, consider supporting so it can keep improving "
+                    "<a:starwardlove:1570666942233055312>"),
+    })
+
+    # A second container preserves V3's two-stage layout when there are more
+    # than ten photos. All stats and action controls stay together at the end.
+    if len(photo_urls) > 10:
+        split_at = next(i for i, component in enumerate(inner_components)
+                        if component.get("type") == 12)
+        remaining = inner_components[split_at + 1:]
+        second = [{"type": 14, "divider": True, "spacing": 1}, *remaining]
+        first = inner_components[:split_at + 1]
+        return {"flags": IS_COMPONENTS_V2, "components": [
+            {"type": 17, "accent_color": 16729344, "components": first},
+            {"type": 17, "accent_color": 16729344, "components": second},
+        ]}
 
     container = {
         "type": 17,

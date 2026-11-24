@@ -141,8 +141,8 @@ jobs:
           # path). Relay lifecycle deletion is automatic and needs no setting.
           # Any Variable whose round-63-removed gate no longer exists is
           # likewise unmapped — see the round-63 note in .env.example.
-          # Two-day Reddit relisting/edit window, expressed in hours.
-          REDDIT_MONITOR_WINDOW_HOURS: ${{ vars.REDDIT_MONITOR_WINDOW_HOURS }}
+          # Relay candidates are age-independent; the retained legacy fallback
+          # uses its fixed five-hour horizon. Intake lookback is configured below.
           # Opt-in: spoiler all media tiles (including video) and the full Reddit-marked body.
           SPOILER_MEDIA_AND_BODY: ${{ vars.SPOILER_MEDIA_AND_BODY }}
           # Round 95 (2026-10-30): independent pre-delivery liveness probe.

@@ -356,17 +356,19 @@ def _env_float(name: str, default: float) -> float:
 MAX_CACHE_SIZE_PER_SUB = _env_int("MAX_CACHE_SIZE_PER_SUB", 250)
 MAX_CACHE_SIZE_TOTAL = _env_int("MAX_CACHE_SIZE_TOTAL", 10000)
 # Round 34: per-run flood cap — one run posts at most this many NEW posts
-# (the newest ones); the rest retry next run inside the configured monitor window. A loud
-# log line instead of a mass re-post storm if the dedup cache ever loses
-# keys again.
+# (the newest ones); the rest retry next run while their relay messages remain
+# inside the Discord intake lookback. A loud log line instead of a mass re-post
+# storm if the dedup cache ever loses keys again.
 MAX_POSTS_PER_RUN = _env_int("MAX_POSTS_PER_RUN", 25)
 
-# Reddit monitoring window, configured in hours; legacy values above 5 are capped.
-REDDIT_MONITOR_WINDOW_HOURS = min(5, max(1, _env_int("REDDIT_MONITOR_WINDOW_HOURS", 5)))
-MAX_AGE_SECONDS = REDDIT_MONITOR_WINDOW_HOURS * 3600
-# One cron interval of slack lets the relay's final 5 h re-check be consumed
-# even when a poll runs a few minutes after its scheduled age.
-RELAY_EDIT_CACHE_SECONDS = MAX_AGE_SECONDS + 1800
+# The old RSS/archive fallback keeps a fixed five-hour discovery horizon.
+# Relay-primary candidates have no source-post-age cutoff: a post held by
+# Reddit/subreddit moderation can still be delivered when its relay record
+# arrives, subject to current status checks, deduplication and the per-run cap.
+LEGACY_MAX_AGE_SECONDS = 5 * 3600
+# Devvit's post-delivery status rechecks run through five hours. Keep the
+# Discord message IDs slightly longer so the final status update can be applied.
+RELAY_EDIT_CACHE_SECONDS = 5 * 3600 + 1800
 
 # ---------------------------------------------------------------------------
 # ■ PENDING-POST RECHECK CACHE (round 30, 2026-09-19)
@@ -393,7 +395,7 @@ PENDING_RECHECK_SECONDS = _env_int("PENDING_RECHECK_SECONDS", 300)  # 5 min
 # deleted posts are still NEVER re-checked (the _NO_RECHECK_REASONS set), so
 # this raises the cadence for the small held set only. Override with the
 # PENDING_RECHECK_SECONDS Variable (set 1800 to restore the old behaviour).
-PENDING_MAX_AGE_SECONDS = REDDIT_MONITOR_WINDOW_HOURS * 3600  # same hour-based window
+PENDING_MAX_AGE_SECONDS = 5 * 3600  # legacy held-post cache retention
 
 # Legacy retraction helper is retained only for its offline historical tests;
 # production lifecycle actions are driven by Devvit intake updates below.
@@ -503,13 +505,12 @@ def _effective_settings() -> dict:
         val = _get(name)
         return val if isinstance(val, (int, float)) and not isinstance(val, bool) else None
 
-    max_age = _int("MAX_AGE_SECONDS")
+    max_age = _int("LEGACY_MAX_AGE_SECONDS")
     probe = _get("REDDIT_LIVENESS_PROBE")
     return {
         "fresh_hold_seconds": _int("FRESH_HOLD_SECONDS"),
         "pending_recheck_seconds": _int("PENDING_RECHECK_SECONDS"),
         "max_age_hours": (round(max_age / 3600) if max_age else None),
-        "reddit_monitor_window_hours": _int("REDDIT_MONITOR_WINDOW_HOURS"),
         "max_posts_per_run": _int("MAX_POSTS_PER_RUN"),
         "dedup_per_sub_cap": _int("MAX_CACHE_SIZE_PER_SUB"),
         "dedup_total_cap": _int("MAX_CACHE_SIZE_TOTAL"),
@@ -632,7 +633,7 @@ def _reclaim_due(pending: dict, seen_keys, now: float, limit: int) -> list:
         if str(rec.get("reason") or "") not in _RECLAIMABLE_REASONS:
             continue
         pub = rec.get("published_ts")
-        if isinstance(pub, (int, float)) and now - float(pub) > MAX_AGE_SECONDS:
+        if isinstance(pub, (int, float)) and now - float(pub) > LEGACY_MAX_AGE_SECONDS:
             continue
         try:
             if now - float(rec.get("last_checked") or 0) < PENDING_RECHECK_SECONDS:
@@ -1743,8 +1744,9 @@ def load_pending() -> dict:
 
 
 def save_pending(pending: dict) -> None:
-    # Prune entries older than PENDING_MAX_AGE_SECONDS (the configured posting
-    # window has passed — collect() can no longer pick the post up anyway).
+    # Prune old legacy retry state after the fixed retention horizon. This does
+    # not age out relay candidates: a relay record can still be reconsidered
+    # while its message remains in the intake lookback.
     def _first_seen_age_ok(v: dict, now: float) -> bool:
         raw = v.get("first_seen")
         if raw is None:
@@ -2881,7 +2883,7 @@ async def fetch_arctic_subreddit_posts(session, subreddit: str,
 
     Returns [] on ANY failure (429/timeout/bad shape) — the RSS path has
     already run, so a search error must never block posting. `after_epoch`
-    (unix seconds) restricts the window to match MAX_AGE_SECONDS; when it is
+    (unix seconds) restricts the window to match LEGACY_MAX_AGE_SECONDS; when it is
     missing the window is applied anyway (round 108: never an unbounded search).
     """
     global _arctic_fail_count
@@ -2898,7 +2900,7 @@ async def fetch_arctic_subreddit_posts(session, subreddit: str,
     except (TypeError, ValueError):
         after_val = 0
     if after_val <= 0:
-        after_val = int(time.time() - MAX_AGE_SECONDS)
+        after_val = int(time.time() - LEGACY_MAX_AGE_SECONDS)
     params["after"] = str(after_val)
     try:
         posts = await _arctic_get_rows(session, ARCTIC_SEARCH_URL, params,
@@ -2949,6 +2951,21 @@ class _ArcticEntry:
 
     def get(self, k, d=None):
         return self._d.get(k, d)
+
+
+def _candidate_age_allowed(entry, *, is_first_run: bool, relay_edit: bool,
+                           relay_repost: bool, now: float,
+                           activity_ts: float) -> bool:
+    """Relay records may arrive long after Reddit created a held post.
+
+    Keep the fixed legacy horizon for the retired RSS/archive discovery path,
+    but never reject a current relay listing solely because the source post is
+    old. Revisions/reposts and first-run behavior remain age-exempt as before.
+    """
+    if (is_first_run or relay_edit or relay_repost
+            or isinstance(entry, _IntakeEntry)):
+        return True
+    return now - activity_ts <= LEGACY_MAX_AGE_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -9376,8 +9393,10 @@ async def main():
                         published_ts = time.mktime(published_parsed) if published_parsed else now
                         updated_ts = time.mktime(updated_parsed) if updated_parsed else published_ts
                         activity_ts = max(published_ts, updated_ts)
-                        if (not is_first_run and not relay_edit and not relay_repost
-                                and now - activity_ts > MAX_AGE_SECONDS):
+                        if not _candidate_age_allowed(
+                                entry, is_first_run=is_first_run,
+                                relay_edit=relay_edit, relay_repost=relay_repost,
+                                now=now, activity_ts=activity_ts):
                             continue
                         if provenance == "reddit-native":
                             native_keys.add(unique_key)
@@ -9513,7 +9532,7 @@ async def main():
                     _circuit_open = _arctic_fail_count >= 3
                     try:
                         arc_posts = await fetch_arctic_subreddit_posts(
-                            session, sub, after_epoch=now - MAX_AGE_SECONDS,
+                            session, sub, after_epoch=now - LEGACY_MAX_AGE_SECONDS,
                             label=sub)
                     except Exception:
                         arc_posts = []
@@ -9539,7 +9558,7 @@ async def main():
                         if _arctic_status == "empty":
                             logging.info(
                                 f"[arctic {sub}] no posts in the last "
-                                f"{int(MAX_AGE_SECONDS / 3600)} h — nothing to recover "
+                                f"{int(LEGACY_MAX_AGE_SECONDS / 3600)} h — nothing to recover "
                                 f"from the archive (this subreddit is covered by the "
                                 f"feed only this run).")
                         continue
@@ -9680,7 +9699,7 @@ async def main():
                                              published_ts=_rpub)
                                 run_stats["reclaim_held"] += 1
                                 _outcome = f"still_removed:{_rremoved}"
-                            elif not _rpath or now - _rpub > MAX_AGE_SECONDS:
+                            elif not _rpath or now - _rpub > LEGACY_MAX_AGE_SECONDS:
                                 _outcome = "outside_window"
                             else:
                                 _rsrc = str(_rrec.get("source") or "arctic")
