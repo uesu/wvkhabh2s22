@@ -2033,6 +2033,137 @@ def build_reply_line(tweet: dict) -> str | None:
     return f"-# ↩️ Replying to [@{replying_to}]({href})"
 
 
+def poll_choice_image_url(choice: dict) -> str | None:
+    """Return a choice's already-supplied image URL, if present."""
+    image = (choice.get("image_url") or choice.get("imageUrl")
+             or choice.get("thumbnail_url") or choice.get("image"))
+    if isinstance(image, dict):
+        image = image.get("url") or image.get("src")
+    media = choice.get("media")
+    if not image and isinstance(media, dict):
+        image = media.get("url") or media.get("thumbnail_url")
+    return image if isinstance(image, str) and image.startswith(("https://", "http://")) else None
+
+
+def poll_display_data(poll: dict | None, *, max_choices: int = 10) -> tuple[str | None, list]:
+    """Return poll text and image gallery items using only URLs in tweet data.
+
+    No poll-specific request is made. FxTwitter's documented poll schema has
+    labels/counts/percentages and poll totals/timing; image URLs are included
+    only when a provider actually supplies them on a choice.
+    """
+    if not isinstance(poll, dict):
+        return None, []
+    choices = poll.get("choices") or poll.get("options") or []
+    if not isinstance(choices, list) or not choices:
+        return None, []
+
+    lines = []
+    image_items = []
+    total_votes = poll.get("total_votes")
+    try:
+        total_votes = int(total_votes) if total_votes is not None else None
+    except (TypeError, ValueError):
+        total_votes = None
+
+    for choice in choices[:max_choices]:
+        if not isinstance(choice, dict):
+            continue
+        label = str(choice.get("label") or choice.get("name") or choice.get("text") or "").strip()
+        if not label:
+            continue
+        percentage = choice.get("percentage")
+        try:
+            percentage = float(percentage) if percentage is not None else None
+        except (TypeError, ValueError):
+            percentage = None
+        count = choice.get("count", choice.get("votes"))
+        if percentage is None and total_votes and count is not None:
+            try:
+                percentage = 100 * int(count) / total_votes
+            except (TypeError, ValueError):
+                percentage = None
+        if percentage is not None:
+            pct = f"{percentage:.1f}".rstrip("0").rstrip(".")
+            lines.append(f"{pct}% — {label}")
+        elif count is not None:
+            lines.append(f"{count} votes — {label}")
+        else:
+            lines.append(f"• {label}")
+
+        image = poll_choice_image_url(choice)
+        if image:
+            image_items.append({"media": {"url": image}})
+
+    if not lines:
+        return None, []
+    footer = []
+    if total_votes is not None:
+        footer.append(f"{total_votes:,} votes")
+    time_left = poll.get("time_left_en") or poll.get("time_left")
+    if isinstance(time_left, str) and time_left.strip():
+        footer.append(time_left.strip())
+    elif poll.get("ends_at"):
+        footer.append(f"Ends {poll['ends_at']}")
+    if footer:
+        lines.append("-# " + " · ".join(footer))
+    return "\n".join(lines), image_items
+
+
+def format_account_summary(account_stats: dict) -> str:
+    """Compact, deterministic per-account counts for the run summary log."""
+    return ",".join(
+        f"{account}:new={counts.get('new', 0)}/cached={counts.get('cached', 0)}"
+        f"/delivered={counts.get('delivered', 0)}"
+        for account, counts in sorted(account_stats.items())
+    )
+
+
+async def enrich_poll_with_syndication_images(session, tweet_id: str, tweet: dict,
+                                             label: str = "") -> dict:
+    """Use one poll-only syndication call to fill missing choice thumbnails."""
+    poll = tweet.get("poll") if isinstance(tweet, dict) else None
+    choices = (poll.get("choices") or poll.get("options") or []) if isinstance(poll, dict) else []
+    if (not choices or not isinstance(choices, list) or twitter_proxy is None
+            or not hasattr(twitter_proxy, "fetch_syndication_poll_images")):
+        return tweet
+
+    labeled = [choice for choice in choices if isinstance(choice, dict)
+               and str(choice.get("label") or choice.get("name") or choice.get("text") or "").strip()]
+    if not labeled:
+        return tweet
+    _, existing_images = poll_display_data(poll)
+    if len(existing_images) >= len(labeled):
+        return tweet
+
+    # The X poll card is not represented in ordinary media arrays. Do one
+    # lookup only when a real poll lacks its per-choice image URLs. Syndication
+    # returns URLs in card bindings; we never download/probe those assets here.
+    image_urls = await twitter_proxy.fetch_syndication_poll_images(
+        session, tweet_id, choice_count=len(choices), label=label)
+    if not image_urls or not any(image_urls):
+        return tweet
+
+    updated_choices = []
+    for index, choice in enumerate(choices):
+        if not isinstance(choice, dict):
+            updated_choices.append(choice)
+            continue
+        current = poll_choice_image_url(choice)
+        candidate = image_urls[index] if index < len(image_urls) else None
+        if not current and candidate:
+            choice = dict(choice, image_url=candidate)
+        updated_choices.append(choice)
+    updated_poll = dict(poll, choices=updated_choices)
+    updated_tweet = dict(tweet)
+    updated_tweet["poll"] = updated_poll
+    found = sum(1 for choice in updated_choices
+                if isinstance(choice, dict) and poll_choice_image_url(choice))
+    logging.info(f"[{label or tweet_id}] syndication poll card supplied {found}/"
+                 f"{len(labeled)} choice image URL(s).")
+    return updated_tweet
+
+
 def build_nested_action_row(read_post_url: str) -> dict:
     """Creates the button components list to be placed INSIDE the container."""
     read_button = {
@@ -2116,6 +2247,14 @@ def build_v3_payload(account: str, tweet: dict, read_post_url: str,
         inner_components.extend(media_gallery_components(lead_gallery_items))
     for chunk in chunks:
         inner_components.append({"type": 10, "content": chunk})
+    poll_text, poll_images = poll_display_data(tweet.get("poll"))
+    if poll_text:
+        inner_components.append({"type": 10, "content": poll_text})
+    # Poll-option artwork is kept distinct from ordinary tweet card artwork:
+    # appending after split_card_thumbnail prevents poll images being mistaken
+    # for a single link-card thumbnail. Regular media order remains untouched.
+    if poll_images:
+        gallery_items = list(gallery_items) + poll_images
     main_gallery_ids = set()
     if gallery_items:
         inner_components.append({"type": 14, "divider": True, "spacing": 1})
@@ -2184,6 +2323,8 @@ async def main():
     # end. Counting only — no control flow depends on them.
     dedup_skipped = 0
     stale_skipped = 0
+    new_candidates = 0
+    account_stats: dict[str, dict[str, int]] = {}
     # Round 34: saturation warning — the pre-round-34 cap failure was silent
     # (lexicographic eviction logged nothing). Warn when an account is within
     # 10 keys of its per-account quota or the total is within 10% of the
@@ -2254,8 +2395,11 @@ async def main():
                     continue
                 tweet_id = match.group(1)
                 unique_key = f"{account}_{tweet_id}"
+                account_counts = account_stats.setdefault(
+                    account, {"new": 0, "cached": 0, "delivered": 0})
                 if unique_key in posted_urls:
                     dedup_skipped += 1
+                    account_counts["cached"] += 1
                     if (test_tweet_id and t_account and t_id
                             and account.lower() == t_account.lower()
                             and tweet_id == t_id):
@@ -2282,6 +2426,12 @@ async def main():
                             f"{TWITTER_MAX_AGE_HOURS} h floor) — old backlog from "
                             f"the feed, not a new tweet; not posted.")
                         continue
+
+                # A new candidate passed cache and age checks. This is a
+                # counting-only metric; provider failures still count as a
+                # candidate considered by this run.
+                new_candidates += 1
+                account_counts["new"] += 1
 
                 # ROUND 11: 4-step tweet-data fallback chain — every result
                 # is normalized to the FxTwitter shape, so the card pipeline
@@ -2356,6 +2506,12 @@ async def main():
                             read_post_url += "/en"
                 # ------------------------------------------------
 
+                # Poll choice images live in X's card bindings, outside normal
+                # tweet.media. Fill them from one public syndication response
+                # only when a poll is present and its choices lack image URLs.
+                tweet_data = await enrich_poll_with_syndication_images(
+                    session, tweet_id, tweet_data, label=unique_key)
+
                 # --- media gallery (videos probed/ported/GIF'd) ---
                 lead_gallery = None
                 if is_article:
@@ -2421,6 +2577,7 @@ async def main():
                 async with session.post(target_url, json=payload) as resp:
                     if resp.status in (200, 204):
                         posted_urls.add(unique_key)
+                        account_counts["delivered"] += 1
                         logging.info(f"V3 Posted: {unique_key} (lang={lang or 'en'}{' | article' if is_article else ''} | source={tweet_source})")
                         created = None
                         if resp.status == 200:
@@ -2465,6 +2622,8 @@ async def main():
     # dedup/backlog state survives without the raw log.
     logging.info(f"V3 SUMMARY: posted={len(posted_urls - posted_urls_at_start)} "
                  f"dedup_skipped={dedup_skipped} stale_skipped={stale_skipped} "
+                 f"new_candidates={new_candidates} "
+                 f"accounts={format_account_summary(account_stats)} "
                  f"cache_missing={len(missing)} cache_keys={len(posted_urls)} "
                  f"max_age_hours={TWITTER_MAX_AGE_HOURS}")
     logging.info("Twitter V3 Monitor execution finished.")

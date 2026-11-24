@@ -1167,6 +1167,165 @@ check("r110: the heal walker still sees the thumbnail (round 49) and the Section
       and len(x3.thumbnail_section([{"type": 10, "content": str(i)} for i in range(5)],
                                    {"media": {"url": _R110_CARD}})["components"]) == 3)
 
+print("\n--- X poll-card rendering and run-summary helpers ---")
+_vx_poll_tweet = x3.twitter_proxy.normalize_vxtwitter({
+    "tweetID": "2125077752852500587", "text": "👀", "user_screen_name": "HonkaiNA",
+    "media_extended": [],
+    "pollData": {"options": [
+        {"name": "🤎Bobabirb", "percent": 41.58, "votes": 79},
+        {"name": "🩶Kaffiend", "percent": 22.63, "votes": 43},
+        {"name": "🩷Nomnom", "percent": 35.79, "votes": 68},
+    ]},
+})
+check("vxTwitter fallback pollData normalizes option text/counts/percentages and total, with no invented artwork",
+      _vx_poll_tweet["poll"]["choices"] == [
+          {"label": "🤎Bobabirb", "count": 79, "percentage": 41.58},
+          {"label": "🩶Kaffiend", "count": 43, "percentage": 22.63},
+          {"label": "🩷Nomnom", "count": 68, "percentage": 35.79},
+      ]
+      and _vx_poll_tweet["poll"]["total_votes"] == 190
+      and _vx_poll_tweet["media"] == {"videos": [], "photos": []}
+      and all("image_url" not in choice for choice in _vx_poll_tweet["poll"]["choices"]))
+_SYNDICATION_ID = "2125077752852500587"
+_SYNDICATION_IMAGES = [
+    "https://pbs.twimg.com/card_img/2125077641678180353/r8XyI4tD?format=jpg&name=orig",
+    "https://pbs.twimg.com/card_img/2125077677384310784/cXxug9SY?format=jpg&name=orig",
+    "https://pbs.twimg.com/card_img/2125077711903465472/JF1s87KX?format=jpg&name=orig",
+]
+_SYNDICATION_THUMBNAILS = [url.replace("name=orig", "name=420x420_2")
+                           for url in _SYNDICATION_IMAGES]
+_SYNDICATION_RAW = {
+    "id_str": _SYNDICATION_ID,
+    "card": {"name": "1906814671912599552:poll_choice_images", "binding_values": {
+        "choice_count": {"string_value": "3", "type": "STRING"},
+        **{f"choice{i}_image_large": {"image_value": {"url": url}, "type": "IMAGE"}
+          for i, url in enumerate(_SYNDICATION_THUMBNAILS, 1)},
+        **{f"choice{i}_image_original": {"image_value": {"url": url}, "type": "IMAGE"}
+          for i, url in enumerate(_SYNDICATION_IMAGES, 1)},
+    }},
+}
+check("syndication token matches the probed X endpoint token format",
+      x3.twitter_proxy.syndication_token(_SYNDICATION_ID) == "55g4mqlsrg1hi"
+      and x3.twitter_proxy.syndication_token("not-a-tweet-id") is None)
+check("syndication bindings prefer the three original-resolution URLs over 420px thumbnails",
+      x3.twitter_proxy.extract_syndication_poll_images(_SYNDICATION_RAW, 3)
+      == _SYNDICATION_IMAGES
+      and all("name=orig" in url for url in _SYNDICATION_IMAGES))
+class _SyndicationResponse:
+    status = 200
+    async def json(self, content_type=None):
+        return _SYNDICATION_RAW
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *args):
+        return False
+class _SyndicationSession:
+    def __init__(self):
+        self.calls = []
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _SyndicationResponse()
+_syndication_session = _SyndicationSession()
+_syndication_result = asyncio.run(x3.twitter_proxy.fetch_syndication_poll_images(
+    _syndication_session, _SYNDICATION_ID, choice_count=3, label="HonkaiNA_" + _SYNDICATION_ID))
+check("one conditional syndication GET returns image URLs with the corrected endpoint and parameters",
+      _syndication_result == _SYNDICATION_IMAGES
+      and len(_syndication_session.calls) == 1
+      and _syndication_session.calls[0][0] == x3.twitter_proxy.SYNDICATION_TWEET_ENDPOINT
+      and _syndication_session.calls[0][1]["params"]["id"] == _SYNDICATION_ID
+      and _syndication_session.calls[0][1]["params"]["token"] == "55g4mqlsrg1hi")
+_POLL_FIXTURE = {
+    "choices": [
+        {"label": "🤎 Bobabirb", "percentage": 42.2, "count": 59,
+         "image_url": _SYNDICATION_IMAGES[0]},
+        {"label": "🩶 Kaffiend", "percentage": 24.4, "count": 34,
+         "image_url": _SYNDICATION_IMAGES[1]},
+        {"label": "🩷 Nomnom", "percentage": 33.3, "count": 47,
+         "image_url": _SYNDICATION_IMAGES[2]},
+    ],
+    "total_votes": 140,
+    "time_left_en": "3 hours left",
+}
+_poll_text, _poll_images = x3.poll_display_data(_POLL_FIXTURE)
+_POLL_NO_IMAGES = dict(_POLL_FIXTURE, choices=[
+    {key: value for key, value in choice.items() if key != "image_url"}
+    for choice in _POLL_FIXTURE["choices"]])
+_poll_to_enrich = {"id": _SYNDICATION_ID, "text": "👀", "poll": _POLL_NO_IMAGES}
+with patch.object(x3.twitter_proxy, "fetch_syndication_poll_images",
+                  new=AsyncMock(return_value=_SYNDICATION_IMAGES)) as _poll_lookup:
+    _poll_enriched = asyncio.run(x3.enrich_poll_with_syndication_images(
+        object(), _SYNDICATION_ID, _poll_to_enrich, label="HonkaiNA_" + _SYNDICATION_ID))
+check("poll enrichment attaches discovered art in choice order and leaves the input payload unchanged",
+      [c.get("image_url") for c in _poll_enriched["poll"]["choices"]] == _SYNDICATION_IMAGES
+      and all("image_url" not in c for c in _poll_to_enrich["poll"]["choices"])
+      and _poll_lookup.await_count == 1
+      and _poll_lookup.await_args.kwargs["choice_count"] == 3,
+      (_poll_enriched, _poll_lookup.await_count, _poll_lookup.await_args))
+with patch.object(x3.twitter_proxy, "fetch_syndication_poll_images",
+                  new=AsyncMock(return_value=_SYNDICATION_IMAGES)) as _unused_poll_lookup:
+    _nonpoll = asyncio.run(x3.enrich_poll_with_syndication_images(
+        object(), _SYNDICATION_ID, {"id": _SYNDICATION_ID, "text": "ordinary"}))
+check("non-poll posts never call the syndication endpoint",
+      _nonpoll["text"] == "ordinary" and _unused_poll_lookup.await_count == 0)
+check("poll fields render choice percentages, choice labels, total votes and remaining time",
+      "42.2% — 🤎 Bobabirb" in _poll_text
+      and "24.4% — 🩶 Kaffiend" in _poll_text
+      and "140 votes · 3 hours left" in _poll_text
+      and len(_poll_images) == 3)
+_poll_data = dict(_POLL_FIXTURE, choices=[dict(c, image_url=None) for c in _POLL_FIXTURE["choices"]])
+_poll_text_no_images, _poll_images_none = x3.poll_display_data(_poll_data)
+check("poll remains readable with no choice-image URLs and does not invent or fetch images",
+      "Bobabirb" in _poll_text_no_images and not _poll_images_none)
+check("poll data absent or malformed gracefully produces no poll section",
+      x3.poll_display_data(None) == (None, [])
+      and x3.poll_display_data({"choices": []}) == (None, []))
+_poll_tweet = {"author": {"name": "Honkai: Nexus Anima", "screen_name": "HonkaiNA"},
+               "text": "👀", "replies": 0, "retweets": 0, "likes": 5, "views": 266,
+               "poll": _POLL_FIXTURE}
+_poll_payload = x3.build_v3_payload("HonkaiNA", _poll_tweet,
+                                   "https://fxtwitter.com/HonkaiNA/status/2125077752852500587",
+                                   posted_ts=1, gallery_items=[])
+def _all_components(node):
+    if isinstance(node, dict):
+        yield node
+        for child in node.get("components", []):
+            yield from _all_components(child)
+        for item in node.get("items", []):
+            yield from _all_components(item)
+    elif isinstance(node, list):
+        for child in node:
+            yield from _all_components(child)
+_poll_components = list(_all_components(_poll_payload["components"]))
+_poll_rendered_text = "\n".join(c.get("content", "") for c in _poll_components
+                                     if c.get("type") == 10)
+_poll_rendered_images = [item["media"]["url"] for c in _poll_components if c.get("type") == 12
+                         for item in c.get("items", [])]
+check("poll is rendered in the existing card layout; Read Post remains the sole post-action link",
+      "42.2% — 🤎 Bobabirb" in _poll_rendered_text
+      and "3 hours left" in _poll_rendered_text
+      and _poll_rendered_images == [c["image_url"] for c in _POLL_FIXTURE["choices"]]
+      and any(c.get("label") == "Read Post" and c.get("url", "").endswith("2125077752852500587")
+              for c in _poll_components if c.get("type") == 2)
+      and not any(c.get("label", "").lower().startswith("vote") for c in _poll_components))
+_poll_with_regular_media = x3.build_v3_payload(
+    "HonkaiNA", _poll_tweet, "https://x.com/HonkaiNA/status/1", posted_ts=1,
+    gallery_items=[{"media": {"url": "https://video.twimg.com/tweet_video/example.mp4"}}])
+_poll_with_media_components = list(_all_components(_poll_with_regular_media["components"]))
+_poll_with_media_urls = [item["media"]["url"] for c in _poll_with_media_components if c.get("type") == 12
+                         for item in c.get("items", [])]
+check("poll artwork appends after normal tweet media without reordering the existing GIF/photo/video gallery",
+      _poll_with_media_urls == ["https://video.twimg.com/tweet_video/example.mp4"]
+      + [c["image_url"] for c in _POLL_FIXTURE["choices"]])
+check("per-account monitor summary reports new, cached, and delivered counts deterministically",
+      x3.format_account_summary({"HonkaiNA": {"new": 1, "cached": 20, "delivered": 1},
+                                 "Ananta_EN": {"new": 2, "cached": 3, "delivered": 2}})
+      == "Ananta_EN:new=2/cached=3/delivered=2,HonkaiNA:new=1/cached=20/delivered=1")
+_twitter_source = open(os.path.join(ROOT, "testing area", "twitter_v3.py"), encoding="utf-8").read()
+check("run summary emits global new-candidate count and per-account breakdown",
+      "new_candidates={new_candidates}" in _twitter_source
+      and "accounts={format_account_summary(account_stats)}" in _twitter_source
+      and 'account_counts[\"delivered\"] += 1' in _twitter_source)
+
 _ci = open(os.path.join(ROOT, ".github", "workflows", "ci.yml"), encoding="utf-8").read()
 check("ci runs this suite", "python tests/test_twitter_media.py" in _ci)
 

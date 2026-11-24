@@ -32,6 +32,7 @@
 # the run: the caller falls back to the legacy direct FxTwitter call.
 # ---------------------------------------------------------------------------
 import re
+import math
 import html as html_lib
 import logging
 from urllib.parse import quote as url_quote
@@ -59,6 +60,7 @@ BROWSER_HEADERS = {
 GIF_WEBP_BASE = "https://gif.fxtwitter.com/tweet_video/"
 GIF_RAILWAY_BASE = "https://fastgif-production.up.railway.app/tweet_video/"
 GIFCONVERT_BASE = "https://gifconvert.vxtwitter.com/convert."
+SYNDICATION_TWEET_ENDPOINT = "https://cdn.syndication.twimg.com/tweet-result"
 
 # The first line of a twitterez og:description is a compact stats line,
 # e.g.  **💬 2  🔁 140  💜 1K  👀 16.7K**  (replies/retweets/likes/views)
@@ -76,6 +78,104 @@ def _compact_int(s) -> int:
     if m.group(2):
         n *= 1_000_000 if m.group(2).upper() == "M" else 1_000
     return int(n)
+
+
+def syndication_token(tweet_id: str) -> str | None:
+    """Generate the same base-36 tweet token used by X's public syndication API."""
+    if not re.fullmatch(r"\d{1,40}", str(tweet_id or "")):
+        return None
+    number = (int(tweet_id) / 1e15) * math.pi
+    integer = int(number)
+    fraction = number - integer
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    encoded = ""
+    while integer:
+        integer, digit = divmod(integer, 36)
+        encoded = alphabet[digit] + encoded
+    if fraction:
+        encoded += "."
+        # Ten fractional digits are sufficient for this opaque token. X accepts
+        # this representation; the endpoint's required path/query are exact.
+        for _ in range(10):
+            fraction *= 36
+            digit = int(fraction)
+            encoded += alphabet[digit]
+            fraction -= digit
+    return re.sub(r"(0+|\.)", "", encoded)
+
+
+def extract_syndication_poll_images(data: dict, choice_count: int = 4) -> list[str | None]:
+    """Read ordered choice image URLs from the raw X syndication card payload.
+
+    The result keeps one slot per poll choice so a missing image doesn't shift
+    a later option onto the wrong position. URLs are taken verbatim from X's
+    IMAGE bindings; no CDN URL rewriting or image probe is performed.
+    """
+    if not isinstance(data, dict):
+        return []
+    card = data.get("card") or {}
+    if not isinstance(card, dict) or "poll" not in str(card.get("name") or "").lower():
+        return []
+    bindings = card.get("binding_values") or {}
+    if isinstance(bindings, list):
+        bindings = {
+            item.get("key"): item.get("value")
+            for item in bindings if isinstance(item, dict) and item.get("key")
+        }
+    if not isinstance(bindings, dict):
+        return []
+
+    results: list[str | None] = []
+    for index in range(1, min(max(int(choice_count or 0), 0), 4) + 1):
+        image_url = None
+        # Prefer X's original/full-resolution image for clearer poll artwork.
+        # Keep the other variants as fallbacks for cards lacking that binding.
+        for suffix in ("_original", "_x_large", "_large", "", "_small"):
+            item = bindings.get(f"choice{index}_image{suffix}")
+            if not isinstance(item, dict):
+                continue
+            value = item.get("value") if "value" in item else item
+            if not isinstance(value, dict):
+                continue
+            image = value.get("image_value")
+            candidate = image.get("url") if isinstance(image, dict) else None
+            if (isinstance(candidate, str)
+                    and candidate.startswith("https://pbs.twimg.com/card_img/")):
+                image_url = candidate
+                break
+        results.append(image_url)
+    return results
+
+
+async def fetch_syndication_poll_images(session, tweet_id: str, *,
+                                        choice_count: int = 4,
+                                        label: str = "") -> list[str | None]:
+    """Fetch raw poll-card bindings once, only for a poll missing option images.
+
+    This is a conditional fallback to the public syndication endpoint, not a
+    vote refresh. It never fetches the image files themselves; Discord receives
+    the exact URLs exposed by X. Any failure degrades to poll text/results only.
+    """
+    token = syndication_token(tweet_id)
+    if not token:
+        return []
+    try:
+        async with session.get(
+            SYNDICATION_TWEET_ENDPOINT,
+            params={"id": str(tweet_id), "lang": "en", "token": token},
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 200:
+                logging.info(f"[{label or tweet_id}] syndication poll-image lookup HTTP {resp.status}")
+                return []
+            data = await resp.json(content_type=None)
+    except Exception as exc:
+        logging.info(f"[{label or tweet_id}] syndication poll-image lookup unavailable: {exc}")
+        return []
+    if not isinstance(data, dict) or str(data.get("id_str") or "") != str(tweet_id):
+        return []
+    return extract_syndication_poll_images(data, choice_count)
 
 
 def _og_meta(page_html: str) -> dict:
@@ -165,6 +265,61 @@ async def resolve_gif_image(session,
 # ---------------------------------------------------------------------------
 # ■ NORMALIZERS — every service's result becomes the FxTwitter "tweet" shape
 # ---------------------------------------------------------------------------
+def normalize_vxtwitter_poll(poll_data: dict | None) -> dict | None:
+    """BetterTwitFix pollData -> the common FxTwitter poll shape.
+
+    The live vxTwitter schema exposes option names, counts and percentages as
+    pollData.options. It does not expose X's poll-card choice images or, in the
+    observed response, the end/time-left fields.
+    """
+    if not isinstance(poll_data, dict):
+        return None
+    options = poll_data.get("choices") or poll_data.get("options") or []
+    if not isinstance(options, list):
+        return None
+    choices = []
+    for option in options:
+        if not isinstance(option, dict):
+            continue
+        label = option.get("label") or option.get("name") or option.get("text")
+        if not isinstance(label, str) or not label.strip():
+            continue
+        choice = {"label": label.strip()}
+        count = option.get("count", option.get("votes"))
+        percentage = option.get("percentage", option.get("percent"))
+        if count is not None:
+            choice["count"] = count
+        if percentage is not None:
+            choice["percentage"] = percentage
+        image = (option.get("image_url") or option.get("imageUrl")
+                 or option.get("image") or option.get("thumbnail_url"))
+        if isinstance(image, dict):
+            image = image.get("url") or image.get("src")
+        if isinstance(image, str) and image.startswith(("https://", "http://")):
+            choice["image_url"] = image
+        choices.append(choice)
+    if not choices:
+        return None
+
+    total_votes = poll_data.get("total_votes", poll_data.get("totalVotes"))
+    if total_votes is None:
+        try:
+            total_votes = sum(int(choice.get("count") or 0) for choice in choices)
+        except (TypeError, ValueError):
+            total_votes = None
+    result = {"choices": choices}
+    if total_votes is not None:
+        result["total_votes"] = total_votes
+    for target, keys in (
+        ("ends_at", ("ends_at", "end_datetime_utc", "end_time")),
+        ("time_left_en", ("time_left_en", "time_left")),
+    ):
+        value = next((poll_data.get(key) for key in keys if poll_data.get(key)), None)
+        if value:
+            result[target] = value
+    return result
+
+
 def normalize_vxtwitter(data: dict) -> dict | None:
     """vxtwitter JSON (api.md) -> FxTwitter "tweet" shape, or None."""
     if not isinstance(data, dict) or not data.get("tweetID"):
@@ -188,7 +343,7 @@ def normalize_vxtwitter(data: dict) -> dict | None:
                 "formats": [{"url": m["url"], "container": "mp4", "bitrate": 0}],
             })
     qrt = data.get("qrt")
-    return {
+    normalized = {
         "id": str(data.get("tweetID")),
         "url": data.get("tweetURL") or "",
         "text": data.get("text") or "",
@@ -208,6 +363,10 @@ def normalize_vxtwitter(data: dict) -> dict | None:
         "quote": normalize_vxtwitter(qrt) if isinstance(qrt, dict) and qrt else None,
         "article": None,  # vxtwitter does not expose X Article bodies
     }
+    poll = normalize_vxtwitter_poll(data.get("pollData") or data.get("poll"))
+    if poll:
+        normalized["poll"] = poll
+    return normalized
 
 
 def normalize_twitterez(meta: dict, tweet_id: str | None = None) -> dict | None:
