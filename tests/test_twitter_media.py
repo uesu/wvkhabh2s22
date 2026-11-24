@@ -1236,11 +1236,11 @@ check("one conditional syndication GET returns image URLs with the corrected end
       and _syndication_session.calls[0][1]["params"]["token"] == "55g4mqlsrg1hi")
 _POLL_FIXTURE = {
     "choices": [
-        {"label": "🤎 Bobabirb", "percentage": 42.2, "count": 59,
+        {"label": "🤎Bobabirb", "percentage": 42.2, "count": 59,
          "image_url": _SYNDICATION_IMAGES[0]},
-        {"label": "🩶 Kaffiend", "percentage": 24.4, "count": 34,
+        {"label": "🩶Kaffiend", "percentage": 24.4, "count": 34,
          "image_url": _SYNDICATION_IMAGES[1]},
-        {"label": "🩷 Nomnom", "percentage": 33.3, "count": 47,
+        {"label": "🩷Nomnom", "percentage": 33.3, "count": 47,
          "image_url": _SYNDICATION_IMAGES[2]},
     ],
     "total_votes": 140,
@@ -1267,11 +1267,39 @@ with patch.object(x3.twitter_proxy, "fetch_syndication_poll_images",
         object(), _SYNDICATION_ID, {"id": _SYNDICATION_ID, "text": "ordinary"}))
 check("non-poll posts never call the syndication endpoint",
       _nonpoll["text"] == "ordinary" and _unused_poll_lookup.await_count == 0)
+_manual_test_entry = x3._TestFeedEntry(
+    f"https://x.com/HonkaiNA/status/{_SYNDICATION_ID}")
+_manual_test_cache = {f"HonkaiNA_{_SYNDICATION_ID}"}
+_manual_test_args = {
+    "entry": _manual_test_entry, "account": "HonkaiNA",
+    "tweet_id": _SYNDICATION_ID, "target_account": "honkaina",
+    "target_id": _SYNDICATION_ID, "cached_at_start": _manual_test_cache,
+}
+check("manual test can explicitly force only its matching cached synthetic entry",
+      x3.should_force_cached_test_tweet(enabled=True, **_manual_test_args)
+      and not x3.should_force_cached_test_tweet(enabled=False, **_manual_test_args)
+      and not x3.should_force_cached_test_tweet(
+          enabled=True, **dict(_manual_test_args, entry={"link": _manual_test_entry.link}))
+      and not x3.should_force_cached_test_tweet(
+          enabled=True, **dict(_manual_test_args, tweet_id="1"))
+      and not x3.should_force_cached_test_tweet(
+          enabled=True, **dict(_manual_test_args, cached_at_start=set())))
+_twitter_workflow = open(os.path.join(ROOT, ".github", "workflows",
+                                     "twitter_monitor.yml"), encoding="utf-8").read()
+check("manual forced repost is an opt-in workflow_dispatch input mapped to the engine",
+      "force_test_tweet:" in _twitter_workflow
+      and "default: false" in _twitter_workflow
+      and "FORCE_TEST_TWEET: ${{ github.event.inputs.force_test_tweet }}" in _twitter_workflow)
 check("poll fields render choice percentages, choice labels, total votes and remaining time",
       "42.2% — 🤎 Bobabirb" in _poll_text
       and "24.4% — 🩶 Kaffiend" in _poll_text
-      and "140 votes · 3 hours left" in _poll_text
+      and "\n\n-# 📜 140 votes · 3 hours left" in _poll_text
       and len(_poll_images) == 3)
+check("poll option text gets exactly one space after a leading emoji",
+      x3.space_after_leading_emoji("🤎Bobabirb") == "🤎 Bobabirb"
+      and x3.space_after_leading_emoji("🤎 Bobabirb") == "🤎 Bobabirb"
+      and x3.space_after_leading_emoji("👩‍🚀Pilot") == "👩‍🚀 Pilot"
+      and x3.space_after_leading_emoji("Ordinary label") == "Ordinary label")
 _poll_data = dict(_POLL_FIXTURE, choices=[dict(c, image_url=None) for c in _POLL_FIXTURE["choices"]])
 _poll_text_no_images, _poll_images_none = x3.poll_display_data(_poll_data)
 check("poll remains readable with no choice-image URLs and does not invent or fetch images",

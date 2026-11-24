@@ -30,6 +30,11 @@ on:
         description: 'Optional TEST TWEET: rebuild ONE specific tweet, e.g. Wuthering_Waves/2100555373073797461 (nitter feed bypassed; same pipeline + cache). Leave empty for a normal run.'
         required: false
         default: ''
+      force_test_tweet:
+        description: 'Force-post the selected test_tweet once even if it is already cached (manual runs only; the cache entry stays recorded).'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -77,9 +82,10 @@ jobs:
           WEBHOOK_WUTHERING_WAVES: ${{ secrets.WEBHOOK_WUTHERING_WAVES }}
           WEBHOOK_HONKAINA: ${{ secrets.WEBHOOK_HONKAINA }}
           WEBHOOK_ANANTA_EN: ${{ secrets.WEBHOOK_ANANTA_EN }}
-          # Test tools (2026-09-17): manual runs only. TEST_TWEET_ID rebuilds
-          # one specific tweet via the direct FxTwitter path (nitter-free).
+          # Manual test only: a selected tweet may optionally be force-posted
+          # once despite an existing cache key. The cache remains intact.
           TEST_TWEET_ID: ${{ github.event.inputs.test_tweet }}
+          FORCE_TEST_TWEET: ${{ github.event.inputs.force_test_tweet }}
           # Nitter RSS token (2026-09-17): nitter.miningtcup.me is behind a
           # bot check. The emailed RSS token lives in the NITTER_RSS_TOKEN
           # repo SECRET (Settings -> Secrets and variables -> Actions ->

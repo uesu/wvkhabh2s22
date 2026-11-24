@@ -1935,6 +1935,25 @@ class _TestFeedEntry:
         return default
 
 
+def should_force_cached_test_tweet(*, enabled: bool, entry, account: str,
+                                   tweet_id: str, target_account: str | None,
+                                   target_id: str | None,
+                                   cached_at_start: set[str]) -> bool:
+    """Only force the explicitly injected manual-test entry, and only if cached.
+
+    Normal RSS entries keep ordinary deduplication. Restricting the override to
+    the synthetic test entry prevents a naturally discovered copy of the same
+    tweet from being delivered twice in one run.
+    """
+    return bool(
+        enabled and isinstance(entry, _TestFeedEntry)
+        and target_account and target_id
+        and account.casefold() == target_account.casefold()
+        and str(tweet_id) == str(target_id)
+        and f"{account}_{tweet_id}" in cached_at_start
+    )
+
+
 class _TestFeed:
     """A feedparser-shaped feed with a single (test) entry."""
 
@@ -2033,6 +2052,64 @@ def build_reply_line(tweet: dict) -> str | None:
     return f"-# ↩️ Replying to [@{replying_to}]({href})"
 
 
+def _is_emoji_base(char: str) -> bool:
+    """Recognize common Unicode emoji bases without a third-party emoji package."""
+    codepoint = ord(char)
+    return (
+        0x1F000 <= codepoint <= 0x1FAFF
+        or 0x2600 <= codepoint <= 0x27BF
+        or 0x2300 <= codepoint <= 0x23FF
+        or 0x2B00 <= codepoint <= 0x2BFF
+        or codepoint in {0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139}
+    )
+
+
+def space_after_leading_emoji(label: str) -> str:
+    """Separate a leading emoji grapheme from the poll option's title text."""
+    if not isinstance(label, str) or not label:
+        return label
+
+    # Keycap emoji start with an ASCII digit / # / * rather than an emoji codepoint.
+    end = 0
+    if label[0] in "#*0123456789":
+        end = 1
+        if end < len(label) and label[end] == "\ufe0f":
+            end += 1
+        if end < len(label) and label[end] == "\u20e3":
+            end += 1
+        else:
+            end = 0
+    elif _is_emoji_base(label[0]):
+        end = 1
+        # A flag is a pair of regional-indicator symbols.
+        if (0x1F1E6 <= ord(label[0]) <= 0x1F1FF and end < len(label)
+                and 0x1F1E6 <= ord(label[end]) <= 0x1F1FF):
+            end += 1
+
+    if not end:
+        return label
+
+    # Keep variation selectors, skin-tone modifiers, tag flags and ZWJ-linked
+    # emoji together; insert the space only after the complete leading cluster.
+    while end < len(label):
+        codepoint = ord(label[end])
+        if (0xFE00 <= codepoint <= 0xFE0F
+                or 0xE0100 <= codepoint <= 0xE01EF
+                or 0x1F3FB <= codepoint <= 0x1F3FF
+                or 0xE0020 <= codepoint <= 0xE007F
+                or codepoint == 0x20E3):
+            end += 1
+        elif label[end] == "\u200d" and end + 1 < len(label) \
+                and _is_emoji_base(label[end + 1]):
+            end += 2
+        else:
+            break
+
+    if end < len(label) and not label[end].isspace():
+        return label[:end] + " " + label[end:]
+    return label
+
+
 def poll_choice_image_url(choice: dict) -> str | None:
     """Return a choice's already-supplied image URL, if present."""
     image = (choice.get("image_url") or choice.get("imageUrl")
@@ -2070,6 +2147,7 @@ def poll_display_data(poll: dict | None, *, max_choices: int = 10) -> tuple[str 
         if not isinstance(choice, dict):
             continue
         label = str(choice.get("label") or choice.get("name") or choice.get("text") or "").strip()
+        label = space_after_leading_emoji(label)
         if not label:
             continue
         percentage = choice.get("percentage")
@@ -2099,14 +2177,14 @@ def poll_display_data(poll: dict | None, *, max_choices: int = 10) -> tuple[str 
         return None, []
     footer = []
     if total_votes is not None:
-        footer.append(f"{total_votes:,} votes")
+        footer.append(f"📜 {total_votes:,} votes")
     time_left = poll.get("time_left_en") or poll.get("time_left")
     if isinstance(time_left, str) and time_left.strip():
         footer.append(time_left.strip())
     elif poll.get("ends_at"):
         footer.append(f"Ends {poll['ends_at']}")
     if footer:
-        lines.append("-# " + " · ".join(footer))
+        lines.extend(("", "-# " + " · ".join(footer)))
     return "\n".join(lines), image_items
 
 
@@ -2324,6 +2402,7 @@ async def main():
     dedup_skipped = 0
     stale_skipped = 0
     new_candidates = 0
+    forced_test_reposts = 0
     account_stats: dict[str, dict[str, int]] = {}
     # Round 34: saturation warning — the pre-round-34 cap failure was silent
     # (lexicographic eviction logged nothing). Warn when an account is within
@@ -2357,9 +2436,13 @@ async def main():
         # Wuthering_Waves/2100555373073797461). Format: screen_name/tweet_id
         # (a full x.com status URL also works). It flows through the SAME
         # pipeline below (data fallback chain, media, card, webhook) and the
-        # SAME cache — an already-posted tweet is skipped by the check further
-        # down, so it is safe to run even if a normal run posts it meanwhile.
+        # SAME cache. By default, already-posted IDs are skipped; the explicit
+        # FORCE_TEST_TWEET manual input can opt to repost only this injected
+        # test entry, while leaving its cache key recorded.
         test_tweet_id = os.getenv("TEST_TWEET_ID", "").strip()
+        force_test_tweet = os.getenv("FORCE_TEST_TWEET", "").strip().lower() \
+            in {"1", "true", "yes", "on"}
+        t_account, t_id = None, None
         if test_tweet_id:
             t_account, t_id = parse_test_tweet_id(test_tweet_id)
             if not t_account or not t_id:
@@ -2367,10 +2450,22 @@ async def main():
                               f"expected screen_name/tweet_id or a full status "
                               f"URL — ignored.")
             else:
+                # Use configured casing for exact posted-cache keys when the
+                # manually typed screen name differs only by letter case.
+                t_account = next((configured for configured in ACCOUNTS
+                                  if configured.casefold() == t_account.casefold()),
+                                 t_account)
                 feed_pairs.append((t_account, _TestFeed([_TestFeedEntry(
                     f"https://x.com/{t_account}/status/{t_id}")])))
                 logging.info(f"TEST TWEET: {t_account}/{t_id} — nitter feed "
                              f"bypassed for this one tweet.")
+                if force_test_tweet:
+                    logging.info("FORCE_TEST_TWEET is enabled for this one "
+                                 "manual test target only; any existing cache "
+                                 "entry will be retained.")
+        elif force_test_tweet:
+            logging.warning("FORCE_TEST_TWEET ignored because TEST_TWEET_ID "
+                            "is empty.")
 
         if not any(feed and feed.entries for _, feed in feed_pairs):
             logging.error("ALL FEEDS FAILED this run — no nitter instance "
@@ -2397,15 +2492,28 @@ async def main():
                 unique_key = f"{account}_{tweet_id}"
                 account_counts = account_stats.setdefault(
                     account, {"new": 0, "cached": 0, "delivered": 0})
+                force_cached_test = should_force_cached_test_tweet(
+                    enabled=force_test_tweet, entry=entry, account=account,
+                    tweet_id=tweet_id, target_account=t_account, target_id=t_id,
+                    cached_at_start=posted_urls_at_start)
                 if unique_key in posted_urls:
-                    dedup_skipped += 1
-                    account_counts["cached"] += 1
-                    if (test_tweet_id and t_account and t_id
-                            and account.lower() == t_account.lower()
-                            and tweet_id == t_id):
-                        logging.info(f"[{unique_key}] TEST_TWEET_ID is already in the "
-                                     f"posted cache — skipping by design.")
-                    continue
+                    if force_cached_test:
+                        logging.info(f"[{unique_key}] FORCE_TEST_TWEET: reposting "
+                                     "the explicitly selected manual test despite "
+                                     "the cache; the cache entry is retained.")
+                    else:
+                        dedup_skipped += 1
+                        account_counts["cached"] += 1
+                        if (test_tweet_id and t_account and t_id
+                                and account.lower() == t_account.lower()
+                                and tweet_id == t_id):
+                            logging.info(f"[{unique_key}] TEST_TWEET_ID is already in the "
+                                         f"posted cache — skipping by design.")
+                            if force_test_tweet:
+                                logging.info(f"[{unique_key}] cached natural-feed copy "
+                                             "remains deduplicated; only the injected "
+                                             "manual test entry may force a repost.")
+                        continue
 
                 published_parsed = entry.get("published_parsed")
                 rss_ts = time.mktime(published_parsed) if published_parsed else now
@@ -2430,8 +2538,9 @@ async def main():
                 # A new candidate passed cache and age checks. This is a
                 # counting-only metric; provider failures still count as a
                 # candidate considered by this run.
-                new_candidates += 1
-                account_counts["new"] += 1
+                if not force_cached_test:
+                    new_candidates += 1
+                    account_counts["new"] += 1
 
                 # ROUND 11: 4-step tweet-data fallback chain — every result
                 # is normalized to the FxTwitter shape, so the card pipeline
@@ -2578,6 +2687,8 @@ async def main():
                     if resp.status in (200, 204):
                         posted_urls.add(unique_key)
                         account_counts["delivered"] += 1
+                        if force_cached_test:
+                            forced_test_reposts += 1
                         logging.info(f"V3 Posted: {unique_key} (lang={lang or 'en'}{' | article' if is_article else ''} | source={tweet_source})")
                         created = None
                         if resp.status == 200:
@@ -2621,6 +2732,7 @@ async def main():
     # readable by later agents; the step summary greps this line, so the
     # dedup/backlog state survives without the raw log.
     logging.info(f"V3 SUMMARY: posted={len(posted_urls - posted_urls_at_start)} "
+                 f"forced_test_reposts={forced_test_reposts} "
                  f"dedup_skipped={dedup_skipped} stale_skipped={stale_skipped} "
                  f"new_candidates={new_candidates} "
                  f"accounts={format_account_summary(account_stats)} "

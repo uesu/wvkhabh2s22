@@ -11098,7 +11098,7 @@ check("r95c: the stale floor's off-switch is actually wired (a Variable the work
 # TEST_* switches are one-off dispatch inputs, EMBEDEZE_API_KEY belongs to the
 # standby V2 engine.
 _r95c_not_variables = {"ACCOUNTS", "SUBREDDITS", "DRY_RUN", "TEST_POST_ID",
-                       "TEST_TWEET_ID", "EMBEDEZ_API_KEY"}
+                       "TEST_TWEET_ID", "FORCE_TEST_TWEET", "EMBEDEZ_API_KEY"}
 # Round 95d (2026-10-30): README.md is a DEV-ONLY file — sync_prod.py keeps it (and
 # docs/) out of both production repositories on purpose. This block used to open it
 # unconditionally, which crashed the first prod CI run after the round-95 merge
