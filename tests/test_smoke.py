@@ -240,22 +240,31 @@ try:
           "; ".join(_target_failures) if _target_failures else None)
     _reddit_wf_new = open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8").read()
     _twitter_wf_new = open(os.path.join(ROOT, ".github/workflows/twitter_monitor.yml"), encoding="utf-8").read()
-    _devvit_manifest_new = json.load(open(os.path.join(ROOT, "devvit/gaming-express/devvit.json"), encoding="utf-8"))
+    _manifest_path = os.path.join(ROOT, "devvit/gaming-express/devvit.json")
     _reddit_secret_names = ["WEBHOOK_REDDIT_SILVERPALACELEAK", "WEBHOOK_REDDIT_NTELEAKS",
                             "WEBHOOK_REDDIT_ARKNIGHTSENDFIELDLEAK"]
     _twitter_secret_names = ["WEBHOOK_NTE_GL", "WEBHOOK_AKENDFIELD", "WEBHOOK_SILVERPALACE_EN"]
-    _manifest_settings = _devvit_manifest_new["settings"]["global"]
-    _manifest_subreddit_value = _manifest_settings["subreddits"]["defaultValue"]
-    _manifest_subreddits_extra = _manifest_settings["subredditsAdditional"]["defaultValue"]
-    _manifest_subreddits = (_manifest_subreddit_value + "," + _manifest_subreddits_extra).split(",")
-    _game_reddit_extra = {"NevernessToEverness", "SilverPalaceOfficial", "Endfield", "ArknightsEndfield"}
-    check("News-Express routing secrets are wired and the shared relay has both News- and Game-Express communities",
+    _manifest_targets_ok = True
+    if os.path.isfile(_manifest_path):
+        with open(_manifest_path, encoding="utf-8") as _manifest_file:
+            _devvit_manifest_new = json.load(_manifest_file)
+        _manifest_settings = _devvit_manifest_new["settings"]["global"]
+        _manifest_subreddit_value = _manifest_settings["subreddits"]["defaultValue"]
+        _manifest_subreddits_extra = _manifest_settings["subredditsAdditional"]["defaultValue"]
+        _manifest_subreddits = (_manifest_subreddit_value + "," + _manifest_subreddits_extra).split(",")
+        _game_reddit_extra = {"NevernessToEverness", "SilverPalaceOfficial", "Endfield", "ArknightsEndfield"}
+        _manifest_targets_ok = (
+            _reddit_extra <= set(_manifest_subreddits)
+            and _game_reddit_extra <= set(_manifest_subreddits)
+            and len(_manifest_subreddit_value) <= 250
+            and len(_manifest_subreddits_extra) <= 250
+        )
+    else:
+        print("INFO: production-layout smoke test skips Devvit manifest assertions (devvit/ is not synced to production).")
+    check("News-Express routing secrets are wired and the shared relay manifest is valid when present",
           all(f"{name}: ${{{{ secrets.{name} }}}}" in _reddit_wf_new for name in _reddit_secret_names)
           and all(f"{name}: ${{{{ secrets.{name} }}}}" in _twitter_wf_new for name in _twitter_secret_names)
-          and _reddit_extra <= set(_manifest_subreddits)
-          and _game_reddit_extra <= set(_manifest_subreddits)
-          and len(_manifest_subreddit_value) <= 250
-          and len(_manifest_subreddits_extra) <= 250)
+          and _manifest_targets_ok)
 except Exception as _target_exc:
     check("News-Express Reddit targets and X accounts append to legacy configured secrets", False,
           f"{type(_target_exc).__name__}: {_target_exc}")
