@@ -244,13 +244,18 @@ try:
     _reddit_secret_names = ["WEBHOOK_REDDIT_SILVERPALACELEAK", "WEBHOOK_REDDIT_NTELEAKS",
                             "WEBHOOK_REDDIT_ARKNIGHTSENDFIELDLEAK"]
     _twitter_secret_names = ["WEBHOOK_NTE_GL", "WEBHOOK_AKENDFIELD", "WEBHOOK_SILVERPALACE_EN"]
-    _manifest_subreddits = _devvit_manifest_new["settings"]["global"]["subreddits"]["defaultValue"].split(",")
+    _manifest_settings = _devvit_manifest_new["settings"]["global"]
+    _manifest_subreddit_value = _manifest_settings["subreddits"]["defaultValue"]
+    _manifest_subreddits_extra = _manifest_settings["subredditsAdditional"]["defaultValue"]
+    _manifest_subreddits = (_manifest_subreddit_value + "," + _manifest_subreddits_extra).split(",")
     _game_reddit_extra = {"NevernessToEverness", "SilverPalaceOfficial", "Endfield", "ArknightsEndfield"}
     check("News-Express routing secrets are wired and the shared relay has both News- and Game-Express communities",
           all(f"{name}: ${{{{ secrets.{name} }}}}" in _reddit_wf_new for name in _reddit_secret_names)
           and all(f"{name}: ${{{{ secrets.{name} }}}}" in _twitter_wf_new for name in _twitter_secret_names)
           and _reddit_extra <= set(_manifest_subreddits)
-          and _game_reddit_extra <= set(_manifest_subreddits))
+          and _game_reddit_extra <= set(_manifest_subreddits)
+          and len(_manifest_subreddit_value) <= 250
+          and len(_manifest_subreddits_extra) <= 250)
 except Exception as _target_exc:
     check("News-Express Reddit targets and X accounts append to legacy configured secrets", False,
           f"{type(_target_exc).__name__}: {_target_exc}")
