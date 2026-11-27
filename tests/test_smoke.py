@@ -209,6 +209,52 @@ if v3 is None:
     print("FATAL: reddit_main_v3.py could not be imported.")
     sys.exit(1)
 
+# Explicitly configured legacy secrets retain their own targets, while the
+# new News-Express Reddit feeds and X accounts are appended if missing.
+try:
+    from unittest.mock import patch as _patch_new_targets
+    _reddit_extra = {"SilverPalaceLeak", "NTELeaks", "ArknightsEndfieldLeak"}
+    _twitter_extra = {"NTE_GL", "AKEndfield", "SilverPalace_EN"}
+    _old_reddit_config = "Zenlesszonezeroleaks_,Genshin_Impact_Leaks,HonkaiStarRail_leaks,WutheringWavesLeaks,HonkaiNexusAnimaLeaks,AnantaLeaks"
+    _old_twitter_config = "TYPEII_EN,PomPom_HonkaiSR,Wuthering_Waves,HonkaiNA,Ananta_EN"
+    _target_failures = []
+    for _target_index, _target_file in enumerate(("testing area/reddit_main.py", "testing area/reddit_main_v2_embedez.py",
+                                                  "testing area/reddit_main_v3.py")):
+        with _patch_new_targets.dict(os.environ, {"SUBREDDITS": _old_reddit_config}):
+            _target_module = load_module("smoke_targets_reddit_" + str(_target_index) + "_" +
+                                         _target_file.rsplit("/", 1)[-1].replace(".", "_"), _target_file)
+        if not _reddit_extra <= set(_target_module.SUBREDDITS):
+            _target_failures.append(f"{_target_file}: missing Reddit targets")
+        if len({s.casefold() for s in _target_module.SUBREDDITS}) != len(_target_module.SUBREDDITS):
+            _target_failures.append(f"{_target_file}: duplicate subreddit")
+    for _target_index, _target_file in enumerate(("testing area/twitter_v1.py", "testing area/twitter_v2_button_outside.py",
+                                                  "testing area/twitter_v3.py")):
+        with _patch_new_targets.dict(os.environ, {"ACCOUNTS": _old_twitter_config}):
+            _target_module = load_module("smoke_targets_x_" + str(_target_index) + "_" +
+                                         _target_file.rsplit("/", 1)[-1].replace(".", "_"), _target_file)
+        if not _twitter_extra <= set(_target_module.ACCOUNTS):
+            _target_failures.append(f"{_target_file}: missing X accounts")
+        if len({a.casefold() for a in _target_module.ACCOUNTS}) != len(_target_module.ACCOUNTS):
+            _target_failures.append(f"{_target_file}: duplicate account")
+    check("News-Express Reddit targets and X accounts append to legacy configured secrets", not _target_failures,
+          "; ".join(_target_failures) if _target_failures else None)
+    _reddit_wf_new = open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8").read()
+    _twitter_wf_new = open(os.path.join(ROOT, ".github/workflows/twitter_monitor.yml"), encoding="utf-8").read()
+    _devvit_manifest_new = json.load(open(os.path.join(ROOT, "devvit/gaming-express/devvit.json"), encoding="utf-8"))
+    _reddit_secret_names = ["WEBHOOK_REDDIT_SILVERPALACELEAK", "WEBHOOK_REDDIT_NTELEAKS",
+                            "WEBHOOK_REDDIT_ARKNIGHTSENDFIELDLEAK"]
+    _twitter_secret_names = ["WEBHOOK_NTE_GL", "WEBHOOK_AKENDFIELD", "WEBHOOK_SILVERPALACE_EN"]
+    _manifest_subreddits = _devvit_manifest_new["settings"]["global"]["subreddits"]["defaultValue"].split(",")
+    _game_reddit_extra = {"NevernessToEverness", "SilverPalaceOfficial", "Endfield", "ArknightsEndfield"}
+    check("News-Express routing secrets are wired and the shared relay has both News- and Game-Express communities",
+          all(f"{name}: ${{{{ secrets.{name} }}}}" in _reddit_wf_new for name in _reddit_secret_names)
+          and all(f"{name}: ${{{{ secrets.{name} }}}}" in _twitter_wf_new for name in _twitter_secret_names)
+          and _reddit_extra <= set(_manifest_subreddits)
+          and _game_reddit_extra <= set(_manifest_subreddits))
+except Exception as _target_exc:
+    check("News-Express Reddit targets and X accounts append to legacy configured secrets", False,
+          f"{type(_target_exc).__name__}: {_target_exc}")
+
 # Existing end-to-end cases exercise the retained legacy engine explicitly;
 # relay-primary behavior has dedicated tests that set the mode themselves.
 v3.INTAKE_READER = "off"
@@ -4524,11 +4570,11 @@ try:
           _r53_proxy.WARMUP_POST_ID == _r53_proxy.DEFAULT_WARMUP_POST ==
           "HonkaiStarRail_leaks/1whbjbh", repr(_r53_proxy.WARMUP_POST_ID))
     _r53_v3 = load_module("smoke_reddit_v3_r53", "testing area/reddit_main_v3.py")
-    check("r53: empty SUBREDDITS keeps the 6 default subreddits",
-          len(_r53_v3.SUBREDDITS) == 6, repr(_r53_v3.SUBREDDITS))
+    check("r53: empty SUBREDDITS keeps the 9 default subreddits",
+          len(_r53_v3.SUBREDDITS) == 9, repr(_r53_v3.SUBREDDITS))
     _r53_tw = load_module("smoke_twitter_v3_r53", "testing area/twitter_v3.py")
-    check("r53: empty ACCOUNTS keeps the 5 default accounts",
-          len(_r53_tw.ACCOUNTS) == 5, repr(_r53_tw.ACCOUNTS))
+    check("r53: empty ACCOUNTS keeps the 8 default accounts",
+          len(_r53_tw.ACCOUNTS) == 8, repr(_r53_tw.ACCOUNTS))
 
     # Instance normalization: bare host (the way REDDIT_MIRROR is stored in
     # this repo's Variables) gains https://, trailing slash is dropped, and

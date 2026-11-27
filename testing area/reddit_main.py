@@ -57,8 +57,18 @@ load_dotenv()
 # ■ SUBREDDITS TO TRACK
 # ---------------------------------------------------------------------------
 # Round 54 parity: an unset-but-wired secret arrives as an EMPTY string — empty keeps the default list (same guard as V3).
-SUBREDDITS_STR = (os.getenv("SUBREDDITS") or "").strip() or "Zenlesszonezeroleaks_,Genshin_Impact_Leaks,HonkaiStarRail_leaks,WutheringWavesLeaks,HonkaiNexusAnimaLeaks,AnantaLeaks"
+SUBREDDITS_STR = (os.getenv("SUBREDDITS") or "").strip() or "Zenlesszonezeroleaks_,Genshin_Impact_Leaks,HonkaiStarRail_leaks,WutheringWavesLeaks,HonkaiNexusAnimaLeaks,AnantaLeaks,SilverPalaceLeak,NTELeaks,ArknightsEndfieldLeak"
 SUBREDDITS = [s.strip() for s in SUBREDDITS_STR.split(",") if s.strip()]
+# News-Express-specific communities. Keep them enabled even when the
+# production SUBREDDITS secret still has the previous list, and preserve any
+# additional operator-configured communities. Game-Express-only subs are in
+# the shared Devvit relay setting, not this engine's delivery target list.
+_REQUIRED_NEWS_SUBREDDITS = ("SilverPalaceLeak", "NTELeaks", "ArknightsEndfieldLeak")
+_SUBREDDIT_NAMES = {name.casefold() for name in SUBREDDITS}
+for _required_subreddit in _REQUIRED_NEWS_SUBREDDITS:
+    if _required_subreddit.casefold() not in _SUBREDDIT_NAMES:
+        SUBREDDITS.append(_required_subreddit)
+        _SUBREDDIT_NAMES.add(_required_subreddit.casefold())
 
 # Optional fallback webhook used only if a subreddit has no dedicated secret
 DEFAULT_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")

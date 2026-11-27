@@ -82,6 +82,9 @@ jobs:
           WEBHOOK_WUTHERING_WAVES: ${{ secrets.WEBHOOK_WUTHERING_WAVES }}
           WEBHOOK_HONKAINA: ${{ secrets.WEBHOOK_HONKAINA }}
           WEBHOOK_ANANTA_EN: ${{ secrets.WEBHOOK_ANANTA_EN }}
+          WEBHOOK_NTE_GL: ${{ secrets.WEBHOOK_NTE_GL }}
+          WEBHOOK_AKENDFIELD: ${{ secrets.WEBHOOK_AKENDFIELD }}
+          WEBHOOK_SILVERPALACE_EN: ${{ secrets.WEBHOOK_SILVERPALACE_EN }}
           # Manual test only: a selected tweet may optionally be force-posted
           # once despite an existing cache key. The cache remains intact.
           TEST_TWEET_ID: ${{ github.event.inputs.test_tweet }}

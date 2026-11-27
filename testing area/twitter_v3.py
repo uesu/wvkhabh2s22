@@ -133,8 +133,16 @@ except Exception as e:  # only when the file is absent from the repo
 
 # Round 53: empty (an unset-but-wired secret) means "not configured", so the
 # documented default list still applies — os.getenv(name, default) would not.
-ACCOUNTS_STR = (os.getenv("ACCOUNTS") or "").strip() or "TYPEII_EN,PomPom_HonkaiSR,Wuthering_Waves,HonkaiNA,Ananta_EN"
+ACCOUNTS_STR = (os.getenv("ACCOUNTS") or "").strip() or "TYPEII_EN,PomPom_HonkaiSR,Wuthering_Waves,HonkaiNA,Ananta_EN,NTE_GL,AKEndfield,SilverPalace_EN"
 ACCOUNTS = [acc.strip() for acc in ACCOUNTS_STR.split(",") if acc.strip()]
+# Keep the newly requested game accounts enabled even while the configured
+# ACCOUNTS secret is being updated; retain any other configured handles.
+_REQUIRED_GAME_ACCOUNTS = ("NTE_GL", "AKEndfield", "SilverPalace_EN")
+_ACCOUNT_NAMES = {account.casefold() for account in ACCOUNTS}
+for _required_account in _REQUIRED_GAME_ACCOUNTS:
+    if _required_account.casefold() not in _ACCOUNT_NAMES:
+        ACCOUNTS.append(_required_account)
+        _ACCOUNT_NAMES.add(_required_account.casefold())
 
 DEFAULT_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
