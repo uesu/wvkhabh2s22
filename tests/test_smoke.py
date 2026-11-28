@@ -252,10 +252,11 @@ try:
         _manifest_subreddit_value = _manifest_settings["subreddits"]["defaultValue"]
         _manifest_subreddits_extra = _manifest_settings["subredditsAdditional"]["defaultValue"]
         _manifest_subreddits = (_manifest_subreddit_value + "," + _manifest_subreddits_extra).split(",")
-        _game_reddit_extra = {"NevernessToEverness", "SilverPalaceOfficial", "Endfield", "ArknightsEndfield"}
+        _game_reddit_extra = {"NevernessToEverness", "SilverPalaceOfficial", "Endfield"}
         _manifest_targets_ok = (
             _reddit_extra <= set(_manifest_subreddits)
             and _game_reddit_extra <= set(_manifest_subreddits)
+            and "ArknightsEndfield" not in _manifest_subreddits
             and len(_manifest_subreddit_value) <= 250
             and len(_manifest_subreddits_extra) <= 250
         )
