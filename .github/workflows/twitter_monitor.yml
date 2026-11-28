@@ -136,10 +136,7 @@ jobs:
         #   ARE REQUIRED (the folder name contains a space):
         #       run: python "testing area/twitter_v3.py"
         # • Check BOTH the Discord post(s) AND this workflow's log.
-        # • Switch between engines by pointing the run line to:
-        #       run: python "testing area/twitter_v1.py"               <- V1 (plain, no API key)
-        #       run: python "testing area/twitter_v2_button_outside.py" <- V2 (card, buttons outside)
-        #       run: python "testing area/twitter_v3.py"                <- V3 (card, buttons nested)
+        # • The maintained X engine is twitter_v3.py.
         # ───────────────────────────────────────────────────────────────────
         run: |
           echo "TWITTER_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"

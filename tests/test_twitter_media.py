@@ -861,8 +861,7 @@ print("\n--- round 119: video cap, resolution fallback and cold-media timing ---
 check("r119: media-heal defaults to 15 seconds without changing bounded attempts/scope",
       (x3.MEDIA_HEAL_DELAY_SECONDS, x3.MEDIA_HEAL_ATTEMPTS,
        x3.MEDIA_HEAL, x3.MEDIA_HEAL_SCOPE) == (15, 4, True, "video"))
-_x2 = load_module("twitter_media_v2_fixed_limit", "testing area/twitter_v2_button_outside.py")
-for _module in (x3, _x2):
+for _module in (x3,):
     check(f"r119: {_module.__name__} has the fixed 400 MiB cap",
           _module.VIDEO_SIZE_LIMIT == 400 * _MB)
     _src = inspect.getsource(_module)
@@ -871,7 +870,7 @@ for _module in (x3, _x2):
           and "_video_size_limit" not in _src)
 
 # The operator's observed ~395 MB 1080p rendition is retained as-is.
-for _module in (x3, _x2):
+for _module in (x3,):
     async def _probe_395(_session, _url, **_kwargs):
         return 395_000_000  # decimal MB from the operator's observed rendition
     with patch.object(_module, "probe_video_size", new=AsyncMock(side_effect=_probe_395)):
@@ -894,7 +893,7 @@ def _ladder_video():
                 {"url": _720, "container": "mp4", "bitrate": 1_000_000},
             ]}
 
-for _module in (x3, _x2):
+for _module in (x3,):
     async def _probe_exact(_session, _url, **_kwargs):
         return 400 * _MB
     with patch.object(_module, "probe_video_size", new=AsyncMock(side_effect=_probe_exact)):

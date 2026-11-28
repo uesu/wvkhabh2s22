@@ -55,7 +55,7 @@ log = logging.getLogger("video-diag")
 FXTWITTER_API_BASE = "https://api.fxtwitter.com"
 FXTWITTER_PROXY = "https://api.fxtwitter.com/2/go?url="
 IS_COMPONENTS_V2 = 1 << 15
-PROD_MAX_MB = 256  # keep in sync with VIDEO_SIZE_LIMIT in twitter_v2_button_outside.py / twitter_v3.py
+PROD_MAX_MB = 256  # keep in sync with VIDEO_SIZE_LIMIT in twitter_v3.py
 DEFAULT_TWEET_IDS = "1971001706466115893,1970307131074355593"  # the 2 failing Ananta amplify tweets
 
 
@@ -210,7 +210,7 @@ async def run(webhook_url: str, tweet_ids: list) -> None:
             payload = build_card(screen_name, tid, items, summary_lines)
             log.info("Posting diagnostic card for %s (%d tiles) ...", screen_name, len(items))
             # Components V2 requires the with_components=true query parameter
-            # (same as twitter_v2_button_outside.py / twitter_v3.py in production).
+            # (same as twitter_v3.py in production).
             target_url = f"{webhook_url}?with_components=true"
             async with session.post(target_url, json=payload,
                                     timeout=aiohttp.ClientTimeout(total=30)) as r:

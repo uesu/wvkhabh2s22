@@ -197,8 +197,8 @@ def _normalize_instance(raw: str, default: str, variable: str) -> str:
     URL, or fall back to the documented default with ONE clear log line.
 
     Accepted: "https://host", "http://host", "host", "host/" and any of those
-    with surrounding whitespace (the REDDIT_MIRROR Variable in this repo is
-    stored bare, as `embeddit.deltandy.me`, so a bare host must work here).
+    with surrounding whitespace (the active `EMBEDDIT_INSTANCE` setting accepts
+    bare hosts, so a bare host must work here).
     Rejected (-> default): empty, whitespace, a scheme other than http(s),
     an embedded space, or anything with no host part.
     """

@@ -14,7 +14,7 @@ Purpose (also used by CI as the safety gate for Dependabot PRs):
      proxy chain, the Arctic media-hint gate skips WITHOUT caching, the
      removal-notice variants are caught and legit posts are not, and the
      round-14 miningtcup RSS token is still sent all three ways,
-  5. the round-28 (2026-09-18) X V2/V3 rules hold: an /en translation
+  5. the round-28 (2026-09-18) X V3 rules hold: an /en translation
      IDENTICAL to the original (X language mis-detection) is dropped, and
      non-ASCII hashtags (zzzero + U+3164 filler) get percent-encoded,
      clickable URLs,
@@ -186,13 +186,11 @@ def load_module(name, path):
 
 # ---- 1. every monitor script must import --------------------------------
 SCRIPTS = [
-    "testing area/twitter_v1.py",
-    "testing area/reddit_main.py",
-    "testing area/reddit_main_v2_embedez.py",
     "testing area/reddit_main_v3.py",
-    "testing area/twitter_v2_button_outside.py",
     "testing area/twitter_v3.py",
+    "testing area/reddit_proxy.py",
     "testing area/twitter_proxy.py",
+    "testing area/reddit_signals.py",
     "testing area/video_diag.py",
 ]
 v3 = None
@@ -218,24 +216,18 @@ try:
     _old_reddit_config = "Zenlesszonezeroleaks_,Genshin_Impact_Leaks,HonkaiStarRail_leaks,WutheringWavesLeaks,HonkaiNexusAnimaLeaks,AnantaLeaks"
     _old_twitter_config = "TYPEII_EN,PomPom_HonkaiSR,Wuthering_Waves,HonkaiNA,Ananta_EN"
     _target_failures = []
-    for _target_index, _target_file in enumerate(("testing area/reddit_main.py", "testing area/reddit_main_v2_embedez.py",
-                                                  "testing area/reddit_main_v3.py")):
-        with _patch_new_targets.dict(os.environ, {"SUBREDDITS": _old_reddit_config}):
-            _target_module = load_module("smoke_targets_reddit_" + str(_target_index) + "_" +
-                                         _target_file.rsplit("/", 1)[-1].replace(".", "_"), _target_file)
-        if not _reddit_extra <= set(_target_module.SUBREDDITS):
-            _target_failures.append(f"{_target_file}: missing Reddit targets")
-        if len({s.casefold() for s in _target_module.SUBREDDITS}) != len(_target_module.SUBREDDITS):
-            _target_failures.append(f"{_target_file}: duplicate subreddit")
-    for _target_index, _target_file in enumerate(("testing area/twitter_v1.py", "testing area/twitter_v2_button_outside.py",
-                                                  "testing area/twitter_v3.py")):
-        with _patch_new_targets.dict(os.environ, {"ACCOUNTS": _old_twitter_config}):
-            _target_module = load_module("smoke_targets_x_" + str(_target_index) + "_" +
-                                         _target_file.rsplit("/", 1)[-1].replace(".", "_"), _target_file)
-        if not _twitter_extra <= set(_target_module.ACCOUNTS):
-            _target_failures.append(f"{_target_file}: missing X accounts")
-        if len({a.casefold() for a in _target_module.ACCOUNTS}) != len(_target_module.ACCOUNTS):
-            _target_failures.append(f"{_target_file}: duplicate account")
+    for _target_name, _target_file, _env_name, _config in (
+        ("reddit", "testing area/reddit_main_v3.py", "SUBREDDITS", _old_reddit_config),
+        ("x", "testing area/twitter_v3.py", "ACCOUNTS", _old_twitter_config),
+    ):
+        with _patch_new_targets.dict(os.environ, {_env_name: _config}):
+            _target_module = load_module("smoke_targets_" + _target_name, _target_file)
+        _required = _reddit_extra if _target_name == "reddit" else _twitter_extra
+        _configured = _target_module.SUBREDDITS if _target_name == "reddit" else _target_module.ACCOUNTS
+        if not _required <= set(_configured):
+            _target_failures.append(f"{_target_file}: missing configured targets")
+        if len({value.casefold() for value in _configured}) != len(_configured):
+            _target_failures.append(f"{_target_file}: duplicate target")
     check("News-Express Reddit targets and X accounts append to legacy configured secrets", not _target_failures,
           "; ".join(_target_failures) if _target_failures else None)
     _reddit_wf_new = open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"), encoding="utf-8").read()
@@ -1044,16 +1036,15 @@ check("r23 gate: the skip is a `continue` and caches nothing "
       _gate.rstrip().endswith("continue") and "posted.add" not in _gate, _gate)
 
 # ---- round 14 (2026-09-18): miningtcup RSS token sent all three ways ------
-for _rel, _label in (("testing area/twitter_v3.py", "X V3"),
-                     ("testing area/twitter_v2_button_outside.py", "X V2")):
-    with open(os.path.join(ROOT, _rel), "r", encoding="utf-8") as _fh:
-        _src = _fh.read()
-    check(f"r14 {_label}: Authorization: Bearer header kept",
-          '"Authorization": f"Bearer {token}"' in _src)
-    check(f"r14 {_label}: token also sent inside the User-Agent",
-          '"User-Agent": f"Mozilla/5.0 {token}"' in _src)
-    check(f"r14 {_label}: ?token= query param kept",
-          "?token={url_quote(token, safe='')}" in _src)
+_rel, _label = "testing area/twitter_v3.py", "X V3"
+with open(os.path.join(ROOT, _rel), "r", encoding="utf-8") as _fh:
+    _src = _fh.read()
+check(f"r14 {_label}: Authorization: Bearer header kept",
+      '"Authorization": f"Bearer {token}"' in _src)
+check(f"r14 {_label}: token also sent inside the User-Agent",
+      '"User-Agent": f"Mozilla/5.0 {token}"' in _src)
+check(f"r14 {_label}: ?token= query param kept",
+      "?token={url_quote(token, safe='')}" in _src)
 
 # ---- round 24 (2026-09-18): redlib.miningtcup.me + DogWAF token helper ----
 def _r24_miningtcup_checks(mod):
@@ -1715,9 +1706,8 @@ for label, overrides, expected in [
 check('r25 gate never writes dedup cache', 'posted.add' not in _r25_gate)
 
 
-# ---- 5. X V2/V3 round 28 (2026-09-18): translation guard + hashtag URLs ----
+# ---- 5. X V3 round 28 (2026-09-18): translation guard + hashtag URLs ----
 v3r = load_module("smoke_x_v3_r28", "testing area/twitter_v3.py")
-v2r = load_module("smoke_x_v2_r28", "testing area/twitter_v2_button_outside.py")
 
 # 5a. the /en translation identical to the original is a language mis-detection
 check('r28 guard: live misfire (identical translation) detected',
@@ -1733,22 +1723,15 @@ check('r28 guard: None/empty safe',
       v3r.translation_is_identical(None, None) is True
       and v3r.translation_is_identical("hi", "") is False
       and v3r.translation_is_identical(None, "x") is False)
-check('r28 guard: V2 carries the same helper',
-      v2r.translation_is_identical is not None
-      and v2r.translation_is_identical("a B!", "a  b") is True)
 src_v3 = open(os.path.join(ROOT, "testing area", "twitter_v3.py"), encoding="utf-8").read()
-src_v2 = open(os.path.join(ROOT, "testing area", "twitter_v2_button_outside.py"), encoding="utf-8").read()
 check('r28 guard: V3 loop compares before showing the block',
       "translation_is_identical(original_text, translated_text)" in src_v3
       and "language mis-detection" in src_v3 and "posting as-is" in src_v3)
-check('r28 guard: V2 loop compares before showing the block',
-      "translation_is_identical(original_text, translated_text)" in src_v2
-      and "language mis-detection" in src_v2 and "posting as-is" in src_v2)
 
 # r51: TEST_TWEET_ID remains subject to the normal cache.  A matching cached
 # test ID must now explain its intentional skip, but must retain `continue`
 # so no already-posted tweet can be sent again.
-for _r51_label, _r51_source in (("V3", src_v3), ("V2", src_v2)):
+for _r51_label, _r51_source in (("V3", src_v3),):
     _r51_cache_branch = _r51_source.split("if unique_key in posted_urls:", 1)[1] \
                                      .split("published_parsed =", 1)[0]
     check(f"r51 {_r51_label}: cached TEST_TWEET_ID logs an intentional skip",
@@ -1774,9 +1757,6 @@ check('r28 linkify: URL #anchor + email still protected',
       == "see example.com/path#anchor and a@b.com")
 check('r28 linkify: @mention unchanged',
       v3r.linkify_text("hi @user") == "hi [@user](https://x.com/user)")
-check('r28 linkify: V2 behaves identically to V3',
-      v2r.linkify_text("Maintenance 🩸\n#zzzeroㅤ #Claret #Roxy")
-      == v3r.linkify_text("Maintenance 🩸\n#zzzeroㅤ #Claret #Roxy"))
 
 
 # ---- round 29 (2026-09-19): crosspost notice + same-file media dedupe ----
@@ -2476,15 +2456,10 @@ with open(os.path.join(ROOT, "testing area", "twitter_v3.py"), encoding="utf-8")
     _r59_src = _r59_f.read()
 check("r59: tracker method retired note recorded", "tracker method retired" in _r59_src)
 check("r59: demoted-not-deleted rationale recorded", "demoted, not deleted" in _r59_src)
-for _r39_rel, _r39_expected in (
-    ("testing area/twitter_v1.py", _r39_x_expected + _r59_x_walled_tail),
-    ("testing area/twitter_v2_button_outside.py", _r39_x_expected + ["https://nitter.miningtcup.me"] + _r59_x_walled_tail),
-):
-    check(f"r39 source fleet: {_r39_rel} has the reviewed X RSS order",
-          _literal_list_constant(_r39_rel, "RSS_INSTANCES") == _r39_expected)
+
 
 # Preserved for history: r76 was 12-member; r77 was 16-member
-# Round 77 (2026-10-22): Teapawt operator expansion (4cuck/teapawt commit de02b80, README lists five public instances on same operator stack: nitter.cf, xitter.cf, teapaw.org, teapawt.net, teapawt.org — status.d420.net 01:29 UTC 100% healthy RSS true All) + Codeberg shitter wiki Working instance https://nitter.mie.foundation/ (fetch_page-verified RSS same top id 2112959650551173522). No Reddit frontend in Teapawt (Twitter/X only). nitter.cf/xitter.cf untouched per request; added three Teapawt hosts as operator-approved spares after the proven head, and mie.foundation above walled tail per no-block rule. V1/V2 retain separately.
+# Round 77 (2026-10-22): Teapawt operator expansion (4cuck/teapawt commit de02b80, README lists five public instances on same operator stack: nitter.cf, xitter.cf, teapaw.org, teapawt.net, teapawt.org — status.d420.net 01:29 UTC 100% healthy RSS true All) + Codeberg shitter wiki Working instance https://nitter.mie.foundation/ (fetch_page-verified RSS same top id 2112959650551173522). No Reddit frontend in Teapawt (Twitter/X only). nitter.cf/xitter.cf untouched per request; added three Teapawt hosts as operator-approved spares after the proven head, and mie.foundation above walled tail per no-block rule. Only the active V3 engine is checked by the current fleet guard.
 # Round 78 (2026-10-22 07:55 UTC): status.d420.net now lists nitter.gq + xitter.gq as Working, Healthy, 100%, RSS true, All, same teapawt operator/stack as nitter.cf/xitter.cf (teapawt 0.19.0, 60 pts, 455ms/450ms). Inserted as seats 3-4 — next operator-proven spares after 1-2, exactly as Teapawt spares. Fleet 16→18, serial fallback unchanged.
 _r77_x_expected = [  # Preserved for history: the r77/r78 18-member order (superseded by r111)
     "https://nitter.cf",
@@ -2580,24 +2555,6 @@ else:
     check("r77/r111: operator pair untouched + teapawt family + mizuki + demoted pair, 19-member fleet", True)
 # Preserve r76 historical 12-member expectation as non-enforced record (for audit, not current fleet)
 check("r76: runner-proven head, xcopy verdict recorded at ten (historical 12-member, preserved)", True)
-
-_r39_reddit_expected = [
-    "https://www.reddit.com",
-    "https://old.reddit.com",
-    "https://redlib.catsarch.com",
-    "https://redlib.nadeko.net",
-    "https://redlib.privadency.com",
-    "https://safereddit.com",
-    "https://red.artemislena.eu",
-    "https://redlib.privacyredirect.com",
-]
-# Legacy files retain r39 8-member list; v3 promoted to r78 16-member (see below)
-for _r39_rel, _r39_expected in (
-    ("testing area/reddit_main.py", _r39_reddit_expected),
-    ("testing area/reddit_main_v2_embedez.py", _r39_reddit_expected),
-):
-    check(f"r39 source fleet: {_r39_rel} has the reviewed Reddit RSS order",
-          _literal_list_constant(_r39_rel, "REDDIT_RSS_INSTANCES") == _r39_expected)
 
 # r78 (2026-10-22): Game-Express audit 01:10-02:50Z 85+ candidates, 3 Azure runs — 7 new dual-path +5 listing reserves verified. Replaces degraded splash/rate-limit/GoAway slots (privadency.com, safereddit, nadeko) with verified dual coverage 2→8; listing-only tail pending v3.0.0 #588/#592. Traps (blitz, arancia, jaydenha, l.opnxng) never added; kareem caveat excluded.
 _r78_reddit_expected = [
@@ -2920,56 +2877,6 @@ except Exception as _e:
     check("r85 integration: _combined_feed_url/_rss_listing/fetch_working/fetch_post_rss/fetch_post_json use format_reddit_feed_query dynamically (synthetic)", False, f"{type(_e).__name__}: {_e}")
 finally:
     v3.REDDIT_FEED_TOKEN = _orig_token
-
-# --- V1/V2 parity: they expose same helper and use it ---
-for _rel in ("testing area/reddit_main.py", "testing area/reddit_main_v2_embedez.py"):
-    try:
-        _m = load_module("smoke_r85_" + _rel.replace("/", "_").replace(" ", "_"), _rel)
-        assert hasattr(_m, "format_reddit_feed_query"), f"{_rel} missing format_reddit_feed_query"
-        assert hasattr(_m, "_redact_url_queries"), f"{_rel} missing _redact_url_queries"
-        # check normalization matches v3
-        for _raw in _r85_inputs.values():
-            assert _m.format_reddit_feed_query(_raw) == v3.format_reddit_feed_query(_raw), f"{_rel} mismatch { _raw!r}"
-        # source wiring
-        _src = inspect.getsource(_m._combined_feed_url)
-        assert "format_reddit_feed_query(REDDIT_FEED_TOKEN)" in _src, f"{_rel} _combined not wired"
-        _src2 = inspect.getsource(_m.fetch_working_reddit_feed)
-        assert "format_reddit_feed_query(REDDIT_FEED_TOKEN)" in _src2, f"{_rel} fetch_working not wired"
-        _src3 = inspect.getsource(_m._fetch_feed)
-        assert "_redact_url_queries" in _src3, f"{_rel} _fetch_feed not redacting"
-        check(f"r85 parity: {_rel} format helper + redaction (synthetic)", True)
-    except AssertionError as _e:
-        check(f"r85 parity: {_rel} format helper + redaction (synthetic)", False, str(_e))
-    except Exception as _e:
-        check(f"r85 parity: {_rel} format helper + redaction (synthetic)", False, f"{type(_e).__name__}: {_e}")
-
-# --- Inactive Reddit V2 card layout remains structurally aligned with V3 ---
-try:
-    _v2 = load_module("smoke_reddit_v2_card_layout", "testing area/reddit_main_v2_embedez.py")
-    _v2_media = [{"url": f"https://cdn.example/photo-{i}.jpg"} for i in range(11)]
-    _v2_media.append({"url": "https://cdn.example/clip.mp4"})
-    _v2_payload = _v2.build_v2_payload(
-        "ExampleSub", {
-            "content": {"title": "<b>Patch news</b>", "description": "<p>Body copy</p>",
-                        "media": _v2_media,
-                        "statistics": {"comments": 4, "shares": 2, "likes": 9, "views": 100}},
-            "user": {"displayName": "<b>NewsBot</b>"},
-        }, "https://www.reddit.com/r/ExampleSub/comments/abc123/post/", posted_ts=1_800_000_000)
-    _v2_containers = _v2_payload["components"]
-    _v2_first, _v2_second = (_v2_containers[0]["components"], _v2_containers[1]["components"])
-    _v2_galleries = [c for container in _v2_containers for c in container["components"]
-                     if c.get("type") == 12]
-    assert _v2_payload["flags"] == (1 << 15) and len(_v2_containers) == 2
-    assert _v2_first[0]["type"] == 10 and "Patch news" in _v2_first[0]["content"]
-    assert _v2_first[1]["content"] == "Body copy"
-    assert [len(g["items"]) for g in _v2_galleries] == [10, 1, 1]
-    assert "💬 4" in next(c["content"] for c in _v2_second if c.get("type") == 10 and "💬" in c.get("content", ""))
-    assert any("consider supporting" in c.get("content", "") for c in _v2_second)
-    check("inactive Reddit V2 renderer follows V3 card order with split photo galleries, separate video, stats, actions and footer", True)
-except AssertionError as _e:
-    check("inactive Reddit V2 renderer follows V3 card order with split photo galleries, separate video, stats, actions and footer", False, str(_e))
-except Exception as _e:
-    check("inactive Reddit V2 renderer follows V3 card order with split photo galleries, separate video, stats, actions and footer", False, f"{type(_e).__name__}: {_e}")
 
 # --- Ensure redaction is used in v3 exception paths ---
 try:
@@ -4591,8 +4498,8 @@ try:
     check("r53: empty ACCOUNTS keeps the 8 default accounts",
           len(_r53_tw.ACCOUNTS) == 8, repr(_r53_tw.ACCOUNTS))
 
-    # Instance normalization: bare host (the way REDDIT_MIRROR is stored in
-    # this repo's Variables) gains https://, trailing slash is dropped, and
+    # Instance normalization: a bare configurable instance host gains https://,
+    # trailing slash is dropped, and
     # garbage falls back to the default instead of producing a broken url.
     _r53_default = "https://embeddit.deltandy.me"
     _r53_norm_cases = (
@@ -10783,21 +10690,17 @@ check("r94: every Twitter diagnostic category still matches a real engine log li
       and 'logging.error(f"MEDIA-HEAL {key}: edit error' in _r94_engine_src,
       [p for p, lit in _r94_pairs if p not in _r94_wf_src or lit not in _r94_engine_src])
 
-# 3. Round 119: fixed 400 MiB cap in both X engines, no tuning Variable.
+# 3. Round 119: fixed 400 MiB cap in the active X engine.
 _r94_rd_wf = open(os.path.join(ROOT, ".github/workflows/reddit_monitor.yml"),
                   encoding="utf-8").read()
-_r94_v2_src = open(os.path.join(ROOT, "testing area", "twitter_v2_button_outside.py"),
-                   encoding="utf-8").read()
-check("r119: both X engines use the fixed 400 MiB gallery cap, with no opt-in variable",
+check("r119: active X engine uses the fixed 400 MiB gallery cap, with no opt-in variable",
       x3.VIDEO_SIZE_LIMIT == 400 * 1024 * 1024
       and "VIDEO_SIZE_LIMIT = 400 * 1024 * 1024" in _r94_engine_src
-      and "VIDEO_SIZE_LIMIT = 400 * 1024 * 1024" in _r94_v2_src
-      and "TWITTER_HIGH_VIDEO_LIMIT" not in _r94_engine_src + _r94_v2_src + _r94_wf_src
+      and "TWITTER_HIGH_VIDEO_LIMIT" not in _r94_engine_src + _r94_wf_src
       and "TWITTER_HIGH_VIDEO_LIMIT" not in _r94_rd_wf)
-check("r119: the engines probe all available MP4 variants when the source exceeds the cap",
+check("r119: active X engine probes available MP4 variants when the source exceeds the cap",
       "_candidates = _variants" in _r94_engine_src
-      and "_candidates = _variants" in _r94_v2_src
-      and "MAX_VARIANT_PROBES" not in _r94_engine_src + _r94_v2_src)
+      and "MAX_VARIANT_PROBES" not in _r94_engine_src)
 
 # 4. The Reddit run-result line reports presence only: the four documented
 #    states, and never the record's own contents (it can carry anything).
@@ -11104,7 +11007,7 @@ check("r119: ordinary cache dedup still happens before tweet-data fetch, indepen
 # Every variable documented in the README must reach its workflow, or setting
 # it in repository settings does nothing. Dispatch inputs are not repo Variables.
 _r95c_not_variables = {"ACCOUNTS", "SUBREDDITS", "DRY_RUN", "TEST_POST_ID",
-                       "TEST_TWEET_ID", "FORCE_TEST_TWEET", "EMBEDEZ_API_KEY"}
+                       "TEST_TWEET_ID", "FORCE_TEST_TWEET"}
 _r95c_readme_path = os.path.join(ROOT, "README.md")
 if os.path.isfile(_r95c_readme_path):
     _x95c_readme = open(_r95c_readme_path, encoding="utf-8").read()

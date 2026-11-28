@@ -1,10 +1,10 @@
 # ---------------------------------------------------------------------------
 # ■ Reddit RSS Feed Monitor — V3 (Components V2 rich card — NATIVE media + proxy services)
 # ---------------------------------------------------------------------------
-# Same monitoring as V1/V2 (combined feed, feed token, 429 retries, mod-queue
-# safe 48h window, per-channel webhooks, dedup cache, auto-commit), but the
-# card media comes from REDDIT'S OWN URLs and keyless public proxy services
-# (vxreddit, redditez/EmbedEZ, Embeddit) — no EmbedEZ API key, no credits.
+# Maintained Reddit monitor: combined feed, feed token, 429 retries, mod-queue
+# safe 48h window, per-channel webhooks, dedup cache, auto-commit, and cards
+# built from Reddit media plus keyless public proxy services (vxreddit, RedditEZ /
+# EmbedEZ, Embeddit) — no EmbedEZ API key or credits required.
 # Round 12 (2026-09-15); proxy-service round 13; EmbedEZ video-quality
 # candidate round 67 (see PROXY MEDIA SERVICES below).
 #

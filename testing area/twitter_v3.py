@@ -1,11 +1,9 @@
 # ---------------------------------------------------------------------------
-# ■ Components V2 Edition (Buttons Inside Container) — twitter_v3.py
+# ■ Twitter V3 engine — Discord Components V2 card (buttons inside container)
 # ---------------------------------------------------------------------------
-# This is a separate file — your V1 twitter_v1.py and V2 twitter_v2_button_outside.py stay untouched.
 # To use it: change the workflow's run line to:  python "testing area/twitter_v3.py"
 #
-# Same behavior as twitter_v2_button_outside.py, but the action row is NESTED INSIDE the
-# type-17 container (all-in-one card look).
+# The action row is nested inside the type-17 container for an all-in-one card.
 #
 # ■ What's new in this revision (2026-09-11, round 4):
 #   • FIXED Discord 400 {"components": ["0"]} errors — caused by tweets with
